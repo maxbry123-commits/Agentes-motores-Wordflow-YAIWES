@@ -17,7 +17,7 @@ ACR puede procesar varios archivos en un lote cuando el tamaño total sea seguro
 11. Archivos muy grandes deben recuperarse por segmentos deterministas y reconstruirse antes de verificar SHA.
 12. Antes de cerrar una familia, reconciliar todos sus archivos por ruta + SHA y detectar faltantes/extras.
 
-### Objetivo
+## Objetivo
 Aumentar el rendimiento de ACR sin perder trazabilidad: un lote puede acelerar la transferencia, pero **SHA individual + evidencia de GitHub siguen siendo la autoridad**.
 
 ## Inventario de raíz confirmado
@@ -50,9 +50,9 @@ Aumentar el rendimiento de ACR sin perder trazabilidad: un lote puede acelerar l
 - Fuente: `openclaw/openclaw@a4178c7eb15a0dd2b8b44804348e256f1a109a34`
 - Familia: `01-root-manifests`
 - Raíz: 61 entradas / 40 archivos / 21 directorios
-- Último archivo verificado: `.pre-commit-config.yaml`
-- Siguiente: `AGENTS.md`
-- `AGENTS.md`: recuperado de fuente, pendiente de escritura/verificación como transferencia.
+- Último archivo verificado: `AGENTS.md`
+- SHA `AGENTS.md`: `7fcee34720673a4285bd35b7613cc226c6eed413`
+- Siguiente: `CLAUDE.md`
 
 ## Incidencias reutilizables
 - Blob truncado → recuperar completo o segmentar/reconstruir.
@@ -60,6 +60,13 @@ Aumentar el rendimiento de ACR sin perder trazabilidad: un lote puede acelerar l
 - Escritura parcial → identificar el parcial y reconstruir desde fuente.
 - Inventario truncado → dividir por familias/directorios.
 - Lote parcialmente fallido → conservar sólo elementos individualmente verificados y reintentar los fallidos.
+
+### Incidencia `AGENTS.md` — solución aplicada
+Durante la transferencia de `AGENTS.md` se produjeron varias copias con SHA diferente al blob fijado. La causa fue reconstrucción manual a partir de respuestas truncadas/ventanas de contenido, que omitió líneas en límites de paginación.
+
+La solución robusta fue dejar de reconstruir manualmente y añadir un workflow de GitHub Actions que descarga directamente el `AGENTS.md` del commit fijado mediante la URL raw, calcula `git hash-object` y exige exactamente `7fcee34720673a4285bd35b7613cc226c6eed413` antes de hacer commit. La verificación final del destino confirmó ese SHA exacto.
+
+Aprendizaje: cuando se requiere identidad criptográfica exacta, la transferencia debe conservar bytes directamente desde la fuente; las reconstrucciones basadas en texto truncado no son equivalentes.
 
 ## Regla final
 No avanzar el cursor sobre un archivo pendiente. No declarar un lote completo hasta verificar cada elemento. No modificar `main` como integración final hasta disponer de SHA y contenido verificables.
