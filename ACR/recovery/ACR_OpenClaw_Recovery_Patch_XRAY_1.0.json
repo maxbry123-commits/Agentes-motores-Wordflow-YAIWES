@@ -1,11 +1,18 @@
 {
   "acr_recovery_patch": {
     "name": "OpenClaw Motor Wordflow - ACR Recovery Patch",
-    "version": "ACR-XRAY-1.0",
-    "status": "INITIALIZED",
-    "source": {"repository": "openclaw/openclaw", "ref": "main", "source_commit": "a4178c7eb15a0dd2b8b44804348e256f1a109a34"},
+    "version": "ACR-XRAY-1.1",
+    "status": "IN_PROGRESS",
+    "source": {"repository": "openclaw/openclaw", "ref": "a4178c7eb15a0dd2b8b44804348e256f1a109a34"},
     "destination": {"repository": "maxbry123-commits/Agentes-motores-Wordflow-YAIWES", "branch": "acr/openclaw-motor-recovery-v2"},
     "objective": "Recover OpenClaw as a Wordflow engine without UI using segmented, resumable ACR transfer and forensic audit logging.",
+    "download_map": {
+      "01-root-manifests": {"status":"in_progress","source_paths":["package.json","pnpm-workspace.yaml","pnpm-lock.yaml","openclaw.mjs","node-version.mjs",".npmrc",".oxfmtrc.jsonc",".oxlintrc.json",".gitattributes","README.md","LICENSE","THIRD_PARTY_NOTICES.md"],"destination_root":"ACR/source/root/"},
+      "02-src": {"status":"pending","source_paths":["src/**"],"destination_root":"ACR/source/src/"},
+      "03-packages": {"status":"pending","source_paths":["packages/**"],"destination_root":"ACR/source/packages/"},
+      "04-extensions": {"status":"pending","source_paths":["extensions/**"],"destination_root":"ACR/source/extensions/"},
+      "05-validation-reconstruction": {"status":"pending","source_paths":["required build/runtime validation material"],"destination_root":"ACR/validation/"}
+    },
     "rules": {
       "exclude": ["ui/**", "node_modules/**", ".pnpm-store/**", "generated build artifacts", "caches", "logs", "secrets", "personal configuration"],
       "preserve": ["src/**", "packages/**", "extensions/**", "root manifests", "required runtime/build files"],
@@ -15,17 +22,13 @@
     "execution_model": {
       "families": ["01-root-manifests", "02-src", "03-packages", "04-extensions", "05-validation-reconstruction"],
       "continuation_rule": "Each family may contain any number of numbered transfer segments.",
-      "restart_recovery": "Read the GitHub ledger and resume after the last verified segment."
+      "restart_recovery": "Read the GitHub ledger first and resume after the last verified output/segment."
     },
     "forensic_ledger": {
-      "required_each_output": ["output number", "family", "segment", "source commit", "files attempted", "files completed", "bytes transferred", "SHA-256 status", "GitHub commit", "next recovery point", "errors/retries"],
-      "dual_history": {"chat_history": "Cumulative short log carried in every response.", "github_history": "Authoritative machine-readable ledger committed to the destination branch."}
+      "required_each_output": ["output number", "family", "segment", "source commit", "files attempted", "files completed", "bytes transferred", "source SHA", "destination commit", "last output", "next output", "next exact file or segment", "errors/retries"],
+      "dual_history": {"chat_history": "Cumulative short status only.", "github_history": "Authoritative machine-readable forensic ledger."}
     },
-    "current_phase": {
-      "phase": "00-initialization",
-      "completed": ["GitHub connectivity verified", "destination repository verified", "OpenClaw source tree queried", "source commit pinned", "recovery branch selected", "transfer families defined", "recovery patch created"],
-      "not_yet_claimed": ["full 2GB transfer", "full dependency closure", "segment completion", "final reconstruction"]
-    },
-    "recovery_protocol": ["Read GitHub ledger first.", "Find the last verified segment.", "Resume at the next unverified segment.", "Never overwrite verified content without recording why.", "Record every batch, byte count and SHA result.", "At completion compare reconstructed tree against the pinned source manifest."]
+    "current_state": {"last_output":3,"current_family":"01-root-manifests","completed_source_files":["pnpm-workspace.yaml","node-version.mjs",".npmrc",".oxfmtrc.jsonc"],"next_output":4,"next_exact_source_file":".oxlintrc.json","then":".gitattributes, package.json, openclaw.mjs, pnpm-lock.yaml and remaining root manifests"},
+    "recovery_protocol": ["Read LEDGER.json first.", "Locate last_output and next_output.", "Resume at next_exact_source_file.", "Never overwrite verified content without recording why.", "Record every batch, byte count, source SHA, destination commit and next recovery point.", "At completion compare reconstructed tree against the pinned source manifest."]
   }
 }
