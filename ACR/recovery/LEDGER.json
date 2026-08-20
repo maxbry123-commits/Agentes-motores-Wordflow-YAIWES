@@ -1,21 +1,22 @@
 {
-  "ledger_version": "1.0",
+  "ledger_version": "1.1",
   "project": "OpenClaw Motor Wordflow",
   "branch": "acr/openclaw-motor-recovery-v2",
   "source": "openclaw/openclaw@a4178c7eb15a0dd2b8b44804348e256f1a109a34",
   "mode": "forensic-xray",
-  "output": 1,
-  "status": "INITIALIZED",
+  "output": 2,
+  "status": "IN_PROGRESS",
   "families": [
-    {"id":"01-root-manifests","status":"pending","segments_verified":0,"bytes_transferred":0},
-    {"id":"02-src","status":"pending","segments_verified":0,"bytes_transferred":0},
-    {"id":"03-packages","status":"pending","segments_verified":0,"bytes_transferred":0},
-    {"id":"04-extensions","status":"pending","segments_verified":0,"bytes_transferred":0},
-    {"id":"05-validation-reconstruction","status":"pending","segments_verified":0,"bytes_transferred":0}
+    {"id":"01-root-manifests","status":"in_progress","segments_verified":0,"bytes_transferred":"tracked by Git blobs","files_transferred":2},
+    {"id":"02-src","status":"pending","segments_verified":0,"bytes_transferred":0,"files_transferred":0},
+    {"id":"03-packages","status":"pending","segments_verified":0,"bytes_transferred":0,"files_transferred":0},
+    {"id":"04-extensions","status":"pending","segments_verified":0,"bytes_transferred":0,"files_transferred":0},
+    {"id":"05-validation-reconstruction","status":"pending","segments_verified":0,"bytes_transferred":0,"files_transferred":0}
   ],
   "exclusions": ["ui/**","node_modules/**",".pnpm-store/**","generated build artifacts","caches","logs","secrets","personal configuration"],
   "events": [
-    {"output":1,"phase":"00-initialization","action":"created recovery patch and ledger","bytes_transferred":0,"segments_verified":0,"errors":0,"next":"Build deterministic source manifest and segment plan."}
+    {"output":1,"phase":"00-initialization","action":"created recovery patch and ledger","bytes_transferred":0,"segments_verified":0,"errors":0},
+    {"output":2,"phase":"01-root-manifests","action":"transferred pnpm-workspace.yaml and node-version.mjs to ACR/source","source_verified":true,"destination_commits":["c3a257bed10e92c0d6d018152403b02622909f53","0002a605dfee1eea0f00822adb749744ff5b3003"],"segments_verified":2,"errors":0,"next":"Continue root manifest transfer; then build deterministic manifest before src segmentation."}
   ],
-  "recovery_rule": "On restart, read this file first; resume from the last event with status verified."
+  "recovery_rule": "On restart, read this file first; resume from the last verified event."
 }
