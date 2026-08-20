@@ -67,6 +67,25 @@ Cuando la fuente exige coincidencia criptográfica exacta, una reconstrucción m
 5. Verificar SHA de destino.
 6. Sólo después actualizar Ledger y continuar.
 
+## Entrada 2026-08-20 — Salida 107
+
+### Hallazgo forense: diferencia concreta identificada
+La auditoría del commit de destino `7b33e5173a991cc64841257cab61f728a2243816` mostró que la copia reconstruida no contiene exactamente todo lo que estaba en la versión fuente fijada.
+
+El diff del commit revela dos diferencias concretas relevantes para la reconstrucción:
+
+1. En `## Validation`, la fuente conserva cuatro reglas sobre no aterrizar cambios relacionados con CI fallido, responsabilidad de CI rojo y validación de cambios sólo de docs/changelog/workflow; esas líneas habían quedado fuera de la copia reconstruida.
+2. En `## Tests`, la fuente contiene el ejemplo de modelo `sol` junto a `sonnet-4.6` y `gpt-5.6-luna`; la copia reconstruida omitió `sol`.
+
+### Aprendizaje ACR
+No basta con recuperar secciones por ventanas ni reconstruir a partir de una salida truncada. Una ventana que comienza en mitad del documento puede ocultar líneas inmediatamente anteriores al punto de continuación. Para archivos críticos, el método debe usar una fuente completa y conservar todas las líneas, incluyendo las que quedan entre límites de paginación.
+
+### Acción
+- Bitácora actualizada antes de continuar.
+- Cursor sigue en `AGENTS.md`.
+- Ledger no avanza.
+- Próxima reconstrucción debe reincorporar las líneas detectadas y verificar nuevamente el SHA.
+
 ## Estado actual
 - Familia: `01-root-manifests`
 - Cursor: `AGENTS.md`
