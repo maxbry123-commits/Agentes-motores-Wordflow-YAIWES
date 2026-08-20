@@ -1,21 +1,30 @@
 {
-  "ledger_version":"1.6",
+  "ledger_version":"1.7",
   "project":"OpenClaw Motor Wordflow",
   "branch":"acr/openclaw-motor-recovery-v2",
   "source":"openclaw/openclaw@a4178c7eb15a0dd2b8b44804348e256f1a109a34",
   "mode":"forensic-xray",
-  "output":14,
+  "output":15,
   "status":"IN_PROGRESS",
-  "last_output":14,
-  "next_output":15,
+  "last_output":15,
+  "next_output":16,
   "current_family":"01-root-manifests",
-  "last_verified_source_file":".oxlintrc.json",
-  "last_source_blob_sha":"cfa18de8e1498d7dc189daff669faca40d99881a",
-  "last_destination_commit":"66049d58102870f9c09b828417b5764fddc6ba59",
-  "next_exact_source_file":".pre-commit-config.yaml",
-  "next_action":"verify .pre-commit-config.yaml against pinned source blob before counting it as transferred; then continue root inventory",
+  "last_verified_source_file":".pre-commit-config.yaml",
+  "last_source_blob_sha":"24a3582ffc4914053a80e1a664bef3eafe355314",
+  "last_destination_commit":"86e87aeb9fe54a1864fdf27a6c952f0ed034c263",
+  "last_destination_blob_sha":"24a3582ffc4914053a80e1a664bef3eafe355314",
+  "next_exact_source_file":"NEXT_ROOT_FILE_AFTER_PRE_COMMIT",
+  "next_action":"continue complete root inventory; reconcile the remaining 25 root files by path + pinned source blob SHA before closing family",
+  "root_inventory":{
+    "source_root_entries_total":61,
+    "source_root_files_total":40,
+    "source_root_directories_total":21,
+    "root_files_verified":15,
+    "root_files_pending_by_count":25,
+    "classification_rule":"GitHub contents type=file is a root file; type=dir is a root directory. Directory entries are not counted as files. Pending-by-count is provisional until all 40 root file paths are reconciled against destination."
+  },
   "families":[
-    {"id":"01-root-manifests","status":"in_progress","segments_verified":5,"files_transferred":14},
+    {"id":"01-root-manifests","status":"in_progress","segments_verified":6,"files_transferred":15},
     {"id":"02-src","status":"pending","segments_verified":0,"files_transferred":0},
     {"id":"03-packages","status":"pending","segments_verified":0,"files_transferred":0},
     {"id":"04-extensions","status":"pending","segments_verified":0,"files_transferred":0},
@@ -50,19 +59,23 @@
     "rule":"Presence of a path is not proof of transfer. Each artifact becomes verified only when source path + pinned source blob SHA + destination evidence agree."
   },
   "inventory_notes":{
-    "verified_count":14,
+    "verified_count":15,
     "global_source_total":"NOT_YET_CLOSED",
     "global_missing_count":"NOT_YET_CLOSED",
+    "root_inventory_confirmed":"61 entries = 40 files + 21 directories",
+    "root_files_pending_by_count":25,
     "pre_commit_source_blob_sha":"24a3582ffc4914053a80e1a664bef3eafe355314",
-    "pre_commit_destination_blob_sha":"158db6861128b6abd12d2a703ec207ec6a8631f7",
-    "pre_commit_status":"PRESENT_BUT_SHA_MISMATCH_PENDING_VERIFICATION"
+    "pre_commit_destination_blob_sha":"24a3582ffc4914053a80e1a664bef3eafe355314",
+    "pre_commit_status":"VERIFIED_WRITE"
   },
   "events":[
     {"output":13,"source_file":".oxfmtrc.jsonc","status":"RETRY_REQUIRED","errors":1},
-    {"output":14,"source_file":".oxlintrc.json","action":"replaced destination with complete pinned source blob and verified destination retrieval begins with exact source content","source_blob_sha":"cfa18de8e1498d7dc189daff669faca40d99881a","destination_commit":"66049d58102870f9c09b828417b5764fddc6ba59","destination_blob_sha":"f5a6f9430a1e53197a5be4f7e5c4b4e08610f1b6","status":"VERIFIED_WRITE","errors":0},
+    {"output":14,"source_file":".oxlintrc.json","action":"replaced destination with complete pinned source blob and verified destination retrieval begins with exact source content","source_blob_sha":"cfa18de8e1498d7dc189daff669faca40d99881a","destination_commit":"66049d58102870f9c09b828417b5764fddc6ba59","destination_blob_sha":"f5a6f9430a1e53197a5be4f7e5c4b4e08610f1b","status":"VERIFIED_WRITE","errors":0},
     {"method_update":"At every family/segment boundary perform a source-vs-destination inventory audit; failed writes never advance the cursor."},
     {"method_update":"Added explicit operational-code index to the recovery patch and ledger so a new GPT/agent can identify the recovery engine, source roots, critical artifacts and verification rule without relying on chat history."},
-    {"output":14,"source_file":".pre-commit-config.yaml","source_blob_sha":"24a3582ffc4914053a80e1a664bef3eafe355314","destination_blob_sha":"158db6861128b6abd12d2a703ec207ec6a8631f7","status":"PRESENT_BUT_SHA_MISMATCH_PENDING_VERIFICATION","errors":0}
+    {"output":14,"source_file":".pre-commit-config.yaml","source_blob_sha":"24a3582ffc4914053a80e1a664bef3eafe355314","destination_blob_sha":"158db6861128b6abd12d2a703ec207ec6a8631f7","status":"PRESENT_BUT_SHA_MISMATCH_PENDING_VERIFICATION","errors":0},
+    {"output":15,"source_file":".pre-commit-config.yaml","source_blob_sha":"24a3582ffc4914053a80e1a664bef3eafe355314","destination_commit":"86e87aeb9fe54a1864fdf27a6c952f0ed034c263","destination_blob_sha":"24a3582ffc4914053a80e1a664bef3eafe355314","status":"VERIFIED_WRITE","errors":0},
+    {"method_update":"Root inventory confirmed as 61 entries: 40 files and 21 directories. Root directory entries are containers and must be inventoried recursively by family; they are not files."}
   ],
   "recovery_rule":"On restart, read this ledger first, then ACR-RECOVERY-PATCH.md and ACR-VERSION-MAP.md; resume only from next_output/next_exact_source_file and never infer transfer from path presence alone."
 }
