@@ -77,7 +77,7 @@ Skills own workflows; root owns hard policy and routing. Product direction and m
 
 ## Map
 
-- Core TS: `src/`, `ui/`, `packages`; plugins: `extensions/`; SDK: `src/plugin-sdk/*`; channels: `src/channels/*`; loader: `src/plugins/*`; protocol: `packages/gateway-protocol/*`; docs/apps: `docs/`, `apps/`.
+- Core TS: `src/`, `ui/`, `packages/`; plugins: `extensions/`; SDK: `src/plugin-sdk/*`; channels: `src/channels/*`; loader: `src/plugins/*`; protocol: `packages/gateway-protocol/*`; docs/apps: `docs/`, `apps/`.
 - Installers: sibling `../openclaw.ai`.
 - Scoped guides: `extensions/`, `src/{plugin-sdk,channels,plugins,gateway,agents,tui}/`, `test/`, `test/helpers*/`, `docs/`, `ui/`, `scripts/`, plus deeper subtree guides — always check the touched path's nearest `AGENTS.md`.
 
@@ -197,6 +197,10 @@ Review invariants; full doctrine: `docs/gateway/audit.md`.
 - Release-branch full validation and its dispatch mechanics: `$release-openclaw-ci`.
 - Pre-land/pre-commit code changes: mandatory fresh `$autoreview` until no accepted/actionable findings remain. Do not land code on CI, ClawSweeper, prior review comments, or your own manual review alone unless user explicitly opts out or scope is truly trivial/docs-only. If findings want refactor, refactor; no ugly fixes. Autoreview staged/uncommitted diff: `--mode uncommitted`; there is no `dirty` or `staged` mode.
 - If proof is blocked, say exactly what is missing and why.
+- Do not land related failing format/lint/type/build/tests. If unrelated on latest `origin/main`, say so with scoped proof.
+- Broken CI is always someone's job; default to making it yours. Red `main`, a red merge gate, or a flaky-by-construction assertion gets fixed, not waited out, worked around, or reported back as someone else's problem. Fix it in the landing PR, note it in the PR body, never land onto red or bypass the gate. Prefer the smallest correct fix (register a missing source file, restore a dropped export, give an exact-equality assertion on renderer/timing-dependent values a tolerance).
+- Only two things override that default: an in-flight fix already open for the same breakage (link it, wait, say so), or a fix that needs owner judgment beyond the failing gate (say exactly what and why). Neither excuses leaving CI red and moving on.
+- Docs/changelog-only and CI/workflow metadata-only: `git diff --check` plus relevant docs/workflow sanity; escalate only if scripts/config/generated/package/runtime behavior changed.
 
 ## GitHub / PRs
 
@@ -232,7 +236,7 @@ Review invariants; full doctrine: `docs/gateway/audit.md`.
 - CI polling: exact SHA, relevant checks only, minimal fields. Skip routine noise (`Auto response`, `Labeler`, docs agents, performance/stale). Logs only after failure/completion or concrete need. Never `gh run watch`; its 3s polling exhausts API quota. Use sparse GraphQL rollups. Filter `gh run list` by workflow/branch/commit; broad JSON lists can exceed relay caps. Exact-SHA fallback dispatches require the full 40-character SHA.
 - CI waits: `node scripts/watch-pr-ci.mjs <pr> <head-sha>` — prechecks mergeable (CONFLICTING = pull_request CI cannot attach) and run attachment before polling; watchers emit every terminal state; no unbounded polls.
 - Agent PR landing to `main`: only the repo-native `scripts/pr` wrapper — `review-init` -> `review-artifacts-init` -> `review-validate-artifacts` -> `OPENCLAW_TESTBOX=1 scripts/pr prepare-run` -> `merge-run`. The Testbox flag is mandatory for agents; invoke `prepare-run` only after exact-head CI is complete and green. Full mechanics (fork-code variant, drift policy, waits): `$openclaw-pr-maintainer`.
-- Non-main PRs: never `scripts/pr prepare-run`/`merge-run` (they diff against `main`); the exact procedure, plus throttle-lock recovery, lives at `$openclaw-pr-maintainer`.
+- Non-main PRs: never `scripts/pr prepare-run`/`merge-run` (they diff against `main`); the exact procedure, plus throttle-lock recovery, lives in `$openclaw-pr-maintainer`.
 - Main-bound workflow dispatch: resolve server `main` SHA immediately before dispatch; retry if identity fails after `main` advances.
 
 ## Tooling Gotchas
