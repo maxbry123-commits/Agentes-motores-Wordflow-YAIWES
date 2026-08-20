@@ -1,6 +1,4 @@
-# maxbry-router — Router inteligente (Cuenta A · Sistema)
-
-Centro de control / routing del ecosistema MAXBRY / YAIWES.
+Agentes motores Wordflow YAIWES.
 
 ## Método de trabajo — multi-cuenta
 
