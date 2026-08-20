@@ -1,30 +1,30 @@
 {
-  "ledger_version":"1.8",
+  "ledger_version":"1.9",
   "project":"OpenClaw Motor Wordflow",
   "branch":"acr/openclaw-motor-recovery-v2",
   "source":"openclaw/openclaw@a4178c7eb15a0dd2b8b44804348e256f1a109a34",
   "mode":"forensic-xray",
-  "output":16,
+  "output":17,
   "status":"IN_PROGRESS",
-  "last_output":16,
-  "next_output":17,
+  "last_output":17,
+  "next_output":18,
   "current_family":"01-root-manifests",
-  "last_verified_source_file":".semgrepignore",
-  "last_source_blob_sha":"95b2b680987de9cb33a98d81767a68481ab65e10",
-  "last_destination_commit":"5a9f4dab86288b5ede2686553c88891c1cc9fcb5",
-  "last_destination_blob_sha":"95b2b680987de9cb33a98d81767a68481ab65e10",
-  "next_exact_source_file":"AGENTS.md",
-  "next_action":"transfer AGENTS.md from the pinned source, verify destination SHA, then continue the remaining root-file inventory",
+  "last_verified_source_file":"AGENTS.md",
+  "last_source_blob_sha":"7fcee34720673a4285bd35b7613cc226c6eed413",
+  "last_destination_commit":"cd7b5cd09e5b7856feb072b1619f87737db7732e",
+  "last_destination_blob_sha":"7fcee34720673a4285bd35b7613cc226c6eed413",
+  "next_exact_source_file":"CLAUDE.md",
+  "next_action":"transfer CLAUDE.md from the pinned source, verify destination SHA, then continue the remaining root-file inventory",
   "root_inventory":{
     "source_root_entries_total":61,
     "source_root_files_total":40,
     "source_root_directories_total":21,
-    "root_files_verified":16,
-    "root_files_pending_by_count":24,
+    "root_files_verified":17,
+    "root_files_pending_by_count":23,
     "classification_rule":"GitHub contents type=file is a root file; type=dir is a root directory. Directory entries are not counted as files. Pending-by-count is provisional until all 40 root file paths are reconciled against destination."
   },
   "families":[
-    {"id":"01-root-manifests","status":"in_progress","segments_verified":7,"files_transferred":16},
+    {"id":"01-root-manifests","status":"in_progress","segments_verified":8,"files_transferred":17},
     {"id":"02-src","status":"pending","segments_verified":0,"files_transferred":0},
     {"id":"03-packages","status":"pending","segments_verified":0,"files_transferred":0},
     {"id":"04-extensions","status":"pending","segments_verified":0,"files_transferred":0},
@@ -59,17 +59,21 @@
     "rule":"Presence of a path is not proof of transfer. Each artifact becomes verified only when source path + pinned source blob SHA + destination evidence agree."
   },
   "inventory_notes":{
-    "verified_count":16,
+    "verified_count":17,
     "global_source_total":"NOT_YET_CLOSED",
     "global_missing_count":"NOT_YET_CLOSED",
     "root_inventory_confirmed":"61 entries = 40 files + 21 directories",
-    "root_files_pending_by_count":24,
+    "root_files_pending_by_count":23,
     "pre_commit_source_blob_sha":"24a3582ffc4914053a80e1a664bef3eafe355314",
     "pre_commit_destination_blob_sha":"24a3582ffc4914053a80e1a664bef3eafe355314",
     "pre_commit_status":"VERIFIED_WRITE",
     "semgrepignore_source_blob_sha":"95b2b680987de9cb33a98d81767a68481ab65e10",
     "semgrepignore_destination_blob_sha":"95b2b680987de9cb33a98d81767a68481ab65e10",
-    "semgrepignore_status":"VERIFIED_WRITE"
+    "semgrepignore_status":"VERIFIED_WRITE",
+    "agents_source_blob_sha":"7fcee34720673a4285bd35b7613cc226c6eed413",
+    "agents_destination_blob_sha":"7fcee34720673a4285bd35b7613cc226c6eed413",
+    "agents_status":"VERIFIED_WRITE",
+    "agents_recovery_method":"GitHub Actions raw fetch from pinned commit + git hash-object exact-SHA gate"
   },
   "events":[
     {"output":13,"source_file":".oxfmtrc.jsonc","status":"RETRY_REQUIRED","errors":1},
@@ -79,7 +83,8 @@
     {"output":14,"source_file":".pre-commit-config.yaml","source_blob_sha":"24a3582ffc4914053a80e1a664bef3eafe355314","destination_blob_sha":"158db6861128b6abd12d2a703ec207ec6a8631f7","status":"PRESENT_BUT_SHA_MISMATCH_PENDING_VERIFICATION","errors":0},
     {"output":15,"source_file":".pre-commit-config.yaml","source_blob_sha":"24a3582ffc4914053a80e1a664bef3eafe355314","destination_commit":"86e87aeb9fe54a1864fdf27a6c952f0ed034c263","destination_blob_sha":"24a3582ffc4914053a80e1a664bef3eafe355314","status":"VERIFIED_WRITE","errors":0},
     {"method_update":"Root inventory confirmed as 61 entries: 40 files and 21 directories. Root directory entries are containers and must be inventoried recursively by family; they are not files."},
-    {"output":16,"source_file":".semgrepignore","source_blob_sha":"95b2b680987de9cb33a98d81767a68481ab65e10","destination_commit":"5a9f4dab86288b5ede2686553c88891c1cc9fcb5","destination_blob_sha":"95b2b680987de9cb33a98d81767a68481ab65e10","status":"VERIFIED_WRITE","errors":0}
+    {"output":16,"source_file":".semgrepignore","source_blob_sha":"95b2b680987de9cb33a98d81767a68481ab65e10","destination_commit":"5a9f4dab86288b5ede2686553c88891c1cc9fcb5","destination_blob_sha":"95b2b680987de9cb33a98d81767a68481ab65e10","status":"VERIFIED_WRITE","errors":0},
+    {"output":17,"source_file":"AGENTS.md","source_blob_sha":"7fcee34720673a4285bd35b7613cc226c6eed413","destination_blob_sha":"7fcee34720673a4285bd35b7613cc226c6eed413","status":"VERIFIED_WRITE","errors":0,"recovery":"GitHub Actions raw fetch from pinned commit + exact git hash-object gate","problem":"Manual/windowed reconstruction produced SHA mismatches because truncated responses lost lines at boundaries","solution":"Use a GitHub Actions workflow to fetch the exact pinned raw blob directly and refuse commit unless hash-object equals the pinned SHA"}
   ],
   "recovery_rule":"On restart, read this ledger first, then ACR-RECOVERY-PATCH.md and ACR-VERSION-MAP.md; resume only from next_output/next_exact_source_file and never infer transfer from path presence alone."
 }
