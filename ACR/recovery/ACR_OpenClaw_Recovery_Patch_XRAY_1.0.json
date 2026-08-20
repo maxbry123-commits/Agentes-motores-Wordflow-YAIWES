@@ -1,0 +1,31 @@
+{
+  "acr_recovery_patch": {
+    "name": "OpenClaw Motor Wordflow - ACR Recovery Patch",
+    "version": "ACR-XRAY-1.0",
+    "status": "INITIALIZED",
+    "source": {"repository": "openclaw/openclaw", "ref": "main", "source_commit": "a4178c7eb15a0dd2b8b44804348e256f1a109a34"},
+    "destination": {"repository": "maxbry123-commits/Agentes-motores-Wordflow-YAIWES", "branch": "acr/openclaw-motor-recovery-v2"},
+    "objective": "Recover OpenClaw as a Wordflow engine without UI using segmented, resumable ACR transfer and forensic audit logging.",
+    "rules": {
+      "exclude": ["ui/**", "node_modules/**", ".pnpm-store/**", "generated build artifacts", "caches", "logs", "secrets", "personal configuration"],
+      "preserve": ["src/**", "packages/**", "extensions/**", "root manifests", "required runtime/build files"],
+      "segmentation": {"method": "byte-based deterministic segments", "target_segment_size_mb": 50, "large_file_policy": "do not rewrite source content; mark large objects for special handling"},
+      "verification": ["source commit pin", "file manifest", "segment manifest", "SHA-256", "reconstruction audit"]
+    },
+    "execution_model": {
+      "families": ["01-root-manifests", "02-src", "03-packages", "04-extensions", "05-validation-reconstruction"],
+      "continuation_rule": "Each family may contain any number of numbered transfer segments.",
+      "restart_recovery": "Read the GitHub ledger and resume after the last verified segment."
+    },
+    "forensic_ledger": {
+      "required_each_output": ["output number", "family", "segment", "source commit", "files attempted", "files completed", "bytes transferred", "SHA-256 status", "GitHub commit", "next recovery point", "errors/retries"],
+      "dual_history": {"chat_history": "Cumulative short log carried in every response.", "github_history": "Authoritative machine-readable ledger committed to the destination branch."}
+    },
+    "current_phase": {
+      "phase": "00-initialization",
+      "completed": ["GitHub connectivity verified", "destination repository verified", "OpenClaw source tree queried", "source commit pinned", "recovery branch selected", "transfer families defined", "recovery patch created"],
+      "not_yet_claimed": ["full 2GB transfer", "full dependency closure", "segment completion", "final reconstruction"]
+    },
+    "recovery_protocol": ["Read GitHub ledger first.", "Find the last verified segment.", "Resume at the next unverified segment.", "Never overwrite verified content without recording why.", "Record every batch, byte count and SHA result.", "At completion compare reconstructed tree against the pinned source manifest."]
+  }
+}
