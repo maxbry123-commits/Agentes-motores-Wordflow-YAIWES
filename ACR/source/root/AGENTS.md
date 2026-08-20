@@ -197,10 +197,6 @@ Review invariants; full doctrine: `docs/gateway/audit.md`.
 - Release-branch full validation and its dispatch mechanics: `$release-openclaw-ci`.
 - Pre-land/pre-commit code changes: mandatory fresh `$autoreview` until no accepted/actionable findings remain. Do not land code on CI, ClawSweeper, prior review comments, or your own manual review alone unless user explicitly opts out or scope is truly trivial/docs-only. If findings want refactor, refactor; no ugly fixes. Autoreview staged/uncommitted diff: `--mode uncommitted`; there is no `dirty` or `staged` mode.
 - If proof is blocked, say exactly what is missing and why.
-- Do not land related failing format/lint/type/build/tests. If unrelated on latest `origin/main`, say so with scoped proof.
-- Broken CI is always someone's job; default to making it yours. Red `main`, a red merge gate, or a flaky-by-construction assertion gets fixed, not waited out, worked around, or reported back as someone else's problem. Fix it in the landing PR, note it in the PR body, never land onto red or bypass the gate. Prefer the smallest correct fix (register a missing source file, restore a dropped export, give an exact-equality assertion on renderer/timing-dependent values a tolerance).
-- Only two things override that default: an in-flight fix already open for the same breakage (link it, wait, say so), or a fix that needs owner judgment beyond the failing gate (say exactly what and why). Neither excuses leaving CI red and moving on.
-- Docs/changelog-only and CI/workflow metadata-only: `git diff --check` plus relevant docs/workflow sanity; escalate only if scripts/config/generated/package/runtime behavior changed.
 
 ## GitHub / PRs
 
@@ -290,7 +286,7 @@ Mechanics only; policy lives above.
 
 ## Tests
 
-- Vitest. Colocated `*.test.ts`; e2e `*.e2e.test.ts`; example models `sonnet-4.6`, `gpt-5.6-luna`, `sol`. Test GPT with Luna preferred; use Sol when capability matters; no GPT-4.x agent-smoke defaults.
+- Vitest. Colocated `*.test.ts`; e2e `*.e2e.test.ts`; example models `sonnet-4.6`, `gpt-5.6-luna`; test GPT with Luna preferred; use Sol when capability matters; no GPT-4.x agent-smoke defaults.
 - Writing/changing tests: `$test-audit` authoring gate applies — named protected behavior, credible failure, no near-duplicate, no new test-only prod seam. Regression tests fail pre-fix for the intended reason. Broader sweeps: `$test-audit` workflow.
 - Test where the bugs live: boundaries, not internals — coverage behind mocks proves the mocks. Inject faults (network, provider, ordering, restart), not only success shapes. Delivery/dispatch/session changes need at least one boundary-level proof (harness or live).
 - Prefer invariant assertions (every input accounted for; every action ends in a visible outcome or recorded non-outcome) over enumerating happy paths.
