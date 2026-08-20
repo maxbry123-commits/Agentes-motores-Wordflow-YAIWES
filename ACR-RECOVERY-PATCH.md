@@ -44,6 +44,17 @@ Esta sección identifica explícitamente los artefactos que forman el motor oper
 
 **Regla:** una ruta listada aquí no significa automáticamente que esté transferida. El estado válido lo determina el ledger mediante ruta + SHA/blob fuente + evidencia de destino.
 
+## Inventario confirmado de la raíz de OpenClaw
+Auditoría directa de `openclaw/openclaw` en `main`: la raíz contiene **61 entradas**, clasificadas como **40 archivos** y **21 directorios**. Los directorios son contenedores que se inventarían recursivamente por sus propias familias; no se deben contar como archivos transferibles.
+
+- `ROOT_ENTRIES_TOTAL = 61`
+- `ROOT_FILES_TOTAL = 40`
+- `ROOT_DIRECTORIES_TOTAL = 21`
+- `ROOT_FILES_VERIFIED_BY_LEDGER = 15` después de verificar `.pre-commit-config.yaml`.
+- `ROOT_FILES_PENDING_BY_COUNT = 25`, sujeto a cruce definitivo por ruta + SHA contra los 40 archivos raíz.
+
+La clasificación se basa en el tipo devuelto por la API de contenidos de GitHub (`file` frente a `dir`). El inventario debe mantenerse separado del conteo de archivos transferidos.
+
 ## Regla de trabajo
 1. Auditar raíz y manifests antes de descargar.
 2. Fijar commit/ref y SHA/blob de cada archivo fuente.
@@ -60,6 +71,7 @@ Esta sección identifica explícitamente los artefactos que forman el motor oper
 13. Al cambiar branch/versión validar nuevamente commit fuente, tip, ledger y contenido.
 14. Antes de declarar integración completa, comparar `main` con el conjunto ACR esperado.
 15. Antes de usar código/herramienta ACR, comprobar ruta, SHA y estado en el ledger.
+16. En la raíz, distinguir siempre `entries`, `files` y `directories`; nunca usar el número de entradas como número de archivos.
 
 ## Incidencias y soluciones reutilizables
 - **Blob truncado:** recuperar blob completo o segmentar/reconstruir; no inventar contenido.
@@ -70,6 +82,7 @@ Esta sección identifica explícitamente los artefactos que forman el motor oper
 - **Bitácora no localizada:** auditar ramas/versiones/commits antes de crear otra.
 - **Documentos desincronizados:** sincronizar parche/bitácora/mapa con ledger.
 - **Archivo presente pero SHA diferente:** mantener pendiente hasta comprobar coincidencia con fuente fijada.
+- **Inventario truncado:** dividir el inventario por directorio/familia y no cerrar el total hasta reconciliar todos los segmentos.
 
 ## Método de auditoría de cuatro pasadas
 **Pasada 1 — Chat → conocimiento:** extraer reglas, errores, soluciones y decisiones reutilizables.
@@ -95,10 +108,11 @@ Esta sección identifica explícitamente los artefactos que forman el motor oper
 ## Estado conocido
 - Branch: `acr/openclaw-motor-recovery-v2`
 - Fuente: `openclaw/openclaw@a4178c7eb15a0dd2b8b44804348e256f1a109a34`
-- Ledger: salida 14 → siguiente 15.
-- Último verificado: `.oxlintrc.json`.
-- Último SHA fuente: `cfa18de8e1498d7dc189daff669faca40d99881a`.
-- Último commit destino: `66049d58102870f9c09b828417b5764fddc6ba59`.
+- Raíz fuente auditada: 61 entradas = 40 archivos + 21 directorios.
+- Ledger: salida 15 → siguiente 16 después de verificar `.pre-commit-config.yaml`.
+- Último verificado: `.pre-commit-config.yaml`.
+- Último SHA fuente: `24a3582ffc4914053a80e1a664bef3eafe355314`.
+- Último commit destino: `86e87aeb9fe54a1864fdf27a6c952f0ed034c263`.
 - Familia: `01-root-manifests`.
 - Siguiente acción: continuar inventario raíz y no cerrar familia hasta pasar auditoría fuente-vs-destino.
 
@@ -113,5 +127,5 @@ El número de salida no demuestra una operación completada; la prueba es eviden
 - La integración total a `main` sigue pendiente hasta verificar SHA completo y contenido.
 
 ## Continuación
-Última salida documentada: 78
-Siguiente salida: continuar desde ledger salida 14 → 15 sin inventar progreso.
+Última salida documentada: 84
+Siguiente salida: continuar desde ledger salida 15 → 16, completando el inventario de los 40 archivos raíz.
