@@ -1,0 +1,21 @@
+{
+  "ledger_version": "1.0",
+  "project": "OpenClaw Motor Wordflow",
+  "branch": "acr/openclaw-motor-recovery-v2",
+  "source": "openclaw/openclaw@a4178c7eb15a0dd2b8b44804348e256f1a109a34",
+  "mode": "forensic-xray",
+  "output": 1,
+  "status": "INITIALIZED",
+  "families": [
+    {"id":"01-root-manifests","status":"pending","segments_verified":0,"bytes_transferred":0},
+    {"id":"02-src","status":"pending","segments_verified":0,"bytes_transferred":0},
+    {"id":"03-packages","status":"pending","segments_verified":0,"bytes_transferred":0},
+    {"id":"04-extensions","status":"pending","segments_verified":0,"bytes_transferred":0},
+    {"id":"05-validation-reconstruction","status":"pending","segments_verified":0,"bytes_transferred":0}
+  ],
+  "exclusions": ["ui/**","node_modules/**",".pnpm-store/**","generated build artifacts","caches","logs","secrets","personal configuration"],
+  "events": [
+    {"output":1,"phase":"00-initialization","action":"created recovery patch and ledger","bytes_transferred":0,"segments_verified":0,"errors":0,"next":"Build deterministic source manifest and segment plan."}
+  ],
+  "recovery_rule": "On restart, read this file first; resume from the last event with status verified."
+}
