@@ -1,0 +1,12 @@
+packages:
+  - .
+  - ui
+  - packages/*
+  - extensions/*
+  - examples/*
+
+minimumReleaseAge: 2880
+
+nodeLinker: hoisted
+verifyDepsBeforeRun: false
+blockExoticSubdeps: true
