@@ -1,22 +1,27 @@
 {
-  "ledger_version": "1.1",
-  "project": "OpenClaw Motor Wordflow",
-  "branch": "acr/openclaw-motor-recovery-v2",
-  "source": "openclaw/openclaw@a4178c7eb15a0dd2b8b44804348e256f1a109a34",
-  "mode": "forensic-xray",
-  "output": 2,
-  "status": "IN_PROGRESS",
-  "families": [
-    {"id":"01-root-manifests","status":"in_progress","segments_verified":0,"bytes_transferred":"tracked by Git blobs","files_transferred":2},
-    {"id":"02-src","status":"pending","segments_verified":0,"bytes_transferred":0,"files_transferred":0},
-    {"id":"03-packages","status":"pending","segments_verified":0,"bytes_transferred":0,"files_transferred":0},
-    {"id":"04-extensions","status":"pending","segments_verified":0,"bytes_transferred":0,"files_transferred":0},
-    {"id":"05-validation-reconstruction","status":"pending","segments_verified":0,"bytes_transferred":0,"files_transferred":0}
+  "ledger_version":"1.2",
+  "project":"OpenClaw Motor Wordflow",
+  "branch":"acr/openclaw-motor-recovery-v2",
+  "source":"openclaw/openclaw@a4178c7eb15a0dd2b8b44804348e256f1a109a34",
+  "mode":"forensic-xray",
+  "output":3,
+  "status":"IN_PROGRESS",
+  "last_output":3,
+  "next_output":4,
+  "current_family":"01-root-manifests",
+  "next_exact_source_file":".oxlintrc.json",
+  "families":[
+    {"id":"01-root-manifests","status":"in_progress","segments_verified":4,"files_transferred":4,"bytes_transferred":"source file sizes recorded in source manifests"},
+    {"id":"02-src","status":"pending","segments_verified":0,"files_transferred":0,"bytes_transferred":0},
+    {"id":"03-packages","status":"pending","segments_verified":0,"files_transferred":0,"bytes_transferred":0},
+    {"id":"04-extensions","status":"pending","segments_verified":0,"files_transferred":0,"bytes_transferred":0},
+    {"id":"05-validation-reconstruction","status":"pending","segments_verified":0,"files_transferred":0,"bytes_transferred":0}
   ],
-  "exclusions": ["ui/**","node_modules/**",".pnpm-store/**","generated build artifacts","caches","logs","secrets","personal configuration"],
-  "events": [
+  "exclusions":["ui/**","node_modules/**",".pnpm-store/**","generated build artifacts","caches","logs","secrets","personal configuration"],
+  "events":[
     {"output":1,"phase":"00-initialization","action":"created recovery patch and ledger","bytes_transferred":0,"segments_verified":0,"errors":0},
-    {"output":2,"phase":"01-root-manifests","action":"transferred pnpm-workspace.yaml and node-version.mjs to ACR/source","source_verified":true,"destination_commits":["c3a257bed10e92c0d6d018152403b02622909f53","0002a605dfee1eea0f00822adb749744ff5b3003"],"segments_verified":2,"errors":0,"next":"Continue root manifest transfer; then build deterministic manifest before src segmentation."}
+    {"output":2,"phase":"01-root-manifests","action":"transferred pnpm-workspace.yaml and node-version.mjs","source_files":["pnpm-workspace.yaml","node-version.mjs"],"source_shas":["5ffb3a0e59272237670f60b5448931290d5b9a65","dc7876dd0ce35116aaef535d342647ebb1ad16e7"],"destination_commits":["c3a257bed10e92c0d6d018152403b02622909f53","0002a605dfee1eea0f00822adb749744ff5b3003"],"errors":0},
+    {"output":3,"phase":"01-root-manifests","action":"transferred/corrected .npmrc and transferred .oxfmtrc.jsonc; expanded recovery map","source_files":[".npmrc",".oxfmtrc.jsonc"],"source_shas":["49ef47513d96a21fa2930743c3bb0f558df17789","75ad194c3e1748bc95b8fadaec13a693f75f2e46"],"destination_commits":["a3ec8b6abfa25da4fedf592a84337b744ec2dc39","5a50993ab70ead68387c76e51eba71318c760314","e72681ac46cce406f6a27ef16ed2be3ca5019577","bfb0d914269b872b59be5a73843230b57f268ba1"],"correction":{"file":"ACR/source/root/.npmrc","reason":"initial staging content did not match source; corrected to exact source content","correction_verified":true},"errors":0,"last_output":3,"next_output":4,"next_exact_source_file":".oxlintrc.json"}
   ],
-  "recovery_rule": "On restart, read this file first; resume from the last verified event."
+  "recovery_rule":"On restart, read this file first; resume from next_output and next_exact_source_file."
 }
