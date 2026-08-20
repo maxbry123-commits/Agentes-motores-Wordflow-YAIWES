@@ -3,7 +3,15 @@
 Este archivo es el mapa visible de recuperación del proceso ACR para descargar OpenClaw como motor de Wordflow, sin la UI.
 
 ## Propósito XRAY
-Este parche debe permitir que otro GPT/agente reconstruya el estado después de un reinicio sin depender de memoria conversacional. El GitHub ledger es la fuente autoritativa; el chat conserva solamente un resumen corto.
+Este parche debe permitir que otro GPT/agente reconstruya el estado después de un reinicio sin depender de memoria conversacional. `LEDGER.json` es la fuente autoritativa del cursor; este parche define el método y las reglas de integridad.
+
+## Orden de recuperación
+1. Leer `LEDGER.json`.
+2. Leer este parche.
+3. Leer `ACR-VERSION-MAP.md` para seleccionar la rama/versión correcta.
+4. Leer `ACR_OpenClaw_Recovery_Patch_XRAY_1.0.json`.
+5. Comprobar manifiestos/inventarios fuente-vs-destino.
+6. Continuar sólo desde el cursor real del ledger.
 
 ## Regla de trabajo
 1. Auditar raíz y manifests antes de descargar.
@@ -16,6 +24,10 @@ Este parche debe permitir que otro GPT/agente reconstruya el estado después de 
 8. En cada frontera de familia/segmento hacer inventario fuente-vs-destino y detectar faltantes/extras antes de marcarla verificada.
 9. Después de un reinicio leer primero `LEDGER.json` y este parche; nunca reconstruir el estado desde memoria del chat.
 10. No sobrescribir contenido verificado sin registrar la razón y el nuevo SHA.
+11. Separar siempre estado **confirmado**, **pendiente** e **histórico/hipotético**.
+12. Nunca mover `main` con un SHA incompleto, supuesto o truncado.
+13. Al cambiar de branch/versión, validar de nuevo commit fuente, SHA del tip, ledger y contenido antes de continuar.
+14. Antes de declarar una integración completa, comparar el estado de `main` con el conjunto ACR esperado.
 
 ## Incidencias y soluciones reutilizables
 - **Blob truncado:** una lectura de archivo grande puede devolver contenido incompleto. **Solución:** recuperar el blob completo o usar segmentación/reconstrucción determinista; no inventar contenido.
@@ -24,6 +36,7 @@ Este parche debe permitir que otro GPT/agente reconstruya el estado después de 
 - **Escritura bloqueada:** el conector puede rechazar una operación que no garantice integridad. **Solución:** no forzar; registrar el bloqueo y cambiar a una operación exacta y verificable.
 - **SHA de rama no disponible:** no mover `main` usando un SHA supuesto o truncado. **Solución:** obtener el tip completo mediante una fuente GitHub verificable antes de actualizar refs.
 - **Bitácora no localizada:** búsquedas por nombre no prueban inexistencia histórica. **Solución:** auditar ramas/versiones y commits antes de crear una nueva.
+- **Documentos desincronizados:** no continuar con dos cursores distintos. **Solución:** sincronizar parche/bitácora/mapa con el ledger y registrar los commits de actualización.
 
 ## Método de auditoría de cuatro pasadas
 **Pasada 1 — Chat → conocimiento:** extraer únicamente reglas, errores, soluciones y decisiones que permitan repetir o recuperar el procedimiento.
@@ -32,7 +45,7 @@ Este parche debe permitir que otro GPT/agente reconstruya el estado después de 
 
 **Pasada 3 — Ledger → repositorio:** verificar que último/siguiente output, archivo exacto, SHA fuente, commit destino y familias sean coherentes.
 
-**Pasada 4 — Recuperación:** comprobar que un agente nuevo pueda continuar usando sólo GitHub: parche + ledger + manifiestos + inventario, sin depender del chat.
+**Pasada 4 — Recuperación:** comprobar que un agente nuevo pueda continuar usando sólo GitHub: parche + ledger + mapa de versiones + mapa XRAY + manifiestos + inventario, sin depender del chat.
 
 ## Mapa de descarga
 - `01-root-manifests`: `package.json`, `pnpm-workspace.yaml`, `pnpm-lock.yaml`, `openclaw.mjs`, `node-version.mjs`, `.npmrc`, configuraciones y avisos/licencias → `ACR/source/root/`
@@ -47,7 +60,7 @@ Este parche debe permitir que otro GPT/agente reconstruya el estado después de 
 **Preservar:** código fuente, paquetes, extensiones, manifests raíz y material requerido para runtime/build.
 
 ## Estado conocido del ledger
-- Branch ACR: `acr/openclaw-motor-recovery-v2`
+- Branch ACR documentado: `acr/openclaw-motor-recovery-v2`
 - Fuente: `openclaw/openclaw@a4178c7eb15a0dd2b8b44804348e256f1a109a34`
 - Ledger: salida 14, siguiente salida 15.
 - Último archivo verificado por ledger: `.oxlintrc.json`.
@@ -56,15 +69,18 @@ Este parche debe permitir que otro GPT/agente reconstruya el estado después de 
 - Familia actual: `01-root-manifests`.
 - Siguiente acción: continuar inventario raíz y no cerrar la familia hasta pasar auditoría fuente-vs-destino.
 
-## Estado operativo de esta auditoría
-- Salida de chat actual: 76.
-- Se detectaron múltiples ramas históricas `acr/openclaw-motor-recovery*`; deben conservarse como evidencia hasta completar la integración y verificación.
-- `main` no debe moverse usando un SHA no confirmado.
-- La nueva bitácora `BITACORA-ACR-XRAY.md` debe contener únicamente información útil para recuperación/aprendizaje operativo y debe ser creada en la raíz de `main` una vez integrada la base ACR.
+## Puntos de recuperación
+Cada checkpoint debe conservar como mínimo: `salida`, `familia`, `segmento`, `archivo exacto`, `fuente/ref`, `SHA fuente`, `bytes reales`, `commit destino`, `estado`, `errores/reintentos`, `última salida`, `siguiente salida` y `siguiente archivo/segmento exacto`.
 
-## Protocolo por salida
-Cada salida debe dejar: número de salida, familia, segmento, fuente/ref, archivos intentados, completados, bytes transferidos, SHA fuente, commit destino, errores/reintentos, última salida, siguiente salida y siguiente archivo/segmento exacto.
+El número de salida por sí solo no demuestra una operación completada. La prueba es la evidencia verificable de GitHub.
+
+## Estado operativo de esta guía
+- Última salida conversacional documentada: 78.
+- Tres mejoras de memoria/recovery implementadas: mapa de versiones, separación explícita de estados y puntos de recuperación sincronizados.
+- `ACR-VERSION-MAP.md` es ahora la referencia para escoger entre ramas históricas.
+- `BITACORA-ACR-XRAY.md` conserva lecciones; no sustituye el ledger.
+- La integración total a `main` sigue pendiente hasta verificar SHA completo y contenido.
 
 ## Continuación
-Última salida: 76
-Siguiente salida: 77 — verificar escritura de este parche y continuar con el cursor del ledger (salida 14 → 15) sin inventar progreso.
+Última salida documentada: 78
+Siguiente salida: 79 — verificar las tres mejoras en GitHub y continuar desde el cursor del ledger (salida 14 → 15) sin inventar progreso.
