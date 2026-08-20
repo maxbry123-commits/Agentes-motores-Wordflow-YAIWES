@@ -1,0 +1,32 @@
+name: ACR restore AGENTS.md
+on:
+  push:
+    branches:
+      - acr/openclaw-motor-recovery-v2
+permissions:
+  contents: write
+jobs:
+  restore:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch exact pinned source blob
+        run: |
+          set -euo pipefail
+          curl --fail --location --silent --show-error \
+            https://raw.githubusercontent.com/openclaw/openclaw/a4178c7eb15a0dd2b8b44804348e256f1a109a34/AGENTS.md \
+            -o ACR/source/root/AGENTS.md
+          sha=$(git hash-object ACR/source/root/AGENTS.md)
+          test "$sha" = "7fcee34720673a4285bd35b7613cc226c6eed413"
+      - name: Commit exact blob
+        run: |
+          set -euo pipefail
+          git config user.name "acr-recovery-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add ACR/source/root/AGENTS.md
+          if git diff --cached --quiet; then
+            echo "AGENTS.md already matches the pinned blob"
+            exit 0
+          fi
+          git commit -m "fix(acr): restore exact AGENTS.md blob"
+          git push
