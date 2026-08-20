@@ -1,7 +1,7 @@
 {
   "acr_recovery_patch": {
     "name": "OpenClaw Motor Wordflow - ACR Recovery Patch",
-    "version": "ACR-XRAY-1.1",
+    "version": "ACR-XRAY-1.2",
     "status": "IN_PROGRESS",
     "source": {"repository": "openclaw/openclaw", "ref": "a4178c7eb15a0dd2b8b44804348e256f1a109a34"},
     "destination": {"repository": "maxbry123-commits/Agentes-motores-Wordflow-YAIWES", "branch": "acr/openclaw-motor-recovery-v2"},
@@ -13,22 +13,18 @@
       "04-extensions": {"status":"pending","source_paths":["extensions/**"],"destination_root":"ACR/source/extensions/"},
       "05-validation-reconstruction": {"status":"pending","source_paths":["required build/runtime validation material"],"destination_root":"ACR/validation/"}
     },
-    "rules": {
-      "exclude": ["ui/**", "node_modules/**", ".pnpm-store/**", "generated build artifacts", "caches", "logs", "secrets", "personal configuration"],
-      "preserve": ["src/**", "packages/**", "extensions/**", "root manifests", "required runtime/build files"],
-      "segmentation": {"method": "byte-based deterministic segments", "target_segment_size_mb": 50, "large_file_policy": "do not rewrite source content; mark large objects for special handling"},
-      "verification": ["source commit pin", "file manifest", "segment manifest", "SHA-256", "reconstruction audit"]
+    "rules": {"exclude":["ui/**","node_modules/**",".pnpm-store/**","generated build artifacts","caches","logs","secrets","personal configuration"],"preserve":["src/**","packages/**","extensions/**","root manifests","required runtime/build files"],"segmentation":{"method":"byte-based deterministic segments","target_segment_size_mb":50,"large_file_policy":"do not rewrite source content; mark large objects for special handling"},"verification":["source commit pin","complete source-tree inventory","file manifest","segment manifest","SHA-256","destination byte/file counts","reconstruction audit"]},
+    "execution_method": {
+      "forensic_xray_rule": "Every output is a transaction checkpoint, not a claim of completion.",
+      "before_each_transfer": ["Read LEDGER.json and recovery patch.", "Resolve the exact next source path from the pinned source commit.", "Fetch the complete source content available through the connector.", "Record the source SHA and size before writing."],
+      "after_each_transfer": ["Verify destination existence/content against the source record.", "Record destination commit and verification status.", "Update last_output, next_output, next_exact_source_file_or_segment.", "Do not advance on a failed or unverified write."],
+      "segment_audit_rule": "When a family or segment boundary is reached, enumerate the source tree for that scope, compare expected paths with destination paths, identify missing/extra items, and only then mark the scope verified.",
+      "failure_rule": "A failed write remains pending and is explicitly logged; it is never silently counted as transferred.",
+      "restart_rule": "After any application/tool restart, reconstruct state only from the GitHub ledger plus this recovery map; never rely on conversational memory alone."
     },
-    "execution_model": {
-      "families": ["01-root-manifests", "02-src", "03-packages", "04-extensions", "05-validation-reconstruction"],
-      "continuation_rule": "Each family may contain any number of numbered transfer segments.",
-      "restart_recovery": "Read the GitHub ledger first and resume after the last verified output/segment."
-    },
-    "forensic_ledger": {
-      "required_each_output": ["output number", "family", "segment", "source commit", "files attempted", "files completed", "bytes transferred", "source SHA", "destination commit", "last output", "next output", "next exact file or segment", "errors/retries"],
-      "dual_history": {"chat_history": "Cumulative short status only.", "github_history": "Authoritative machine-readable forensic ledger."}
-    },
-    "current_state": {"last_output":3,"current_family":"01-root-manifests","completed_source_files":["pnpm-workspace.yaml","node-version.mjs",".npmrc",".oxfmtrc.jsonc"],"next_output":4,"next_exact_source_file":".oxlintrc.json","then":".gitattributes, package.json, openclaw.mjs, pnpm-lock.yaml and remaining root manifests"},
-    "recovery_protocol": ["Read LEDGER.json first.", "Locate last_output and next_output.", "Resume at next_exact_source_file.", "Never overwrite verified content without recording why.", "Record every batch, byte count, source SHA, destination commit and next recovery point.", "At completion compare reconstructed tree against the pinned source manifest."]
+    "execution_model": {"families":["01-root-manifests","02-src","03-packages","04-extensions","05-validation-reconstruction"],"continuation_rule":"Each family may contain any number of numbered transfer segments.","restart_recovery":"Read the GitHub ledger first and resume after the last verified output/segment."},
+    "forensic_ledger": {"required_each_output":["output number","family","segment","source commit","files attempted","files completed","bytes transferred","source SHA","destination commit","last output","next output","next exact file or segment","errors/retries"],"dual_history":{"chat_history":"Cumulative short status only.","github_history":"Authoritative machine-readable forensic ledger."}},
+    "current_state": {"last_output":13,"current_family":"01-root-manifests","completed_source_files":["pnpm-workspace.yaml","node-version.mjs",".npmrc",".oxfmtrc.jsonc",".oxlintrc.json",".pre-commit-config.yaml",".crabbox.yaml",".dockerignore",".gitignore",".gitattributes","LICENSE","THIRD_PARTY_NOTICES.md",".env.example"],"pending_source_files":[".oxfmtrc.jsonc"],"next_output":13,"next_exact_source_file":".oxfmtrc.jsonc","status":"retry_pending_after_write_failure"},
+    "recovery_protocol":["Read LEDGER.json first.","Locate last_output and next_output.","Resume at next_exact_source_file.","Never overwrite verified content without recording why.","Record every batch, byte count, source SHA, destination commit and next recovery point.","At family/segment boundaries perform a source-vs-destination inventory audit.","At completion compare reconstructed tree against the pinned source manifest."]
   }
 }
