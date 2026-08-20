@@ -43,9 +43,33 @@ Ante cualquier inconsistencia:
 - actualizar Ledger;
 - sólo entonces continuar.
 
+## Entrada 2026-08-20 — Salida 105
+
+### Nueva incidencia: reconstrucción escrita pero SHA no coincide
+Después de ejecutar una actualización real de `ACR/source/root/AGENTS.md` desde el contenido recuperado del blob fuente, GitHub devolvió:
+
+- commit de destino: `a69bdf7e5864468fa6248ea5a2d446533be42f49`
+- blob de destino: `f1331f42ada9397d98b605ffce253307a1231a39`
+- SHA fuente fijado: `7fcee34720673a4285bd35b7613cc226c6eed413`
+- resultado: `SHA_MISMATCH`
+
+### Diagnóstico
+La operación de escritura sí ocurrió, pero la reconstrucción manual del contenido no fue byte-exacta respecto al blob fuente. Por seguridad, el archivo sigue sin estar `VERIFIED` y el Ledger no se mueve.
+
+### Aprendizaje reutilizable
+Cuando la fuente exige coincidencia criptográfica exacta, una reconstrucción manual del contenido es una operación de riesgo aunque el texto aparente ser completo. El método debe tratar cualquier SHA diferente como fallo de transferencia, no como éxito semántico.
+
+### Acción obligatoria
+1. Mantener `AGENTS.md` como cursor.
+2. No incrementar `root_files_verified`.
+3. Recuperar nuevamente el blob fuente exacto.
+4. Resolver la transferencia sin alterar contenido.
+5. Verificar SHA de destino.
+6. Sólo después actualizar Ledger y continuar.
+
 ## Estado actual
 - Familia: `01-root-manifests`
 - Cursor: `AGENTS.md`
-- `AGENTS.md`: pendiente de verificación exacta.
+- `AGENTS.md`: `SHA_MISMATCH` / `RETRY_PENDING`
 - Raíz fuente auditada: 61 entradas = 40 archivos + 21 directorios.
 - No contabilizar archivos por mera existencia de ruta.
