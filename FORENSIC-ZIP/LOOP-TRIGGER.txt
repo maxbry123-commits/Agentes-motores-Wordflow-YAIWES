@@ -1,0 +1,1 @@
+Trigger commit for final pull-request forensic verification. The workflow must compare ROOTS/openclaw against the exact OpenClaw canonical ref and restore the canonical pnpm-lock.yaml if absent.
