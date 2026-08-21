@@ -23,28 +23,36 @@ Conservar conocimiento verificable para que otro GPT/agente pueda recuperar y co
 - Existe `FORENSIC-INVENTORY-2026-08-21.md` con el inventario inicial.
 - El inventario inicial detectó 8 ZIP; ZIP 1 y ZIP 4 fueron observados con el mismo blob SHA y, por tanto, son duplicados exactos a nivel GitHub.
 - El conector disponible no pudo descargar directamente el ZIP binario del `zipball` oficial; por tanto, la descarga/extracción real NO está marcada como completada.
+- `FORENSIC-CROSSCHECK-OPENCLAW.md` fue creado con la primera matriz de discrepancias verificadas.
 
-## HALLAZGO CRÍTICO — VERIFICACIÓN CRUZADA CANÓNICO ↔ REPO ACTUAL
-Se comparó el `package.json` del ref canónico con el `package.json` actualmente en `main`.
+## HALLAZGOS DE VERIFICACIÓN CRUZADA CANÓNICO ↔ REPO ACTUAL
 
-### Fuente canónica
-`openclaw/openclaw@a4178c7eb15a0dd2b8b44804348e256f1a109a34`
-- versión observada: `2026.8.1`
-- contiene bloque `openclaw.schemaVersions` con `state: 9` y `agent: 17`.
-- declara `node-version.mjs` en el campo `files`.
-- autor observado: `OpenClaw Foundation (https://openclaw.org)`.
+### 1. `package.json`
+Fuente canónica `openclaw/openclaw@a4178c7...`:
+- versión observada `2026.8.1`;
+- bloque `openclaw.schemaVersions` con `state: 9` y `agent: 17`;
+- autor `OpenClaw Foundation (https://openclaw.org)`;
+- declara `node-version.mjs` en `files`.
 
-### Repositorio actual
-`maxbry123-commits/Agentes-motores-Wordflow-YAIWES@main`
-- versión observada: `2026.7.1`
-- NO contiene el bloque `openclaw.schemaVersions` observado en la fuente canónica.
-- su campo `files` contiene `npm-shrinkwrap.json`, que no aparece en el fragmento inicial equivalente de la fuente canónica.
-- autor observado: vacío.
+Repo actual `main`:
+- versión observada `2026.7.1`;
+- no contiene el bloque `openclaw.schemaVersions` observado en la fuente canónica;
+- autor vacío;
+- contiene `npm-shrinkwrap.json` en `files`.
 
-### Veredicto de esta comparación
-`package.json` actual = **MODIFIED / NO MATCH** respecto al ref canónico. No se puede tratar como copia válida del ref `a4178c7...` ni usarlo como autoridad para reconstruir la raíz.
+Veredicto: **MODIFIED / NO MATCH**. No usar este archivo actual como copia canónica.
 
-Evidencia: lecturas GitHub de `openclaw/openclaw/package.json` en el ref fijado y de `maxbry123-commits/Agentes-motores-Wordflow-YAIWES/package.json` en `main`.
+### 2. `node-version.mjs`
+- Existe en el ref canónico y fue leído directamente; blob observado `dc7876dd0ce35116aaef535d342647ebb1ad16e7`.
+- No existe en la raíz actual del repositorio de trabajo (`Not Found`).
+
+Veredicto: **MISSING** en el repo actual respecto al ref canónico.
+
+### 3. `npm-shrinkwrap.json`
+- No existe en el ref canónico fijado (`Not Found`).
+- Existe en la raíz actual del repositorio de trabajo.
+
+Veredicto: **EXTRA / NON-CANONICAL** respecto al ref fijado.
 
 ## REGLA DE VERIFICACIÓN CRUZADA — NO ALUCINAR
 Toda afirmación sobre OpenClaw debe poder trazarse a: árbol/archivo real del ref canónico; archivo/árbol real de ZIP extraído; archivo/árbol real del destino; SHA/blob/tamaño/commit verificable; o prueba reproducible real.
@@ -70,7 +78,7 @@ Comparar rutas, hashes, tamaños, subconjuntos, duplicados y piezas complementar
 Obtener el árbol exacto del ref fijado; separar blobs/trees/modes. Salida: `OPENCLAW-CANONICAL-TREE`.
 
 ### T06 — CANÓNICO↔CANDIDATOS
-Para cada archivo candidato: ruta exacta, tipo/mode, tamaño, blob SHA si aplica, y clasificación MATCH/MISSING/EXTRA/MODIFIED/DUPLICATE/UNKNOWN. El `package.json` ya tiene evidencia de `MODIFIED/NO MATCH`. Salida: `ROOT-DIFF-MATRIX`.
+Para cada archivo candidato: ruta exacta, tipo/mode, tamaño, blob SHA si aplica, y clasificación MATCH/MISSING/EXTRA/MODIFIED/DUPLICATE/UNKNOWN. Hallazgos actuales: `package.json` MODIFIED/NO MATCH; `node-version.mjs` MISSING; `npm-shrinkwrap.json` EXTRA/NON-CANONICAL. Salida: `ROOT-DIFF-MATRIX`.
 
 ### T07 — MULTI-AGENT ROOTS
 Mantener `ROOTS/` fuera de documentación/control y reservar `ROOTS/openclaw/`, `ROOTS/<agente-02>/`, etc. No mezclar árboles. No mover la raíz actual hasta completar T06/T08.
@@ -117,13 +125,14 @@ Bloqueos/reparación: <evidencia>
 Mientras haya tareas pendientes, continuar con el siguiente lote disponible. Fallo de herramienta → registrar → inspeccionar estado → cambiar mecanismo tras dos fallos iguales → reintentar determinísticamente. Si un bloqueo externo impide continuar, marcar `BLOCKED` con evidencia, nunca inventar `DONE`.
 
 ## ESTADO DEL CICLO ACTUAL
-- Tarea en curso: T03/T04/T05/T06 en paralelo.
+- Tarea en curso: T03/T04/T06 en paralelo; T05 canónico continúa como referencia.
 - Total: 16.
-- T01/T02: evidencia de baseline/inventario inicial disponible; clasificación y auditoría ZIP siguen abiertas.
+- T01/T02: baseline/inventario inicial disponibles; clasificación detallada sigue abierta.
 - T05: árbol canónico consultado.
-- T06: primer hallazgo confirmado: `package.json` = MODIFIED/NO MATCH.
-- T07: `ROOTS/README.md` creado y verificado; decisión estructural implementada, pero auditoría final pendiente.
-- Siguiente lote: continuar T03/T04/T06 en paralelo, obtener evidencia real de los ZIP y ampliar la matriz canónica↔repo/ZIP con archivos raíz críticos.
+- T06: tres hallazgos confirmados (`package.json` MODIFIED, `node-version.mjs` MISSING, `npm-shrinkwrap.json` EXTRA).
+- T07: `ROOTS/README.md` creado y verificado; layout reservado, auditoría final pendiente.
+- T03/T04: bloqueados parcialmente por la limitación actual para obtener los bytes binarios de los ZIP del repositorio mediante el conector. No se declara descarga/extracción.
+- Siguiente lote en paralelo: ampliar T06 con más archivos raíz críticos y continuar T03/T04 buscando un mecanismo verificable de adquisición de los ZIP; después construir el manifiesto.
 
 ## REGLA FINAL
 La última salida del proyecto debe contener la verificación cruzada completa y la auditoría forense XRAY final. Una afirmación del asistente nunca sustituye evidencia.
