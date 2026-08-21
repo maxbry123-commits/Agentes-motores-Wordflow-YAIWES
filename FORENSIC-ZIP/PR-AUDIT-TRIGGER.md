@@ -1,0 +1,1 @@
+PR-triggered audit: verify canonical OpenClaw source, workspace, lockfile, runtime, UI, extensions, generated-artifact exclusions, and multi-root isolation.
