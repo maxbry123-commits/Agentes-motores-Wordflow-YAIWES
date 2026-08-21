@@ -1,6 +1,6 @@
 # ACR RECOVERY PATCH MAESTRO — OPENCLAW
 
-**Versión:** 1.0  
+**Versión:** 1.1  
 **Propósito:** punto único de recuperación para reconstruir, validar y desplegar OpenClaw en GitHub sin sobreingeniería, sin duplicar archivos y sin depender de memoria conversacional.
 
 ---
@@ -65,6 +65,11 @@ Describe qué pertenece al árbol fuente y qué son artefactos locales.
 `ACR-RECOVERY-PATCH-ZIP.md`
 
 Conserva las reglas históricas de descarga/verificación mediante ZIP. No debe utilizarse para inventar un estado actual si la fuente/ref cambia.
+
+## 2.6 Anexo de accesorios
+`ACR-RECOVERY-PATCH-ANEXO-ACCESORIOS-INSTALACION.md`
+
+Detalla qué dependencias pesadas se reconstruyen durante el build/despliegue de OpenClaw y Hermes, qué permanece en GitHub y qué NO debe subirse.
 
 ---
 
@@ -366,7 +371,162 @@ Las pruebas anteriores A/B/C del repositorio fueron **pruebas históricas**. No 
 
 ---
 
-# 14. DESPLIEGUE FINAL
+# 14. INSTALACIÓN DE ACCESORIOS Y DEPENDENCIAS PESADAS
+
+Esta sección es obligatoria para entender la diferencia entre **fuente recuperable** y **entorno operativo generado**.
+
+## 14.1 OpenClaw — instalación de dependencias
+
+Desde la raíz del proyecto:
+
+```bash
+cd openclaw
+pnpm install
+```
+
+Este comando lee los manifiestos del proyecto, principalmente `package.json` y `pnpm-workspace.yaml`, y resuelve/instala las dependencias declaradas en el workspace.
+
+Entre las dependencias que pueden quedar instaladas, según el ref elegido, se encuentran componentes como:
+
+- `sharp` para procesamiento de imágenes;
+- `node-llama-cpp` para soporte de LLM local;
+- SDKs e integraciones de canales como WhatsApp/Baileys, Telegram/grammY, Discord, Slack/Bolt y otros.
+
+El resultado se materializa principalmente en:
+
+```text
+node_modules/
+.pnpm-store/   # según configuración/entorno
+```
+
+Estos directorios son **artefactos del entorno de instalación** y no forman parte de la copia de recuperación que se publica en GitHub.
+
+## 14.2 OpenClaw — UI
+
+Si el ref elegido define el script `ui:build`:
+
+```bash
+pnpm ui:build
+```
+
+Este proceso resuelve las dependencias necesarias para la Control UI y genera los artefactos de compilación correspondientes. Puede involucrar herramientas como Vite y Lit cuando estén declaradas por la versión concreta.
+
+## 14.3 OpenClaw — build principal
+
+Cuando el `package.json` del ref elegido define `build`:
+
+```bash
+pnpm build
+```
+
+Puede generar `dist/` u otros directorios definidos por la versión concreta. Verificar siempre los scripts reales del `package.json` del ref fijado.
+
+## 14.4 OpenClaw — `pnpm approve-builds`
+
+En versiones de pnpm que bloqueen scripts de instalación que requieren aprobación, puede ser necesario revisar/aprobar los builds de dependencias.
+
+La operación indicada históricamente en este workflow es:
+
+```bash
+pnpm approve-builds -g
+```
+
+**IMPORTANTE:** no ejecutar este comando ciegamente como requisito universal. Su comportamiento y sintaxis dependen de la versión de pnpm. Primero revisar la salida de `pnpm install` y la versión de pnpm requerida por el proyecto.
+
+Si una dependencia queda bloqueada por scripts de build, registrar dependencia, versión de pnpm, mensaje real, aprobación necesaria y resultado.
+
+## 14.5 Hermes — instalación completa
+
+Si se utiliza el instalador oficial de Hermes:
+
+```bash
+curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
+```
+
+Este método puede clonar/instalar el agente y preparar su entorno según el instalador oficial vigente.
+
+**No ejecutar este instalador dentro del repositorio OpenClaw ni mezclar sus dependencias con las de OpenClaw.**
+
+## 14.6 Hermes — código ya presente
+
+Si el código de Hermes ya está presente y se necesita instalar sus extras:
+
+```bash
+cd "${HERMES_HOME:-$HOME/.hermes}/hermes-agent"
+uv pip install -e ".[all,dev]"
+```
+
+Este comando utiliza la configuración declarada por `pyproject.toml` y crea/usa el entorno Python correspondiente.
+
+## 14.7 Regla repositorio vs servidor final
+
+| Componente | GitHub | Entorno final |
+|---|---|---|
+| OpenClaw código fuente | SÍ | — |
+| `package.json` | SÍ | — |
+| `pnpm-lock.yaml` | SÍ, si está versionado | — |
+| `pnpm-workspace.yaml` | SÍ | — |
+| `node_modules/` | NO | `pnpm install` |
+| `.pnpm-store/` | NO | según gestor/entorno |
+| `dist/` generado | NO, salvo que el ref lo versione expresamente | `pnpm build` |
+| UI build generado | NO, salvo que el ref lo versione expresamente | `pnpm ui:build` |
+| Hermes código fuente | SÍ | — |
+| `pyproject.toml` | SÍ | — |
+| `.venv/` | NO | `uv pip install ...` |
+
+La columna GitHub siempre queda subordinada al árbol real del ref elegido. Si el proyecto versiona explícitamente un artefacto, se debe conservar salvo decisión documentada.
+
+## 14.8 Regla Dockerfile/servidor
+
+Si el despliegue usa Docker o cualquier entorno de build reproducible, las instalaciones deben ocurrir durante el build o inicialización del entorno, no como archivos copiados desde el teléfono/PC del usuario.
+
+Conceptualmente:
+
+```dockerfile
+# fuente ya presente en la imagen
+RUN pnpm install
+RUN pnpm ui:build
+RUN pnpm build
+```
+
+Estas líneas son un modelo conceptual, no un Dockerfile para copiar sin revisar. Si OpenClaw proporciona un procedimiento Docker oficial, ese procedimiento tiene prioridad.
+
+## 14.9 Regla de recuperación
+
+Si el entorno final se pierde, NO se recuperan `node_modules` ni `.venv` desde GitHub. Se recuperan fuente exacta, versión/tag/commit, manifests, lockfiles, configuración y procedimiento de build; después se reconstruye el entorno.
+
+## 14.10 Evidencia de instalación
+
+Para declarar que los accesorios fueron instalados correctamente registrar:
+
+```text
+PROYECTO:
+VERSION/REF:
+GESTOR:
+VERSIÓN DEL GESTOR:
+COMANDO:
+RESULTADO:
+DEPENDENCIAS INSTALADAS:
+BUILD:
+RESULTADO DEL BUILD:
+PRUEBA FUNCIONAL:
+RESULTADO:
+```
+
+Si falla:
+
+```text
+ESTADO: FALLIDO
+PASO:
+COMANDO:
+ERROR REAL:
+CAUSA CONFIRMADA / HIPÓTESIS:
+SIGUIENTE ACCIÓN:
+```
+
+---
+
+# 15. DESPLIEGUE FINAL
 
 Sólo cuando la validación sea suficiente:
 
@@ -383,7 +543,7 @@ Sólo cuando la validación sea suficiente:
 
 ---
 
-# 15. AUDITORÍA FORENSE FINAL
+# 16. AUDITORÍA FORENSE FINAL
 
 Antes de declarar TERMINADO:
 
@@ -427,7 +587,7 @@ Comprobar que otro agente puede leer este parche y saber exactamente:
 
 ---
 
-# 16. CRITERIO DE ÉXITO
+# 17. CRITERIO DE ÉXITO
 
 El proyecto se considera **DESPLEGADO Y VERIFICADO** únicamente si:
 
@@ -445,7 +605,7 @@ Si cualquiera de estos puntos falla, el estado es **PENDIENTE** o **FALLIDO**, n
 
 ---
 
-# 17. PLAN QUE SE EJECUTARÁ CUANDO EL USUARIO SUBA LOS ARCHIVOS
+# 18. PLAN QUE SE EJECUTARÁ CUANDO EL USUARIO SUBA LOS ARCHIVOS
 
 **ESTADO ACTUAL: ESPERANDO ARCHIVOS DEL USUARIO.**
 
@@ -463,7 +623,7 @@ Recibir los archivos que el usuario va a subir, inventariarlos y fijar la fuente
 
 ---
 
-# 18. REGLAS DE NO SOBREENIGENIERÍA
+# 19. REGLAS DE NO SOBREENIGENIERÍA
 
 - No descargar todas las releases.
 - No guardar ZIP y TAR del mismo código sin motivo.
@@ -477,7 +637,7 @@ Recibir los archivos que el usuario va a subir, inventariarlos y fijar la fuente
 
 ---
 
-# 19. RECUPERACIÓN DESPUÉS DE UN REINICIO
+# 20. RECUPERACIÓN DESPUÉS DE UN REINICIO
 
 Un agente nuevo debe hacer:
 
@@ -495,7 +655,7 @@ Un agente nuevo debe hacer:
 
 ---
 
-# 20. FORMATO DE CHECKPOINT
+# 21. FORMATO DE CHECKPOINT
 
 Al terminar cada bloque de trabajo registrar:
 
@@ -518,8 +678,18 @@ Este bloque debe permitir continuar sin volver a interpretar toda la conversaci�
 
 ---
 
-# 21. PROHIBICIÓN FINAL
+# 22. PROHIBICIÓN FINAL
 
 No borrar, mover, reemplazar ni declarar completado un componente de OpenClaw hasta que exista evidencia suficiente para saber qué es, de dónde proviene y qué función cumple.
 
 **Fuente → evidencia → escritura → lectura posterior → validación → siguiente paso.**
+
+---
+
+# 23. ANEXO DE REFERENCIA
+
+La versión ampliada y operativa de las reglas de instalación de dependencias y accesorios también queda conservada en:
+
+`ACR-RECOVERY-PATCH-ANEXO-ACCESORIOS-INSTALACION.md`
+
+Ese anexo sirve como referencia detallada y no reemplaza este parche maestro.
