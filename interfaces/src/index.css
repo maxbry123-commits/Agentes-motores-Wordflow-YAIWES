@@ -1,6 +1,0 @@
-html, body, #root { margin: 0; padding: 0; height: 100%; background: #0a0e1a; color: #fafafa; font-family: -apple-system, 'Inter', 'Segoe UI', sans-serif; -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; }
-* { box-sizing: border-box; }
-::-webkit-scrollbar { width: 8px; height: 8px; }
-::-webkit-scrollbar-track { background: #0a0e1a; }
-::-webkit-scrollbar-thumb { background: #2a3147; border-radius: 4px; }
-::-webkit-scrollbar-thumb:hover { background: #3a4262; }

@@ -1,7 +1,0 @@
-contract:
-  name: api-base
-  version: 1.0
-  endpoints:
-    - /api/dashboard
-    - /api/fichas
-    - /api/red
