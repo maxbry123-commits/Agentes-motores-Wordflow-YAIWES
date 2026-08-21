@@ -1,0 +1,389 @@
+# ZIP source cross-check — content vs metadata
+
+- Release ref: `0790d9f593ad30c940ed93b5872a8cf6d6f3cf8c`
+- Unique paths: **14839**
+- Content/type failures: **2603**
+- Mode-only differences: **172**
+- Symlinks flattened by ZIP transport: **0**
+
+## Interpretation
+
+**CONTENT FAIL:** at least one path differs in content/type.
+
+**METADATA:** mode/symlink fidelity is not trusted from these ZIPs; the final root is therefore built from the exact canonical ref.
+
+## Content/type failures (first 200)
+- `zip1 | apps/android/CLAUDE.md | ('file', 'a54ff182c7e8acf56acfd6e4b9c3ff41e2c41a31c9b211b2deb9df75d9a478f9', 420) | ('symlink', 'AGENTS.md', 511)`
+- `zip1 | apps/ios/CLAUDE.md | ('file', 'a54ff182c7e8acf56acfd6e4b9c3ff41e2c41a31c9b211b2deb9df75d9a478f9', 420) | ('symlink', 'AGENTS.md', 511)`
+- `zip2 | apps/android/CLAUDE.md | ('file', 'a54ff182c7e8acf56acfd6e4b9c3ff41e2c41a31c9b211b2deb9df75d9a478f9', 420) | ('symlink', 'AGENTS.md', 511)`
+- `zip2 | apps/ios/CLAUDE.md | ('file', 'a54ff182c7e8acf56acfd6e4b9c3ff41e2c41a31c9b211b2deb9df75d9a478f9', 420) | ('symlink', 'AGENTS.md', 511)`
+- `zip3 | extensions/CLAUDE.md | ('file', 'a54ff182c7e8acf56acfd6e4b9c3ff41e2c41a31c9b211b2deb9df75d9a478f9', 420) | ('symlink', 'AGENTS.md', 511)`
+- `zip3 | packages/agent-core/node_modules/@openclaw/ai | ('file', '21350727838d6a71c1ee7be1cd749836a416b4f2bd9d36525155943c54f99c2f', 420) | ('symlink', '../../../ai', 511)`
+- `zip3 | packages/media-core/node_modules/@openclaw/normalization-core | ('file', 'fd873120b692d01406d2fa15e04ce5254acc133ecde72e05b8c268030e5f9c2e', 420) | ('symlink', '../../../normalization-core', 511)`
+- `zip3 | packages/speech-core/node_modules/openclaw | ('file', '297823c2f472cdfefd4dfdec487f9069aaf971ac18839bbb2dd4f2c7f3ca57ca', 420) | ('symlink', '../../..', 511)`
+- `zip3 | packages/speech-core/node_modules/.bin/openclaw | ('file', '9f8cbeebe843dbf4c7a7b4e4facd9cc0647467f8d1620b6e3d2afdc5b4360bc4', 420) | ('symlink', '../openclaw/openclaw.mjs', 511)`
+- `zip3 | packages/acp-core/node_modules/@openclaw/normalization-core | ('file', 'fd873120b692d01406d2fa15e04ce5254acc133ecde72e05b8c268030e5f9c2e', 420) | ('symlink', '../../../normalization-core', 511)`
+- `zip3 | packages/sdk/node_modules/@openclaw/gateway-client | ('file', '671f7d19a7eed6ffcb80dd7c9c107e4332c6360e4a9033c211d6aa36e3e6d47b', 420) | ('symlink', '../../../gateway-client', 511)`
+- `zip3 | packages/gateway-client/node_modules/@openclaw/gateway-protocol | ('file', '3f7822db48a78ff50463bdd45c3417557b869bc60ec7816769b0c8db8695d41c', 420) | ('symlink', '../../../gateway-protocol', 511)`
+- `zip3 | extensions/acpx/CLAUDE.md | ('file', 'a54ff182c7e8acf56acfd6e4b9c3ff41e2c41a31c9b211b2deb9df75d9a478f9', 420) | ('symlink', 'AGENTS.md', 511)`
+- `zip3 | extensions/telegram/CLAUDE.md | ('file', 'a54ff182c7e8acf56acfd6e4b9c3ff41e2c41a31c9b211b2deb9df75d9a478f9', 420) | ('symlink', 'AGENTS.md', 511)`
+- `zip4 | docs/CLAUDE.md | ('file', 'a54ff182c7e8acf56acfd6e4b9c3ff41e2c41a31c9b211b2deb9df75d9a478f9', 420) | ('symlink', 'AGENTS.md', 511)`
+- `zip4 | docs/reference/templates/CLAUDE.md | ('file', 'a54ff182c7e8acf56acfd6e4b9c3ff41e2c41a31c9b211b2deb9df75d9a478f9', 420) | ('symlink', 'AGENTS.md', 511)`
+- `zip5 | docs/CLAUDE.md | ('file', 'a54ff182c7e8acf56acfd6e4b9c3ff41e2c41a31c9b211b2deb9df75d9a478f9', 420) | ('symlink', 'AGENTS.md', 511)`
+- `zip5 | docs/reference/templates/CLAUDE.md | ('file', 'a54ff182c7e8acf56acfd6e4b9c3ff41e2c41a31c9b211b2deb9df75d9a478f9', 420) | ('symlink', 'AGENTS.md', 511)`
+- `zip6 | scripts/CLAUDE.md | ('file', 'a54ff182c7e8acf56acfd6e4b9c3ff41e2c41a31c9b211b2deb9df75d9a478f9', 420) | ('symlink', 'AGENTS.md', 511)`
+- `zip7 | ui/CLAUDE.md | ('file', 'a54ff182c7e8acf56acfd6e4b9c3ff41e2c41a31c9b211b2deb9df75d9a478f9', 420) | ('symlink', 'AGENTS.md', 511)`
+- `zip7 | test/CLAUDE.md | ('file', 'a54ff182c7e8acf56acfd6e4b9c3ff41e2c41a31c9b211b2deb9df75d9a478f9', 420) | ('symlink', 'AGENTS.md', 511)`
+- `zip7 | ui/node_modules/@openclaw/normalization-core | ('file', '21d0311a6c8d37201b066a53fdc1a92dc830319ab5b0717f39644d0f74f6ba3d', 420) | ('symlink', '../../../packages/normalization-core', 511)`
+- `zip7 | ui/node_modules/@openclaw/media-core | ('file', 'ff2d99b138dd3b497ef485a7b1164878a760cf4908ab3f628632fdff4567016e', 420) | ('symlink', '../../../packages/media-core', 511)`
+- `zip7 | test/helpers/CLAUDE.md | ('file', 'a54ff182c7e8acf56acfd6e4b9c3ff41e2c41a31c9b211b2deb9df75d9a478f9', 420) | ('symlink', 'AGENTS.md', 511)`
+- `zip8 | audit/audit-events.test.ts | MISSING`
+- `zip8 | audit/audit-event-writer.ts | MISSING`
+- `zip8 | audit/audit-event-writer.test.ts | MISSING`
+- `zip8 | audit/agent-event-audit.ts | MISSING`
+- `zip8 | audit/audit-config.test.ts | MISSING`
+- `zip8 | audit/audit-config.ts | MISSING`
+- `zip8 | audit/audit-event-types.ts | MISSING`
+- `zip8 | audit/audit-event-store.ts | MISSING`
+- `zip8 | audit/audit-event-writer.worker.ts | MISSING`
+- `zip8 | agents/embedded-agent-mcp.ts | MISSING`
+- `zip8 | agents/acp-spawn.test.ts | MISSING`
+- `zip8 | agents/embedded-agent-utils.test.ts | MISSING`
+- `zip8 | agents/subagent-spawn.context.test.ts | MISSING`
+- `zip8 | agents/models-config.ts | MISSING`
+- `zip8 | agents/memory-search.ts | MISSING`
+- `zip8 | agents/subagent-registry.steer-restart.test.ts | MISSING`
+- `zip8 | agents/chutes-oauth.ts | MISSING`
+- `zip8 | agents/bash-tools.exec-types.ts | MISSING`
+- `zip8 | agents/embedded-agent-subscribe.tools.test.ts | MISSING`
+- `zip8 | agents/tool-search.test.ts | MISSING`
+- `zip8 | agents/agent-compaction-constants.ts | MISSING`
+- `zip8 | agents/agent-steering-queue.test.ts | MISSING`
+- `zip8 | agents/failover-error.test.ts | MISSING`
+- `zip8 | agents/transport-stream-shared.test.ts | MISSING`
+- `zip8 | agents/system-prompt-config.test.ts | MISSING`
+- `zip8 | agents/subagent-session-metrics.ts | MISSING`
+- `zip8 | agents/provider-model-normalization.runtime.ts | MISSING`
+- `zip8 | agents/tool-policy-match.ts | MISSING`
+- `zip8 | agents/accepted-session-spawn.ts | MISSING`
+- `zip8 | agents/session-tool-result-guard.tool-result-persist-hook.test.ts | MISSING`
+- `zip8 | agents/subagent-run-generation.ts | MISSING`
+- `zip8 | agents/agent-tools.params.test.ts | MISSING`
+- `zip8 | agents/bash-tools.exec-host-node.test.ts | MISSING`
+- `zip8 | agents/run-termination.ts | MISSING`
+- `zip8 | agents/embedded-agent-helpers.sanitizeuserfacingtext.test.ts | MISSING`
+- `zip8 | agents/embedded-agent-subscribe.handlers.tools.ts | MISSING`
+- `zip8 | agents/models-config.merge.test.ts | MISSING`
+- `zip8 | agents/agent-tools-agent-config.exec.test.ts | MISSING`
+- `zip8 | agents/subagent-registry-queries.ts | MISSING`
+- `zip8 | agents/live-model-turn-probes.test.ts | MISSING`
+- `zip8 | agents/session-transcript-repair.test.ts | MISSING`
+- `zip8 | agents/models-config.providers.ts | MISSING`
+- `zip8 | agents/tool-schema-quarantine-health.ts | MISSING`
+- `zip8 | agents/bash-tools.exec-host-shared.ts | MISSING`
+- `zip8 | agents/subagent-registry.persistence.resume.test.ts | MISSING`
+- `zip8 | agents/mcp-stdio-transport.test.ts | MISSING`
+- `zip8 | agents/run-session-target.test.ts | MISSING`
+- `zip8 | agents/agent-tools.schema.test.ts | MISSING`
+- `zip8 | agents/api-key-rotation.test.ts | MISSING`
+- `zip8 | agents/docs-path.test.ts | MISSING`
+- `zip8 | agents/exec-auto-reviewer.prompt.ts | MISSING`
+- `zip8 | agents/sanitize-for-prompt.ts | MISSING`
+- `zip8 | agents/bash-tools.process.supervisor.test.ts | MISSING`
+- `zip8 | agents/session-agent-binding.ts | MISSING`
+- `zip8 | agents/model-catalog.types.ts | MISSING`
+- `zip8 | agents/google-gemini-switch.live.test.ts | MISSING`
+- `zip8 | agents/subagent-capabilities.test.ts | MISSING`
+- `zip8 | agents/tool-replay-safety.test.ts | MISSING`
+- `zip8 | agents/subagent-announce.test.ts | MISSING`
+- `zip8 | agents/acp-spawn-parent-stream.test.ts | MISSING`
+- `zip8 | agents/session-async-task-status.ts | MISSING`
+- `zip8 | agents/mcp-oauth.test.ts | MISSING`
+- `zip8 | agents/agent-auth-credentials.ts | MISSING`
+- `zip8 | agents/trace-base.ts | MISSING`
+- `zip8 | agents/sandbox-media-paths.test.ts | MISSING`
+- `zip8 | agents/live-auth-keys.test.ts | MISSING`
+- `zip8 | agents/openclaw-tools.image-generation.test.ts | MISSING`
+- `zip8 | agents/anthropic.setup-token.live.test.ts | MISSING`
+- `zip8 | agents/bundle-mcp.test-harness.ts | MISSING`
+- `zip8 | agents/compaction.ts | MISSING`
+- `zip8 | agents/embedded-agent-subscribe.handlers.messages.ts | MISSING`
+- `zip8 | agents/live-target-matcher.ts | MISSING`
+- `zip8 | agents/payload-redaction.ts | MISSING`
+- `zip8 | agents/code-mode-control-tools.ts | MISSING`
+- `zip8 | agents/agent-auth-discovery.ts | MISSING`
+- `zip8 | agents/tool-terminal-presentation.ts | MISSING`
+- `zip8 | agents/subagent-task-name.ts | MISSING`
+- `zip8 | agents/live-test-provider-drift.test.ts | MISSING`
+- `zip8 | agents/path-policy.ts | MISSING`
+- `zip8 | agents/openclaw-tools.subagents.sessions-spawn.cron-note.test.ts | MISSING`
+- `zip8 | agents/models-config.providers.implicit.ts | MISSING`
+- `zip8 | agents/models-config.providers.nvidia.test.ts | MISSING`
+- `zip8 | agents/mcp-http-fetch.ts | MISSING`
+- `zip8 | agents/embedded-agent-runner.sanitize-session-history.test-harness.ts | MISSING`
+- `zip8 | agents/subagent-list.ts | MISSING`
+- `zip8 | agents/session-suspension.test.ts | MISSING`
+- `zip8 | agents/agent-tools.policy.test.ts | MISSING`
+- `zip8 | agents/models-config.skips-writing-models-json-no-env-token.test.ts | MISSING`
+- `zip8 | agents/console-sanitize.test.ts | MISSING`
+- `zip8 | agents/bash-process-registry.test-helpers.ts | MISSING`
+- `zip8 | agents/models-config.providers.policy.ts | MISSING`
+- `zip8 | agents/cli-runner.spawn.test.ts | MISSING`
+- `zip8 | agents/code-mode-headless.test.ts | MISSING`
+- `zip8 | agents/models-config.providers.live-filter.test.ts | MISSING`
+- `zip8 | agents/minimax.live.test.ts | MISSING`
+- `zip8 | agents/compaction.identifier-preservation.test.ts | MISSING`
+- `zip8 | agents/sandbox-tool-policy.ts | MISSING`
+- `zip8 | agents/mcp-stdio-transport.ts | MISSING`
+- `zip8 | agents/compaction.test.ts | MISSING`
+- `zip8 | agents/agent-bundle-mcp-tools.materialize.test.ts | MISSING`
+- `zip8 | agents/model-auth.workspace-plugin.test.ts | MISSING`
+- `zip8 | agents/model-ref-shared.test.ts | MISSING`
+- `zip8 | agents/bundle-mcp-config.test.ts | MISSING`
+- `zip8 | agents/subagent-announce-output.ts | MISSING`
+- `zip8 | agents/responses-image-payload-sanitizer.ts | MISSING`
+- `zip8 | agents/context.eager-warmup.test.ts | MISSING`
+- `zip8 | agents/openai-transport-stream.ts | MISSING`
+- `zip8 | agents/subagent-registry.test.ts | MISSING`
+- `zip8 | agents/model-catalog-browse.ts | MISSING`
+- `zip8 | agents/subagent-registry.lifecycle-retry-grace.e2e.test.ts | MISSING`
+- `zip8 | agents/embedded-agent-runner.run-embedded-agent.auth-profile-rotation.e2e.test.ts | MISSING`
+- `zip8 | agents/embedded-agent-subscribe.handlers.compaction.runtime.ts | MISSING`
+- `zip8 | agents/tool-display.ts | MISSING`
+- `zip8 | agents/subagent-registry.store.sqlite.ts | MISSING`
+- `zip8 | agents/exec-approval-result.test.ts | MISSING`
+- `zip8 | agents/identity-file.ts | MISSING`
+- `zip8 | agents/workspace.ts | MISSING`
+- `zip8 | agents/openai-routing.test.ts | MISSING`
+- `zip8 | agents/subagent-control.runtime.ts | MISSING`
+- `zip8 | agents/agent-tools.availability.test.ts | MISSING`
+- `zip8 | agents/models-config.providers.cloudflare-ai-gateway.test.ts | MISSING`
+- `zip8 | agents/content-blocks.test.ts | MISSING`
+- `zip8 | agents/embedded-agent-messaging.ts | MISSING`
+- `zip8 | agents/live-model-switch-error.ts | MISSING`
+- `zip8 | agents/subagent-registry-helpers.test.ts | MISSING`
+- `zip8 | agents/compaction.retry.test.ts | MISSING`
+- `zip8 | agents/tool-description-summary.ts | MISSING`
+- `zip8 | agents/agent-tools.message-provider-policy.ts | MISSING`
+- `zip8 | agents/provider-attribution.catalog-endpoints.test.ts | MISSING`
+- `zip8 | agents/realtime-bootstrap-context.test.ts | MISSING`
+- `zip8 | agents/session-tool-result-guard-wrapper.ts | MISSING`
+- `zip8 | agents/embedded-agent-subscribe.handlers.compaction.test.ts | MISSING`
+- `zip8 | agents/subagent-session-reconciliation.ts | MISSING`
+- `zip8 | agents/model-selection-cli.ts | MISSING`
+- `zip8 | agents/run-cleanup-timeout.test.ts | MISSING`
+- `zip8 | agents/spawn-requester-origin.test.ts | MISSING`
+- `zip8 | agents/openclaw-tools.subagents.sessions-spawn-applies-thinking-default.test.ts | MISSING`
+- `zip8 | agents/models-config.providers.policy.test.ts | MISSING`
+- `zip8 | agents/compaction-planning.ts | MISSING`
+- `zip8 | agents/anthropic-transport-stream.test.ts | MISSING`
+- `zip8 | agents/mcp-stdio.ts | MISSING`
+- `zip8 | agents/embedded-agent-subscribe.subscribe-embedded-agent-session.withholds-anthropic-pretool-narration.test.ts | MISSING`
+- `zip8 | agents/compaction.token-sanitize.test.ts | MISSING`
+- `zip8 | agents/tool-loop-detection.ts | MISSING`
+- `zip8 | agents/tool-replay-safety.ts | MISSING`
+- `zip8 | agents/api-key-rotation.ts | MISSING`
+- `zip8 | agents/usage.test.ts | MISSING`
+- `zip8 | agents/embedded-agent-helpers.validate-turns.test.ts | MISSING`
+- `zip8 | agents/model-fallback.test.ts | MISSING`
+- `zip8 | agents/sandbox-paths.windows-drive-resolve.test.ts | MISSING`
+- `zip8 | agents/subagent-registry-read-context.test.ts | MISSING`
+- `zip8 | agents/models-config.replace-mode-skip-implicit-discovery.test.ts | MISSING`
+- `zip8 | agents/live-model-dynamic-candidates.ts | MISSING`
+- `zip8 | agents/session-slug.ts | MISSING`
+- `zip8 | agents/tool-policy-declared-context.ts | MISSING`
+- `zip8 | agents/model-selection-display.test.ts | MISSING`
+- `zip8 | agents/btw-transcript.ts | MISSING`
+- `zip8 | agents/generated-attachments.ts | MISSING`
+- `zip8 | agents/sandbox-merge.test.ts | MISSING`
+- `zip8 | agents/embedded-agent-subscribe.subscribe-embedded-agent-session.subscribeembeddedagentsession.test.ts | MISSING`
+- `zip8 | agents/embedded-agent-subscribe.ts | MISSING`
+- `zip8 | agents/diagnostic-redaction.ts | MISSING`
+- `zip8 | agents/subagent-run-timeout.test.ts | MISSING`
+- `zip8 | agents/shell-utils.ts | MISSING`
+- `zip8 | agents/shell-snapshot.ts | MISSING`
+- `zip8 | agents/agent-bundle-mcp-test-harness.ts | MISSING`
+- `zip8 | agents/subagent-registry-run-manager.ts | MISSING`
+- `zip8 | agents/subagent-spawn.test-helpers.ts | MISSING`
+- `zip8 | agents/embedded-agent-subscribe.shared-types.ts | MISSING`
+- `zip8 | agents/bash-tools.exec-approval-followup.test.ts | MISSING`
+- `zip8 | agents/model-catalog.test.ts | MISSING`
+- `zip8 | agents/sandbox.resolveSandboxContext.test.ts | MISSING`
+- `zip8 | agents/prompt-composition.test.ts | MISSING`
+- `zip8 | agents/openclaw-tools.plugin-context.ts | MISSING`
+- `zip8 | agents/execution-contract.ts | MISSING`
+- `zip8 | agents/conversation-capability-profile.test.ts | MISSING`
+## Mode-only differences (first 200)
+- `zip1 | apps/android/gradlew | 420 | 493`
+- `zip1 | apps/swabble/scripts/format.sh | 420 | 493`
+- `zip1 | apps/swabble/scripts/lint.sh | 420 | 493`
+- `zip1 | apps/android/scripts/perf-startup-benchmark.sh | 420 | 493`
+- `zip1 | apps/android/scripts/perf-startup-hotspots.sh | 420 | 493`
+- `zip1 | apps/android/scripts/voice-e2e.sh | 420 | 493`
+- `zip1 | apps/android/scripts/perf-online-benchmark.sh | 420 | 493`
+- `zip2 | apps/android/gradlew | 420 | 493`
+- `zip2 | apps/swabble/scripts/format.sh | 420 | 493`
+- `zip2 | apps/swabble/scripts/lint.sh | 420 | 493`
+- `zip2 | apps/android/scripts/perf-startup-benchmark.sh | 420 | 493`
+- `zip2 | apps/android/scripts/perf-startup-hotspots.sh | 420 | 493`
+- `zip2 | apps/android/scripts/voice-e2e.sh | 420 | 493`
+- `zip2 | apps/android/scripts/perf-online-benchmark.sh | 420 | 493`
+- `zip3 | git-hooks/pre-commit | 420 | 493`
+- `zip3 | extensions/copilot/doctor-contract-api.test.ts | 420 | 493`
+- `zip3 | extensions/copilot/doctor-contract-api.ts | 420 | 493`
+- `zip3 | extensions/copilot/src/permission-bridge.test.ts | 420 | 493`
+- `zip3 | extensions/copilot/src/compaction-bridge.ts | 420 | 493`
+- `zip3 | extensions/copilot/src/dual-write-transcripts.ts | 420 | 493`
+- `zip3 | extensions/copilot/src/replay-shim.ts | 420 | 493`
+- `zip3 | extensions/copilot/src/permission-bridge.ts | 420 | 493`
+- `zip3 | extensions/copilot/src/dual-write-transcripts.test.ts | 420 | 493`
+- `zip3 | extensions/copilot/src/sdk-loader.test.ts | 420 | 493`
+- `zip3 | extensions/copilot/src/replay-shim.test.ts | 420 | 493`
+- `zip3 | extensions/copilot/src/auth-bridge.test.ts | 420 | 493`
+- `zip3 | extensions/copilot/src/hooks-bridge.ts | 420 | 493`
+- `zip3 | extensions/copilot/src/auth-bridge.ts | 420 | 493`
+- `zip3 | extensions/copilot/src/hooks-bridge.test.ts | 420 | 493`
+- `zip3 | extensions/copilot/src/sdk-loader.ts | 420 | 493`
+- `zip3 | extensions/copilot/src/compaction-bridge.test.ts | 420 | 493`
+- `zip4 | docs/plugins/copilot.md | 420 | 493`
+- `zip5 | docs/plugins/copilot.md | 420 | 493`
+- `zip6 | scripts/ios-validate-app-store-ipa.sh | 420 | 493`
+- `zip6 | scripts/full-release-validation-at-sha.mjs | 420 | 493`
+- `zip6 | scripts/sandbox-browser-setup.sh | 420 | 493`
+- `zip6 | scripts/clawlog.sh | 420 | 493`
+- `zip6 | scripts/ci-hydrate-testbox-env.sh | 420 | 493`
+- `zip6 | scripts/recover-orphaned-processes.sh | 420 | 493`
+- `zip6 | scripts/test-live-models-docker.sh | 420 | 493`
+- `zip6 | scripts/test-install-sh-e2e-docker.sh | 420 | 493`
+- `zip6 | scripts/sandbox-browser-entrypoint.sh | 420 | 493`
+- `zip6 | scripts/make_appcast.sh | 420 | 493`
+- `zip6 | scripts/build_icon.sh | 420 | 493`
+- `zip6 | scripts/ios-write-version-xcconfig.sh | 420 | 493`
+- `zip6 | scripts/ios-run.sh | 420 | 493`
+- `zip6 | scripts/run-opengrep.sh | 420 | 493`
+- `zip6 | scripts/sandbox-setup.sh | 420 | 493`
+- `zip6 | scripts/check-plugin-sdk-exports.mjs | 420 | 493`
+- `zip6 | scripts/openclaw-release-clawhub-runtime-state.ts | 420 | 493`
+- `zip6 | scripts/ios-app-store-connect-keychain-setup.sh | 420 | 493`
+- `zip6 | scripts/ios-screenshots.sh | 420 | 493`
+- `zip6 | scripts/build-and-run-mac.sh | 420 | 493`
+- `zip6 | scripts/gh-read | 420 | 493`
+- `zip6 | scripts/ocm-npm-workspace-deps.mjs | 420 | 493`
+- `zip6 | scripts/codesign-mac-app.sh | 420 | 493`
+- `zip6 | scripts/ios-configure-signing.sh | 420 | 493`
+- `zip6 | scripts/ci-docker-login-ghcr.sh | 420 | 493`
+- `zip6 | scripts/bundle-a2ui.sh | 420 | 493`
+- `zip6 | scripts/test-install-sh-docker.sh | 420 | 493`
+- `zip6 | scripts/test-live-acp-spawn-defaults-docker.sh | 420 | 493`
+- `zip6 | scripts/claude-auth-status.sh | 420 | 493`
+- `zip6 | scripts/release-fast-pretag-check.sh | 420 | 493`
+- `zip6 | scripts/test-live-gateway-models-docker.sh | 420 | 493`
+- `zip6 | scripts/ios-team-id.sh | 420 | 493`
+- `zip6 | scripts/restart-mac.sh | 420 | 493`
+- `zip6 | scripts/setup-auth-system.sh | 420 | 493`
+- `zip6 | scripts/install-cli.sh | 420 | 493`
+- `zip6 | scripts/install.sh | 420 | 493`
+- `zip6 | scripts/pr-prepare | 420 | 493`
+- `zip6 | scripts/release-ci-summary.mjs | 420 | 493`
+- `zip6 | scripts/test-force.ts | 420 | 493`
+- `zip6 | scripts/ios-release-archive.sh | 420 | 493`
+- `zip6 | scripts/package-mac-app.sh | 420 | 493`
+- `zip6 | scripts/mobile-reauth.sh | 420 | 493`
+- `zip6 | scripts/release-check.ts | 420 | 493`
+- `zip6 | scripts/crabbox-wrapper.mjs | 420 | 493`
+- `zip6 | scripts/notarize-mac-artifact.sh | 420 | 493`
+- `zip6 | scripts/committer | 420 | 493`
+- `zip6 | scripts/crabbox-untrusted-bootstrap.sh | 420 | 493`
+- `zip6 | scripts/ios-release-signing.mjs | 420 | 493`
+- `zip6 | scripts/release-verify-beta.ts | 420 | 493`
+- `zip6 | scripts/pr-merge | 420 | 493`
+- `zip6 | scripts/ios-release-upload.sh | 420 | 493`
+- `zip6 | scripts/changelog-to-html.sh | 420 | 493`
+- `zip6 | scripts/test-live-build-docker.sh | 420 | 493`
+- `zip6 | scripts/pr-review | 420 | 493`
+- `zip6 | scripts/create-dmg.sh | 420 | 493`
+- `zip6 | scripts/sandbox-common-setup.sh | 420 | 493`
+- `zip6 | scripts/package-mac-dist.sh | 420 | 493`
+- `zip6 | scripts/openclaw-release-clawhub-plan.ts | 420 | 493`
+- `zip6 | scripts/ios-release-prepare.sh | 420 | 493`
+- `zip6 | scripts/test-cleanup-docker.sh | 420 | 493`
+- `zip6 | scripts/ci-live-command-retry.sh | 420 | 493`
+- `zip6 | scripts/validate-full-release-validation-evidence.mjs | 420 | 493`
+- `zip6 | scripts/auth-monitor.sh | 420 | 493`
+- `zip6 | scripts/docs-list.js | 420 | 493`
+- `zip6 | scripts/pr | 420 | 493`
+- `zip6 | scripts/run-openclaw-podman.sh | 420 | 493`
+- `zip6 | scripts/clawdock/clawdock-helpers.sh | 420 | 493`
+- `zip6 | scripts/k8s/deploy.sh | 420 | 493`
+- `zip6 | scripts/k8s/create-kind.sh | 420 | 493`
+- `zip6 | scripts/podman/setup.sh | 420 | 493`
+- `zip6 | scripts/github/resolve-openclaw-ref.sh | 420 | 493`
+- `zip6 | scripts/github/find-reusable-release-validation.sh | 420 | 493`
+- `zip6 | scripts/github/run-openclaw-cross-os-release-checks.sh | 420 | 493`
+- `zip6 | scripts/docker/setup.sh | 420 | 493`
+- `zip6 | scripts/pre-commit/run-node-tool.sh | 420 | 493`
+- `zip6 | scripts/repro/code-mode-namespace-live.ts | 420 | 493`
+- `zip6 | scripts/repro/code-mode-namespace-live-scenario.sh | 420 | 493`
+- `zip6 | scripts/repro/code-mode-namespace-live-docker.sh | 420 | 493`
+- `zip6 | scripts/dev/ios-pull-gateway-log.sh | 420 | 493`
+- `zip6 | scripts/e2e/onboard-docker.sh | 420 | 493`
+- `zip6 | scripts/e2e/kitchen-sink-rpc-docker.sh | 420 | 493`
+- `zip6 | scripts/e2e/bundled-plugin-install-uninstall-docker.sh | 420 | 493`
+- `zip6 | scripts/e2e/agent-bundle-mcp-tools-docker.sh | 420 | 493`
+- `zip6 | scripts/e2e/plugin-update-unchanged-docker.sh | 420 | 493`
+- `zip6 | scripts/e2e/update-channel-switch-docker.sh | 420 | 493`
+- `zip6 | scripts/e2e/mcp-code-mode-gateway-docker.sh | 420 | 493`
+- `zip6 | scripts/e2e/commitments-safety-docker.sh | 420 | 493`
+- `zip6 | scripts/e2e/mcp-code-mode-gateway-live-docker.sh | 420 | 493`
+- `zip6 | scripts/e2e/docker-package-install.sh | 420 | 493`
+- `zip6 | scripts/e2e/doctor-install-switch-docker.sh | 420 | 493`
+- `zip6 | scripts/e2e/parallels-windows-smoke.sh | 420 | 493`
+- `zip6 | scripts/e2e/codex-on-demand-docker.sh | 420 | 493`
+- `zip6 | scripts/e2e/release-upgrade-user-journey-docker.sh | 420 | 493`
+- `zip6 | scripts/e2e/config-reload-source-docker.sh | 420 | 493`
+- `zip6 | scripts/e2e/parallels-linux-smoke.sh | 420 | 493`
+- `zip6 | scripts/e2e/crestodian-rescue-docker.sh | 420 | 493`
+- `zip6 | scripts/e2e/cron-cli-docker.sh | 420 | 493`
+- `zip6 | scripts/e2e/multi-node-update-docker.sh | 420 | 493`
+- `zip6 | scripts/e2e/compose-setup.sh | 420 | 493`
+- `zip6 | scripts/e2e/release-user-journey-docker.sh | 420 | 493`
+- `zip6 | scripts/e2e/telegram-user-driver.py | 420 | 493`
+- `zip6 | scripts/e2e/qr-import-docker.sh | 420 | 493`
+- `zip6 | scripts/e2e/upgrade-survivor-docker.sh | 420 | 493`
+- `zip6 | scripts/e2e/plugin-lifecycle-matrix-docker.sh | 420 | 493`
+- `zip6 | scripts/e2e/live-plugin-tool-docker.sh | 420 | 493`
+- `zip6 | scripts/e2e/npm-telegram-live-docker.sh | 420 | 493`
+- `zip6 | scripts/e2e/openai-web-search-minimal-docker.sh | 420 | 493`
+- `zip6 | scripts/e2e/skill-install-docker.sh | 420 | 493`
+- `zip6 | scripts/e2e/release-media-memory-docker.sh | 420 | 493`
+- `zip6 | scripts/e2e/plugins-docker.sh | 420 | 493`
+- `zip6 | scripts/e2e/release-plugin-marketplace-docker.sh | 420 | 493`
+- `zip6 | scripts/e2e/release-typed-onboarding-docker.sh | 420 | 493`
+- `zip6 | scripts/e2e/openwebui-docker.sh | 420 | 493`
+- `zip6 | scripts/e2e/bun-global-install-smoke.sh | 420 | 493`
+- `zip6 | scripts/e2e/crestodian-planner-docker.sh | 420 | 493`
+- `zip6 | scripts/e2e/parallels-macos-smoke.sh | 420 | 493`
+- `zip6 | scripts/e2e/browser-cdp-snapshot-docker.sh | 420 | 493`
+- `zip6 | scripts/e2e/parallels-npm-update-smoke.sh | 420 | 493`
+- `zip6 | scripts/secrets/openclaw-bws-resolver.mjs | 420 | 493`
+- `zip6 | scripts/docker/install-sh-e2e/run.sh | 420 | 493`
+- `zip6 | scripts/docker/cleanup-smoke/run.sh | 420 | 493`
+- `zip6 | scripts/docker/install-sh-smoke/run.sh | 420 | 493`
+- `zip6 | scripts/e2e/parallels/linux-smoke.ts | 420 | 493`
+- `zip6 | scripts/e2e/parallels/windows-smoke.ts | 420 | 493`
+- `zip6 | scripts/e2e/parallels/npm-update-smoke.ts | 420 | 493`
+- `zip6 | scripts/e2e/parallels/macos-smoke.ts | 420 | 493`
+- `zip6 | scripts/e2e/lib/release-typed-onboarding/scenario.sh | 420 | 493`
+- `zip6 | scripts/e2e/lib/release-media-memory/scenario.sh | 420 | 493`
+- `zip6 | scripts/e2e/lib/release-user-journey/scenario.sh | 420 | 493`
+- `zip6 | scripts/e2e/lib/release-plugin-marketplace/scenario.sh | 420 | 493`
+- `zip6 | scripts/e2e/lib/release-upgrade-user-journey/scenario.sh | 420 | 493`
+- `zip6 | scripts/e2e/lib/doctor-install-switch/shims/loginctl | 420 | 493`
+- `zip6 | scripts/e2e/lib/doctor-install-switch/shims/systemctl | 420 | 493`
+- `zip6 | skills/video-frames/scripts/frame.sh | 420 | 493`
+- `zip6 | skills/openai-whisper-api/scripts/transcribe.sh | 420 | 493`
+- `zip6 | skills/meme-maker/scripts/meme.mjs | 420 | 493`
+- `zip6 | skills/tmux/scripts/find-sessions.sh | 420 | 493`
+- `zip6 | skills/tmux/scripts/wait-for-text.sh | 420 | 493`
+- `zip6 | skills/sherpa-onnx-tts/bin/sherpa-onnx-tts | 420 | 493`
+## Flattened symlinks (first 200)
