@@ -1,207 +1,207 @@
-# ZIP source cross-check
+# ZIP source cross-check (type + content + mode)
 
 - Release ref: `0790d9f593ad30c940ed93b5872a8cf6d6f3cf8c`
-- Unique ZIP paths: **12111**
-- Failures: **2602**
+- Unique ZIP paths checked: **12260**
+- Failures: **2775**
 
 ## First 200 failures
-- `acr-zip1-extracted` | `apps/android/CLAUDE.md` | `CONTENT_MISMATCH` | `a54ff182c7e8acf56acfd6e4b9c3ff41e2c41a31c9b211b2deb9df75d9a478f9` | `b6dcc9ea01cf21ef5ef6dd18660856bf11cb26fbb568bcca2a80913fdcd9c19b`
-- `acr-zip1-extracted` | `apps/ios/CLAUDE.md` | `CONTENT_MISMATCH` | `a54ff182c7e8acf56acfd6e4b9c3ff41e2c41a31c9b211b2deb9df75d9a478f9` | `51495be75086e8625a3d1fe604545da0f45ce785a6df49ade929c1ee8c2a9ec3`
-- `acr-zip4-extracted` | `apps/android/CLAUDE.md` | `CONTENT_MISMATCH` | `a54ff182c7e8acf56acfd6e4b9c3ff41e2c41a31c9b211b2deb9df75d9a478f9` | `b6dcc9ea01cf21ef5ef6dd18660856bf11cb26fbb568bcca2a80913fdcd9c19b`
-- `acr-zip4-extracted` | `apps/ios/CLAUDE.md` | `CONTENT_MISMATCH` | `a54ff182c7e8acf56acfd6e4b9c3ff41e2c41a31c9b211b2deb9df75d9a478f9` | `51495be75086e8625a3d1fe604545da0f45ce785a6df49ade929c1ee8c2a9ec3`
-- `acr-zip5-extracted` | `extensions/CLAUDE.md` | `CONTENT_MISMATCH` | `a54ff182c7e8acf56acfd6e4b9c3ff41e2c41a31c9b211b2deb9df75d9a478f9` | `ba85d81f0649a3d5ba8fdab5b9a939ed624aa984a2bc0fb5e2f996a885d8fa73`
-- `acr-zip5-extracted` | `packages/agent-core/node_modules/@openclaw/ai` | `MISSING_IN_RELEASE` | `21350727838d6a71c1ee7be1cd749836a416b4f2bd9d36525155943c54f99c2f` | ``
-- `acr-zip5-extracted` | `packages/media-core/node_modules/@openclaw/normalization-core` | `MISSING_IN_RELEASE` | `fd873120b692d01406d2fa15e04ce5254acc133ecde72e05b8c268030e5f9c2e` | ``
-- `acr-zip5-extracted` | `packages/speech-core/node_modules/openclaw` | `MISSING_IN_RELEASE` | `297823c2f472cdfefd4dfdec487f9069aaf971ac18839bbb2dd4f2c7f3ca57ca` | ``
-- `acr-zip5-extracted` | `packages/acp-core/node_modules/@openclaw/normalization-core` | `MISSING_IN_RELEASE` | `fd873120b692d01406d2fa15e04ce5254acc133ecde72e05b8c268030e5f9c2e` | ``
-- `acr-zip5-extracted` | `packages/sdk/node_modules/@openclaw/gateway-client` | `MISSING_IN_RELEASE` | `671f7d19a7eed6ffcb80dd7c9c107e4332c6360e4a9033c211d6aa36e3e6d47b` | ``
-- `acr-zip5-extracted` | `packages/gateway-client/node_modules/@openclaw/gateway-protocol` | `MISSING_IN_RELEASE` | `3f7822db48a78ff50463bdd45c3417557b869bc60ec7816769b0c8db8695d41c` | ``
-- `acr-zip5-extracted` | `extensions/acpx/CLAUDE.md` | `CONTENT_MISMATCH` | `a54ff182c7e8acf56acfd6e4b9c3ff41e2c41a31c9b211b2deb9df75d9a478f9` | `2f9f6f56da696a1aff937a5131cbfcb4736a650491737c11fd155f4bce5cb16f`
-- `acr-zip5-extracted` | `extensions/telegram/CLAUDE.md` | `CONTENT_MISMATCH` | `a54ff182c7e8acf56acfd6e4b9c3ff41e2c41a31c9b211b2deb9df75d9a478f9` | `c1ff802c8bf5ae6e20141861a97cd8562f0216adcd0a28cfbc2a94c289be65ec`
-- `acr-zip51-extracted` | `docs/CLAUDE.md` | `CONTENT_MISMATCH` | `a54ff182c7e8acf56acfd6e4b9c3ff41e2c41a31c9b211b2deb9df75d9a478f9` | `a8712b1aeb2e605055c22cf308049e5e74fdf33061870026be20bd55cb0c3d1d`
-- `acr-zip51-extracted` | `docs/reference/templates/CLAUDE.md` | `CONTENT_MISMATCH` | `a54ff182c7e8acf56acfd6e4b9c3ff41e2c41a31c9b211b2deb9df75d9a478f9` | `7d340e13e845b8bf7c69c60f5dbcc7b5b0e03b1401496d2a091af7223499bbfc`
-- `acr-zip6-extracted` | `docs/CLAUDE.md` | `CONTENT_MISMATCH` | `a54ff182c7e8acf56acfd6e4b9c3ff41e2c41a31c9b211b2deb9df75d9a478f9` | `a8712b1aeb2e605055c22cf308049e5e74fdf33061870026be20bd55cb0c3d1d`
-- `acr-zip6-extracted` | `docs/reference/templates/CLAUDE.md` | `CONTENT_MISMATCH` | `a54ff182c7e8acf56acfd6e4b9c3ff41e2c41a31c9b211b2deb9df75d9a478f9` | `7d340e13e845b8bf7c69c60f5dbcc7b5b0e03b1401496d2a091af7223499bbfc`
-- `acr-zip7-extracted` | `scripts/CLAUDE.md` | `CONTENT_MISMATCH` | `a54ff182c7e8acf56acfd6e4b9c3ff41e2c41a31c9b211b2deb9df75d9a478f9` | `4b5875184b28f5496e173ea90593546a37f19bdcf79729e37b6e65bf7923cc20`
-- `acr-zip8-extracted` | `ui/CLAUDE.md` | `CONTENT_MISMATCH` | `a54ff182c7e8acf56acfd6e4b9c3ff41e2c41a31c9b211b2deb9df75d9a478f9` | `40878d3f17c6ba7bcf766e5172940c6f47015578009045acf6b2c04219224ae0`
-- `acr-zip8-extracted` | `test/CLAUDE.md` | `CONTENT_MISMATCH` | `a54ff182c7e8acf56acfd6e4b9c3ff41e2c41a31c9b211b2deb9df75d9a478f9` | `63f019200d56ee448f8beb4520d0f49e401e7ef841b02f85311ccf11a063f190`
-- `acr-zip8-extracted` | `ui/node_modules/@openclaw/normalization-core` | `MISSING_IN_RELEASE` | `21d0311a6c8d37201b066a53fdc1a92dc830319ab5b0717f39644d0f74f6ba3d` | ``
-- `acr-zip8-extracted` | `ui/node_modules/@openclaw/media-core` | `MISSING_IN_RELEASE` | `ff2d99b138dd3b497ef485a7b1164878a760cf4908ab3f628632fdff4567016e` | ``
-- `acr-zip8-extracted` | `test/helpers/CLAUDE.md` | `CONTENT_MISMATCH` | `a54ff182c7e8acf56acfd6e4b9c3ff41e2c41a31c9b211b2deb9df75d9a478f9` | `2cdab1e0d02170a5200a3517f3a76afd010db360c144414b4c9dfae29511ee69`
-- `acr-zip9-extracted` | `audit/audit-events.test.ts` | `MISSING_IN_RELEASE` | `eb6732f9b517ac1dadd75cfd3b6689084364900187d5e99c71a580565651be98` | ``
-- `acr-zip9-extracted` | `audit/audit-event-writer.ts` | `MISSING_IN_RELEASE` | `c0d19151ed3f8d93cb4c3139d9b2c5cdaa6047d3dcea8bb8facea6dd25e03a4f` | ``
-- `acr-zip9-extracted` | `audit/audit-event-writer.test.ts` | `MISSING_IN_RELEASE` | `4f0e8aa9209e3f11f67294cc4936624c062440e0f3415d558296fc722e49a84c` | ``
-- `acr-zip9-extracted` | `audit/agent-event-audit.ts` | `MISSING_IN_RELEASE` | `14080fcd90294500bdb6171ce25ef550581656850a4fe1a128bc9dac1b8924f7` | ``
-- `acr-zip9-extracted` | `audit/audit-config.test.ts` | `MISSING_IN_RELEASE` | `5df78267e15aed5b01c7b6c27bd2e7783dde2568946c37d0958190fc332b6025` | ``
-- `acr-zip9-extracted` | `audit/audit-config.ts` | `MISSING_IN_RELEASE` | `fc7e0267658cc86cf9a62974721d176a7380e8468dfc5132a357fc6322f6dead` | ``
-- `acr-zip9-extracted` | `audit/audit-event-types.ts` | `MISSING_IN_RELEASE` | `5567c2bd3046533ed028172eccdc56f304c230e23beddbdf5878d5fbf3c08059` | ``
-- `acr-zip9-extracted` | `audit/audit-event-store.ts` | `MISSING_IN_RELEASE` | `12b6051e7ccd549ab4a82840668c71c31d73ebb8043ebbf35f3d514ab4b91fc0` | ``
-- `acr-zip9-extracted` | `audit/audit-event-writer.worker.ts` | `MISSING_IN_RELEASE` | `ec83e90807e5e658e8e32482cfa9efe1ee07743c074208879f3a6ff36fda4a61` | ``
-- `acr-zip9-extracted` | `agents/embedded-agent-mcp.ts` | `MISSING_IN_RELEASE` | `cdb7b090433a147ea719b4a186d33acafb8245f51c42a48430e03ef7c0e7e92d` | ``
-- `acr-zip9-extracted` | `agents/acp-spawn.test.ts` | `MISSING_IN_RELEASE` | `92e771d44a0da201bb34a64bc4f21f15cf57cd360fe02a0c64d56704d608e84b` | ``
-- `acr-zip9-extracted` | `agents/embedded-agent-utils.test.ts` | `MISSING_IN_RELEASE` | `bbbf4726cfaddc510a1bc2a6d009d5e7b2ed802ddf5fa63427f93d61668dfb69` | ``
-- `acr-zip9-extracted` | `agents/subagent-spawn.context.test.ts` | `MISSING_IN_RELEASE` | `59ca6d2ab56b50a85092ad7ac36a69fc1072c1c09731641d412f641ba82c37bf` | ``
-- `acr-zip9-extracted` | `agents/models-config.ts` | `MISSING_IN_RELEASE` | `5ee01d8c60586bdc5665225e9daffe1d2c0ab2bf82ed3550ec64451467f0a469` | ``
-- `acr-zip9-extracted` | `agents/memory-search.ts` | `MISSING_IN_RELEASE` | `6752bad5f256370887c24e0fccaa8d3a5c6ae93ab2b411750e4efecf5faef8ff` | ``
-- `acr-zip9-extracted` | `agents/subagent-registry.steer-restart.test.ts` | `MISSING_IN_RELEASE` | `6df5a7b19ac30afb48484627ba3baefbf8b044cdd4e9202a815a34f9e8e84a7d` | ``
-- `acr-zip9-extracted` | `agents/chutes-oauth.ts` | `MISSING_IN_RELEASE` | `9ef3f82f00d329fba60fcfc1b0385e5977b6c9e1b66f5019e57dc2e7dffdf47b` | ``
-- `acr-zip9-extracted` | `agents/bash-tools.exec-types.ts` | `MISSING_IN_RELEASE` | `0d9f287af9ab62cc5e2b245973ec8bbdd3bd4d20a052e3a00ebb745385b58327` | ``
-- `acr-zip9-extracted` | `agents/embedded-agent-subscribe.tools.test.ts` | `MISSING_IN_RELEASE` | `b949b49dd38020ec2df48ce2aa71cfcc9d5e4d4f9c24ec3e8d23c09e81ed4d86` | ``
-- `acr-zip9-extracted` | `agents/tool-search.test.ts` | `MISSING_IN_RELEASE` | `877f61faf8c73516e3ec56a4f439de4490a7f90d1b884dbcb5fae57d490a9d27` | ``
-- `acr-zip9-extracted` | `agents/agent-compaction-constants.ts` | `MISSING_IN_RELEASE` | `741c99bee52e9d9a8e4aea2ed567610937f4d9990a51b1b99d5cf494a009f050` | ``
-- `acr-zip9-extracted` | `agents/agent-steering-queue.test.ts` | `MISSING_IN_RELEASE` | `1a3749f90952c5fef2485ccba44a69f003c3096e7353574fdc67d42d08b161a4` | ``
-- `acr-zip9-extracted` | `agents/failover-error.test.ts` | `MISSING_IN_RELEASE` | `368597a424ac21e11130262d436dd94e3fd973a6e6efc4b8646d07f0e92709f1` | ``
-- `acr-zip9-extracted` | `agents/transport-stream-shared.test.ts` | `MISSING_IN_RELEASE` | `8c1c0d14cbc90ebdfa94d636da311791dab9797ae1475b4cd0e125eb04c623ab` | ``
-- `acr-zip9-extracted` | `agents/system-prompt-config.test.ts` | `MISSING_IN_RELEASE` | `e1f9df3bc8c5970aae87b0025dba6166b07418e8e4af10d90e98769a581f94a8` | ``
-- `acr-zip9-extracted` | `agents/subagent-session-metrics.ts` | `MISSING_IN_RELEASE` | `4b6984c15dec0bc5b490612285107365dbe596a7013dd289bb218e861dab881b` | ``
-- `acr-zip9-extracted` | `agents/provider-model-normalization.runtime.ts` | `MISSING_IN_RELEASE` | `7eb2132e58d0fe9ef45d18c95c2aa05f3bc799d14f58ad84a9e1a7473abffdd4` | ``
-- `acr-zip9-extracted` | `agents/tool-policy-match.ts` | `MISSING_IN_RELEASE` | `12cdb6186301b0ee9723e337b6942d9d3a4b54d187c4453a52903a99dd7885a6` | ``
-- `acr-zip9-extracted` | `agents/accepted-session-spawn.ts` | `MISSING_IN_RELEASE` | `bbc92330023c12ba4606b2a494fec307da935485044069d353650bf3d52f8c54` | ``
-- `acr-zip9-extracted` | `agents/session-tool-result-guard.tool-result-persist-hook.test.ts` | `MISSING_IN_RELEASE` | `497e01c9d776ba6992b5cc4e2352a5f65edc26b58f889ac615464e5a143b1393` | ``
-- `acr-zip9-extracted` | `agents/subagent-run-generation.ts` | `MISSING_IN_RELEASE` | `56f5d51a2a1da603e17844e0716889c5dafc0a87e2623479d47d21e803735cf4` | ``
-- `acr-zip9-extracted` | `agents/agent-tools.params.test.ts` | `MISSING_IN_RELEASE` | `49e98d7e7dcc4586f80ef3bb80138abec436284cb20d4aaeffcfa5641a1ea3d5` | ``
-- `acr-zip9-extracted` | `agents/bash-tools.exec-host-node.test.ts` | `MISSING_IN_RELEASE` | `a9b83aa34c519e4fdb3ff65497d98c0b2e086ea32d223da1742b6c54b2408a72` | ``
-- `acr-zip9-extracted` | `agents/run-termination.ts` | `MISSING_IN_RELEASE` | `8d54c25ef7e22a44f452521e4365665e13fb53385b19c9d4fd7762a59d91b287` | ``
-- `acr-zip9-extracted` | `agents/embedded-agent-helpers.sanitizeuserfacingtext.test.ts` | `MISSING_IN_RELEASE` | `b2078b89ef7149bb678095f9a786df1333d290e65835427f34f41c5a8dde08c7` | ``
-- `acr-zip9-extracted` | `agents/embedded-agent-subscribe.handlers.tools.ts` | `MISSING_IN_RELEASE` | `348d13aedc676e2b21ef8d1e8b22931e52e40b529d10c347d52d0c9bb2e70120` | ``
-- `acr-zip9-extracted` | `agents/models-config.merge.test.ts` | `MISSING_IN_RELEASE` | `9ecc318c467a7a423a966901a7740a6d049de2a9259ced507cd111b161494cc4` | ``
-- `acr-zip9-extracted` | `agents/agent-tools-agent-config.exec.test.ts` | `MISSING_IN_RELEASE` | `7b56d9626d0b8ab366f329a37de810e3000fa15139d057629f0ae8f81a99371b` | ``
-- `acr-zip9-extracted` | `agents/subagent-registry-queries.ts` | `MISSING_IN_RELEASE` | `830a7e3c1972181bf85c1a0036f0061e53cf20ebeac78ae471ea8939094b57df` | ``
-- `acr-zip9-extracted` | `agents/live-model-turn-probes.test.ts` | `MISSING_IN_RELEASE` | `f2303bc3fa08a453d621e60bc794e9b5deca91117f277cba3a5780eca7f2acc5` | ``
-- `acr-zip9-extracted` | `agents/session-transcript-repair.test.ts` | `MISSING_IN_RELEASE` | `0fe3cd1e86dd06c08f4a83063aae23999beb4b98eee0cfb3df3d5cc11061caf9` | ``
-- `acr-zip9-extracted` | `agents/models-config.providers.ts` | `MISSING_IN_RELEASE` | `1c194cdb6aa75a07d5cf900682c57782be5ff674c33260073ef64d0c40040e9d` | ``
-- `acr-zip9-extracted` | `agents/tool-schema-quarantine-health.ts` | `MISSING_IN_RELEASE` | `e354aa92d8ad821872ad7643c2ce8f300f3457ea34e324d5661efae4547e4d78` | ``
-- `acr-zip9-extracted` | `agents/bash-tools.exec-host-shared.ts` | `MISSING_IN_RELEASE` | `ca4c14c341571d3fa27fd9b5cfc7bc5c365f0e6d0e9102d4fd4351eede164599` | ``
-- `acr-zip9-extracted` | `agents/subagent-registry.persistence.resume.test.ts` | `MISSING_IN_RELEASE` | `1992172b24715137f2a0f9a6f4c9662f4369f05003d82e60952885293562e865` | ``
-- `acr-zip9-extracted` | `agents/mcp-stdio-transport.test.ts` | `MISSING_IN_RELEASE` | `818d7265e50f8190abb0c918a876eea1816bbb2426f8bce5c7c8dcc4597e0574` | ``
-- `acr-zip9-extracted` | `agents/run-session-target.test.ts` | `MISSING_IN_RELEASE` | `db7aa68509f7ce79582db9af89081b17f5e4ad24ec1a564bd6526417e4751d4c` | ``
-- `acr-zip9-extracted` | `agents/agent-tools.schema.test.ts` | `MISSING_IN_RELEASE` | `3611611383af5b6d80540237acb2f19c6531b89650da2fad7be16c9df5a189a2` | ``
-- `acr-zip9-extracted` | `agents/api-key-rotation.test.ts` | `MISSING_IN_RELEASE` | `7178c92e44abddee9c112b25218d99660695258be13dab0a29a6de6c0e35bdde` | ``
-- `acr-zip9-extracted` | `agents/docs-path.test.ts` | `MISSING_IN_RELEASE` | `879fca937fd45d6a64cc86425af3d7f399a874092d23d443f4c524d62b847569` | ``
-- `acr-zip9-extracted` | `agents/exec-auto-reviewer.prompt.ts` | `MISSING_IN_RELEASE` | `4bf05282f245d025964c6767c014ca3ef92e117333a8dfd442666a8b4d608225` | ``
-- `acr-zip9-extracted` | `agents/sanitize-for-prompt.ts` | `MISSING_IN_RELEASE` | `7ed8aa11d8d54d8d83d2132ad432089834b9ecd45c0e09393875c58726dd26ed` | ``
-- `acr-zip9-extracted` | `agents/bash-tools.process.supervisor.test.ts` | `MISSING_IN_RELEASE` | `3411860ea1a4007c85289804550cfeeba28095e46ec8c9203e7a30cdc2866d5c` | ``
-- `acr-zip9-extracted` | `agents/session-agent-binding.ts` | `MISSING_IN_RELEASE` | `f97e8463ea6b38261c4e0686113207a11949614b3e5d6ab6791279c8a4ed87bb` | ``
-- `acr-zip9-extracted` | `agents/model-catalog.types.ts` | `MISSING_IN_RELEASE` | `6c65582580023b30535f8626851a69ece2c86a66eca372166229a67feac6add9` | ``
-- `acr-zip9-extracted` | `agents/google-gemini-switch.live.test.ts` | `MISSING_IN_RELEASE` | `13521fb3afba9e5ec4620512cf9546334ebae1a7c4a415496fbf5aff51c8b3a8` | ``
-- `acr-zip9-extracted` | `agents/subagent-capabilities.test.ts` | `MISSING_IN_RELEASE` | `6d652bbb87324d928cf46bb93075a2c3bc41540f860bc2afb2affc24e1598885` | ``
-- `acr-zip9-extracted` | `agents/tool-replay-safety.test.ts` | `MISSING_IN_RELEASE` | `8e97a7d5c55e745bf5907780c163f0b6ae2061f496c0edbc7ca4cefe3505a4ff` | ``
-- `acr-zip9-extracted` | `agents/subagent-announce.test.ts` | `MISSING_IN_RELEASE` | `b1e4c0ce7558c5a9a896e90414dfe87d6dfac9f75ba79da6690a03b484c13995` | ``
-- `acr-zip9-extracted` | `agents/acp-spawn-parent-stream.test.ts` | `MISSING_IN_RELEASE` | `46dc9d1db74547a31534c02a95ab70c264aa796c6b3479e6d526f417b423f2f8` | ``
-- `acr-zip9-extracted` | `agents/session-async-task-status.ts` | `MISSING_IN_RELEASE` | `091995b14ed8eeb8bb20c292d89d9028bc9a2b165b14828bb0c360114323a512` | ``
-- `acr-zip9-extracted` | `agents/mcp-oauth.test.ts` | `MISSING_IN_RELEASE` | `1aefcded9d58558d406de999dcfb4bce7af9eafb7363694c3c1d0fdedb56d50e` | ``
-- `acr-zip9-extracted` | `agents/agent-auth-credentials.ts` | `MISSING_IN_RELEASE` | `a2d7c2441feec082c553ffe7615e9d48e5afade633745332095bde571e018417` | ``
-- `acr-zip9-extracted` | `agents/trace-base.ts` | `MISSING_IN_RELEASE` | `bf2606d6f9a2171b1e704601daa3648b208148462c29293d0e802718ec315df8` | ``
-- `acr-zip9-extracted` | `agents/sandbox-media-paths.test.ts` | `MISSING_IN_RELEASE` | `988e070c010c558a907ad10eea79affc100d99c49b8235249edb72c99b71b78b` | ``
-- `acr-zip9-extracted` | `agents/live-auth-keys.test.ts` | `MISSING_IN_RELEASE` | `0cdc90b8fd2a0ea146a23601181e22ed189b373ea0cc0010331142798cc2dfd9` | ``
-- `acr-zip9-extracted` | `agents/openclaw-tools.image-generation.test.ts` | `MISSING_IN_RELEASE` | `1eb5428d579f652e553abeb4b6c29b8b57648058735510b465a772451a21d89e` | ``
-- `acr-zip9-extracted` | `agents/anthropic.setup-token.live.test.ts` | `MISSING_IN_RELEASE` | `664ee69a7785c5a07dd2afd0123e2b22493a6c45dc86b1c8c9dc2d0d34c8cc88` | ``
-- `acr-zip9-extracted` | `agents/bundle-mcp.test-harness.ts` | `MISSING_IN_RELEASE` | `5eeb94f6040620f2b25bfce494d466f168fd8bfda1aa360eb30580564cbd8df6` | ``
-- `acr-zip9-extracted` | `agents/compaction.ts` | `MISSING_IN_RELEASE` | `f6f133273cbf939fbc693f7a7cd773020c80d97b5804367ce5031c221c4b3efb` | ``
-- `acr-zip9-extracted` | `agents/embedded-agent-subscribe.handlers.messages.ts` | `MISSING_IN_RELEASE` | `8aab918112432b60dc9623f79ab454336b6e0e13283398122f1b073f829b1669` | ``
-- `acr-zip9-extracted` | `agents/live-target-matcher.ts` | `MISSING_IN_RELEASE` | `91b1c3077e99deaded2334d1e97a62450b4cfc9366a4aba11ac64df2a2caf3c8` | ``
-- `acr-zip9-extracted` | `agents/payload-redaction.ts` | `MISSING_IN_RELEASE` | `798380eb2bc3d79a865f89dd5844ae21374008c80d27645dd7899753c0356784` | ``
-- `acr-zip9-extracted` | `agents/code-mode-control-tools.ts` | `MISSING_IN_RELEASE` | `85a65745f1e31db3eec3372b5516d4df6cffc77ebc924c19c299f3a73d08f1cb` | ``
-- `acr-zip9-extracted` | `agents/agent-auth-discovery.ts` | `MISSING_IN_RELEASE` | `118ed11a771fd6576de4d92bf0f3b8b3afd4de41a89595a1ec9503d7aba0dae9` | ``
-- `acr-zip9-extracted` | `agents/tool-terminal-presentation.ts` | `MISSING_IN_RELEASE` | `cbee21d67e7492cebec43185c251b52993ef8336e68a30bc4752513baee02f74` | ``
-- `acr-zip9-extracted` | `agents/subagent-task-name.ts` | `MISSING_IN_RELEASE` | `66b90786fdc0ae101fd3ba5227c18c7fe926221099afe80730009e8827ee1ca7` | ``
-- `acr-zip9-extracted` | `agents/live-test-provider-drift.test.ts` | `MISSING_IN_RELEASE` | `9e12a15331d003496d9b69e1f7116011535ae3e9934fd9b1e5d67c8141c6d482` | ``
-- `acr-zip9-extracted` | `agents/path-policy.ts` | `MISSING_IN_RELEASE` | `59fa54fe4c4c821260dca370bd6d4f45d256f0ead57d25be3603b206c1b90e85` | ``
-- `acr-zip9-extracted` | `agents/openclaw-tools.subagents.sessions-spawn.cron-note.test.ts` | `MISSING_IN_RELEASE` | `8ed95358ed4b07ff24c0708f6cefbde19224240d057163395e58b4141228cb47` | ``
-- `acr-zip9-extracted` | `agents/models-config.providers.implicit.ts` | `MISSING_IN_RELEASE` | `97ceec010d83d20c09132f2b07b1446b27868cd87b8e34429019c98d4c2d1459` | ``
-- `acr-zip9-extracted` | `agents/models-config.providers.nvidia.test.ts` | `MISSING_IN_RELEASE` | `13d613444a3ce538ee6ff6dcea3a8995f49358c0f0f0d6f40160273087bce5e8` | ``
-- `acr-zip9-extracted` | `agents/mcp-http-fetch.ts` | `MISSING_IN_RELEASE` | `5752be55e9d4fb2afc93f7790cd180690c7ca03e9d727d6062eb2345256c067d` | ``
-- `acr-zip9-extracted` | `agents/embedded-agent-runner.sanitize-session-history.test-harness.ts` | `MISSING_IN_RELEASE` | `0a98d95c7a3fa7d61ca4c3aec7db324f4f86a891a534391a97d21005fa4bc30d` | ``
-- `acr-zip9-extracted` | `agents/subagent-list.ts` | `MISSING_IN_RELEASE` | `b7ab2b974fabf0618cf33bbc2a560902b41161578ea04eb328121de10189c0de` | ``
-- `acr-zip9-extracted` | `agents/session-suspension.test.ts` | `MISSING_IN_RELEASE` | `db4dcc98d3d746a1be6e16972f1fda0bb334936f7550d3fc1f88c82b37ec25f7` | ``
-- `acr-zip9-extracted` | `agents/agent-tools.policy.test.ts` | `MISSING_IN_RELEASE` | `232c003b51353842749b72f27ccd5a82eb6348a024d3ecb5dc6f54071c325217` | ``
-- `acr-zip9-extracted` | `agents/models-config.skips-writing-models-json-no-env-token.test.ts` | `MISSING_IN_RELEASE` | `766e287ee9330a9130586bb113bb58929df21f6bd0890e04698eafedc5cf4c1f` | ``
-- `acr-zip9-extracted` | `agents/console-sanitize.test.ts` | `MISSING_IN_RELEASE` | `6743c5ec8f758a92dde7731e820b8b239ded03ac27b4e979b75b77aa4b86a32b` | ``
-- `acr-zip9-extracted` | `agents/bash-process-registry.test-helpers.ts` | `MISSING_IN_RELEASE` | `228dcda66c80d0e7e24cc03a61f434d8c9784fc2266bc836ac4c0d6c9598f441` | ``
-- `acr-zip9-extracted` | `agents/models-config.providers.policy.ts` | `MISSING_IN_RELEASE` | `14cf793e060320bafb644caffe2c46080eaeb7ddfc9f90410084268f5387e549` | ``
-- `acr-zip9-extracted` | `agents/cli-runner.spawn.test.ts` | `MISSING_IN_RELEASE` | `f65f3c49abc002ffb255f19b6db729f18b1baa71b27aa1af5803edca3f4be6a0` | ``
-- `acr-zip9-extracted` | `agents/code-mode-headless.test.ts` | `MISSING_IN_RELEASE` | `b6041f5afed3dfe663555a8329084300a8e18290f92642ac9c32dab1f45bc185` | ``
-- `acr-zip9-extracted` | `agents/models-config.providers.live-filter.test.ts` | `MISSING_IN_RELEASE` | `61d0e02d3ea6796b384f5084af185ba5c5fa42b30bc5f2ee28de82e35082ca8f` | ``
-- `acr-zip9-extracted` | `agents/minimax.live.test.ts` | `MISSING_IN_RELEASE` | `66fe8d03594dc06ecd285b55be051fbb34fffacbc0b3f264217530de37b4382c` | ``
-- `acr-zip9-extracted` | `agents/compaction.identifier-preservation.test.ts` | `MISSING_IN_RELEASE` | `9f7afe8ad32c27cdfe5b1374988038ece790a1c3bd632e9ff833f5f4ece7747f` | ``
-- `acr-zip9-extracted` | `agents/sandbox-tool-policy.ts` | `MISSING_IN_RELEASE` | `acf55bff533c202ec92de860724be5c91ca7e41371df5f090d17c076104657ac` | ``
-- `acr-zip9-extracted` | `agents/mcp-stdio-transport.ts` | `MISSING_IN_RELEASE` | `e07909e4482e3b7b018728b2a50c85a1a609fc3a1f0d131d6a16bca7269762e4` | ``
-- `acr-zip9-extracted` | `agents/compaction.test.ts` | `MISSING_IN_RELEASE` | `3434737401a6ac004d6e12a0ef1a54655aa0f378377250122117bf7532692964` | ``
-- `acr-zip9-extracted` | `agents/agent-bundle-mcp-tools.materialize.test.ts` | `MISSING_IN_RELEASE` | `036b955bf9c050bec5702e47752e0587f3f3baa42dd445b85fd7d05aa47a91d1` | ``
-- `acr-zip9-extracted` | `agents/model-auth.workspace-plugin.test.ts` | `MISSING_IN_RELEASE` | `784046a1f7f072dbfa30323258a88776d5f04475151605fea9ad40a5f21a82e9` | ``
-- `acr-zip9-extracted` | `agents/model-ref-shared.test.ts` | `MISSING_IN_RELEASE` | `235d1f86f92bb6fd2ca3ac1893f5aae16fa1f4e2c2ba6b3eaa241426ef585f6a` | ``
-- `acr-zip9-extracted` | `agents/bundle-mcp-config.test.ts` | `MISSING_IN_RELEASE` | `bb11b4e99c9ebc64b336b6f15c8a076c7b5c999a0ad47b7915d83c4abf8122fc` | ``
-- `acr-zip9-extracted` | `agents/subagent-announce-output.ts` | `MISSING_IN_RELEASE` | `2cd1708b67933b578472a3579ff90ca154d9bf3717cb286a27fb1723b06077b4` | ``
-- `acr-zip9-extracted` | `agents/responses-image-payload-sanitizer.ts` | `MISSING_IN_RELEASE` | `4f99224a6e499a26e0efc656f2d890dc5112db74bc9f996cd6363d9e969165af` | ``
-- `acr-zip9-extracted` | `agents/context.eager-warmup.test.ts` | `MISSING_IN_RELEASE` | `e83f6972a9c961ed96234175158e45e601e2a8b5bd0dccbedf926fd3b086c06f` | ``
-- `acr-zip9-extracted` | `agents/openai-transport-stream.ts` | `MISSING_IN_RELEASE` | `cae1fafff86da4e75e4bd14b4fb449adf35263c005375d5f2df0958dfb71562b` | ``
-- `acr-zip9-extracted` | `agents/subagent-registry.test.ts` | `MISSING_IN_RELEASE` | `a31dcd6230a78286910a75127798e7d8f295d6689eb5f7f865dba8c8e97e21b6` | ``
-- `acr-zip9-extracted` | `agents/model-catalog-browse.ts` | `MISSING_IN_RELEASE` | `f51608d9c10ae4a3d3c5755ecd0de56ca5ead07b68c712b16ba81aceb2fc1395` | ``
-- `acr-zip9-extracted` | `agents/subagent-registry.lifecycle-retry-grace.e2e.test.ts` | `MISSING_IN_RELEASE` | `93c8de2a707f6ea6d0589394ee71e0aa7a3e412d717e25e81f2e63f8eebde762` | ``
-- `acr-zip9-extracted` | `agents/embedded-agent-runner.run-embedded-agent.auth-profile-rotation.e2e.test.ts` | `MISSING_IN_RELEASE` | `8c19b76acfe105f0173d9604830b456a789f0861bd78a47ee516a3733696038a` | ``
-- `acr-zip9-extracted` | `agents/embedded-agent-subscribe.handlers.compaction.runtime.ts` | `MISSING_IN_RELEASE` | `15dcfbefc48a66d59a9532b1af741cb347848aba5f130b111a0d8f61f5b15b96` | ``
-- `acr-zip9-extracted` | `agents/tool-display.ts` | `MISSING_IN_RELEASE` | `4b000bdb20ac3e171e1cb87a163bb19f6e30c9ca04beabaec4e63a42b6152fa9` | ``
-- `acr-zip9-extracted` | `agents/subagent-registry.store.sqlite.ts` | `MISSING_IN_RELEASE` | `0f9444924ece6d684e5630682e0b455af6dd137d82a0c50f8cb4bac39a370ab3` | ``
-- `acr-zip9-extracted` | `agents/exec-approval-result.test.ts` | `MISSING_IN_RELEASE` | `ee0e77d0f196be8ec438d7352f036a74087e1d23e5764b1167f569690381c527` | ``
-- `acr-zip9-extracted` | `agents/identity-file.ts` | `MISSING_IN_RELEASE` | `0b69f060d0307e15aa48a3c0ac4ec853fbbf83def9015a7b80b0e33c15052da1` | ``
-- `acr-zip9-extracted` | `agents/workspace.ts` | `MISSING_IN_RELEASE` | `724d5e49cc34737e0b40cc48994f5a7837fa228e308be639c9dc025f67596797` | ``
-- `acr-zip9-extracted` | `agents/openai-routing.test.ts` | `MISSING_IN_RELEASE` | `30004f68396b93f2407f97090b594b955d7011be13c1d4928aff96b483944599` | ``
-- `acr-zip9-extracted` | `agents/subagent-control.runtime.ts` | `MISSING_IN_RELEASE` | `ded943990c23cff4b6451798b7b8001ef4cc24ed1446b0ba28fbdeb0d7128b0b` | ``
-- `acr-zip9-extracted` | `agents/agent-tools.availability.test.ts` | `MISSING_IN_RELEASE` | `ba78223b0c9076fb44c368c92036b62bb789b2cf028979614a47bb386ae833a3` | ``
-- `acr-zip9-extracted` | `agents/models-config.providers.cloudflare-ai-gateway.test.ts` | `MISSING_IN_RELEASE` | `3d412c31cae7a1173fb72a216633112fa08f898aaf5b7314eae914c71b0c340b` | ``
-- `acr-zip9-extracted` | `agents/content-blocks.test.ts` | `MISSING_IN_RELEASE` | `2190553e82c6e0ad264c4f5e3b60270171f4f32d1e3060291cd49ea9a71caf89` | ``
-- `acr-zip9-extracted` | `agents/embedded-agent-messaging.ts` | `MISSING_IN_RELEASE` | `3274edbf1544b315e14b00eb2df0cd44228d351e0a93907c12551e6fb1d3b4b3` | ``
-- `acr-zip9-extracted` | `agents/live-model-switch-error.ts` | `MISSING_IN_RELEASE` | `41682a16aacfec758abdf7eaea1b6b6242ae054d311e46740097680c8146a290` | ``
-- `acr-zip9-extracted` | `agents/subagent-registry-helpers.test.ts` | `MISSING_IN_RELEASE` | `ee758f25bac30a7476544d960e3f11f6163c1c8eda4770b468f9f5f7bb917c56` | ``
-- `acr-zip9-extracted` | `agents/compaction.retry.test.ts` | `MISSING_IN_RELEASE` | `e50c61a56e7ff748d306c533ff6b28dcba40c4f9109086bca48bd3bf46d43c93` | ``
-- `acr-zip9-extracted` | `agents/tool-description-summary.ts` | `MISSING_IN_RELEASE` | `ed8d56cbc31abe9d6e1d624aa9c6ee9a56c81cfe2e9c8848b1aa78a90f8d5045` | ``
-- `acr-zip9-extracted` | `agents/agent-tools.message-provider-policy.ts` | `MISSING_IN_RELEASE` | `23311b541cfbc3f5092fc3caba0ab8ad4ca27c9bbf4bb228c5feb4d7108344c7` | ``
-- `acr-zip9-extracted` | `agents/provider-attribution.catalog-endpoints.test.ts` | `MISSING_IN_RELEASE` | `a035e806a0971e378a00dcc9333df2fd14394323643ccb4fadf2e66289f3cdda` | ``
-- `acr-zip9-extracted` | `agents/realtime-bootstrap-context.test.ts` | `MISSING_IN_RELEASE` | `ce50730861b0e564bfa526ea19de7c18c9948b189d164ea72218fe8a1bc089f3` | ``
-- `acr-zip9-extracted` | `agents/session-tool-result-guard-wrapper.ts` | `MISSING_IN_RELEASE` | `fbb62b4258ff1bc60f20d6f9cb314b00bc2cd56fd57a55fd9cb95118b3884b4a` | ``
-- `acr-zip9-extracted` | `agents/embedded-agent-subscribe.handlers.compaction.test.ts` | `MISSING_IN_RELEASE` | `cde6be9157f0bc0842b5ea7a557f258bc2147ca9451d981015cd92f20af0d7a8` | ``
-- `acr-zip9-extracted` | `agents/subagent-session-reconciliation.ts` | `MISSING_IN_RELEASE` | `31e66e84f8e697eb9b7a21b3d2d7b08b7e014a14ee7cc808f4505e853fcc05ae` | ``
-- `acr-zip9-extracted` | `agents/model-selection-cli.ts` | `MISSING_IN_RELEASE` | `4ac118a3d93e706c59b9420efa0ecb1c2084ecf1f85f357371a44eb6ce39b495` | ``
-- `acr-zip9-extracted` | `agents/run-cleanup-timeout.test.ts` | `MISSING_IN_RELEASE` | `1f62cd81214ac74d4531301b17e9a0138c6b2f449535e2a91cc40723980db462` | ``
-- `acr-zip9-extracted` | `agents/spawn-requester-origin.test.ts` | `MISSING_IN_RELEASE` | `3ad36c436c91163543c58f443c519bb2520dc20f988f6309566fc2ed70b4cbd5` | ``
-- `acr-zip9-extracted` | `agents/openclaw-tools.subagents.sessions-spawn-applies-thinking-default.test.ts` | `MISSING_IN_RELEASE` | `413a9ca757b753a714e5bf4e68423072ab4490239e1f97085b2b22ea6164b44e` | ``
-- `acr-zip9-extracted` | `agents/models-config.providers.policy.test.ts` | `MISSING_IN_RELEASE` | `f5d1df52c6ab2b2afd9a45bca589c2bb38caec9f77b744c97064463d2313d60f` | ``
-- `acr-zip9-extracted` | `agents/compaction-planning.ts` | `MISSING_IN_RELEASE` | `2cb01726a6ad5b9af871d27bff89d75e25828a34600af8865bf0fd3393977ed1` | ``
-- `acr-zip9-extracted` | `agents/anthropic-transport-stream.test.ts` | `MISSING_IN_RELEASE` | `43b82bba98b0c77a97ac593256535639c3efc72584379b91372c47cce097587c` | ``
-- `acr-zip9-extracted` | `agents/mcp-stdio.ts` | `MISSING_IN_RELEASE` | `bb5b608c730b2558ebaf863b4aa36ebdb309be0c1f67608b5f78c8b60d4779a3` | ``
-- `acr-zip9-extracted` | `agents/embedded-agent-subscribe.subscribe-embedded-agent-session.withholds-anthropic-pretool-narration.test.ts` | `MISSING_IN_RELEASE` | `d14fb1113c78703a4183764b5e11ff2b32bf7cf641f62b7095d60127cb26ee1d` | ``
-- `acr-zip9-extracted` | `agents/compaction.token-sanitize.test.ts` | `MISSING_IN_RELEASE` | `8bd389c4314abb9d28435327204934fc33e58ad6cfc2aebcf85769cad11f3ed5` | ``
-- `acr-zip9-extracted` | `agents/tool-loop-detection.ts` | `MISSING_IN_RELEASE` | `35fd13a56ca9a785d40b8431efb14a3429e77753e7c5ce76928b3dda0a308bf0` | ``
-- `acr-zip9-extracted` | `agents/tool-replay-safety.ts` | `MISSING_IN_RELEASE` | `b5da5bb815f76453afd97674d965683da40490b53e7996317b26bb7f68d61765` | ``
-- `acr-zip9-extracted` | `agents/api-key-rotation.ts` | `MISSING_IN_RELEASE` | `da17e91585e94cec43ebc1ed22bc3887630d201597f368411e6da343d247a131` | ``
-- `acr-zip9-extracted` | `agents/usage.test.ts` | `MISSING_IN_RELEASE` | `98a95283843db3241334db9f9d3f2d75b6893d731fa9a44c89642c806c3f4b2a` | ``
-- `acr-zip9-extracted` | `agents/embedded-agent-helpers.validate-turns.test.ts` | `MISSING_IN_RELEASE` | `5dbc6c3941dd7f31507945e1097b22ff163e0b147f3c990793628ae1a603cd33` | ``
-- `acr-zip9-extracted` | `agents/model-fallback.test.ts` | `MISSING_IN_RELEASE` | `361c71326cc41718dbf916549a6ca7c2cb49d4a1f0c6883fd7bf91b802014a9b` | ``
-- `acr-zip9-extracted` | `agents/sandbox-paths.windows-drive-resolve.test.ts` | `MISSING_IN_RELEASE` | `4c89948abfca0ec35404d85e26f8b25988f7185aef07d797fc2d096da5b9a837` | ``
-- `acr-zip9-extracted` | `agents/subagent-registry-read-context.test.ts` | `MISSING_IN_RELEASE` | `822c79baab07494feec2b806b88b3dffd6cd3c0a9fae5190bcebff9c1de5ad43` | ``
-- `acr-zip9-extracted` | `agents/models-config.replace-mode-skip-implicit-discovery.test.ts` | `MISSING_IN_RELEASE` | `50d9115e5db75901084ee8b9a2dbd818c866d6e4103d0bee17d5e3ef38f554a1` | ``
-- `acr-zip9-extracted` | `agents/live-model-dynamic-candidates.ts` | `MISSING_IN_RELEASE` | `052ff006b04abd765d7a4d7cba3dae009b51297288a611c40ff6e5fc2f7dd9a8` | ``
-- `acr-zip9-extracted` | `agents/session-slug.ts` | `MISSING_IN_RELEASE` | `03144db8483a49f50393cc7910b52c1f76d0d82bc9779bee6c9eedce4d59387b` | ``
-- `acr-zip9-extracted` | `agents/tool-policy-declared-context.ts` | `MISSING_IN_RELEASE` | `42cf8676f4e6eae5fab1cda98c2f44f2025c4ee75606ff74fb0ef0e3909e9c26` | ``
-- `acr-zip9-extracted` | `agents/model-selection-display.test.ts` | `MISSING_IN_RELEASE` | `55e8e1f2d9243e53add280a0b5c619641427594184c4925580870ccaf9652210` | ``
-- `acr-zip9-extracted` | `agents/btw-transcript.ts` | `MISSING_IN_RELEASE` | `d247bbfd49ab29cdfc56d857605d31b6d3c896626f8984e7a3d71c329182f20c` | ``
-- `acr-zip9-extracted` | `agents/generated-attachments.ts` | `MISSING_IN_RELEASE` | `670725115f546b330a312b3dbdedf5a34a1ded08869956543e673910a5cd583d` | ``
-- `acr-zip9-extracted` | `agents/sandbox-merge.test.ts` | `MISSING_IN_RELEASE` | `df34f7f21aa08dbaa40269dd525f19f652030322d2070b36e3b82d2767026743` | ``
-- `acr-zip9-extracted` | `agents/embedded-agent-subscribe.subscribe-embedded-agent-session.subscribeembeddedagentsession.test.ts` | `MISSING_IN_RELEASE` | `3dbd0a497552c176e17ac6fd6cd1b781507624acc1728564c91f24a851b0c6a5` | ``
-- `acr-zip9-extracted` | `agents/embedded-agent-subscribe.ts` | `MISSING_IN_RELEASE` | `f7aaea2225b48562bb2378a3c41b93acee133104d6af4e656da031d6508c5876` | ``
-- `acr-zip9-extracted` | `agents/diagnostic-redaction.ts` | `MISSING_IN_RELEASE` | `94c3b8509a567e78771fc9e029658dd0f4d60c17f12c95ec6f4b780abdeeb955` | ``
-- `acr-zip9-extracted` | `agents/subagent-run-timeout.test.ts` | `MISSING_IN_RELEASE` | `b87587e683c6b1a7adb6172d7263f1c94dcb2a96fab149ace21d3d23198c6cac` | ``
-- `acr-zip9-extracted` | `agents/shell-utils.ts` | `MISSING_IN_RELEASE` | `b81912f693e0b24689084af2c49880ef32d396717d062683d4065efce65344d3` | ``
-- `acr-zip9-extracted` | `agents/shell-snapshot.ts` | `MISSING_IN_RELEASE` | `c9f60eede56f23a90fbc175e93f0238f035002772f9350065a5daa016aaf701d` | ``
-- `acr-zip9-extracted` | `agents/agent-bundle-mcp-test-harness.ts` | `MISSING_IN_RELEASE` | `3c3c5f51c7e0200c16a2d1b6682497c3134eaf0489ee32b30229ceda251bd245` | ``
-- `acr-zip9-extracted` | `agents/subagent-registry-run-manager.ts` | `MISSING_IN_RELEASE` | `9c88fa1c887d4144d49fedde17152e7399a7130deb28d56cd24866686275ee7d` | ``
-- `acr-zip9-extracted` | `agents/subagent-spawn.test-helpers.ts` | `MISSING_IN_RELEASE` | `afd75b8eab13dd93e55a0fb32478721a598724ade1744a538c9bac98f121154b` | ``
-- `acr-zip9-extracted` | `agents/embedded-agent-subscribe.shared-types.ts` | `MISSING_IN_RELEASE` | `00290b5dbf74b7f52cb0ff31d7cdc869f1c2bfe45ce7e0438cd5c37f0753483f` | ``
-- `acr-zip9-extracted` | `agents/bash-tools.exec-approval-followup.test.ts` | `MISSING_IN_RELEASE` | `b8fb49c4964827f44bd3ccfb919b9ead2f6a0799b7c8139a5ba6a806bf8ab7bc` | ``
-- `acr-zip9-extracted` | `agents/model-catalog.test.ts` | `MISSING_IN_RELEASE` | `9b172deef9c0ec14c8a60a9da483979e5385b95aa86f404cde8ca3b2b54b04d2` | ``
-- `acr-zip9-extracted` | `agents/sandbox.resolveSandboxContext.test.ts` | `MISSING_IN_RELEASE` | `2185a8a0693dacdb3406abbe8ee95db55c6dd99627ae3bef08cef73871aa6cfd` | ``
-- `acr-zip9-extracted` | `agents/prompt-composition.test.ts` | `MISSING_IN_RELEASE` | `84248a2e0c81ea080f227d616cd77f9aad4f6b36a44b14e7f76362f9e9ef4a14` | ``
-- `acr-zip9-extracted` | `agents/openclaw-tools.plugin-context.ts` | `MISSING_IN_RELEASE` | `f98bc60112610df3c626d33690b0ed3f7d680c09ffd1a3ff56df57ed1cf424cd` | ``
-- `acr-zip9-extracted` | `agents/execution-contract.ts` | `MISSING_IN_RELEASE` | `e1c89e38095dcc9c6f55c2949dc6c315186fabb2e9065f2cbe56b01fde9a13e4` | ``
-- `acr-zip9-extracted` | `agents/conversation-capability-profile.test.ts` | `MISSING_IN_RELEASE` | `80bbd8149d127a452ed099ecbca4188d09bce46278607c46487c3969d7bdce7d` | ``
-- `acr-zip9-extracted` | `agents/session-suspension.ts` | `MISSING_IN_RELEASE` | `beddc7c47cc8187166a1cb7b2ec6eee9e6af8834f10bdb51844133b35fafa8a2` | ``
+- `zip1 | apps/android/CLAUDE.md | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'a54ff182c7e8acf56acfd6e4b9c3ff41e2c41a31c9b211b2deb9df75d9a478f9', 420) | ('symlink', 'AGENTS.md', 511)`
+- `zip1 | apps/android/gradlew | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'a5a5c199ba02189ae8c46a334223371a20599d9c298ef65e7540ede4a3f72d59', 420) | ('file', 'a5a5c199ba02189ae8c46a334223371a20599d9c298ef65e7540ede4a3f72d59', 493)`
+- `zip1 | apps/ios/CLAUDE.md | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'a54ff182c7e8acf56acfd6e4b9c3ff41e2c41a31c9b211b2deb9df75d9a478f9', 420) | ('symlink', 'AGENTS.md', 511)`
+- `zip1 | apps/swabble/scripts/format.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'ed82b1410f121f3b1436d54099143d7010035ba702c64f21d2669fce9dd3f2ae', 420) | ('file', 'ed82b1410f121f3b1436d54099143d7010035ba702c64f21d2669fce9dd3f2ae', 493)`
+- `zip1 | apps/swabble/scripts/lint.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '55a6b11a1c41001ab69518efe2fe586d5484853fb23644218e5c4780faa3abce', 420) | ('file', '55a6b11a1c41001ab69518efe2fe586d5484853fb23644218e5c4780faa3abce', 493)`
+- `zip1 | apps/android/scripts/perf-startup-benchmark.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'c25a08c5e4c0054a69c124185d187dc2ff1ed29435cc0db10f0488bb6e8287bf', 420) | ('file', 'c25a08c5e4c0054a69c124185d187dc2ff1ed29435cc0db10f0488bb6e8287bf', 493)`
+- `zip1 | apps/android/scripts/perf-startup-hotspots.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '55408b572fd0e3d68f1f7059db797774eafe6728c992409ac3d2eab75e6710aa', 420) | ('file', '55408b572fd0e3d68f1f7059db797774eafe6728c992409ac3d2eab75e6710aa', 493)`
+- `zip1 | apps/android/scripts/voice-e2e.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '92529e6dac7c70a1f2846e3ecab433947c7ac77f7e17bef3453ff97387336c51', 420) | ('file', '92529e6dac7c70a1f2846e3ecab433947c7ac77f7e17bef3453ff97387336c51', 493)`
+- `zip1 | apps/android/scripts/perf-online-benchmark.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '9da46bf831d7d99c68850d766b0c55de71b630dac716192c623cc171a4285e04', 420) | ('file', '9da46bf831d7d99c68850d766b0c55de71b630dac716192c623cc171a4285e04', 493)`
+- `zip2 | apps/android/CLAUDE.md | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'a54ff182c7e8acf56acfd6e4b9c3ff41e2c41a31c9b211b2deb9df75d9a478f9', 420) | ('symlink', 'AGENTS.md', 511)`
+- `zip2 | apps/android/gradlew | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'a5a5c199ba02189ae8c46a334223371a20599d9c298ef65e7540ede4a3f72d59', 420) | ('file', 'a5a5c199ba02189ae8c46a334223371a20599d9c298ef65e7540ede4a3f72d59', 493)`
+- `zip2 | apps/ios/CLAUDE.md | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'a54ff182c7e8acf56acfd6e4b9c3ff41e2c41a31c9b211b2deb9df75d9a478f9', 420) | ('symlink', 'AGENTS.md', 511)`
+- `zip2 | apps/swabble/scripts/format.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'ed82b1410f121f3b1436d54099143d7010035ba702c64f21d2669fce9dd3f2ae', 420) | ('file', 'ed82b1410f121f3b1436d54099143d7010035ba702c64f21d2669fce9dd3f2ae', 493)`
+- `zip2 | apps/swabble/scripts/lint.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '55a6b11a1c41001ab69518efe2fe586d5484853fb23644218e5c4780faa3abce', 420) | ('file', '55a6b11a1c41001ab69518efe2fe586d5484853fb23644218e5c4780faa3abce', 493)`
+- `zip2 | apps/android/scripts/perf-startup-benchmark.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'c25a08c5e4c0054a69c124185d187dc2ff1ed29435cc0db10f0488bb6e8287bf', 420) | ('file', 'c25a08c5e4c0054a69c124185d187dc2ff1ed29435cc0db10f0488bb6e8287bf', 493)`
+- `zip2 | apps/android/scripts/perf-startup-hotspots.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '55408b572fd0e3d68f1f7059db797774eafe6728c992409ac3d2eab75e6710aa', 420) | ('file', '55408b572fd0e3d68f1f7059db797774eafe6728c992409ac3d2eab75e6710aa', 493)`
+- `zip2 | apps/android/scripts/voice-e2e.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '92529e6dac7c70a1f2846e3ecab433947c7ac77f7e17bef3453ff97387336c51', 420) | ('file', '92529e6dac7c70a1f2846e3ecab433947c7ac77f7e17bef3453ff97387336c51', 493)`
+- `zip2 | apps/android/scripts/perf-online-benchmark.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '9da46bf831d7d99c68850d766b0c55de71b630dac716192c623cc171a4285e04', 420) | ('file', '9da46bf831d7d99c68850d766b0c55de71b630dac716192c623cc171a4285e04', 493)`
+- `zip3 | git-hooks/pre-commit | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '1fe806863292325d0e6d67242fcd5f81223d84843b2a524fddf1cd1c0f384ac3', 420) | ('file', '1fe806863292325d0e6d67242fcd5f81223d84843b2a524fddf1cd1c0f384ac3', 493)`
+- `zip3 | extensions/CLAUDE.md | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'a54ff182c7e8acf56acfd6e4b9c3ff41e2c41a31c9b211b2deb9df75d9a478f9', 420) | ('symlink', 'AGENTS.md', 511)`
+- `zip3 | packages/agent-core/node_modules/@openclaw/ai | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '21350727838d6a71c1ee7be1cd749836a416b4f2bd9d36525155943c54f99c2f', 420) | ('symlink', '../../../ai', 511)`
+- `zip3 | packages/media-core/node_modules/@openclaw/normalization-core | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'fd873120b692d01406d2fa15e04ce5254acc133ecde72e05b8c268030e5f9c2e', 420) | ('symlink', '../../../normalization-core', 511)`
+- `zip3 | packages/speech-core/node_modules/openclaw | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '297823c2f472cdfefd4dfdec487f9069aaf971ac18839bbb2dd4f2c7f3ca57ca', 420) | ('symlink', '../../..', 511)`
+- `zip3 | packages/speech-core/node_modules/.bin/openclaw | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '9f8cbeebe843dbf4c7a7b4e4facd9cc0647467f8d1620b6e3d2afdc5b4360bc4', 420) | ('symlink', '../openclaw/openclaw.mjs', 511)`
+- `zip3 | packages/acp-core/node_modules/@openclaw/normalization-core | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'fd873120b692d01406d2fa15e04ce5254acc133ecde72e05b8c268030e5f9c2e', 420) | ('symlink', '../../../normalization-core', 511)`
+- `zip3 | packages/sdk/node_modules/@openclaw/gateway-client | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '671f7d19a7eed6ffcb80dd7c9c107e4332c6360e4a9033c211d6aa36e3e6d47b', 420) | ('symlink', '../../../gateway-client', 511)`
+- `zip3 | packages/gateway-client/node_modules/@openclaw/gateway-protocol | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '3f7822db48a78ff50463bdd45c3417557b869bc60ec7816769b0c8db8695d41c', 420) | ('symlink', '../../../gateway-protocol', 511)`
+- `zip3 | extensions/acpx/CLAUDE.md | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'a54ff182c7e8acf56acfd6e4b9c3ff41e2c41a31c9b211b2deb9df75d9a478f9', 420) | ('symlink', 'AGENTS.md', 511)`
+- `zip3 | extensions/telegram/CLAUDE.md | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'a54ff182c7e8acf56acfd6e4b9c3ff41e2c41a31c9b211b2deb9df75d9a478f9', 420) | ('symlink', 'AGENTS.md', 511)`
+- `zip3 | extensions/copilot/doctor-contract-api.test.ts | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '6df84b2e259bb0e492d711339fef48e0bcc9e93a50f845e51921ef634f5a79f9', 420) | ('file', '6df84b2e259bb0e492d711339fef48e0bcc9e93a50f845e51921ef634f5a79f9', 493)`
+- `zip3 | extensions/copilot/doctor-contract-api.ts | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '22b65c992014b98f75dba9ca04830c141c7e36710b4e024c937e03deb83748e9', 420) | ('file', '22b65c992014b98f75dba9ca04830c141c7e36710b4e024c937e03deb83748e9', 493)`
+- `zip3 | extensions/copilot/src/permission-bridge.test.ts | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'c297161a3923b5ba1e129b73d663b9d7052ebe60b78d9d78b503c24f2cc513a7', 420) | ('file', 'c297161a3923b5ba1e129b73d663b9d7052ebe60b78d9d78b503c24f2cc513a7', 493)`
+- `zip3 | extensions/copilot/src/compaction-bridge.ts | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '42b90cc736fd75ab848f2d89f6aabdbe53bc7deea44375671438a7bbfefaa123', 420) | ('file', '42b90cc736fd75ab848f2d89f6aabdbe53bc7deea44375671438a7bbfefaa123', 493)`
+- `zip3 | extensions/copilot/src/dual-write-transcripts.ts | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '5780399453f9956bf02f3e36344b6566df820bacde3f15c798bbf63fee85ccd1', 420) | ('file', '5780399453f9956bf02f3e36344b6566df820bacde3f15c798bbf63fee85ccd1', 493)`
+- `zip3 | extensions/copilot/src/replay-shim.ts | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '5fe8ad22a2514d6d56b30b359b1272e424cdbde1abac1d72e4884857d0d87db5', 420) | ('file', '5fe8ad22a2514d6d56b30b359b1272e424cdbde1abac1d72e4884857d0d87db5', 493)`
+- `zip3 | extensions/copilot/src/permission-bridge.ts | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'e69434177a3b8f683b38dd956066e71f96354b0c0e4c87019975f2e4c154cb37', 420) | ('file', 'e69434177a3b8f683b38dd956066e71f96354b0c0e4c87019975f2e4c154cb37', 493)`
+- `zip3 | extensions/copilot/src/dual-write-transcripts.test.ts | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '9e8cefc371297ed735fb2ca2ac091cc0d76135c1b4e8a38bf91cbef570307781', 420) | ('file', '9e8cefc371297ed735fb2ca2ac091cc0d76135c1b4e8a38bf91cbef570307781', 493)`
+- `zip3 | extensions/copilot/src/sdk-loader.test.ts | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '2f9eda057b74e196bd5368acd4e65c3b8e762509d867763a12bb8f38cd5561ca', 420) | ('file', '2f9eda057b74e196bd5368acd4e65c3b8e762509d867763a12bb8f38cd5561ca', 493)`
+- `zip3 | extensions/copilot/src/replay-shim.test.ts | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '10595b34c34b8f2b87680575214d9f0d0e38071e83e57b810b66d56b9c50f60b', 420) | ('file', '10595b34c34b8f2b87680575214d9f0d0e38071e83e57b810b66d56b9c50f60b', 493)`
+- `zip3 | extensions/copilot/src/auth-bridge.test.ts | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '2c5a18a0b9416a01bf048cc9bc6e42e97b59b9fc66b7cf85693545a3f9cd327d', 420) | ('file', '2c5a18a0b9416a01bf048cc9bc6e42e97b59b9fc66b7cf85693545a3f9cd327d', 493)`
+- `zip3 | extensions/copilot/src/hooks-bridge.ts | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '3a389c8b1c1df3788aaca33d841e18ed2feb3f96b50002d5dd5b8c1de01943cf', 420) | ('file', '3a389c8b1c1df3788aaca33d841e18ed2feb3f96b50002d5dd5b8c1de01943cf', 493)`
+- `zip3 | extensions/copilot/src/auth-bridge.ts | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'caa9dfccdc31645e911491d57ba6fe4bfba09537cdff917964a030dc215983b3', 420) | ('file', 'caa9dfccdc31645e911491d57ba6fe4bfba09537cdff917964a030dc215983b3', 493)`
+- `zip3 | extensions/copilot/src/hooks-bridge.test.ts | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'eacafc44efd0d6349cdb7de77dab7b949270712ef4688050339022abcafa1338', 420) | ('file', 'eacafc44efd0d6349cdb7de77dab7b949270712ef4688050339022abcafa1338', 493)`
+- `zip3 | extensions/copilot/src/sdk-loader.ts | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '7f758a516f3f182abb4fa89dd6162eceb204b4c834b9250f736c881bd5501c4e', 420) | ('file', '7f758a516f3f182abb4fa89dd6162eceb204b4c834b9250f736c881bd5501c4e', 493)`
+- `zip3 | extensions/copilot/src/compaction-bridge.test.ts | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '9988bbd5d27793367c47f0aaee23cb5fed67ea12e9fee827f4ece07d85db3ec7', 420) | ('file', '9988bbd5d27793367c47f0aaee23cb5fed67ea12e9fee827f4ece07d85db3ec7', 493)`
+- `zip4 | docs/CLAUDE.md | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'a54ff182c7e8acf56acfd6e4b9c3ff41e2c41a31c9b211b2deb9df75d9a478f9', 420) | ('symlink', 'AGENTS.md', 511)`
+- `zip4 | docs/plugins/copilot.md | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '9ce0dd8fb69275450b3342a3acd7ec5c1d993a88196c5d0ad2f2fa9a34badf97', 420) | ('file', '9ce0dd8fb69275450b3342a3acd7ec5c1d993a88196c5d0ad2f2fa9a34badf97', 493)`
+- `zip4 | docs/reference/templates/CLAUDE.md | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'a54ff182c7e8acf56acfd6e4b9c3ff41e2c41a31c9b211b2deb9df75d9a478f9', 420) | ('symlink', 'AGENTS.md', 511)`
+- `zip5 | docs/CLAUDE.md | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'a54ff182c7e8acf56acfd6e4b9c3ff41e2c41a31c9b211b2deb9df75d9a478f9', 420) | ('symlink', 'AGENTS.md', 511)`
+- `zip5 | docs/plugins/copilot.md | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '9ce0dd8fb69275450b3342a3acd7ec5c1d993a88196c5d0ad2f2fa9a34badf97', 420) | ('file', '9ce0dd8fb69275450b3342a3acd7ec5c1d993a88196c5d0ad2f2fa9a34badf97', 493)`
+- `zip5 | docs/reference/templates/CLAUDE.md | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'a54ff182c7e8acf56acfd6e4b9c3ff41e2c41a31c9b211b2deb9df75d9a478f9', 420) | ('symlink', 'AGENTS.md', 511)`
+- `zip6 | scripts/ios-validate-app-store-ipa.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '92b189f42cb0b3dab7561ccad0e004c092e023902a046d4a64d8bcfc6db35821', 420) | ('file', '92b189f42cb0b3dab7561ccad0e004c092e023902a046d4a64d8bcfc6db35821', 493)`
+- `zip6 | scripts/full-release-validation-at-sha.mjs | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'e7ca10d5b93dc0a4d2e22cf49c57465a608bcf46cb51ca738e85d0a5df352ffe', 420) | ('file', 'e7ca10d5b93dc0a4d2e22cf49c57465a608bcf46cb51ca738e85d0a5df352ffe', 493)`
+- `zip6 | scripts/sandbox-browser-setup.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'f9a5c678ed6f238727043ed8869861363dc6f6799966cb1d3a8a9ce7e1c7dbc5', 420) | ('file', 'f9a5c678ed6f238727043ed8869861363dc6f6799966cb1d3a8a9ce7e1c7dbc5', 493)`
+- `zip6 | scripts/clawlog.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'a90e0379a15223ca41a72c06b632da680c79f4ed3e4497c1ff6ef14e97184873', 420) | ('file', 'a90e0379a15223ca41a72c06b632da680c79f4ed3e4497c1ff6ef14e97184873', 493)`
+- `zip6 | scripts/ci-hydrate-testbox-env.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'c7e3d632bb8def1ea88aa1bc7bf141f323ffb023ffe1abb849a1fd8d24432865', 420) | ('file', 'c7e3d632bb8def1ea88aa1bc7bf141f323ffb023ffe1abb849a1fd8d24432865', 493)`
+- `zip6 | scripts/recover-orphaned-processes.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'fb758d6839889536b8c614e3eeae8bf16b595283b7e0b680d6bbb9606448105e', 420) | ('file', 'fb758d6839889536b8c614e3eeae8bf16b595283b7e0b680d6bbb9606448105e', 493)`
+- `zip6 | scripts/test-live-models-docker.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '2ab6079d27c602b34c31d54bfa6331814261719fbbf5db6745b9e84bce23c250', 420) | ('file', '2ab6079d27c602b34c31d54bfa6331814261719fbbf5db6745b9e84bce23c250', 493)`
+- `zip6 | scripts/test-install-sh-e2e-docker.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '6a69879e42cac80c80ab6f93543d02f29134f34b6e62b184b60cbda4dbbd8923', 420) | ('file', '6a69879e42cac80c80ab6f93543d02f29134f34b6e62b184b60cbda4dbbd8923', 493)`
+- `zip6 | scripts/CLAUDE.md | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'a54ff182c7e8acf56acfd6e4b9c3ff41e2c41a31c9b211b2deb9df75d9a478f9', 420) | ('symlink', 'AGENTS.md', 511)`
+- `zip6 | scripts/sandbox-browser-entrypoint.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '132b6af8620360a876ddcecb82ecb02f17f726428987ac8c8b8742dac32a3395', 420) | ('file', '132b6af8620360a876ddcecb82ecb02f17f726428987ac8c8b8742dac32a3395', 493)`
+- `zip6 | scripts/make_appcast.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '8941b0d762119d757cb26e0712e05f55be259984c074f4a0091cb1dd267cb23e', 420) | ('file', '8941b0d762119d757cb26e0712e05f55be259984c074f4a0091cb1dd267cb23e', 493)`
+- `zip6 | scripts/build_icon.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'cff712785adbfe2fa94661b7b8457fbc21ec0b21bc3bc77e5cfa7018f473e486', 420) | ('file', 'cff712785adbfe2fa94661b7b8457fbc21ec0b21bc3bc77e5cfa7018f473e486', 493)`
+- `zip6 | scripts/ios-write-version-xcconfig.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '0cbd3e402bcd936572b81e6f90deae18dbc64c8b2e4b77f1c818154bcbecc979', 420) | ('file', '0cbd3e402bcd936572b81e6f90deae18dbc64c8b2e4b77f1c818154bcbecc979', 493)`
+- `zip6 | scripts/ios-run.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'a24d956ecb5c98cd1a4a5a02d7350c6b854f50c78847ab3f8db206ddea88b140', 420) | ('file', 'a24d956ecb5c98cd1a4a5a02d7350c6b854f50c78847ab3f8db206ddea88b140', 493)`
+- `zip6 | scripts/run-opengrep.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '7a89cdb55e192fd33e19e0450f8e612f0161a9181c20b7f6296767bf8a4f7d00', 420) | ('file', '7a89cdb55e192fd33e19e0450f8e612f0161a9181c20b7f6296767bf8a4f7d00', 493)`
+- `zip6 | scripts/sandbox-setup.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '3cccbc7ab1fbedebaa1e50dec0481e455437c262b89eba5f2bba007b3baac768', 420) | ('file', '3cccbc7ab1fbedebaa1e50dec0481e455437c262b89eba5f2bba007b3baac768', 493)`
+- `zip6 | scripts/check-plugin-sdk-exports.mjs | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '980c8898c1780776ecfb7cd94be05ec52baedb85dc462b5747c42a42ed67fb1e', 420) | ('file', '980c8898c1780776ecfb7cd94be05ec52baedb85dc462b5747c42a42ed67fb1e', 493)`
+- `zip6 | scripts/openclaw-release-clawhub-runtime-state.ts | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '6554a4b10288ba39c8811faa0cb0636ba1bbf8199bc77a23e08992d226226aa2', 420) | ('file', '6554a4b10288ba39c8811faa0cb0636ba1bbf8199bc77a23e08992d226226aa2', 493)`
+- `zip6 | scripts/ios-app-store-connect-keychain-setup.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'bb63526b3b8bc01bbc7bfc046ffb4173e658754e05799371dcda0b4cafbf8f9a', 420) | ('file', 'bb63526b3b8bc01bbc7bfc046ffb4173e658754e05799371dcda0b4cafbf8f9a', 493)`
+- `zip6 | scripts/ios-screenshots.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'd6ea58633dd14115988802b7607ead528cfbfd3e0a6dd05c5c83c3d1a4f68d0b', 420) | ('file', 'd6ea58633dd14115988802b7607ead528cfbfd3e0a6dd05c5c83c3d1a4f68d0b', 493)`
+- `zip6 | scripts/build-and-run-mac.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'cea22a0961487d2a8f796f9d879796242d8c0eaa7c3cc70edc5f3d5e06bb7d31', 420) | ('file', 'cea22a0961487d2a8f796f9d879796242d8c0eaa7c3cc70edc5f3d5e06bb7d31', 493)`
+- `zip6 | scripts/gh-read | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '761d0d19f8406422fe948f2c7dd804db61eeefe5487534002cff524efae9c08a', 420) | ('file', '761d0d19f8406422fe948f2c7dd804db61eeefe5487534002cff524efae9c08a', 493)`
+- `zip6 | scripts/ocm-npm-workspace-deps.mjs | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '384639bc871e29465f0a30f8dc09a322a0cfaa0bfaa7abb16b4d2717d13f50f7', 420) | ('file', '384639bc871e29465f0a30f8dc09a322a0cfaa0bfaa7abb16b4d2717d13f50f7', 493)`
+- `zip6 | scripts/codesign-mac-app.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '113c160c86b263ba961073d925d81c8cfb52e492a6be8468b5493dcc22a47f3c', 420) | ('file', '113c160c86b263ba961073d925d81c8cfb52e492a6be8468b5493dcc22a47f3c', 493)`
+- `zip6 | scripts/ios-configure-signing.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'e0e5fcce656611637b2b445149c3deba2d26d4ddf110bcd236230a87a16f848f', 420) | ('file', 'e0e5fcce656611637b2b445149c3deba2d26d4ddf110bcd236230a87a16f848f', 493)`
+- `zip6 | scripts/ci-docker-login-ghcr.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '87643cd73db693bd4432d30be5367a9bc92d6bdc47041619a1ef470e14437121', 420) | ('file', '87643cd73db693bd4432d30be5367a9bc92d6bdc47041619a1ef470e14437121', 493)`
+- `zip6 | scripts/bundle-a2ui.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '25e94789e3af346018b091c7c4d6d65632394c19fcf9eaaeac876efbe534149a', 420) | ('file', '25e94789e3af346018b091c7c4d6d65632394c19fcf9eaaeac876efbe534149a', 493)`
+- `zip6 | scripts/test-install-sh-docker.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '97c001cc7a1115062d770fa51a49ffd16a8002e725c17da1b0b8c800047581c5', 420) | ('file', '97c001cc7a1115062d770fa51a49ffd16a8002e725c17da1b0b8c800047581c5', 493)`
+- `zip6 | scripts/test-live-acp-spawn-defaults-docker.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '5f4f078bd3f07eb24b8c931d6fa8cfb36d03e602b46303fd39012303a1604469', 420) | ('file', '5f4f078bd3f07eb24b8c931d6fa8cfb36d03e602b46303fd39012303a1604469', 493)`
+- `zip6 | scripts/claude-auth-status.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'ad84b512efd3241933b00a31478e700a1893e55a766a00e7eb175e7d09c0357d', 420) | ('file', 'ad84b512efd3241933b00a31478e700a1893e55a766a00e7eb175e7d09c0357d', 493)`
+- `zip6 | scripts/release-fast-pretag-check.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'f064fc91dfed2b21a203d09ae0264d8c5e40dd19155257a069e666f63f0481d6', 420) | ('file', 'f064fc91dfed2b21a203d09ae0264d8c5e40dd19155257a069e666f63f0481d6', 493)`
+- `zip6 | scripts/test-live-gateway-models-docker.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '0c47deafbb7384d8799a1c547805959a1f121cdce06279d694c65532737af389', 420) | ('file', '0c47deafbb7384d8799a1c547805959a1f121cdce06279d694c65532737af389', 493)`
+- `zip6 | scripts/ios-team-id.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '0d3c841bba0e482b339b520bdf37bceb31006d06040b74c597f9043a875cb31a', 420) | ('file', '0d3c841bba0e482b339b520bdf37bceb31006d06040b74c597f9043a875cb31a', 493)`
+- `zip6 | scripts/restart-mac.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '348690cf7d49cef9c88bb500073a185faa36fe95156db8885ff7c4a5a2fa5503', 420) | ('file', '348690cf7d49cef9c88bb500073a185faa36fe95156db8885ff7c4a5a2fa5503', 493)`
+- `zip6 | scripts/setup-auth-system.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '8d028228cbdf32b4e0ed54ed751bb56e5cbc430bc8897a5607e1a4e727097c7b', 420) | ('file', '8d028228cbdf32b4e0ed54ed751bb56e5cbc430bc8897a5607e1a4e727097c7b', 493)`
+- `zip6 | scripts/install-cli.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '78cd47e401f97dd769125afd4c933b62610eddce234c424441bbe2422e0fed17', 420) | ('file', '78cd47e401f97dd769125afd4c933b62610eddce234c424441bbe2422e0fed17', 493)`
+- `zip6 | scripts/install.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '957e20de009d6e41fcf8fe005705bc114172e185cd640f4811220ec645014324', 420) | ('file', '957e20de009d6e41fcf8fe005705bc114172e185cd640f4811220ec645014324', 493)`
+- `zip6 | scripts/pr-prepare | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '7307aaf9df6efe12812d7eac0493ebf9c0000d9986b6bddbe331d147bc01a623', 420) | ('file', '7307aaf9df6efe12812d7eac0493ebf9c0000d9986b6bddbe331d147bc01a623', 493)`
+- `zip6 | scripts/release-ci-summary.mjs | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'a3dede1d219b91af39650f778200f57dba14c87172b54002e86f91503976f2a9', 420) | ('file', 'a3dede1d219b91af39650f778200f57dba14c87172b54002e86f91503976f2a9', 493)`
+- `zip6 | scripts/test-force.ts | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '8bbc1dd56019ab38b61c7c2cb278703df343f64220b7d57b5247fc6ec1e6c9a0', 420) | ('file', '8bbc1dd56019ab38b61c7c2cb278703df343f64220b7d57b5247fc6ec1e6c9a0', 493)`
+- `zip6 | scripts/ios-release-archive.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '14689243181727f7c03fdb15b328df9cb446cd813a1f0275c069e9beb66f76f8', 420) | ('file', '14689243181727f7c03fdb15b328df9cb446cd813a1f0275c069e9beb66f76f8', 493)`
+- `zip6 | scripts/package-mac-app.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'ddc22be4404f6af9763963beea5e900b9e49fa38debda84e06052e3000a4a4de', 420) | ('file', 'ddc22be4404f6af9763963beea5e900b9e49fa38debda84e06052e3000a4a4de', 493)`
+- `zip6 | scripts/mobile-reauth.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'd3300ba4e9de67693d9b48d74a23cb8af1dbdb0cdb126acf48178f9d3b36b39a', 420) | ('file', 'd3300ba4e9de67693d9b48d74a23cb8af1dbdb0cdb126acf48178f9d3b36b39a', 493)`
+- `zip6 | scripts/release-check.ts | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '5ecfb298e88ce5c5352c3c276d253db8399db8760069e1bd2d381a7b19eb0c80', 420) | ('file', '5ecfb298e88ce5c5352c3c276d253db8399db8760069e1bd2d381a7b19eb0c80', 493)`
+- `zip6 | scripts/crabbox-wrapper.mjs | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '7e98d48efa9e09eaa769b1adedaf1edef26daa8aa30136edd07871be42421e28', 420) | ('file', '7e98d48efa9e09eaa769b1adedaf1edef26daa8aa30136edd07871be42421e28', 493)`
+- `zip6 | scripts/notarize-mac-artifact.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '80bab2b460490b7c2484b965c63574c3382306c8b1d3f58c9247723f79c5f813', 420) | ('file', '80bab2b460490b7c2484b965c63574c3382306c8b1d3f58c9247723f79c5f813', 493)`
+- `zip6 | scripts/committer | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '6380aec25a4c44a3594f762499e9a9548a3f0f68077ca9ad097fa2dc3790138b', 420) | ('file', '6380aec25a4c44a3594f762499e9a9548a3f0f68077ca9ad097fa2dc3790138b', 493)`
+- `zip6 | scripts/crabbox-untrusted-bootstrap.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'b83232f211c7b07f48e4f6ab1639cc70ba407785937fecb1e0a74493c2d9cfa2', 420) | ('file', 'b83232f211c7b07f48e4f6ab1639cc70ba407785937fecb1e0a74493c2d9cfa2', 493)`
+- `zip6 | scripts/ios-release-signing.mjs | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '92d486765d497ad291bee965d2b54dad966514865bd132731ca37d69c7fcfaed', 420) | ('file', '92d486765d497ad291bee965d2b54dad966514865bd132731ca37d69c7fcfaed', 493)`
+- `zip6 | scripts/release-verify-beta.ts | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'b8d9361f531295697ab9d903ae33a1a176a614c662264ea8d5f601bbdad43055', 420) | ('file', 'b8d9361f531295697ab9d903ae33a1a176a614c662264ea8d5f601bbdad43055', 493)`
+- `zip6 | scripts/pr-merge | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '6b5b480176ffdf631d0c6c7c2470519a34ce1dfb590f157addc8555bcc22d7cd', 420) | ('file', '6b5b480176ffdf631d0c6c7c2470519a34ce1dfb590f157addc8555bcc22d7cd', 493)`
+- `zip6 | scripts/ios-release-upload.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '03c83ad1007b8eeeb8c409f9ab69d4eea80c8a1706e2aa48d90e67988f372257', 420) | ('file', '03c83ad1007b8eeeb8c409f9ab69d4eea80c8a1706e2aa48d90e67988f372257', 493)`
+- `zip6 | scripts/changelog-to-html.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '13f974bf78b140bc88bd9f3afe27c500660ef59498ed533c38c18bca0c6f6331', 420) | ('file', '13f974bf78b140bc88bd9f3afe27c500660ef59498ed533c38c18bca0c6f6331', 493)`
+- `zip6 | scripts/test-live-build-docker.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'cce52c8599cc70f4dbf3a24c2256ddd054ff3b2d7ea5f58e7e48dcf0f7298496', 420) | ('file', 'cce52c8599cc70f4dbf3a24c2256ddd054ff3b2d7ea5f58e7e48dcf0f7298496', 493)`
+- `zip6 | scripts/pr-review | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'f54ea3d89ff5d052b9f3b60cbedeb2ffab014a9fbdceabf6fc1c27178265c77f', 420) | ('file', 'f54ea3d89ff5d052b9f3b60cbedeb2ffab014a9fbdceabf6fc1c27178265c77f', 493)`
+- `zip6 | scripts/create-dmg.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '9740c8abbd8394e55d2667b16af226ffe17715cbe2fd92168ae634d4fcf39fd5', 420) | ('file', '9740c8abbd8394e55d2667b16af226ffe17715cbe2fd92168ae634d4fcf39fd5', 493)`
+- `zip6 | scripts/sandbox-common-setup.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '3e5c7d507b25cc2288a4fbc8545c357090671d8ee3c41f7716b981655a17c4cb', 420) | ('file', '3e5c7d507b25cc2288a4fbc8545c357090671d8ee3c41f7716b981655a17c4cb', 493)`
+- `zip6 | scripts/package-mac-dist.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '28252efcea3eeaa7207b4f8afbcb644375eaf676fdcd46459eb7656c980986e4', 420) | ('file', '28252efcea3eeaa7207b4f8afbcb644375eaf676fdcd46459eb7656c980986e4', 493)`
+- `zip6 | scripts/openclaw-release-clawhub-plan.ts | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'bd3f24248ff627f82f4b4ccbd1543b3690dee0aa79895429a5ab667e206054a9', 420) | ('file', 'bd3f24248ff627f82f4b4ccbd1543b3690dee0aa79895429a5ab667e206054a9', 493)`
+- `zip6 | scripts/ios-release-prepare.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'df1c05eec1399954c27ef87dca5bdd62434d7c7666b2f46e12882201c2d55a78', 420) | ('file', 'df1c05eec1399954c27ef87dca5bdd62434d7c7666b2f46e12882201c2d55a78', 493)`
+- `zip6 | scripts/test-cleanup-docker.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '8fc3c61e5dec5abf2ffe5d3d63ba6007b4152f78a2044a65c880d17d34cfa5ee', 420) | ('file', '8fc3c61e5dec5abf2ffe5d3d63ba6007b4152f78a2044a65c880d17d34cfa5ee', 493)`
+- `zip6 | scripts/ci-live-command-retry.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '91fd92de4fec2963222668b33463c8231b66756a6daff6ab76632719b7f4e1bc', 420) | ('file', '91fd92de4fec2963222668b33463c8231b66756a6daff6ab76632719b7f4e1bc', 493)`
+- `zip6 | scripts/validate-full-release-validation-evidence.mjs | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'f0b158cf660a192ed5e483a1c4f206c7151f03aa35edb32a6dd71f8da26a869e', 420) | ('file', 'f0b158cf660a192ed5e483a1c4f206c7151f03aa35edb32a6dd71f8da26a869e', 493)`
+- `zip6 | scripts/auth-monitor.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '1b768b4627aefaf197a8527eb8d8e07f78581a610d21f42b3476d0a9ad33fb76', 420) | ('file', '1b768b4627aefaf197a8527eb8d8e07f78581a610d21f42b3476d0a9ad33fb76', 493)`
+- `zip6 | scripts/docs-list.js | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'bb60020b69b586b3559ead95a5e6408f9a80c66d76ed8fe514e1751a75818431', 420) | ('file', 'bb60020b69b586b3559ead95a5e6408f9a80c66d76ed8fe514e1751a75818431', 493)`
+- `zip6 | scripts/pr | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '83c3df79d96bb599377e584b2215dfd313cf6faa72dc848f834a66b7fa22bf2a', 420) | ('file', '83c3df79d96bb599377e584b2215dfd313cf6faa72dc848f834a66b7fa22bf2a', 493)`
+- `zip6 | scripts/run-openclaw-podman.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '0161c919d6b58a09e8cd4fec9850effc285d06b4623ac0a2b0294e7e649f36dc', 420) | ('file', '0161c919d6b58a09e8cd4fec9850effc285d06b4623ac0a2b0294e7e649f36dc', 493)`
+- `zip6 | scripts/clawdock/clawdock-helpers.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '8f4ad2c47d40fb1ed48a6a936bcd0d268b9a4faa553c1f0c17d040c1c20325e5', 420) | ('file', '8f4ad2c47d40fb1ed48a6a936bcd0d268b9a4faa553c1f0c17d040c1c20325e5', 493)`
+- `zip6 | scripts/k8s/deploy.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '63319fafc417f55b9ebfbbf603884b2115df3e4beca4721c89ba94979000b954', 420) | ('file', '63319fafc417f55b9ebfbbf603884b2115df3e4beca4721c89ba94979000b954', 493)`
+- `zip6 | scripts/k8s/create-kind.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '0b34859835a67df0e0d843c6021a9baa05d3a07ff6af2a5f1fff13f9dfac5d8b', 420) | ('file', '0b34859835a67df0e0d843c6021a9baa05d3a07ff6af2a5f1fff13f9dfac5d8b', 493)`
+- `zip6 | scripts/podman/setup.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '07b6b9e60da1713f156bd712c2a9c1e60f646aefb240abb8892942fc8700e10d', 420) | ('file', '07b6b9e60da1713f156bd712c2a9c1e60f646aefb240abb8892942fc8700e10d', 493)`
+- `zip6 | scripts/github/resolve-openclaw-ref.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '154f8a907331f706d2f100bf3bcd388e49789e2e6694a2e2613320506c46a092', 420) | ('file', '154f8a907331f706d2f100bf3bcd388e49789e2e6694a2e2613320506c46a092', 493)`
+- `zip6 | scripts/github/find-reusable-release-validation.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '0eb6f858c2c382fad16ab4e6efb6ae7ecc63a4009004f7d6e36e9fb06b417518', 420) | ('file', '0eb6f858c2c382fad16ab4e6efb6ae7ecc63a4009004f7d6e36e9fb06b417518', 493)`
+- `zip6 | scripts/github/run-openclaw-cross-os-release-checks.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '920354ff7cc4618cc6fe6d2e099d172f999abc405b365e8917d707160c20eff8', 420) | ('file', '920354ff7cc4618cc6fe6d2e099d172f999abc405b365e8917d707160c20eff8', 493)`
+- `zip6 | scripts/docker/setup.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'f1905b95a5e0777efe2b7abc0279aae84808659da7cc19fe63ce39f0349e3a42', 420) | ('file', 'f1905b95a5e0777efe2b7abc0279aae84808659da7cc19fe63ce39f0349e3a42', 493)`
+- `zip6 | scripts/pre-commit/run-node-tool.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'aa9dde5c752e9d2babcfdd289e1c3bcd4ae90b771374e99245b897216efe4884', 420) | ('file', 'aa9dde5c752e9d2babcfdd289e1c3bcd4ae90b771374e99245b897216efe4884', 493)`
+- `zip6 | scripts/repro/code-mode-namespace-live.ts | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '52b17a6b6f8f7f7f57ee7316728e5371b138012c116d1aa1a1fae9da58edc6ed', 420) | ('file', '52b17a6b6f8f7f7f57ee7316728e5371b138012c116d1aa1a1fae9da58edc6ed', 493)`
+- `zip6 | scripts/repro/code-mode-namespace-live-scenario.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'f141d696ad726ff8a2da751fbd76a347733c13dce529995a8fe70b766a1735a0', 420) | ('file', 'f141d696ad726ff8a2da751fbd76a347733c13dce529995a8fe70b766a1735a0', 493)`
+- `zip6 | scripts/repro/code-mode-namespace-live-docker.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '96724892e4ec20b7391fb28ee4f55a9db7326f8679fbff02565909bee4ac8d19', 420) | ('file', '96724892e4ec20b7391fb28ee4f55a9db7326f8679fbff02565909bee4ac8d19', 493)`
+- `zip6 | scripts/dev/ios-pull-gateway-log.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '7cdb7194431256ef888fc491dca3cb022d111c68b16e00a306e591e167017582', 420) | ('file', '7cdb7194431256ef888fc491dca3cb022d111c68b16e00a306e591e167017582', 493)`
+- `zip6 | scripts/e2e/onboard-docker.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '0c915623228038bf7431b65db6dab798282063fb64915c33c8cf04f9ede077dd', 420) | ('file', '0c915623228038bf7431b65db6dab798282063fb64915c33c8cf04f9ede077dd', 493)`
+- `zip6 | scripts/e2e/kitchen-sink-rpc-docker.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'de37ef50f12c1dfd1c900347ec56c0ab11404d1c0e40c907897bc0800776a0e7', 420) | ('file', 'de37ef50f12c1dfd1c900347ec56c0ab11404d1c0e40c907897bc0800776a0e7', 493)`
+- `zip6 | scripts/e2e/bundled-plugin-install-uninstall-docker.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '95db02dec9d72032406140d42eb93b816037fdf7389bde838144977e6e100042', 420) | ('file', '95db02dec9d72032406140d42eb93b816037fdf7389bde838144977e6e100042', 493)`
+- `zip6 | scripts/e2e/agent-bundle-mcp-tools-docker.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'f22c678830784e57dbf459a08469f531f90a2050019879e924c645d03a5976f3', 420) | ('file', 'f22c678830784e57dbf459a08469f531f90a2050019879e924c645d03a5976f3', 493)`
+- `zip6 | scripts/e2e/plugin-update-unchanged-docker.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'a8a4ebec797527218311e847ed7a531bc00339769870e1a099a20e412ccbedc1', 420) | ('file', 'a8a4ebec797527218311e847ed7a531bc00339769870e1a099a20e412ccbedc1', 493)`
+- `zip6 | scripts/e2e/update-channel-switch-docker.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '71d01f642d2c5e3550e0b96f8917a9997d958025a1fff89bbaf010a29d415366', 420) | ('file', '71d01f642d2c5e3550e0b96f8917a9997d958025a1fff89bbaf010a29d415366', 493)`
+- `zip6 | scripts/e2e/mcp-code-mode-gateway-docker.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'e80d38d57b1ee3a301b6c236ee5f83ae0ba41743bdf1d905962ee11b084d709d', 420) | ('file', 'e80d38d57b1ee3a301b6c236ee5f83ae0ba41743bdf1d905962ee11b084d709d', 493)`
+- `zip6 | scripts/e2e/commitments-safety-docker.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '954e8d4af969b6c716286c42f13e22365a2c9d3d41376a4fc410f88915c1f3e6', 420) | ('file', '954e8d4af969b6c716286c42f13e22365a2c9d3d41376a4fc410f88915c1f3e6', 493)`
+- `zip6 | scripts/e2e/mcp-code-mode-gateway-live-docker.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'b8bc319d6b9a9c9026193a02ada390916a3cd0ce81b24c1d9a2c293e7fa2e8da', 420) | ('file', 'b8bc319d6b9a9c9026193a02ada390916a3cd0ce81b24c1d9a2c293e7fa2e8da', 493)`
+- `zip6 | scripts/e2e/docker-package-install.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '61732c83754e573cbb12d44943fbd802a9657933aadc89f91cd53428992b4ca0', 420) | ('file', '61732c83754e573cbb12d44943fbd802a9657933aadc89f91cd53428992b4ca0', 493)`
+- `zip6 | scripts/e2e/doctor-install-switch-docker.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '272b81541faf45d70467418ab9d70a4cfe9efa17e534d05132b007fd3a33cf63', 420) | ('file', '272b81541faf45d70467418ab9d70a4cfe9efa17e534d05132b007fd3a33cf63', 493)`
+- `zip6 | scripts/e2e/parallels-windows-smoke.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'b9b9127f88bc6a2595d700e5a9f262312b2a3f91e3593382cfa05058f74a3e1a', 420) | ('file', 'b9b9127f88bc6a2595d700e5a9f262312b2a3f91e3593382cfa05058f74a3e1a', 493)`
+- `zip6 | scripts/e2e/codex-on-demand-docker.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '3a83292b5df3d95077a5b9bd0a221bb00568c77a9d69bfcf13326bc382ea50de', 420) | ('file', '3a83292b5df3d95077a5b9bd0a221bb00568c77a9d69bfcf13326bc382ea50de', 493)`
+- `zip6 | scripts/e2e/release-upgrade-user-journey-docker.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'b82df1e0cf3a57a74e2e5b648172984576ea6c64e158ccd5c12fde4bf9d8a9eb', 420) | ('file', 'b82df1e0cf3a57a74e2e5b648172984576ea6c64e158ccd5c12fde4bf9d8a9eb', 493)`
+- `zip6 | scripts/e2e/config-reload-source-docker.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '34cfcd48256a1bd6987b168bd2705f6ed191c7ee25cfa05207534d3cd25177ba', 420) | ('file', '34cfcd48256a1bd6987b168bd2705f6ed191c7ee25cfa05207534d3cd25177ba', 493)`
+- `zip6 | scripts/e2e/parallels-linux-smoke.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '8217ddfe1a76729f5d5ee7700d5003fb6f50158e750bbe8014febbfe77d7c2c3', 420) | ('file', '8217ddfe1a76729f5d5ee7700d5003fb6f50158e750bbe8014febbfe77d7c2c3', 493)`
+- `zip6 | scripts/e2e/crestodian-rescue-docker.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '521e5e30517a386bc1a70bfb689a0f05533294e9d9ab73bcb9bed967c70ebe5d', 420) | ('file', '521e5e30517a386bc1a70bfb689a0f05533294e9d9ab73bcb9bed967c70ebe5d', 493)`
+- `zip6 | scripts/e2e/cron-cli-docker.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '6a7cb8fae541df1dfcc51f64a5db050857126ddb6ed3ac1f4461e67bb162e06f', 420) | ('file', '6a7cb8fae541df1dfcc51f64a5db050857126ddb6ed3ac1f4461e67bb162e06f', 493)`
+- `zip6 | scripts/e2e/multi-node-update-docker.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '5d055a25b369b0b01d6e01bb1a1da6561e408a7203e780fc67f61166db19cbbe', 420) | ('file', '5d055a25b369b0b01d6e01bb1a1da6561e408a7203e780fc67f61166db19cbbe', 493)`
+- `zip6 | scripts/e2e/compose-setup.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '72a831c43a92b5e5bc70253fda05ea64deaeb3c841935ecb933f26946aaac43e', 420) | ('file', '72a831c43a92b5e5bc70253fda05ea64deaeb3c841935ecb933f26946aaac43e', 493)`
+- `zip6 | scripts/e2e/release-user-journey-docker.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'b126c4cf4735cb7174915149d2cbe3aba6a813ebeb907fef3b14a1c436eacd16', 420) | ('file', 'b126c4cf4735cb7174915149d2cbe3aba6a813ebeb907fef3b14a1c436eacd16', 493)`
+- `zip6 | scripts/e2e/telegram-user-driver.py | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '0c2887073e61cb8ba1cf73590ddd49090c4e92b4b4075c298d262a43ab3b88d5', 420) | ('file', '0c2887073e61cb8ba1cf73590ddd49090c4e92b4b4075c298d262a43ab3b88d5', 493)`
+- `zip6 | scripts/e2e/qr-import-docker.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '14d7e8b98d1c68045a61e4ff8861ed2b5f46e1fbc2876cc75f0b41aee33a0678', 420) | ('file', '14d7e8b98d1c68045a61e4ff8861ed2b5f46e1fbc2876cc75f0b41aee33a0678', 493)`
+- `zip6 | scripts/e2e/upgrade-survivor-docker.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'fdaeed11d914469484ae576d4ac58fd8c91c7ba7dc046e9ac0f6e450f632d430', 420) | ('file', 'fdaeed11d914469484ae576d4ac58fd8c91c7ba7dc046e9ac0f6e450f632d430', 493)`
+- `zip6 | scripts/e2e/plugin-lifecycle-matrix-docker.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '30a94d26a1c3dd5a51b02c2dfcbf4e9eca9b2a294387298eb3453a70c0929e02', 420) | ('file', '30a94d26a1c3dd5a51b02c2dfcbf4e9eca9b2a294387298eb3453a70c0929e02', 493)`
+- `zip6 | scripts/e2e/live-plugin-tool-docker.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'b136cf0edacadd6fb835700eca71354c11aa2d0c47f626529559ba9ed834f686', 420) | ('file', 'b136cf0edacadd6fb835700eca71354c11aa2d0c47f626529559ba9ed834f686', 493)`
+- `zip6 | scripts/e2e/npm-telegram-live-docker.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '3a9e92d634b399d4a5ace57d4464a9762440403c09a387dfa9096d0b70200d28', 420) | ('file', '3a9e92d634b399d4a5ace57d4464a9762440403c09a387dfa9096d0b70200d28', 493)`
+- `zip6 | scripts/e2e/openai-web-search-minimal-docker.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'b5997780b745a1e26993c426d732810208afc5cefbe989fcace65cf079d1c7c4', 420) | ('file', 'b5997780b745a1e26993c426d732810208afc5cefbe989fcace65cf079d1c7c4', 493)`
+- `zip6 | scripts/e2e/skill-install-docker.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'c69c3bd0a77be30a8f1582e5acb1b35e7ff4ff9bf4088c0720652fa450c847aa', 420) | ('file', 'c69c3bd0a77be30a8f1582e5acb1b35e7ff4ff9bf4088c0720652fa450c847aa', 493)`
+- `zip6 | scripts/e2e/release-media-memory-docker.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '1cfced6053684ed580976f9a741c4bc605fc5076eeb887a88e53000bc7977d66', 420) | ('file', '1cfced6053684ed580976f9a741c4bc605fc5076eeb887a88e53000bc7977d66', 493)`
+- `zip6 | scripts/e2e/plugins-docker.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'ce4e9a77db27054d86973bb6fbe3b16c8dfa980b8ef53ba692ed37bacdb3f190', 420) | ('file', 'ce4e9a77db27054d86973bb6fbe3b16c8dfa980b8ef53ba692ed37bacdb3f190', 493)`
+- `zip6 | scripts/e2e/release-plugin-marketplace-docker.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '655de70673acbc461717c97f70557490272c56c0bbdca7a69ec6ddf099ca138a', 420) | ('file', '655de70673acbc461717c97f70557490272c56c0bbdca7a69ec6ddf099ca138a', 493)`
+- `zip6 | scripts/e2e/release-typed-onboarding-docker.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '27a4fbc942284ecfbe3999b8d9f7026e77f09ad6657a49680b34c510638c82a2', 420) | ('file', '27a4fbc942284ecfbe3999b8d9f7026e77f09ad6657a49680b34c510638c82a2', 493)`
+- `zip6 | scripts/e2e/openwebui-docker.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '40442e4ebaed16559b39657aafd85f231bc8c329f7da67301bf90e96129703b1', 420) | ('file', '40442e4ebaed16559b39657aafd85f231bc8c329f7da67301bf90e96129703b1', 493)`
+- `zip6 | scripts/e2e/bun-global-install-smoke.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '4e90d4451d97884267a5b8182bf9d4766969a17925a4337f535522516840f4f9', 420) | ('file', '4e90d4451d97884267a5b8182bf9d4766969a17925a4337f535522516840f4f9', 493)`
+- `zip6 | scripts/e2e/crestodian-planner-docker.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'f5d954f7dad6d85bcc701a885359d8facda7b375691ecc940cecc59443b1ec36', 420) | ('file', 'f5d954f7dad6d85bcc701a885359d8facda7b375691ecc940cecc59443b1ec36', 493)`
+- `zip6 | scripts/e2e/parallels-macos-smoke.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '791aff7391d0f0165337752d0bd3c106ae09c26e3bfd2733dd5a17530e34b59b', 420) | ('file', '791aff7391d0f0165337752d0bd3c106ae09c26e3bfd2733dd5a17530e34b59b', 493)`
+- `zip6 | scripts/e2e/browser-cdp-snapshot-docker.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'ae341b0435bc8d7afe75acf08c8ea05f64b7aeea3e3452892d53e5a8696ff7a8', 420) | ('file', 'ae341b0435bc8d7afe75acf08c8ea05f64b7aeea3e3452892d53e5a8696ff7a8', 493)`
+- `zip6 | scripts/e2e/parallels-npm-update-smoke.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'd1274781ced66ed0013cf901d8bc3ca01d75b0dbcc4cb1ea8d3669156539a89d', 420) | ('file', 'd1274781ced66ed0013cf901d8bc3ca01d75b0dbcc4cb1ea8d3669156539a89d', 493)`
+- `zip6 | scripts/secrets/openclaw-bws-resolver.mjs | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'bbe02f70d32b454d0f8659517636fa74a5092f4c4b4d8ed6743344d4ab1e16a1', 420) | ('file', 'bbe02f70d32b454d0f8659517636fa74a5092f4c4b4d8ed6743344d4ab1e16a1', 493)`
+- `zip6 | scripts/docker/install-sh-e2e/run.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '1364484209fa0977748fafed69dc9a93337fc1e6ef5b865b5e1c04f23615ef83', 420) | ('file', '1364484209fa0977748fafed69dc9a93337fc1e6ef5b865b5e1c04f23615ef83', 493)`
+- `zip6 | scripts/docker/cleanup-smoke/run.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'e5ddd591b022ed9a81edf244d69e6fb80c90cd54ac25880b4e5939b11987d81a', 420) | ('file', 'e5ddd591b022ed9a81edf244d69e6fb80c90cd54ac25880b4e5939b11987d81a', 493)`
+- `zip6 | scripts/docker/install-sh-smoke/run.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'b95e9b91302116ba68a091bc6ab8bf96c7237abac0400af29330a7cc1704e8f7', 420) | ('file', 'b95e9b91302116ba68a091bc6ab8bf96c7237abac0400af29330a7cc1704e8f7', 493)`
+- `zip6 | scripts/e2e/parallels/linux-smoke.ts | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'aed9dd897e70d829029d7bab19d77c5bbfc64440e2399ffaabedfccc3b68091c', 420) | ('file', 'aed9dd897e70d829029d7bab19d77c5bbfc64440e2399ffaabedfccc3b68091c', 493)`
+- `zip6 | scripts/e2e/parallels/windows-smoke.ts | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '3ded31c1aa218b0f92eb61a28122df95e466bea25dec605cd35451b9801c90e3', 420) | ('file', '3ded31c1aa218b0f92eb61a28122df95e466bea25dec605cd35451b9801c90e3', 493)`
+- `zip6 | scripts/e2e/parallels/npm-update-smoke.ts | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'f3c8ec1727aac88f1ac40df1b956a5cd01d829e0fd977ec969dbaa18dfc7bba8', 420) | ('file', 'f3c8ec1727aac88f1ac40df1b956a5cd01d829e0fd977ec969dbaa18dfc7bba8', 493)`
+- `zip6 | scripts/e2e/parallels/macos-smoke.ts | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '8adc086c9b712b8f6b3cf43c6eab6e19cf0e1591b61e50decce845f2a4d459f2', 420) | ('file', '8adc086c9b712b8f6b3cf43c6eab6e19cf0e1591b61e50decce845f2a4d459f2', 493)`
+- `zip6 | scripts/e2e/lib/release-typed-onboarding/scenario.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '1fb31d20c2a8c3e2da0041971ff17bcd90d8cd94f2c32305bfbeff240f6ae486', 420) | ('file', '1fb31d20c2a8c3e2da0041971ff17bcd90d8cd94f2c32305bfbeff240f6ae486', 493)`
+- `zip6 | scripts/e2e/lib/release-media-memory/scenario.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '70c36196d1e1d55d223169088722b22265af553ea5203e8c163d4cc0003014fe', 420) | ('file', '70c36196d1e1d55d223169088722b22265af553ea5203e8c163d4cc0003014fe', 493)`
+- `zip6 | scripts/e2e/lib/release-user-journey/scenario.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '9ebe603c6c826bf62b373a2a63404d2220f9ce471de22dd37f43f861d9a123e1', 420) | ('file', '9ebe603c6c826bf62b373a2a63404d2220f9ce471de22dd37f43f861d9a123e1', 493)`
+- `zip6 | scripts/e2e/lib/release-plugin-marketplace/scenario.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'e3182fb710382627c933aea70e410bcb8359d84750f604318db2a592769c9ec5', 420) | ('file', 'e3182fb710382627c933aea70e410bcb8359d84750f604318db2a592769c9ec5', 493)`
+- `zip6 | scripts/e2e/lib/release-upgrade-user-journey/scenario.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'e6ae2b626d341bab0cd72bd3550dd4fc5e88a0fc171a8cc0b4d62a34b4fe2f90', 420) | ('file', 'e6ae2b626d341bab0cd72bd3550dd4fc5e88a0fc171a8cc0b4d62a34b4fe2f90', 493)`
+- `zip6 | scripts/e2e/lib/doctor-install-switch/shims/loginctl | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '1ce3145e0de63f2388dc65d4a9473ccd310a52ab3a7026ac57b09b8be7d4e5bb', 420) | ('file', '1ce3145e0de63f2388dc65d4a9473ccd310a52ab3a7026ac57b09b8be7d4e5bb', 493)`
+- `zip6 | scripts/e2e/lib/doctor-install-switch/shims/systemctl | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'f306427e913b826d70204da162eb81adfca489b7bd40d6a74abe466874d01a5c', 420) | ('file', 'f306427e913b826d70204da162eb81adfca489b7bd40d6a74abe466874d01a5c', 493)`
+- `zip6 | skills/video-frames/scripts/frame.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'b339455e9e618c836ccf2e3732e4fec9897f079730d8814eadb716e2459df453', 420) | ('file', 'b339455e9e618c836ccf2e3732e4fec9897f079730d8814eadb716e2459df453', 493)`
+- `zip6 | skills/openai-whisper-api/scripts/transcribe.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '7840f2628e2e5d878434419592a8cfc5fbfcf2f560cc1511085387e38e429c78', 420) | ('file', '7840f2628e2e5d878434419592a8cfc5fbfcf2f560cc1511085387e38e429c78', 493)`
+- `zip6 | skills/meme-maker/scripts/meme.mjs | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '650c9df4a5cda74f681e70d9433f6eb643763bde0575074b400f74a563385bc6', 420) | ('file', '650c9df4a5cda74f681e70d9433f6eb643763bde0575074b400f74a563385bc6', 493)`
+- `zip6 | skills/tmux/scripts/find-sessions.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '4c4552ce0adb2754080969f00b761c1c118766771e0595b8c9b416ee0842fbae', 420) | ('file', '4c4552ce0adb2754080969f00b761c1c118766771e0595b8c9b416ee0842fbae', 493)`
+- `zip6 | skills/tmux/scripts/wait-for-text.sh | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '96bc42702f7353c32233c223d61dd11f2f99033267aeefac838aea8983a67735', 420) | ('file', '96bc42702f7353c32233c223d61dd11f2f99033267aeefac838aea8983a67735', 493)`
+- `zip6 | skills/sherpa-onnx-tts/bin/sherpa-onnx-tts | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '542d46f42f5ff8d22ed71f58ca052e4e525a337d90bd25664a6237b6da56fd2a', 420) | ('file', '542d46f42f5ff8d22ed71f58ca052e4e525a337d90bd25664a6237b6da56fd2a', 493)`
+- `zip7 | ui/CLAUDE.md | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'a54ff182c7e8acf56acfd6e4b9c3ff41e2c41a31c9b211b2deb9df75d9a478f9', 420) | ('symlink', 'AGENTS.md', 511)`
+- `zip7 | test/CLAUDE.md | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'a54ff182c7e8acf56acfd6e4b9c3ff41e2c41a31c9b211b2deb9df75d9a478f9', 420) | ('symlink', 'AGENTS.md', 511)`
+- `zip7 | ui/node_modules/@openclaw/normalization-core | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', '21d0311a6c8d37201b066a53fdc1a92dc830319ab5b0717f39644d0f74f6ba3d', 420) | ('symlink', '../../../packages/normalization-core', 511)`
+- `zip7 | ui/node_modules/@openclaw/media-core | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'ff2d99b138dd3b497ef485a7b1164878a760cf4908ab3f628632fdff4567016e', 420) | ('symlink', '../../../packages/media-core', 511)`
+- `zip7 | test/helpers/CLAUDE.md | TYPE_CONTENT_OR_MODE_MISMATCH | ('file', 'a54ff182c7e8acf56acfd6e4b9c3ff41e2c41a31c9b211b2deb9df75d9a478f9', 420) | ('symlink', 'AGENTS.md', 511)`
+- `zip8 | audit/audit-events.test.ts | MISSING_IN_RELEASE | ('file', 'eb6732f9b517ac1dadd75cfd3b6689084364900187d5e99c71a580565651be98', 420) | `
+- `zip8 | audit/audit-event-writer.ts | MISSING_IN_RELEASE | ('file', 'c0d19151ed3f8d93cb4c3139d9b2c5cdaa6047d3dcea8bb8facea6dd25e03a4f', 420) | `
+- `zip8 | audit/audit-event-writer.test.ts | MISSING_IN_RELEASE | ('file', '4f0e8aa9209e3f11f67294cc4936624c062440e0f3415d558296fc722e49a84c', 420) | `
+- `zip8 | audit/agent-event-audit.ts | MISSING_IN_RELEASE | ('file', '14080fcd90294500bdb6171ce25ef550581656850a4fe1a128bc9dac1b8924f7', 420) | `
