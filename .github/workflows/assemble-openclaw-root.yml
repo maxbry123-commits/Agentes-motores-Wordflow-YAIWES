@@ -1,17 +1,12 @@
 name: Assemble verified OpenClaw root
 
 on:
-  push:
-    branches: [main]
   pull_request:
-  issues:
-    types: [opened]
   workflow_dispatch:
 
 permissions:
   contents: write
   actions: read
-  issues: read
 
 env:
   TARGET_CANONICAL_REF: a4178c7eb15a0dd2b8b44804348e256f1a109a34
@@ -22,9 +17,12 @@ jobs:
   assemble:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout destination repository
+      - name: Checkout working branch
         uses: actions/checkout@v4
-        with: {fetch-depth: 1, token: ${{ secrets.GITHUB_TOKEN }}}
+        with:
+          ref: ${{ github.head_ref || github.ref_name }}
+          fetch-depth: 1
+          token: ${{ secrets.GITHUB_TOKEN }}
       - name: Download all verified ZIP extraction artifacts
         uses: actions/download-artifact@v4
         with:
@@ -40,7 +38,7 @@ jobs:
           curl -fsSL --retry 5 --retry-delay 2 "https://github.com/openclaw/openclaw/archive/${ZIP_SOURCE_REF}.tar.gz" -o /tmp/zip-source.tar.gz
           mkdir -p /tmp/zip-source; tar -xzf /tmp/zip-source.tar.gz -C /tmp/zip-source --strip-components=1
           test -f /tmp/zip-source/package.json
-      - name: Audit ZIPs against their release ref without guessing
+      - name: Audit ZIPs against release ref
         shell: bash
         run: |
           set -euo pipefail
@@ -95,26 +93,17 @@ jobs:
           with open('FORENSIC-AUDIT-XRAY.md','w',encoding='utf-8') as f:
               f.write(f'# FINAL FORENSIC XRAY AUDIT\n\n- Target canonical: `{os.environ["TARGET_CANONICAL_REF"]}`\n- ZIP release: `{os.environ["ZIP_SOURCE_REF"]}`\n- ZIP-source status: **{zip_status}**\n- Root files: **{len(files)}**\n- Canonical root build: PASS\n- ROOTS isolation: PASS\n- Generated dependencies excluded: PASS\n')
           PY
-      - name: Upload forensic evidence
-        uses: actions/upload-artifact@v4
-        with:
-          name: openclaw-final-forensic-evidence
-          path: |
-            FORENSIC-ZIP/ZIP-SOURCE-CROSSCHECK.md
-            FORENSIC-ZIP/ZIP-SOURCE-STATUS.txt
-            FORENSIC-AUDIT-XRAY.md
-            OPENCLAW-ROOT-MANIFEST.md
-          if-no-files-found: error
-          retention-days: 7
-      - name: Persist root and evidence on non-PR execution
-        if: ${{ github.event_name != 'pull_request' }}
+      - name: Persist root and evidence to current branch
         run: |
+          set -euo pipefail
           git config user.name "github-actions[bot]"; git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add ROOTS/openclaw OPENCLAW-ROOT-MANIFEST.md FORENSIC-ZIP/ZIP-SOURCE-CROSSCHECK.md FORENSIC-ZIP/ZIP-SOURCE-STATUS.txt FORENSIC-AUDIT-XRAY.md
-          git diff --cached --quiet || git commit -m "build: reconstruct verified OpenClaw root"
-          git push
-      - name: Remote read-back on non-PR execution
-        if: ${{ github.event_name != 'pull_request' }}
+          if ! git diff --cached --quiet; then
+            git commit -m "build: reconstruct verified OpenClaw root"
+            if [ -n "${GITHUB_HEAD_REF:-}" ]; then git push origin "HEAD:${GITHUB_HEAD_REF}"; else git push origin "HEAD:${GITHUB_REF_NAME}"; fi
+          fi
+      - name: Remote read-back
         run: |
+          set -euo pipefail
           test -f ROOTS/openclaw/package.json; test -f ROOTS/openclaw/pnpm-workspace.yaml; test -f ROOTS/openclaw/node-version.mjs
           test ! -d ROOTS/openclaw/node_modules; test ! -d ROOTS/openclaw/.pnpm-store
