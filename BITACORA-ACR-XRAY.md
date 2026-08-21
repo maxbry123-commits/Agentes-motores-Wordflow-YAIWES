@@ -3,156 +3,54 @@
 ## Objetivo
 Conservar conocimiento verificable para que otro GPT/agente pueda recuperar y continuar el trabajo sin depender de memoria conversacional. GitHub es la fuente persistente de verdad. No convertir hipótesis, planes o respuestas del asistente en hechos confirmados.
 
-## Orden obligatorio de recuperación
-1. `LEDGER.json` — si existe, cursor transaccional.
-2. `ACR-RECOVERY-PATCH.md` / Recovery Patch vigente.
-3. `ACR-VERSION-MAP.md`.
-4. `ACR_OpenClaw_Recovery_Patch_XRAY_1.0.json` si existe.
-5. `RAIZ-OPENCLAW-COMO-HACER-TODO.md`.
-6. `PIPELINE/00_METODO_TRABAJO_Y_ARQUITECTURA.md`.
-7. Esta bitácora.
-8. Inventarios/manifiestos y árbol GitHub actual.
+## Estado confirmado
+- Repo: `maxbry123-commits/Agentes-motores-Wordflow-YAIWES`
+- Branch: `main`
+- Canonical OpenClaw: `openclaw/openclaw@a4178c7eb15a0dd2b8b44804348e256f1a109a34`
+- `ROOTS/README.md` confirma arquitectura multi-agente y aislamiento de `ROOTS/openclaw/`.
+- 8 ZIPs están identificados; ZIP 1 y ZIP 4 comparten blob SHA/tamaño y son duplicados exactos a nivel GitHub.
+- La extracción binaria real de los ZIP sigue BLOQUEADA por el mecanismo actual de acceso a blobs grandes. No marcar descarga/extracción como completada.
 
-## ESTADO ACTUAL CONFIRMADO
-- Repositorio de trabajo: `maxbry123-commits/Agentes-motores-Wordflow-YAIWES`.
-- Rama: `main`.
-- Fuente canónica OpenClaw fijada: `openclaw/openclaw@a4178c7eb15a0dd2b8b44804348e256f1a109a34`.
-- El árbol oficial de ese ref fue consultado mediante GitHub API. La respuesta visible del árbol puede truncarse por presupuesto de herramienta; por eso solo se consideran confirmadas las rutas que puedan ser consultadas directamente o estén en una respuesta completa.
-- El repositorio de trabajo es multi-agente/multi-motor; no se debe mezclar OpenClaw con futuras raíces.
-- `ROOTS/README.md` fue creado y verificado en GitHub como reserva estructural para `ROOTS/openclaw/` y futuras raíces independientes.
-- Existe `FORENSIC-INVENTORY-2026-08-21.md` con el inventario inicial.
-- El inventario inicial detectó 8 ZIP; ZIP 1 y ZIP 4 fueron observados con el mismo blob SHA y tamaño y, por tanto, son duplicados exactos a nivel GitHub.
-- El conector disponible no pudo descargar directamente el ZIP binario grande para extracción; por tanto, la descarga/extracción real NO está marcada como completada.
-- `FORENSIC-CROSSCHECK-OPENCLAW.md` fue ampliado y verificado en GitHub en commit `fcd2b3f2e631d0f8baaf07c6df2d0b8aa5faf4cc`.
+## Método persistente
+`TASK_INTAKE → SANDBOX_BUILD → LOCAL_VERIFY → READY_FOR_PUBLISH → GITHUB_PUBLISH → REMOTE_VERIFY → FORENSIC_AUDIT → DONE`.
+GitHub es la verdad persistente; sandbox es temporal; HTTP 200 no basta; toda publicación requiere read-back; una afirmación LLM no es evidencia; mismo fallo ×2 obliga a cambiar mecanismo.
 
-## MÉTODO DE TRABAJO VERIFICADO
-La guía persistida en `PIPELINE/00_METODO_TRABAJO_Y_ARQUITECTURA.md` establece: TASK_INTAKE → SANDBOX_BUILD → LOCAL_VERIFY → READY_FOR_PUBLISH → GITHUB_PUBLISH → REMOTE_VERIFY → FORENSIC_AUDIT → DONE. GitHub es la fuente persistente de verdad; sandbox es temporal; HTTP 200 no basta; cada publicación requiere read-back; una afirmación LLM no es evidencia; mismo fallo ×2 obliga a cambiar mecanismo. fileciteturn25file0L2-L2
+## Hallazgos canónico ↔ repo
+1. `package.json`: MODIFIED / NO MATCH. Canonical 2026.8.1, schemaVersions state 9/agent 17; repo 2026.7.1 sin bloque observado.
+2. `node-version.mjs`: MISSING en repo; canonical blob `dc7876dd0ce35116aaef535d342647ebb1ad16e7`.
+3. `npm-shrinkwrap.json`: EXTRA / NON-CANONICAL; ausente en canonical, presente en repo.
+4. `pnpm-workspace.yaml`: MODIFIED / NO MATCH; canonical blob `5ffb3a0e59272237670f60b5448931290d5b9a65`; repo blob `05d3a199ce86c756006b698af705ae45e2855dd3`.
+5. `README.md`: MODIFIED / NO MATCH; canonical blob `c74989cee8a9c1e8648aa892175de3c9e375bafe`; repo blob `c656353ef50013d27756c1717fd2df6e2645c1db`.
+6. `LICENSE`: MATCH; canonical y repo comparten blob `ebaebf7c416761a32f932ad70ebe5d1d2e214f68`.
+7. `THIRD_PARTY_NOTICES.md`: MATCH; canonical y repo comparten blob `6b6721901b7590d20774ba0504d975e1be70a57a`.
+8. `openclaw.mjs`: MODIFIED / NO MATCH. Canonical importa `./node-version.mjs` y recomienda Node 26; repo actual contiene implementación distinta y recomienda Node 24. Las respuestas largas están truncadas, pero las diferencias del prefijo son directamente observables.
 
-## HALLAZGOS DE VERIFICACIÓN CRUZADA CANÓNICO ↔ REPO ACTUAL
+## Arquitectura multi-raíz
+`ROOTS/openclaw/` es el destino exclusivo de OpenClaw. Futuras raíces serán hermanas. No mover archivos OpenClaw existentes hasta T06/T08. Documentación, manifiestos y control permanecen fuera de las raíces.
 
-### 1. `package.json`
-Fuente canónica `openclaw/openclaw@a4178c7...`:
-- versión observada `2026.8.1`;
-- bloque `openclaw.schemaVersions` con `state: 9` y `agent: 17`;
-- autor `OpenClaw Foundation (https://openclaw.org)`;
-- declara `node-version.mjs` en `files`.
+## Archivos de control creados/actualizados
+- `FORENSIC-CROSSCHECK-OPENCLAW.md` actualizado en commit `dbcbeecaaa2f69ebbd73da3386a0566e56c25f79`.
+- `OPENCLAW-ROOT-MANIFEST.md` creado como borrador de evidencia en commit `f7c6e450ef158367f527512dffef7fd9469553eb`.
 
-Repo actual `main`:
-- versión observada `2026.7.1`;
-- no contiene el bloque `openclaw.schemaVersions` observado en la fuente canónica;
-- autor vacío;
-- contiene `npm-shrinkwrap.json` en `files`.
+## Plan T01–T16
+T01 baseline; T02 XRAY repo; T03 auditoría ZIP; T04 ZIP↔ZIP; T05 árbol canónico; T06 canónico↔candidatos; T07 multi-agent ROOTS; T08 manifiesto; T09 build temporal; T10 local verify; T11 publish; T12 remote read-back; T13 boot verify; T14 XRAY final; T15 multi-root audit; T16 completion record.
 
-Veredicto: **MODIFIED / NO MATCH**. No usar este archivo actual como copia canónica. fileciteturn29file0L2-L2
+## Lote ejecutado en este LOOP
+- T03-A: revalidado estado de adquisición; sigue bloqueado, sin falsa extracción.
+- T04-B: revalidado inventario de 8 ZIP y duplicado ZIP1=ZIP4.
+- T06-C: ampliada matriz con `LICENSE`, `THIRD_PARTY_NOTICES.md` y `openclaw.mjs`.
+- T07-D: releído `ROOTS/README.md`; aislamiento confirmado.
+- T08-E: creado `OPENCLAW-ROOT-MANIFEST.md` con esquema y entradas solo verificadas.
 
-### 2. `node-version.mjs`
-- Existe en el ref canónico y fue leído directamente; blob observado `dc7876dd0ce35116aaef535d342647ebb1ad16e7`.
-- No existe en la raíz actual del repositorio de trabajo.
+## Próximo lote — 5 tareas paralelas
+1. T03-A: probar mecanismo reproducible alternativo para obtener bytes ZIP reales.
+2. T04-B: completar tabla ZIP con todos los blobs/tamaños y buscar duplicados restantes.
+3. T06-C: verificar 3–5 archivos/directorios raíz adicionales mediante consultas directas no truncadas.
+4. T08-D: ampliar `OPENCLAW-ROOT-MANIFEST.md` únicamente con evidencia nueva.
+5. T10-E: diseñar checks locales de conteo/rutas/SHA sin construir todavía la raíz final.
 
-Veredicto: **MISSING** en el repo actual respecto al ref canónico.
+## Formato obligatorio
+Tarea en curso / Total de tareas / Tareas terminadas al 100% / Tareas pendientes / Siguiente tarea con 3–5 subtareas paralelas / Confirmación 100% / Bloqueos-reparación.
 
-### 3. `npm-shrinkwrap.json`
-- No existe en el ref canónico fijado.
-- Existe en la raíz actual del repositorio de trabajo.
-
-Veredicto: **EXTRA / NON-CANONICAL** respecto al ref fijado.
-
-### 4. `pnpm-workspace.yaml`
-- Canónico: blob `5ffb3a0e59272237670f60b5448931290d5b9a65`; conserva los globs de workspace `.`/`ui`/`packages/*`/`extensions/*`/`examples/*`, mas contiene una política de dependencias/overrides/allowBuilds diferente.
-- Repo actual: blob `05d3a199ce86c756006b698af705ae45e2855dd3`; conserva esos globs pero difiere en exclusiones, versiones, overrides y contiene `patchedDependencies` no observado en la lectura canónica.
-
-Veredicto: **MODIFIED / NO MATCH**. fileciteturn27file0L2-L6 fileciteturn28file0L2-L6
-
-### 5. `README.md`
-- Canónico: blob `c74989cee8a9c1e8648aa892175de3c9e375bafe`; incluye guía actual de instalación, Node soportado, onboarding y Gateway.
-- Repo actual: blob `c656353ef50013d27756c1717fd2df6e2645c1db`; contenido y estructura textual difieren materialmente.
-
-Veredicto: **MODIFIED / NO MATCH**. fileciteturn30file0L2-L6 fileciteturn31file0L2-L6
-
-## REGLA DE VERIFICACIÓN CRUZADA — NO ALUCINAR
-Toda afirmación sobre OpenClaw debe poder trazarse a: árbol/archivo real del ref canónico; archivo/árbol real de ZIP extraído; archivo/árbol real del destino; SHA/blob/tamaño/commit verificable; o prueba reproducible real.
-
-No usar nombre de ZIP, lista aproximada, memoria del chat, inferencia ni salida truncada para afirmar existencia/equivalencia.
-
-## PLAN MAESTRO — LOOP/BÚCLE PARALELO
-Cada lote debe terminar todas sus subtareas planificadas antes de emitir la salida del lote. La siguiente salida debe planificarse con 3–5 tareas independientes en paralelo. `100%` solo con evidencia.
-
-### T01 — BASELINE GITHUB
-Branch, tip, árbol y documentos de control. Registrar commit/SHA. Gate: estado reproducible.
-
-### T02 — XRAY REPO
-Inventario completo, clasificación y duplicados. Salida: `FORENSIC-INVENTORY`.
-
-### T03 — AUDITORÍA ZIP
-Para cada ZIP: ruta, tamaño, blob SHA, adquisición real, SHA-256, listado, envoltura, extracción, árbol relativo y artefactos. Salidas: `ZIP-MANIFEST`, `ZIP-XRAY-MATRIX`, `ZIP-EXTRACTION-MANIFEST`.
-
-### T04 — ZIP↔ZIP
-Comparar rutas, hashes, tamaños, subconjuntos, duplicados y piezas complementarias. Salidas: `ZIP-CROSS-COMPARISON`, `DUPLICATE-REPORT`.
-
-### T05 — ÁRBOL CANÓNICO
-Obtener el árbol exacto del ref fijado; separar blobs/trees/modes. Salida: `OPENCLAW-CANONICAL-TREE`.
-
-### T06 — CANÓNICO↔CANDIDATOS
-Para cada archivo candidato: ruta exacta, tipo/mode, tamaño, blob SHA si aplica, y clasificación MATCH/MISSING/EXTRA/MODIFIED/DUPLICATE/UNKNOWN. Hallazgos actuales: `package.json` MODIFIED, `node-version.mjs` MISSING, `npm-shrinkwrap.json` EXTRA, `pnpm-workspace.yaml` MODIFIED, `README.md` MODIFIED. Salida: `ROOT-DIFF-MATRIX`.
-
-### T07 — MULTI-AGENT ROOTS
-Mantener `ROOTS/` fuera de documentación/control y reservar `ROOTS/openclaw/`, `ROOTS/<agente-02>/`, etc. No mezclar árboles. No mover la raíz actual hasta completar T06/T08.
-
-### T08 — MANIFIESTO OPENCLAW
-Ruta canónica → ruta ZIP → ruta destino `ROOTS/openclaw/...` → SHA/tamaño → acción KEEP/COPY/MERGE/EXCLUDE/REPAIR → evidencia. Gate obligatorio antes de publicar.
-
-### T09 — BUILD TEMPORAL
-Construir `ROOTS/openclaw/` en workspace temporal conservando rutas relativas y excluyendo dependencias/artefactos generados.
-
-### T10 — LOCAL VERIFY
-Conteos, rutas, tamaños, SHA-256, anchors, `git diff --check` y pruebas mínimas. PASS requerido para publicar.
-
-### T11 — PUBLISH
-Publicar por familias/lotes con commit y cursor registrados. No regenerar desde LLM.
-
-### T12 — REMOTE READ-BACK
-Releer GitHub después de cada lote; comparar ruta/tamaño/blob/commit. Fallo = REPAIR, no DONE.
-
-### T13 — OPENCLAW BOOT VERIFY
-Después de persistencia: validar workspace, instalar dependencias solo temporalmente y ejecutar procedimiento oficial disponible. Registrar PASS/FAIL real.
-
-### T14 — FORENSIC XRAY FINAL
-Cruce independiente: CANÓNICO ↔ ZIP EXTRAÍDO ↔ MANIFIESTO ↔ `ROOTS/openclaw` ↔ GITHUB READ-BACK. Dominios METHOD/REQUIREMENTS/TRACEABILITY/SOURCE/ZIP/ROOT/INTEGRITY/PUBLISH/REMOTE/TESTS/DOCS/NO_UNAUTHORIZED.
-
-### T15 — MULTI-ROOT AUDIT
-Confirmar aislamiento de OpenClaw, espacio para otros agentes, documentación fuera de roots y ausencia de duplicados accidentales.
-
-### T16 — COMPLETION RECORD
-DONE solo si T01–T15 tienen evidencia y read-back. Registrar task_id, objetivo, fuentes, outputs, paths, commits, SHA, verdict y next_task.
-
-## FORMATO OBLIGATORIO DE SALIDA
-```text
-Tarea en curso: Txx — <nombre>
-Total de tareas: 16
-Tareas terminadas al 100%: <lista + evidencia>
-Tareas pendientes: <lista>
-Siguiente tarea: <Txx + 3–5 subtareas paralelas>
-Confirmación de tarea terminada al 100%: SÍ/NO — evidencia real
-Bloqueos/reparación: <evidencia>
-```
-
-## LOOP / NO-STOP
-Mientras haya tareas pendientes, continuar con el siguiente lote disponible. Fallo de herramienta → registrar → inspeccionar estado → cambiar mecanismo tras dos fallos iguales → reintentar determinísticamente. Si un bloqueo externo impide una subtarea, marcar `BLOCKED` con evidencia, continuar las subtareas independientes y no inventar `DONE`.
-
-## ESTADO DEL CICLO ACTUAL
-- T01/T02: baseline/inventario inicial disponibles; clasificación detallada sigue abierta.
-- T05: árbol canónico consultado y se confirmó que es un árbol grande; la vista de herramienta puede truncarse, por lo que se harán consultas directas de rutas críticas.
-- T06: cinco discrepancias confirmadas (`package.json`, `node-version.mjs`, `npm-shrinkwrap.json`, `pnpm-workspace.yaml`, `README.md`).
-- T07: `ROOTS/README.md` creado y verificado; layout reservado, auditoría final pendiente.
-- T03/T04: bloqueados parcialmente por la limitación actual para obtener los bytes binarios de los ZIP del repositorio mediante el conector. No se declara descarga/extracción.
-- `FORENSIC-CROSSCHECK-OPENCLAW.md` actualizado y leído de vuelta en commit `fcd2b3f2e631d0f8baaf07c6df2d0b8aa5faf4cc`.
-
-## SIGUIENTE LOTE PARA LOOP — 5 TAREAS EN PARALELO
-1. **T03-A — ZIP acquisition:** investigar y probar un segundo mecanismo verificable para adquirir los bytes reales de los 8 ZIP, sin afirmar éxito hasta disponer de un archivo utilizable.
-2. **T04-B — ZIP metadata:** completar tabla de blobs/tamaños/rutas de los 8 ZIP y confirmar todos los duplicados posibles sin extracción.
-3. **T06-C — root cross-check:** verificar directamente 3–5 archivos raíz canónicos adicionales y sus equivalentes actuales, registrando MATCH/MISSING/EXTRA/MODIFIED.
-4. **T07-D — multi-root audit:** releer `ROOTS/` y comprobar que ningún archivo OpenClaw actual se haya movido todavía y que las raíces futuras estén aisladas.
-5. **T08-E — manifest design:** preparar la estructura del manifiesto `OPENCLAW-ROOT-MANIFEST` sin rellenar rutas no verificadas; incluir fuente, ruta relativa, blob/SHA, tamaño y acción.
-
-## REGLA FINAL
-La última salida del proyecto debe contener la verificación cruzada completa y la auditoría forense XRAY final. Una afirmación del asistente nunca sustituye evidencia.
+## Regla final
+No DONE hasta completar T01–T15 con evidencia, publicación, read-back, verificación cruzada y auditoría forense XRAY. Si una subtarea está bloqueada, continuar tareas independientes y registrar BLOCKED; nunca inventar DONE.
