@@ -1,0 +1,62 @@
+{
+  "run_id": 32529275113,
+  "status": "in_progress",
+  "artifacts": [
+    {
+      "id": 9463285201,
+      "name": "acr-zip5-extracted",
+      "size_in_bytes": 16803726,
+      "expired": false,
+      "archive_download_url": "https://api.github.com/repos/maxbry123-commits/Agentes-motores-Wordflow-YAIWES/actions/artifacts/9463285201/zip"
+    },
+    {
+      "id": 9463283012,
+      "name": "acr-zip8-extracted",
+      "size_in_bytes": 3727935,
+      "expired": false,
+      "archive_download_url": "https://api.github.com/repos/maxbry123-commits/Agentes-motores-Wordflow-YAIWES/actions/artifacts/9463283012/zip"
+    },
+    {
+      "id": 9463282609,
+      "name": "acr-zip9-extracted",
+      "size_in_bytes": 7373710,
+      "expired": false,
+      "archive_download_url": "https://api.github.com/repos/maxbry123-commits/Agentes-motores-Wordflow-YAIWES/actions/artifacts/9463282609/zip"
+    },
+    {
+      "id": 9463282580,
+      "name": "acr-zip6-extracted",
+      "size_in_bytes": 10044463,
+      "expired": false,
+      "archive_download_url": "https://api.github.com/repos/maxbry123-commits/Agentes-motores-Wordflow-YAIWES/actions/artifacts/9463282580/zip"
+    },
+    {
+      "id": 9463282499,
+      "name": "acr-zip1-extracted",
+      "size_in_bytes": 14354121,
+      "expired": false,
+      "archive_download_url": "https://api.github.com/repos/maxbry123-commits/Agentes-motores-Wordflow-YAIWES/actions/artifacts/9463282499/zip"
+    },
+    {
+      "id": 9463282194,
+      "name": "acr-zip4-extracted",
+      "size_in_bytes": 14354098,
+      "expired": false,
+      "archive_download_url": "https://api.github.com/repos/maxbry123-commits/Agentes-motores-Wordflow-YAIWES/actions/artifacts/9463282194/zip"
+    },
+    {
+      "id": 9463282058,
+      "name": "acr-zip7-extracted",
+      "size_in_bytes": 2450449,
+      "expired": false,
+      "archive_download_url": "https://api.github.com/repos/maxbry123-commits/Agentes-motores-Wordflow-YAIWES/actions/artifacts/9463282058/zip"
+    },
+    {
+      "id": 9463281605,
+      "name": "acr-zip51-extracted",
+      "size_in_bytes": 10036168,
+      "expired": false,
+      "archive_download_url": "https://api.github.com/repos/maxbry123-commits/Agentes-motores-Wordflow-YAIWES/actions/artifacts/9463281605/zip"
+    }
+  ]
+}
