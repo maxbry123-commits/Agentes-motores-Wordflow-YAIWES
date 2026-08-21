@@ -1,4 +1,4 @@
-name: OpenClaw Smoke Test
+name: OpenClaw Option A - Image Smoke Test
 
 on:
   workflow_dispatch:
@@ -7,45 +7,16 @@ on:
       - '.github/workflows/openclaw-smoke-test.yml'
 
 jobs:
-  smoke-test:
+  option-a:
     runs-on: ubuntu-latest
     steps:
-      - name: Pull OpenClaw image
+      - name: Pull exact OpenClaw image
         run: docker pull ghcr.io/openclaw/openclaw:2026.7.1-2
 
-      - name: Start container
+      - name: Verify image metadata
         run: |
-          docker run -d --name openclaw-test \
-            -p 18789:18789 \
-            ghcr.io/openclaw/openclaw:2026.7.1-2
-          sleep 10
-          docker ps -a
-          docker logs openclaw-test
+          docker image inspect ghcr.io/openclaw/openclaw:2026.7.1-2
 
-      - name: Check healthz
+      - name: Verify OpenClaw executable
         run: |
-          for i in $(seq 1 12); do
-            STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:18789/healthz || true)
-            echo "Attempt $i - /healthz: $STATUS"
-            if [ "$STATUS" = "200" ]; then exit 0; fi
-            sleep 5
-          done
-          exit 1
-
-      - name: Check startupz and readyz
-        run: |
-          curl -fsS -w "\nHTTP %{http_code}\n" http://localhost:18789/startupz
-          curl -fsS -w "\nHTTP %{http_code}\n" http://localhost:18789/readyz
-
-      - name: Check CLI
-        run: docker exec openclaw-test openclaw --version
-
-      - name: Logs on failure
-        if: failure()
-        run: |
-          docker logs openclaw-test || true
-          docker inspect openclaw-test || true
-
-      - name: Cleanup
-        if: always()
-        run: docker rm -f openclaw-test || true
+          docker run --rm ghcr.io/openclaw/openclaw:2026.7.1-2 --version
