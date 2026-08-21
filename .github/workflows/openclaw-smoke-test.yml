@@ -1,38 +1,51 @@
-name: OpenClaw smoke test
+name: OpenClaw Smoke Test
 
 on:
   workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/openclaw-smoke-test.yml'
 
 jobs:
-  smoke:
+  smoke-test:
     runs-on: ubuntu-latest
     steps:
-      - name: Pull official OpenClaw image
+      - name: Pull OpenClaw image
         run: docker pull ghcr.io/openclaw/openclaw:2026.7.1-2
 
-      - name: Start OpenClaw container
-        run: docker run -d --name openclaw-smoke -p 18789:18789 -e OPENCLAW_GATEWAY_BIND=lan ghcr.io/openclaw/openclaw:2026.7.1-2
-
-      - name: Wait for liveness
+      - name: Start container
         run: |
-          for i in {1..30}; do
-            if curl -fsS http://127.0.0.1:18789/healthz; then exit 0; fi
-            sleep 2
+          docker run -d --name openclaw-test \
+            -p 18789:18789 \
+            ghcr.io/openclaw/openclaw:2026.7.1-2
+          sleep 10
+          docker ps -a
+          docker logs openclaw-test
+
+      - name: Check healthz
+        run: |
+          for i in $(seq 1 12); do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:18789/healthz || true)
+            echo "Attempt $i - /healthz: $STATUS"
+            if [ "$STATUS" = "200" ]; then exit 0; fi
+            sleep 5
           done
-          docker logs openclaw-smoke
           exit 1
 
-      - name: Check startup
-        run: curl -fsS http://127.0.0.1:18789/startupz
+      - name: Check startupz and readyz
+        run: |
+          curl -fsS -w "\nHTTP %{http_code}\n" http://localhost:18789/startupz
+          curl -fsS -w "\nHTTP %{http_code}\n" http://localhost:18789/readyz
 
-      - name: Show container status
-        if: always()
-        run: docker ps -a --filter name=openclaw-smoke
+      - name: Check CLI
+        run: docker exec openclaw-test openclaw --version
 
-      - name: Show logs on failure
+      - name: Logs on failure
         if: failure()
-        run: docker logs openclaw-smoke
+        run: |
+          docker logs openclaw-test || true
+          docker inspect openclaw-test || true
 
       - name: Cleanup
         if: always()
-        run: docker rm -f openclaw-smoke || true
+        run: docker rm -f openclaw-test || true
