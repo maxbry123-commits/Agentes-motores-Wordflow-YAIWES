@@ -31,23 +31,33 @@ GitHub es la verdad persistente; sandbox es temporal; HTTP 200 no basta; toda pu
 ## Archivos de control creados/actualizados
 - `FORENSIC-CROSSCHECK-OPENCLAW.md` actualizado en commit `dbcbeecaaa2f69ebbd73da3386a0566e56c25f79`.
 - `OPENCLAW-ROOT-MANIFEST.md` creado como borrador de evidencia en commit `f7c6e450ef158367f527512dffef7fd9469553eb`.
+- `.github/workflows/acr-zip-xray.yml` creado y posteriormente reparado para extraer los 8 ZIP en jobs paralelos, validar ZIP, generar SHA-256/manifiestos y subir artefactos; último commit del workflow `39e983ffc38aded79359f2653a7323868ef6ab42`.
+- `ACR-LOOP-TRIGGER.md` usado para provocar un push posterior al workflow; último commit `71e9c2f90e44172f90e7a7d6d49fb0c65ad21b3e`.
 
 ## Plan T01–T16
 T01 baseline; T02 XRAY repo; T03 auditoría ZIP; T04 ZIP↔ZIP; T05 árbol canónico; T06 canónico↔candidatos; T07 multi-agent ROOTS; T08 manifiesto; T09 build temporal; T10 local verify; T11 publish; T12 remote read-back; T13 boot verify; T14 XRAY final; T15 multi-root audit; T16 completion record.
 
-## Lote ejecutado en este LOOP
-- T03-A: revalidado estado de adquisición; sigue bloqueado, sin falsa extracción.
-- T04-B: revalidado inventario de 8 ZIP y duplicado ZIP1=ZIP4.
-- T06-C: ampliada matriz con `LICENSE`, `THIRD_PARTY_NOTICES.md` y `openclaw.mjs`.
-- T07-D: releído `ROOTS/README.md`; aislamiento confirmado.
-- T08-E: creado `OPENCLAW-ROOT-MANIFEST.md` con esquema y entradas solo verificadas.
+## Lote LOOP actual — 5 líneas en paralelo
+- T03-A: se cambió de mecanismo: se creó workflow GitHub Actions para que GitHub Runner tenga acceso directo a los ZIP grandes, ejecute `unzip -t`, extraiga preservando rutas relativas y genere SHA-256/manifiestos. Evidencia: `.github/workflows/acr-zip-xray.yml`.
+- T04-B: el workflow usa matriz de 8 ZIPs con `fail-fast:false`; los 8 quedan preparados para extracción independiente y paralela.
+- T06-C: el workflow no declara ningún ZIP como canónico; solo valida/extracción. La comparación contra el ref oficial sigue siendo gate posterior.
+- T08-D: se añadió un agregador que descarga los artefactos, genera `ARTIFACT-INDEX.json` y `RUN-<run_id>.md`, y persiste evidencia bajo `FORENSIC-ZIP/` con `[skip ci]`.
+- T10-E: el pipeline de extracción genera checks locales: tamaño, `unzip -t`, conteo de archivos/directorios, lista de rutas y SHA-256 por archivo.
+
+## Resultado de este lote
+- Workflow creado: CONFIRMADO por read-back en GitHub.
+- Workflow reparado: CONFIRMADO por read-back del commit.
+- Trigger de push: CONFIRMADO por commit.
+- `fetch_commit_workflow_runs` para el commit de trigger devuelve lista vacía; esta herramienta solo expone runs asociados a PR según su contrato. No se interpreta como prueba de que Actions no ejecutó.
+- `FORENSIC-ZIP/` todavía no aparece en GitHub; por tanto la ejecución/extracción real NO está confirmada todavía.
+- No se ha movido ni sobrescrito ningún archivo de OpenClaw a `ROOTS/openclaw/`.
 
 ## Próximo lote — 5 tareas paralelas
-1. T03-A: probar mecanismo reproducible alternativo para obtener bytes ZIP reales.
-2. T04-B: completar tabla ZIP con todos los blobs/tamaños y buscar duplicados restantes.
-3. T06-C: verificar 3–5 archivos/directorios raíz adicionales mediante consultas directas no truncadas.
-4. T08-D: ampliar `OPENCLAW-ROOT-MANIFEST.md` únicamente con evidencia nueva.
-5. T10-E: diseñar checks locales de conteo/rutas/SHA sin construir todavía la raíz final.
+1. T03-A: buscar evidencia de ejecución del workflow mediante mecanismos GitHub disponibles y, si aparece, recuperar los artifact IDs.
+2. T04-B: leer `ACR-RECOVERY-PATCH-ZIP.md` y contrastar sus requisitos con el workflow de extracción recién creado.
+3. T06-C: ampliar la comparación canónico↔repo con 5 rutas raíz adicionales, usando consultas directas no truncadas.
+4. T08-D: preparar el manifiesto para incorporar automáticamente los manifests extraídos cuando GitHub los publique.
+5. T10-E: preparar el esquema de auditoría SHA/ruta/conteo para comparar cada ZIP extraído contra el ref canónico.
 
 ## Formato obligatorio
 Tarea en curso / Total de tareas / Tareas terminadas al 100% / Tareas pendientes / Siguiente tarea con 3–5 subtareas paralelas / Confirmación 100% / Bloqueos-reparación.
