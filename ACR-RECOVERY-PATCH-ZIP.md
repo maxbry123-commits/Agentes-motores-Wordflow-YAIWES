@@ -8,10 +8,17 @@
 - No borrar ni modificar `ACR/`, la bitácora ni este parche durante la operación.
 
 ## 2. Descarga oficial del ZIP
-GitHub documenta `GET /repos/{owner}/{repo}/zipball/{ref}` para descargar un archivo ZIP del repositorio. El endpoint responde `302 Found`; el cliente debe seguir `Location`. Para un repositorio público no se requiere autenticación. Se recomienda `Accept: application/vnd.github+json` y se puede usar `curl -L`, JavaScript o GitHub CLI.
+GitHub documenta `GET /repos/{owner}/{repo}/zipball/{ref}` para descargar un ZIP del repositorio. El endpoint responde `302 Found`; el cliente debe seguir `Location`. Para un repositorio público no se requiere autenticación. Se puede usar `curl -L`, JavaScript o GitHub CLI.
 
-Ejemplo conceptual:
+Ejemplo:
 `curl -L -H "Accept: application/vnd.github+json" https://api.github.com/repos/openclaw/openclaw/zipball/a4178c7eb15a0dd2b8b44804348e256f1a109a34 -o openclaw-a4178c7.zip`
+
+### Solución de transferencia cuando el conector no puede guardar el ZIP
+- No sustituir el ref exacto por `main`, un tag o una release.
+- Ejecutar la descarga en un entorno con capacidad de seguir HTTP `302` y guardar bytes binarios (`curl -L`, GitHub CLI o un cliente HTTP equivalente).
+- Después de guardar el ZIP, calcular su hash y tamaño antes de extraerlo.
+- El archivo descargado debe quedar disponible para el paso de extracción; no declarar la descarga completada si no existe el ZIP real.
+- Los ZIP de Source code de una release sólo pueden usarse si se verifica que corresponden exactamente al ref SHA requerido; de lo contrario no son sustitutos.
 
 ## 3. Preparación del destino
 - Eliminar únicamente los archivos OpenClaw creados previamente por este proceso.
@@ -23,7 +30,7 @@ Ejemplo conceptual:
 - Extraer el ZIP.
 - Desplegar su contenido en la raíz del repositorio de recuperación.
 - Mantener exactamente las rutas relativas.
-- Mantener symlinks como symlinks; GitHub indica que los symlinks tienen tratamiento especial en Contents API.
+- Mantener symlinks como symlinks.
 
 ## 5. Verificación
 - Verificar que el ZIP se descargó completo.
@@ -44,3 +51,8 @@ Ejemplo conceptual:
 ## 8. Estado
 ZIP = única fuente de archivos OpenClaw.
 ACR = evidencia/instrumentación, no fuente alternativa de copia.
+
+## 9. Incidencia de transferencia investigada
+- El conector GitHub disponible en esta sesión no puede seguir/guardar directamente el binario devuelto por el `zipball` (`302` → `Location`).
+- La solución integral es realizar la transferencia en un entorno con descarga HTTP binaria y seguimiento de redirecciones, conservar el ZIP real, verificar hash/tamaño y continuar inmediatamente con extracción y despliegue.
+- Esta limitación del entorno no debe registrarse como una descarga exitosa.
