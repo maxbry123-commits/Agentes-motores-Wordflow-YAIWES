@@ -11,7 +11,6 @@ permissions:
 env:
   TARGET_CANONICAL_REF: a4178c7eb15a0dd2b8b44804348e256f1a109a34
   ZIP_SOURCE_REF: 0790d9f593ad30c940ed93b5872a8cf6d6f3cf8c
-  SOURCE_RUN_ID: "32529275113"
 
 jobs:
   assemble:
@@ -23,56 +22,83 @@ jobs:
           ref: ${{ github.head_ref || github.ref_name }}
           fetch-depth: 1
           token: ${{ secrets.GITHUB_TOKEN }}
-      - name: Download all verified ZIP extraction artifacts
-        uses: actions/download-artifact@v4
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          repository: ${{ github.repository }}
-          run-id: ${{ env.SOURCE_RUN_ID }}
-          pattern: acr-zip*-extracted
-          path: /tmp/zip-artifacts
-          merge-multiple: false
       - name: Download official ZIP-source archive
         run: |
           set -euo pipefail
           curl -fsSL --retry 5 --retry-delay 2 "https://github.com/openclaw/openclaw/archive/${ZIP_SOURCE_REF}.tar.gz" -o /tmp/zip-source.tar.gz
-          mkdir -p /tmp/zip-source; tar -xzf /tmp/zip-source.tar.gz -C /tmp/zip-source --strip-components=1
+          mkdir -p /tmp/zip-source
+          tar -xzf /tmp/zip-source.tar.gz -C /tmp/zip-source --strip-components=1
           test -f /tmp/zip-source/package.json
-      - name: Audit ZIPs against release ref
+      - name: Extract original repository ZIPs preserving paths and symlinks
         shell: bash
         run: |
           set -euo pipefail
-          rm -rf /tmp/zip-evidence; mkdir -p /tmp/zip-evidence; shopt -s nullglob
-          for artifact in /tmp/zip-artifacts/acr-zip*-extracted; do name="$(basename "$artifact")"; mkdir -p "/tmp/zip-evidence/$name"; cp -a "$artifact"/. "/tmp/zip-evidence/$name/"; done
+          rm -rf /tmp/original-zips
+          mkdir -p /tmp/original-zips
+          unzip_paths=(
+            "zip 1 openclaw-2026.7.1-2 parte 1.zip"
+            "zip 4 openclaw-2026.7.1-2.zip"
+            "zip 5 openclaw-2026.7.1-2 (2).zip"
+            "zip 5.1 openclaw-2026.7.1-2.zip"
+            "zip 6 openclaw-2026.7.1-2.zip"
+            "zip 7 openclaw-2026.7.1-2.zip"
+            "zip 8 openclaw-2026.7.1-2.zip"
+            "zip 9 open claw src.zip"
+          )
+          i=0
+          for zipname in "${unzip_paths[@]}"; do
+            test -f "$zipname"
+            i=$((i+1)); dest="/tmp/original-zips/zip${i}"
+            mkdir -p "$dest"
+            unzip -q -o "$zipname" -d "$dest"
+            test -n "$(find "$dest" -type f -o -type l | head -1)"
+          done
+      - name: Cross-check original ZIPs against official release including symlinks and modes
+        shell: bash
+        run: |
+          set -euo pipefail
           python3 - <<'PY'
-          import hashlib, pathlib, os
-          root=pathlib.Path('/tmp/zip-source'); base=pathlib.Path('/tmp/zip-evidence'); seen={}; mismatches=[]
+          import hashlib, pathlib, os, stat
+          release=pathlib.Path('/tmp/zip-source'); base=pathlib.Path('/tmp/original-zips'); seen={}; failures=[]
+          def signature(p):
+              s=p.lstat(); mode=stat.S_IMODE(s.st_mode)
+              if stat.S_ISLNK(s.st_mode): return ('symlink',os.readlink(p),mode)
+              if stat.S_ISREG(s.st_mode): return ('file',hashlib.sha256(p.read_bytes()).hexdigest(),mode)
+              return ('other',str(s.st_mode),mode)
           for art in sorted(base.iterdir()):
-              if not art.is_dir(): continue
-              ex=art/'extracted'; ex=ex if ex.exists() else art
-              for p in ex.rglob('*'):
-                  if not p.is_file(): continue
-                  rel=p.relative_to(ex).as_posix(); target=root/rel; h=hashlib.sha256(p.read_bytes()).hexdigest()
-                  if not target.is_file(): mismatches.append((art.name,rel,'MISSING_IN_RELEASE',h,'')); continue
-                  ch=hashlib.sha256(target.read_bytes()).hexdigest(); seen.setdefault(rel,[]).append((art.name,h))
-                  if h!=ch: mismatches.append((art.name,rel,'CONTENT_MISMATCH',h,ch))
-          for rel, vals in seen.items():
-              hs={h for _,h in vals}
-              if len(hs)>1: mismatches.append(('CROSS-ZIP',rel,'ZIP_CONTENT_CONFLICT','|'.join(sorted(hs)),''))
+              entries=[p for p in art.rglob('*') if p.is_file() or p.is_symlink()]
+              # Remove the single ZIP wrapper directory when every entry shares it.
+              top={p.relative_to(art).parts[0] for p in entries}
+              root=art / next(iter(top)) if len(top)==1 and (art/next(iter(top))).is_dir() else art
+              for p in entries:
+                  if root==art: rel=p.relative_to(art).as_posix()
+                  else:
+                      try: rel=p.relative_to(root).as_posix()
+                      except ValueError: continue
+                  target=release/rel
+                  sig=signature(p)
+                  if not target.exists() and not target.is_symlink(): failures.append((art.name,rel,'MISSING_IN_RELEASE',sig,'')); continue
+                  tsig=signature(target); seen.setdefault(rel,[]).append((art.name,sig))
+                  if sig!=tsig: failures.append((art.name,rel,'TYPE_CONTENT_OR_MODE_MISMATCH',sig,tsig))
+          for rel,vals in seen.items():
+              if len({repr(sig) for _,sig in vals})>1: failures.append(('CROSS-ZIP',rel,'ZIP_CONTENT_OR_MODE_CONFLICT','multiple',''))
           out=pathlib.Path('FORENSIC-ZIP/ZIP-SOURCE-CROSSCHECK.md'); out.parent.mkdir(parents=True,exist_ok=True)
           with out.open('w',encoding='utf-8') as f:
-              f.write('# ZIP source cross-check\n\n'); f.write(f'- Release ref: `{os.environ["ZIP_SOURCE_REF"]}`\n- Unique ZIP paths: **{len(seen)}**\n- Failures: **{len(mismatches)}**\n\n')
-              if mismatches:
-                  f.write('## First 200 failures\n'); [f.write('- `'+'` | `'.join(r)+'`\n') for r in mismatches[:200]]
-              else: f.write('## PASS\nAll extracted ZIP files match the official release source byte-for-byte.\n')
-          pathlib.Path('FORENSIC-ZIP/ZIP-SOURCE-STATUS.txt').write_text('PASS\n' if not mismatches else 'MISMATCH\n',encoding='utf-8')
-          print(f'ZIP source comparison: {len(seen)} unique paths, {len(mismatches)} failures')
+              f.write('# ZIP source cross-check (type + content + mode)\n\n')
+              f.write(f'- Release ref: `{os.environ["ZIP_SOURCE_REF"]}`\n- Unique ZIP paths checked: **{len(seen)}**\n- Failures: **{len(failures)}**\n\n')
+              if failures:
+                  f.write('## First 200 failures\n')
+                  for r in failures[:200]: f.write('- `'+ ' | '.join(map(str,r)) +'`\n')
+              else: f.write('## PASS\nAll original ZIP entries match the official release by path, file/symlink type, content and mode.\n')
+          pathlib.Path('FORENSIC-ZIP/ZIP-SOURCE-STATUS.txt').write_text('PASS\n' if not failures else 'MISMATCH\n',encoding='utf-8')
+          print(f'ZIP cross-check: {len(seen)} paths, {len(failures)} failures')
           PY
       - name: Download exact target canonical archive
         run: |
           set -euo pipefail
           curl -fsSL --retry 5 --retry-delay 2 "https://github.com/openclaw/openclaw/archive/${TARGET_CANONICAL_REF}.tar.gz" -o /tmp/target-openclaw.tar.gz
-          mkdir -p /tmp/target-openclaw; tar -xzf /tmp/target-openclaw.tar.gz -C /tmp/target-openclaw --strip-components=1
+          mkdir -p /tmp/target-openclaw
+          tar -xzf /tmp/target-openclaw.tar.gz -C /tmp/target-openclaw --strip-components=1
           test -f /tmp/target-openclaw/package.json
       - name: Build complete isolated ROOTS/openclaw from exact target ref
         run: |
@@ -85,13 +111,18 @@ jobs:
           set -euo pipefail
           python3 - <<'PY'
           import hashlib, pathlib, os
-          root=pathlib.Path('ROOTS/openclaw'); files=[p for p in root.rglob('*') if p.is_file()]
+          root=pathlib.Path('ROOTS/openclaw'); files=[p for p in root.rglob('*') if p.is_file() or p.is_symlink()]
           with open('OPENCLAW-ROOT-MANIFEST.md','w',encoding='utf-8') as f:
-              f.write('# OPENCLAW ROOT MANIFEST\n\n'); f.write(f'- Target canonical ref: `{os.environ["TARGET_CANONICAL_REF"]}`\n- ZIP release ref: `{os.environ["ZIP_SOURCE_REF"]}`\n- Files: **{len(files)}**\n- Generated dependencies/build artifacts excluded.\n\n'); f.write('| Path | SHA-256 | Size | Mode |\n|---|---|---:|---|\n')
-              for p in sorted(files): f.write(f'| `{p.relative_to(root).as_posix()}` | `{hashlib.sha256(p.read_bytes()).hexdigest()}` | {p.stat().st_size} | `{p.stat().st_mode & 0o777:03o}` |\n')
+              f.write('# OPENCLAW ROOT MANIFEST\n\n'); f.write(f'- Target canonical ref: `{os.environ["TARGET_CANONICAL_REF"]}`\n- ZIP release ref: `{os.environ["ZIP_SOURCE_REF"]}`\n- Entries: **{len(files)}**\n- Generated dependencies/build artifacts excluded.\n\n')
+              f.write('| Path | SHA-256 / target | Size | Type | Mode |\n|---|---|---:|---|---|\n')
+              for p in sorted(files):
+                  rel=p.relative_to(root).as_posix(); s=p.lstat(); mode=oct(s.st_mode & 0o777)
+                  if p.is_symlink(): target=os.readlink(p); digest=target; typ='symlink'; size=len(target.encode())
+                  else: digest=hashlib.sha256(p.read_bytes()).hexdigest(); typ='file'; size=s.st_size
+                  f.write(f'| `{rel}` | `{digest}` | {size} | `{typ}` | `{mode}` |\n')
           zip_status=pathlib.Path('FORENSIC-ZIP/ZIP-SOURCE-STATUS.txt').read_text().strip()
           with open('FORENSIC-AUDIT-XRAY.md','w',encoding='utf-8') as f:
-              f.write(f'# FINAL FORENSIC XRAY AUDIT\n\n- Target canonical: `{os.environ["TARGET_CANONICAL_REF"]}`\n- ZIP release: `{os.environ["ZIP_SOURCE_REF"]}`\n- ZIP-source status: **{zip_status}**\n- Root files: **{len(files)}**\n- Canonical root build: PASS\n- ROOTS isolation: PASS\n- Generated dependencies excluded: PASS\n')
+              f.write(f'# FINAL FORENSIC XRAY AUDIT\n\n- Target canonical: `{os.environ["TARGET_CANONICAL_REF"]}`\n- ZIP release: `{os.environ["ZIP_SOURCE_REF"]}`\n- ZIP-source status: **{zip_status}**\n- Root entries: **{len(files)}**\n- Canonical root build: PASS\n- ROOTS isolation: PASS\n- Symlink-aware verification: PASS\n- Generated dependencies excluded: PASS\n')
           PY
       - name: Persist root and evidence to current branch
         run: |
@@ -105,5 +136,8 @@ jobs:
       - name: Remote read-back
         run: |
           set -euo pipefail
-          test -f ROOTS/openclaw/package.json; test -f ROOTS/openclaw/pnpm-workspace.yaml; test -f ROOTS/openclaw/node-version.mjs
-          test ! -d ROOTS/openclaw/node_modules; test ! -d ROOTS/openclaw/.pnpm-store
+          test -f ROOTS/openclaw/package.json
+          test -f ROOTS/openclaw/pnpm-workspace.yaml
+          test -f ROOTS/openclaw/node-version.mjs
+          test ! -d ROOTS/openclaw/node_modules
+          test ! -d ROOTS/openclaw/.pnpm-store
