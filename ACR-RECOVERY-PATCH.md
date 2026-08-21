@@ -21,8 +21,14 @@ ACR debe trabajar por **bloques/lotes de archivos** siempre que sea técnicament
 - No contar existencia, contenido parcial o intento de escritura como transferencia completada.
 - Archivos grandes: lote individual o grupo pequeño; segmentar sólo cuando sea necesario.
 
+### Regla de fallback literal
+Si un archivo normal falla dos veces en el método de lote, en lugar de detener el proceso se usa lectura literal/input block del contenido completo, se escribe completo en una salida y en la salida siguiente se vuelve a leer el destino para comprobar tamaño y SHA. Después de `PASS` se continúa con el siguiente lote. No se permite un tercer intento idéntico ni un bucle.
+
 ### Symlinks
-`CLAUDE.md` raíz es `mode=120000`, blob literal `AGENTS.md` (9 caracteres). No copiar el contenido resuelto por Contents API como archivo normal. Si el método Git Tree no está disponible, una copia de contenido puede usarse únicamente como **recuperación provisional explícitamente marcada**, sin falsear que conserva el symlink.
+`CLAUDE.md` raíz es `mode=120000` y su blob Git literal es el objetivo del enlace. Contents API puede resolver el enlace y mostrar el contenido de `AGENTS.md`; eso no debe confundirse con el modo Git. La copia de contenido en `ACR/source/root/CLAUDE.md` queda marcada como recuperación de contenido/provisional hasta verificar el modo `120000` en destino. La estructura Git ideal se conserva con Blob → Tree (`mode=120000`) → Commit → Branch.
+
+### ZIP / artefactos empaquetados
+ACR puede leer un ZIP que haya descargado o generado si los bytes del ZIP están disponibles en el entorno de trabajo. El flujo es: descargar/generar ZIP → conservar bytes → inspeccionar/listar → extraer → auditar archivos → comparar SHA → escribir/verificar. Un ZIP no se considera transferido sólo por existir: sus archivos extraídos también requieren verificación. Para repositorios Git, preferir el árbol Git cuando se necesita conservar modos/symlinks; usar ZIP como transporte cuando simplifique la transferencia.
 
 ## Inventario de raíz confirmado
 `openclaw/openclaw`: **61 entradas = 40 archivos + 21 directorios**.
@@ -36,7 +42,7 @@ ACR debe trabajar por **bloques/lotes de archivos** siempre que sea técnicament
 - Pendientes: 23
 
 ## Incidencia CLAUDE.md
-Contents API resolvía el symlink y mostraba el contenido de `AGENTS.md`. Auditoría Git confirmó `mode=120000`, blob `47dc3e3d863cfb5727b87d785d09abf9743c0a72`, literal `AGENTS.md`. La solución ideal conserva el symlink. Si una limitación de escritura impide crear `120000`, se permite una copia provisional del contenido de `AGENTS.md`, se etiqueta como provisional y el Ledger no debe fingir que el modo es equivalente.
+Contents API resolvía el symlink y mostraba el contenido de `AGENTS.md`. Auditoría Git confirmó el tipo symlink en la fuente. La solución ideal conserva el symlink. Si una limitación de escritura impide crear `120000`, una copia provisional del contenido puede usarse explícitamente marcada, sin afirmar que conserva el modo.
 
 ## Regla de continuidad
 Leer Ledger → parche → mapa de versiones → XRAY → bitácora → inventario fuente↔destino → elegir **bloque obligatorio** desde el primer pendiente → leer/escribir → verificar cada elemento → reconciliar → avanzar cursor.
