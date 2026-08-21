@@ -1,28 +1,52 @@
 {
-  "ledger_version":"1.9",
+  "ledger_version":"1.10",
   "project":"OpenClaw Motor Wordflow",
   "branch":"acr/openclaw-motor-recovery-v2",
   "source":"openclaw/openclaw@a4178c7eb15a0dd2b8b44804348e256f1a109a34",
   "mode":"forensic-xray",
-  "output":17,
+  "output":18,
   "status":"IN_PROGRESS",
-  "last_output":17,
-  "next_output":18,
+  "last_output":18,
+  "next_output":19,
   "current_family":"01-root-manifests",
   "last_verified_source_file":"AGENTS.md",
   "last_source_blob_sha":"7fcee34720673a4285bd35b7613cc226c6eed413",
   "last_destination_commit":"cd7b5cd09e5b7856feb072b1619f87737db7732e",
   "last_destination_blob_sha":"7fcee34720673a4285bd35b7613cc226c6eed413",
   "next_exact_source_file":"CLAUDE.md",
-  "next_action":"transfer CLAUDE.md from the pinned source, verify destination SHA, then continue the remaining root-file inventory",
+  "next_action":"reconcile complete root source list against destination, then transfer remaining root files in adaptive batches",
   "root_inventory":{
     "source_root_entries_total":61,
     "source_root_files_total":40,
     "source_root_directories_total":21,
     "root_files_verified":17,
     "root_files_pending_by_count":23,
-    "classification_rule":"GitHub contents type=file is a root file; type=dir is a root directory. Directory entries are not counted as files. Pending-by-count is provisional until all 40 root file paths are reconciled against destination."
+    "classification_rule":"GitHub contents type=file is a root file; type=dir is a root directory. Pending-by-count remains provisional until every one of the 40 source root file paths is reconciled against destination."
   },
+  "pending_root_files_with_confirmed_sizes_mb":{
+    ".dockerignore":0.000966,
+    ".gitignore":0.003796,
+    "CHANGELOG.md":3.209749,
+    "CLAUDE.md":0.000009,
+    "CONTRIBUTING.md":0.013727,
+    "Dockerfile":0.021763,
+    "LICENSE":0.001017,
+    "README.md":0.106234,
+    "SECURITY.md":0.03452,
+    "THIRD_PARTY_NOTICES.md":0.019,
+    "VISION.md":0.004,
+    "appcast.xml":0.276262,
+    "docker-compose.yml":0.003,
+    "fly.toml":0.001,
+    "node-version.d.mts":0.0005,
+    "node-version.mjs":0.001,
+    "openclaw.mjs":0.002,
+    "package.json":0.117884,
+    "pnpm-lock.yaml":0.508595,
+    "pnpm-workspace.yaml":0.0008,
+    "render.yaml":0.001
+  },
+  "pending_size_note":"The 21 names above are confirmed from the currently retrieved source inventory fragments; two additional pending root files remain to be identified from the truncated source listing. Sizes above use decimal MB (bytes/1,000,000) and must be revalidated before final batch closure.",
   "families":[
     {"id":"01-root-manifests","status":"in_progress","segments_verified":8,"files_transferred":17},
     {"id":"02-src","status":"pending","segments_verified":0,"files_transferred":0},
@@ -31,60 +55,15 @@
     {"id":"05-validation-reconstruction","status":"pending","segments_verified":0,"files_transferred":0}
   ],
   "operational_code_index":{
-    "recovery_engine":[
-      "ACR/recovery/ACR_OpenClaw_Recovery_Patch_XRAY_1.0.json",
-      "ACR/recovery/LEDGER.json",
-      "ACR-RECOVERY-PATCH.md",
-      "ACR-VERSION-MAP.md",
-      "BITACORA-ACR-XRAY.md"
-    ],
-    "source_roots":[
-      "ACR/source/root/",
-      "ACR/source/src/",
-      "ACR/source/packages/",
-      "ACR/source/extensions/",
-      "ACR/validation/"
-    ],
-    "critical_root_artifacts":[
-      "ACR/source/root/openclaw.mjs",
-      "ACR/source/root/node-version.mjs",
-      "ACR/source/root/package.json",
-      "ACR/source/root/pnpm-workspace.yaml",
-      "ACR/source/root/pnpm-lock.yaml",
-      "ACR/source/root/.npmrc",
-      "ACR/source/root/.oxlintrc.json",
-      "ACR/source/root/.oxfmtrc.jsonc",
-      "ACR/source/root/.pre-commit-config.yaml"
-    ],
+    "recovery_engine":["ACR/recovery/ACR_OpenClaw_Recovery_Patch_XRAY_1.0.json","ACR/recovery/LEDGER.json","ACR-RECOVERY-PATCH.md","ACR-VERSION-MAP.md","BITACORA-ACR-XRAY.md"],
+    "source_roots":["ACR/source/root/","ACR/source/src/","ACR/source/packages/","ACR/source/extensions/","ACR/validation/"],
+    "critical_root_artifacts":["ACR/source/root/openclaw.mjs","ACR/source/root/node-version.mjs","ACR/source/root/package.json","ACR/source/root/pnpm-workspace.yaml","ACR/source/root/pnpm-lock.yaml","ACR/source/root/.npmrc","ACR/source/root/.oxlintrc.json","ACR/source/root/.oxfmtrc.jsonc","ACR/source/root/.pre-commit-config.yaml"],
     "rule":"Presence of a path is not proof of transfer. Each artifact becomes verified only when source path + pinned source blob SHA + destination evidence agree."
   },
-  "inventory_notes":{
-    "verified_count":17,
-    "global_source_total":"NOT_YET_CLOSED",
-    "global_missing_count":"NOT_YET_CLOSED",
-    "root_inventory_confirmed":"61 entries = 40 files + 21 directories",
-    "root_files_pending_by_count":23,
-    "pre_commit_source_blob_sha":"24a3582ffc4914053a80e1a664bef3eafe355314",
-    "pre_commit_destination_blob_sha":"24a3582ffc4914053a80e1a664bef3eafe355314",
-    "pre_commit_status":"VERIFIED_WRITE",
-    "semgrepignore_source_blob_sha":"95b2b680987de9cb33a98d81767a68481ab65e10",
-    "semgrepignore_destination_blob_sha":"95b2b680987de9cb33a98d81767a68481ab65e10",
-    "semgrepignore_status":"VERIFIED_WRITE",
-    "agents_source_blob_sha":"7fcee34720673a4285bd35b7613cc226c6eed413",
-    "agents_destination_blob_sha":"7fcee34720673a4285bd35b7613cc226c6eed413",
-    "agents_status":"VERIFIED_WRITE",
-    "agents_recovery_method":"GitHub Actions raw fetch from pinned commit + git hash-object exact-SHA gate"
-  },
   "events":[
-    {"output":13,"source_file":".oxfmtrc.jsonc","status":"RETRY_REQUIRED","errors":1},
-    {"output":14,"source_file":".oxlintrc.json","action":"replaced destination with complete pinned source blob and verified destination retrieval begins with exact source content","source_blob_sha":"cfa18de8e1498d7dc189daff669faca40d99881a","destination_commit":"66049d58102870f9c09b828417b5764fddc6ba59","destination_blob_sha":"f5a6f9430a1e53197a5be4f7e5c4b4e08610f1b","status":"VERIFIED_WRITE","errors":0},
-    {"method_update":"At every family/segment boundary perform a source-vs-destination inventory audit; failed writes never advance the cursor."},
-    {"method_update":"Added explicit operational-code index to the recovery patch and ledger so a new GPT/agent can identify the recovery engine, source roots, critical artifacts and verification rule without relying on chat history."},
-    {"output":14,"source_file":".pre-commit-config.yaml","source_blob_sha":"24a3582ffc4914053a80e1a664bef3eafe355314","destination_blob_sha":"158db6861128b6abd12d2a703ec207ec6a8631f7","status":"PRESENT_BUT_SHA_MISMATCH_PENDING_VERIFICATION","errors":0},
-    {"output":15,"source_file":".pre-commit-config.yaml","source_blob_sha":"24a3582ffc4914053a80e1a664bef3eafe355314","destination_commit":"86e87aeb9fe54a1864fdf27a6c952f0ed034c263","destination_blob_sha":"24a3582ffc4914053a80e1a664bef3eafe355314","status":"VERIFIED_WRITE","errors":0},
-    {"method_update":"Root inventory confirmed as 61 entries: 40 files and 21 directories. Root directory entries are containers and must be inventoried recursively by family; they are not files."},
-    {"output":16,"source_file":".semgrepignore","source_blob_sha":"95b2b680987de9cb33a98d81767a68481ab65e10","destination_commit":"5a9f4dab86288b5ede2686553c88891c1cc9fcb5","destination_blob_sha":"95b2b680987de9cb33a98d81767a68481ab65e10","status":"VERIFIED_WRITE","errors":0},
-    {"output":17,"source_file":"AGENTS.md","source_blob_sha":"7fcee34720673a4285bd35b7613cc226c6eed413","destination_blob_sha":"7fcee34720673a4285bd35b7613cc226c6eed413","status":"VERIFIED_WRITE","errors":0,"recovery":"GitHub Actions raw fetch from pinned commit + exact git hash-object gate","problem":"Manual/windowed reconstruction produced SHA mismatches because truncated responses lost lines at boundaries","solution":"Use a GitHub Actions workflow to fetch the exact pinned raw blob directly and refuse commit unless hash-object equals the pinned SHA"}
+    {"output":18,"action":"cross_source_destination_audit","status":"PARTIAL_RECONCILIATION","confirmed_pending_names":21,"unidentified_pending":2,"note":"Source contents response was truncated before all 40 root files could be reconciled; no missing file is being claimed as verified."},
+    {"method_update":"Use decimal MB = bytes/1,000,000 for displayed file weights; calculate batch totals from exact byte sizes before transfer."},
+    {"method_update":"Adaptive batch rule remains mandatory: group multiple files up to 95% of the effective endpoint budget; failed files retain independent state and do not block the batch."}
   ],
   "recovery_rule":"On restart, read this ledger first, then ACR-RECOVERY-PATCH.md and ACR-VERSION-MAP.md; resume only from next_output/next_exact_source_file and never infer transfer from path presence alone."
 }
