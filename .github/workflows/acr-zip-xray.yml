@@ -1,0 +1,77 @@
+name: ACR ZIP XRAY Extraction
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  extract-zip:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: zip1
+            file: "zip 1 openclaw-2026.7.1-2 parte 1.zip"
+          - id: zip4
+            file: "zip 4 openclaw-2026.7.1-2.zip"
+          - id: zip5
+            file: "zip 5 openclaw-2026.7.1-2 (2).zip"
+          - id: zip51
+            file: "zip 5.1 openclaw-2026.7.1-2.zip"
+          - id: zip6
+            file: "zip 6 openclaw-2026.7.1-2.zip"
+          - id: zip7
+            file: "zip 7 openclaw-2026.7.1-2.zip"
+          - id: zip8
+            file: "zip 8 openclaw-2026.7.1-2.zip"
+          - id: zip9
+            file: "zip 9 open claw src.zip"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Validate archive
+        env:
+          ZIP_FILE: ${{ matrix.file }}
+        run: |
+          set -euo pipefail
+          test -f "$ZIP_FILE"
+          sha256sum "$ZIP_FILE" | tee sha256.txt
+          unzip -t "$ZIP_FILE" | tee unzip-test.txt
+
+      - name: Extract archive preserving relative paths
+        env:
+          ZIP_FILE: ${{ matrix.file }}
+        run: |
+          set -euo pipefail
+          rm -rf extracted
+          mkdir -p extracted
+          unzip -q "$ZIP_FILE" -d extracted
+          find extracted -type f -print0 | sort -z | xargs -0 -r sha256sum > extracted-sha256.txt
+          find extracted -type f | sort > extracted-files.txt
+          find extracted -type d | sort > extracted-dirs.txt
+          printf 'archive=%s\n' "$ZIP_FILE" > manifest.txt
+          printf 'archive_size_bytes=%s\n' "$(stat -c '%s' "$ZIP_FILE")" >> manifest.txt
+          printf 'file_count=%s\n' "$(find extracted -type f | wc -l)" >> manifest.txt
+          printf 'dir_count=%s\n' "$(find extracted -type d | wc -l)" >> manifest.txt
+
+      - name: Upload verified extraction artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: acr-${{ matrix.id }}-extracted
+          path: |
+            extracted
+            manifest.txt
+            sha256.txt
+            unzip-test.txt
+            extracted-sha256.txt
+            extracted-files.txt
+            extracted-dirs.txt
+          if-no-files-found: error
+          retention-days: 7
