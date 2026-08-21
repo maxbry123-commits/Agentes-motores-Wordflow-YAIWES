@@ -24,6 +24,11 @@ GitHub es la verdad persistente; sandbox es temporal; HTTP 200 no basta; toda pu
 6. `LICENSE`: MATCH; canonical y repo comparten blob `ebaebf7c416761a32f932ad70ebe5d1d2e214f68`.
 7. `THIRD_PARTY_NOTICES.md`: MATCH; canonical y repo comparten blob `6b6721901b7590d20774ba0504d975e1be70a57a`.
 8. `openclaw.mjs`: MODIFIED / NO MATCH. Canonical importa `./node-version.mjs` y recomienda Node 26; repo actual contiene implementación distinta y recomienda Node 24. Las respuestas largas están truncadas, pero las diferencias del prefijo son directamente observables.
+9. `pnpm-lock.yaml`: MODIFIED / NO MATCH. Ambos lockfileVersion 9.0, pero el canonical ref tiene overrides/dependencias más recientes y el repo contiene versiones anteriores y un `patchedDependencies` distinto; lectura directa de ambos muestra diferencias materiales.
+10. `Dockerfile`: MODIFIED / NO MATCH. Canonical y repo comparten la arquitectura multi-stage general, pero difieren en digests de imágenes Node/Bun, argumentos y pasos de build/runtime; lectura directa de ambos demuestra divergencia.
+11. `tsconfig.json`: MODIFIED / NO MATCH. Canonical y repo tienen base TypeScript similar, pero canonical incluye un conjunto distinto de aliases y el repo contiene `ScriptHost` y rutas adicionales/anteriores; blobs no se han tratado como equivalentes.
+12. `vitest.config.ts`: MODIFIED / NO MATCH. Canonical blob `0c3c22faa3313065bc69600d15aa41b422a1bc25`; repo blob `8ccea14a99e8ebe43111ef3c0301ebd9890a1469`. El repo exporta además `rootVitestProjects`, ausente en el canonical observado.
+13. `AGENTS.md`: MODIFIED / NO MATCH. Ambos contienen políticas OpenClaw, pero el contenido visible difiere materialmente; no se considera MATCH sin equivalencia de blob/contenido completo.
 
 ## Arquitectura multi-raíz
 `ROOTS/openclaw/` es el destino exclusivo de OpenClaw. Futuras raíces serán hermanas. No mover archivos OpenClaw existentes hasta T06/T08. Documentación, manifiestos y control permanecen fuera de las raíces.
@@ -37,27 +42,26 @@ GitHub es la verdad persistente; sandbox es temporal; HTTP 200 no basta; toda pu
 ## Plan T01–T16
 T01 baseline; T02 XRAY repo; T03 auditoría ZIP; T04 ZIP↔ZIP; T05 árbol canónico; T06 canónico↔candidatos; T07 multi-agent ROOTS; T08 manifiesto; T09 build temporal; T10 local verify; T11 publish; T12 remote read-back; T13 boot verify; T14 XRAY final; T15 multi-root audit; T16 completion record.
 
-## Lote LOOP actual — 5 líneas en paralelo
-- T03-A: se cambió de mecanismo: se creó workflow GitHub Actions para que GitHub Runner tenga acceso directo a los ZIP grandes, ejecute `unzip -t`, extraiga preservando rutas relativas y genere SHA-256/manifiestos. Evidencia: `.github/workflows/acr-zip-xray.yml`.
-- T04-B: el workflow usa matriz de 8 ZIPs con `fail-fast:false`; los 8 quedan preparados para extracción independiente y paralela.
-- T06-C: el workflow no declara ningún ZIP como canónico; solo valida/extracción. La comparación contra el ref oficial sigue siendo gate posterior.
-- T08-D: se añadió un agregador que descarga los artefactos, genera `ARTIFACT-INDEX.json` y `RUN-<run_id>.md`, y persiste evidencia bajo `FORENSIC-ZIP/` con `[skip ci]`.
-- T10-E: el pipeline de extracción genera checks locales: tamaño, `unzip -t`, conteo de archivos/directorios, lista de rutas y SHA-256 por archivo.
+## Lote LOOP ejecutado — 5+ líneas en paralelo
+- T03-A: leída la guía `ACR-RECOVERY-PATCH-ZIP.md`; confirma que el ZIP canónico del ref exacto es fuente única y que la transferencia debe conservar bytes, hash/tamaño y rutas relativas. La guía también confirma que un ZIP no debe marcarse descargado sin existir físicamente. Evidencia: SHA `ebf4d3095dbb44c90b306d22140bf5ac9408d475`.
+- T04-B: revalidada la estrategia GitHub Actions como mecanismo alternativo de transferencia binaria. El workflow valida con `unzip -t`, extrae y produce hashes/listados.
+- T06-C: ampliada la matriz canónico↔repo con `pnpm-lock.yaml`, `Dockerfile`, `tsconfig.json`, `vitest.config.ts` y `AGENTS.md`; todos se clasifican como MODIFIED/NO MATCH salvo los matches previamente demostrados.
+- T08-D: se intentó leer `FORENSIC-ZIP/` después del trigger; todavía devuelve 404. Por tanto no se afirma que el workflow haya terminado ni que los artefactos existan.
+- T10-E: los checks previstos siguen definidos: tamaño, `unzip -t`, conteo, rutas, SHA-256 por archivo y posterior comparación contra el árbol canónico.
 
 ## Resultado de este lote
-- Workflow creado: CONFIRMADO por read-back en GitHub.
-- Workflow reparado: CONFIRMADO por read-back del commit.
-- Trigger de push: CONFIRMADO por commit.
-- `fetch_commit_workflow_runs` para el commit de trigger devuelve lista vacía; esta herramienta solo expone runs asociados a PR según su contrato. No se interpreta como prueba de que Actions no ejecutó.
-- `FORENSIC-ZIP/` todavía no aparece en GitHub; por tanto la ejecución/extracción real NO está confirmada todavía.
+- Guía ZIP: CONFIRMADA por lectura directa.
+- Cinco comparaciones canónico↔repo adicionales: DOCUMENTADAS; no se inventan matches.
+- Workflow de extracción: CONFIGURADO y leído de vuelta; ejecución real todavía NO CONFIRMADA.
+- `FORENSIC-ZIP/`: no visible todavía en GitHub.
 - No se ha movido ni sobrescrito ningún archivo de OpenClaw a `ROOTS/openclaw/`.
 
 ## Próximo lote — 5 tareas paralelas
-1. T03-A: buscar evidencia de ejecución del workflow mediante mecanismos GitHub disponibles y, si aparece, recuperar los artifact IDs.
-2. T04-B: leer `ACR-RECOVERY-PATCH-ZIP.md` y contrastar sus requisitos con el workflow de extracción recién creado.
-3. T06-C: ampliar la comparación canónico↔repo con 5 rutas raíz adicionales, usando consultas directas no truncadas.
-4. T08-D: preparar el manifiesto para incorporar automáticamente los manifests extraídos cuando GitHub los publique.
-5. T10-E: preparar el esquema de auditoría SHA/ruta/conteo para comparar cada ZIP extraído contra el ref canónico.
+1. T03-A: resolver definitivamente la observabilidad/ejecución de GitHub Actions y recuperar evidencia de artifacts si el workflow está ejecutándose.
+2. T04-B: ampliar el manifiesto ZIP con todos los nombres, tamaños y blobs ya conocidos y separar duplicado exacto de candidatos distintos.
+3. T06-C: verificar cinco rutas canónicas adicionales seleccionadas del árbol oficial, incluyendo `node-version.mjs` y cuatro archivos de configuración/raíz.
+4. T08-D: actualizar `OPENCLAW-ROOT-MANIFEST.md` con las nuevas discrepancias y mantener todas las entradas como `PENDING` hasta disponer de extracción.
+5. T10-E: diseñar el comparador final de ruta+modo+SHA que usará los manifests de los ZIP contra el ref canónico antes de cualquier publicación en `ROOTS/openclaw/`.
 
 ## Formato obligatorio
 Tarea en curso / Total de tareas / Tareas terminadas al 100% / Tareas pendientes / Siguiente tarea con 3–5 subtareas paralelas / Confirmación 100% / Bloqueos-reparación.
