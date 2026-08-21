@@ -5,7 +5,7 @@ on:
     branches: [main]
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   extract-zip:
@@ -75,3 +75,69 @@ jobs:
             extracted-dirs.txt
           if-no-files-found: error
           retention-days: 7
+
+  aggregate:
+    if: ${{ always() }}
+    needs: [extract-zip]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Download all extraction artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: acr-*-extracted
+          path: FORENSIC-ZIP/artifacts
+          merge-multiple: false
+
+      - name: Record artifact IDs and extraction status
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const runId = context.runId;
+            const data = await github.rest.actions.listWorkflowRunArtifacts({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: runId,
+              per_page: 100
+            });
+            const rows = data.data.artifacts.map(a => ({
+              id: a.id,
+              name: a.name,
+              size_in_bytes: a.size_in_bytes,
+              expired: a.expired,
+              archive_download_url: a.archive_download_url
+            }));
+            require('fs').mkdirSync('FORENSIC-ZIP', {recursive:true});
+            require('fs').writeFileSync(
+              'FORENSIC-ZIP/ARTIFACT-INDEX.json',
+              JSON.stringify({run_id: runId, status: context.payload.workflow_run?.conclusion ?? 'in_progress', artifacts: rows}, null, 2) + '\n'
+            );
+
+      - name: Build consolidated extraction index
+        run: |
+          set -euo pipefail
+          {
+            echo "# ZIP XRAY EXTRACTION RUN $GITHUB_RUN_ID"
+            echo
+            echo "Commit: $GITHUB_SHA"
+            echo "Workflow: ACR ZIP XRAY Extraction"
+            echo
+            echo "## Artifacts"
+            find FORENSIC-ZIP/artifacts -maxdepth 2 -type f | sort || true
+            echo
+            echo "## Manifests"
+            find FORENSIC-ZIP/artifacts -name manifest.txt -print -exec cat {} \; || true
+          } > FORENSIC-ZIP/RUN-${GITHUB_RUN_ID}.md
+
+      - name: Persist extraction evidence
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add FORENSIC-ZIP
+          git commit -m "chore(acr): persist ZIP XRAY extraction evidence [skip ci]" || exit 0
+          git push
