@@ -1,11 +1,10 @@
 # OPENCLAW ROOT MANIFEST
 
 - Target canonical ref: `a4178c7eb15a0dd2b8b44804348e256f1a109a34`
-- ZIP release ref: `0790d9f593ad30c940ed93b5872a8cf6d6f3cf8c`
 - Entries: **33266**
 - Generated dependencies/build artifacts excluded.
 
-| Path | SHA-256 / target | Size | Type | Mode |
+| Path | Hash/Target | Size | Type | Mode |
 |---|---|---:|---|---|
 | `.acr-canonical-ref` | `f724120d4dfc649e7f42bc0e2dcea42dfd2e60d2f557debaf76ac7f58a93cfc0` | 41 | `file` | `0o644` |
 | `.agents/skills/agent-transcript/SKILL.md` | `9dff41588ca019ca7c48426da630e1fdd644a83e2ffab4b7fefa9ddb3d7a3972` | 4048 | `file` | `0o644` |
