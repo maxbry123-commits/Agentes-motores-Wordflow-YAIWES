@@ -17,13 +17,16 @@ Conservar conocimiento verificable para que otro GPT/agente pueda recuperar y co
 - Repositorio de trabajo: `maxbry123-commits/Agentes-motores-Wordflow-YAIWES`.
 - Rama: `main`.
 - Fuente canónica OpenClaw fijada: `openclaw/openclaw@a4178c7eb15a0dd2b8b44804348e256f1a109a34`.
-- El árbol oficial de ese ref fue consultado mediante GitHub API.
+- El árbol oficial de ese ref fue consultado mediante GitHub API. La respuesta visible del árbol puede truncarse por presupuesto de herramienta; por eso solo se consideran confirmadas las rutas que puedan ser consultadas directamente o estén en una respuesta completa.
 - El repositorio de trabajo es multi-agente/multi-motor; no se debe mezclar OpenClaw con futuras raíces.
 - `ROOTS/README.md` fue creado y verificado en GitHub como reserva estructural para `ROOTS/openclaw/` y futuras raíces independientes.
 - Existe `FORENSIC-INVENTORY-2026-08-21.md` con el inventario inicial.
-- El inventario inicial detectó 8 ZIP; ZIP 1 y ZIP 4 fueron observados con el mismo blob SHA y, por tanto, son duplicados exactos a nivel GitHub.
-- El conector disponible no pudo descargar directamente el ZIP binario del `zipball` oficial; por tanto, la descarga/extracción real NO está marcada como completada.
-- `FORENSIC-CROSSCHECK-OPENCLAW.md` fue creado con la primera matriz de discrepancias verificadas.
+- El inventario inicial detectó 8 ZIP; ZIP 1 y ZIP 4 fueron observados con el mismo blob SHA y tamaño y, por tanto, son duplicados exactos a nivel GitHub.
+- El conector disponible no pudo descargar directamente el ZIP binario grande para extracción; por tanto, la descarga/extracción real NO está marcada como completada.
+- `FORENSIC-CROSSCHECK-OPENCLAW.md` fue ampliado y verificado en GitHub en commit `fcd2b3f2e631d0f8baaf07c6df2d0b8aa5faf4cc`.
+
+## MÉTODO DE TRABAJO VERIFICADO
+La guía persistida en `PIPELINE/00_METODO_TRABAJO_Y_ARQUITECTURA.md` establece: TASK_INTAKE → SANDBOX_BUILD → LOCAL_VERIFY → READY_FOR_PUBLISH → GITHUB_PUBLISH → REMOTE_VERIFY → FORENSIC_AUDIT → DONE. GitHub es la fuente persistente de verdad; sandbox es temporal; HTTP 200 no basta; cada publicación requiere read-back; una afirmación LLM no es evidencia; mismo fallo ×2 obliga a cambiar mecanismo. fileciteturn25file0L2-L2
 
 ## HALLAZGOS DE VERIFICACIÓN CRUZADA CANÓNICO ↔ REPO ACTUAL
 
@@ -40,27 +43,39 @@ Repo actual `main`:
 - autor vacío;
 - contiene `npm-shrinkwrap.json` en `files`.
 
-Veredicto: **MODIFIED / NO MATCH**. No usar este archivo actual como copia canónica.
+Veredicto: **MODIFIED / NO MATCH**. No usar este archivo actual como copia canónica. fileciteturn29file0L2-L2
 
 ### 2. `node-version.mjs`
 - Existe en el ref canónico y fue leído directamente; blob observado `dc7876dd0ce35116aaef535d342647ebb1ad16e7`.
-- No existe en la raíz actual del repositorio de trabajo (`Not Found`).
+- No existe en la raíz actual del repositorio de trabajo.
 
 Veredicto: **MISSING** en el repo actual respecto al ref canónico.
 
 ### 3. `npm-shrinkwrap.json`
-- No existe en el ref canónico fijado (`Not Found`).
+- No existe en el ref canónico fijado.
 - Existe en la raíz actual del repositorio de trabajo.
 
 Veredicto: **EXTRA / NON-CANONICAL** respecto al ref fijado.
 
+### 4. `pnpm-workspace.yaml`
+- Canónico: blob `5ffb3a0e59272237670f60b5448931290d5b9a65`; conserva los globs de workspace `.`/`ui`/`packages/*`/`extensions/*`/`examples/*`, mas contiene una política de dependencias/overrides/allowBuilds diferente.
+- Repo actual: blob `05d3a199ce86c756006b698af705ae45e2855dd3`; conserva esos globs pero difiere en exclusiones, versiones, overrides y contiene `patchedDependencies` no observado en la lectura canónica.
+
+Veredicto: **MODIFIED / NO MATCH**. fileciteturn27file0L2-L6 fileciteturn28file0L2-L6
+
+### 5. `README.md`
+- Canónico: blob `c74989cee8a9c1e8648aa892175de3c9e375bafe`; incluye guía actual de instalación, Node soportado, onboarding y Gateway.
+- Repo actual: blob `c656353ef50013d27756c1717fd2df6e2645c1db`; contenido y estructura textual difieren materialmente.
+
+Veredicto: **MODIFIED / NO MATCH**. fileciteturn30file0L2-L6 fileciteturn31file0L2-L6
+
 ## REGLA DE VERIFICACIÓN CRUZADA — NO ALUCINAR
 Toda afirmación sobre OpenClaw debe poder trazarse a: árbol/archivo real del ref canónico; archivo/árbol real de ZIP extraído; archivo/árbol real del destino; SHA/blob/tamaño/commit verificable; o prueba reproducible real.
 
-No usar nombre de ZIP, lista aproximada, memoria del chat o inferencia para afirmar existencia/equivalencia.
+No usar nombre de ZIP, lista aproximada, memoria del chat, inferencia ni salida truncada para afirmar existencia/equivalencia.
 
 ## PLAN MAESTRO — LOOP/BÚCLE PARALELO
-Cada lote termina todas sus subtareas antes de emitir la salida del lote. Se planifica el siguiente lote con tareas independientes en paralelo. `100%` solo con evidencia.
+Cada lote debe terminar todas sus subtareas planificadas antes de emitir la salida del lote. La siguiente salida debe planificarse con 3–5 tareas independientes en paralelo. `100%` solo con evidencia.
 
 ### T01 — BASELINE GITHUB
 Branch, tip, árbol y documentos de control. Registrar commit/SHA. Gate: estado reproducible.
@@ -69,7 +84,7 @@ Branch, tip, árbol y documentos de control. Registrar commit/SHA. Gate: estado 
 Inventario completo, clasificación y duplicados. Salida: `FORENSIC-INVENTORY`.
 
 ### T03 — AUDITORÍA ZIP
-Para cada ZIP: ruta, tamaño, blob SHA, descarga real, SHA-256, listado, envoltura, extracción, árbol relativo y artefactos. Salidas: `ZIP-MANIFEST`, `ZIP-XRAY-MATRIX`, `ZIP-EXTRACTION-MANIFEST`.
+Para cada ZIP: ruta, tamaño, blob SHA, adquisición real, SHA-256, listado, envoltura, extracción, árbol relativo y artefactos. Salidas: `ZIP-MANIFEST`, `ZIP-XRAY-MATRIX`, `ZIP-EXTRACTION-MANIFEST`.
 
 ### T04 — ZIP↔ZIP
 Comparar rutas, hashes, tamaños, subconjuntos, duplicados y piezas complementarias. Salidas: `ZIP-CROSS-COMPARISON`, `DUPLICATE-REPORT`.
@@ -78,7 +93,7 @@ Comparar rutas, hashes, tamaños, subconjuntos, duplicados y piezas complementar
 Obtener el árbol exacto del ref fijado; separar blobs/trees/modes. Salida: `OPENCLAW-CANONICAL-TREE`.
 
 ### T06 — CANÓNICO↔CANDIDATOS
-Para cada archivo candidato: ruta exacta, tipo/mode, tamaño, blob SHA si aplica, y clasificación MATCH/MISSING/EXTRA/MODIFIED/DUPLICATE/UNKNOWN. Hallazgos actuales: `package.json` MODIFIED/NO MATCH; `node-version.mjs` MISSING; `npm-shrinkwrap.json` EXTRA/NON-CANONICAL. Salida: `ROOT-DIFF-MATRIX`.
+Para cada archivo candidato: ruta exacta, tipo/mode, tamaño, blob SHA si aplica, y clasificación MATCH/MISSING/EXTRA/MODIFIED/DUPLICATE/UNKNOWN. Hallazgos actuales: `package.json` MODIFIED, `node-version.mjs` MISSING, `npm-shrinkwrap.json` EXTRA, `pnpm-workspace.yaml` MODIFIED, `README.md` MODIFIED. Salida: `ROOT-DIFF-MATRIX`.
 
 ### T07 — MULTI-AGENT ROOTS
 Mantener `ROOTS/` fuera de documentación/control y reservar `ROOTS/openclaw/`, `ROOTS/<agente-02>/`, etc. No mezclar árboles. No mover la raíz actual hasta completar T06/T08.
@@ -116,23 +131,28 @@ Tarea en curso: Txx — <nombre>
 Total de tareas: 16
 Tareas terminadas al 100%: <lista + evidencia>
 Tareas pendientes: <lista>
-Siguiente tarea: <Txx + subtareas paralelas>
+Siguiente tarea: <Txx + 3–5 subtareas paralelas>
 Confirmación de tarea terminada al 100%: SÍ/NO — evidencia real
 Bloqueos/reparación: <evidencia>
 ```
 
 ## LOOP / NO-STOP
-Mientras haya tareas pendientes, continuar con el siguiente lote disponible. Fallo de herramienta → registrar → inspeccionar estado → cambiar mecanismo tras dos fallos iguales → reintentar determinísticamente. Si un bloqueo externo impide continuar, marcar `BLOCKED` con evidencia, nunca inventar `DONE`.
+Mientras haya tareas pendientes, continuar con el siguiente lote disponible. Fallo de herramienta → registrar → inspeccionar estado → cambiar mecanismo tras dos fallos iguales → reintentar determinísticamente. Si un bloqueo externo impide una subtarea, marcar `BLOCKED` con evidencia, continuar las subtareas independientes y no inventar `DONE`.
 
 ## ESTADO DEL CICLO ACTUAL
-- Tarea en curso: T03/T04/T06 en paralelo; T05 canónico continúa como referencia.
-- Total: 16.
 - T01/T02: baseline/inventario inicial disponibles; clasificación detallada sigue abierta.
-- T05: árbol canónico consultado.
-- T06: tres hallazgos confirmados (`package.json` MODIFIED, `node-version.mjs` MISSING, `npm-shrinkwrap.json` EXTRA).
+- T05: árbol canónico consultado y se confirmó que es un árbol grande; la vista de herramienta puede truncarse, por lo que se harán consultas directas de rutas críticas.
+- T06: cinco discrepancias confirmadas (`package.json`, `node-version.mjs`, `npm-shrinkwrap.json`, `pnpm-workspace.yaml`, `README.md`).
 - T07: `ROOTS/README.md` creado y verificado; layout reservado, auditoría final pendiente.
 - T03/T04: bloqueados parcialmente por la limitación actual para obtener los bytes binarios de los ZIP del repositorio mediante el conector. No se declara descarga/extracción.
-- Siguiente lote en paralelo: ampliar T06 con más archivos raíz críticos y continuar T03/T04 buscando un mecanismo verificable de adquisición de los ZIP; después construir el manifiesto.
+- `FORENSIC-CROSSCHECK-OPENCLAW.md` actualizado y leído de vuelta en commit `fcd2b3f2e631d0f8baaf07c6df2d0b8aa5faf4cc`.
+
+## SIGUIENTE LOTE PARA LOOP — 5 TAREAS EN PARALELO
+1. **T03-A — ZIP acquisition:** investigar y probar un segundo mecanismo verificable para adquirir los bytes reales de los 8 ZIP, sin afirmar éxito hasta disponer de un archivo utilizable.
+2. **T04-B — ZIP metadata:** completar tabla de blobs/tamaños/rutas de los 8 ZIP y confirmar todos los duplicados posibles sin extracción.
+3. **T06-C — root cross-check:** verificar directamente 3–5 archivos raíz canónicos adicionales y sus equivalentes actuales, registrando MATCH/MISSING/EXTRA/MODIFIED.
+4. **T07-D — multi-root audit:** releer `ROOTS/` y comprobar que ningún archivo OpenClaw actual se haya movido todavía y que las raíces futuras estén aisladas.
+5. **T08-E — manifest design:** preparar la estructura del manifiesto `OPENCLAW-ROOT-MANIFEST` sin rellenar rutas no verificadas; incluir fuente, ruta relativa, blob/SHA, tamaño y acción.
 
 ## REGLA FINAL
 La última salida del proyecto debe contener la verificación cruzada completa y la auditoría forense XRAY final. Una afirmación del asistente nunca sustituye evidencia.
