@@ -1,95 +1,44 @@
 # ACR Recovery Patch — OpenClaw Motor
 
-## Método ACR por lotes adaptativos
-ACR debe intentar primero lotes de varios archivos cuando el tamaño agregado sea seguro para el canal. La integridad nunca es del lote: es **por archivo**.
+## Método ACR por lotes — OBLIGATORIO
+ACR debe trabajar por **bloques/lotes de archivos** siempre que sea técnicamente posible. No volver al flujo de una salida = un archivo salvo una excepción técnica concreta (symlink, binario incompatible, límite de tamaño o fallo individual).
 
-### Reglas operativas
-1. Fijar commit fuente antes de leer.
-2. Inventariar ruta, tamaño, modo Git y SHA fuente antes de agrupar.
-3. Agrupar archivos pequeños/medianos cuando la suma real permanezca dentro del límite efectivo del canal.
-4. Archivos grandes: lote individual o grupo pequeño; segmentar sólo cuando sea necesario.
-5. Cada archivo conserva estado independiente: `PENDING`, `FETCHED`, `WRITTEN`, `VERIFIED`, `FAILED`, `SHA_MISMATCH`.
-6. Un lote sólo queda `VERIFIED` cuando todos sus elementos están individualmente verificados.
-7. Un fallo no invalida elementos ya verificados; reintentar sólo el elemento fallido.
-8. Registrar por archivo: `batch_id`, ruta, bytes, modo, SHA fuente, SHA destino, commit destino, estado y errores.
-9. Después de cada lote, reconciliar fuente↔destino y mover el cursor al primer archivo no verificado.
-10. Nunca contar una ruta existente, contenido parcial o intento de escritura como descarga completada.
-11. Para archivos muy grandes usar segmentos deterministas y reconstruir antes de verificar SHA.
-12. Antes de cerrar una familia, reconciliar rutas, modos y SHA y detectar faltantes/extras.
-13. Si un archivo es un symlink Git (`mode=120000`), no copiar el contenido resuelto por Contents API como archivo normal.
-14. Para symlinks usar Git Tree API: blob = texto literal del destino del enlace; entrada del tree = `mode=120000`, `type=blob`, `sha=<blob>`; conservar el tree existente como `base_tree`.
-15. Verificar symlink con árbol Git: ruta + `mode=120000` + blob de destino. No inferir el tipo por el contenido mostrado por Contents API.
-16. Si falta el SHA del tip/tree de la rama destino, no inventarlo ni crear un tree sin `base_tree`; recuperar el tip mediante una fuente GitHub verificable o usar un workflow con checkout de la rama.
-17. Toda anomalía se registra en bitácora antes de avanzar.
-18. Cada modificación real debe quedar asociada a evidencia de commit/push; un trigger sólo se declara ejecutado cuando existe evidencia de run y resultado.
+### Regla rápida para archivos normales <=100.000 caracteres
+1. Leer el archivo completo.
+2. Escribirlo completo.
+3. En la siguiente salida verificar ruta, tamaño y SHA.
+4. Si falla tras un máximo de 2 intentos, cambiar de estrategia y continuar; nunca entrar en bucle.
+5. El fallo de un archivo no detiene los demás elementos del lote.
 
-## Regla de lectura/escritura rápida — archivos normales <=100.000 caracteres
-Si un archivo fuente es un archivo Git normal (`mode=100644` u otro modo regular), mide **<=100.000 caracteres** y no requiere segmentación, ACR debe intentar una transferencia directa en un máximo de **2 intentos**: lectura completa → escritura completa. No entrar en bucle. En la siguiente salida se verifica bytes/SHA/ruta y, si falla, se registra la causa y se cambia de estrategia (blob directo, lote más pequeño, workflow/checkout o segmentación determinista). Los archivos ya verificados del lote nunca se rehacen sólo porque otro elemento falló.
+### Reglas de lotes
+- Primero inventariar ruta, bytes, modo Git y SHA fuente.
+- Agrupar archivos pequeños/medianos en un bloque seguro por tamaño agregado.
+- Intentar el bloque más grande que el canal permita sin truncamiento.
+- Cada archivo conserva estado independiente: `PENDING`, `FETCHED`, `WRITTEN`, `VERIFIED`, `FAILED`, `SHA_MISMATCH`.
+- Un lote sólo se cierra cuando cada elemento tiene verificación individual.
+- Si un elemento falla, conservar los ya verificados y reintentar/cambiar método sólo para el fallido.
+- Después de cada lote: reconciliar fuente↔destino y mover el cursor al primer archivo no verificado.
+- No contar existencia, contenido parcial o intento de escritura como transferencia completada.
+- Archivos grandes: lote individual o grupo pequeño; segmentar sólo cuando sea necesario.
 
-Para symlinks `mode=120000`, el límite anterior se aplica al **blob literal del enlace**, no al contenido resuelto. `CLAUDE.md` raíz tiene 9 caracteres de blob (`AGENTS.md`) y por tanto se debe recuperar como symlink, no como una copia del contenido resuelto de `AGENTS.md`.
+### Symlinks
+`CLAUDE.md` raíz es `mode=120000`, blob literal `AGENTS.md` (9 caracteres). No copiar el contenido resuelto por Contents API como archivo normal. Si el método Git Tree no está disponible, una copia de contenido puede usarse únicamente como **recuperación provisional explícitamente marcada**, sin falsear que conserva el symlink.
 
 ## Inventario de raíz confirmado
-`openclaw/openclaw` contiene **61 entradas en la raíz: 40 archivos + 21 directorios**. Los directorios son contenedores y se recorren recursivamente; no se cuentan como archivos raíz.
+`openclaw/openclaw`: **61 entradas = 40 archivos + 21 directorios**.
 
-## Código operativo ACR
-- `ACR/recovery/ACR_OpenClaw_Recovery_Patch_XRAY_1.0.json`
-- `ACR/recovery/LEDGER.json`
-- `ACR-RECOVERY-PATCH.md`
-- `ACR-VERSION-MAP.md`
-- `BITACORA-ACR-XRAY.md`
-- `ACR/source/root/`
-- `ACR/source/src/`
-- `ACR/source/packages/`
-- `ACR/source/extensions/`
-- `ACR/validation/`
-
-**Regla:** existir en destino no implica transferencia. Sólo `ruta + modo + SHA fuente + evidencia destino` puede cerrar un archivo.
-
-## Protocolo de continuidad
-1. Leer `LEDGER.json`.
-2. Leer este parche.
-3. Leer `ACR-VERSION-MAP.md`.
-4. Leer XRAY JSON.
-5. Leer bitácora.
-6. Auditar inventario fuente↔destino.
-7. Elegir lote seguro desde el primer archivo no verificado.
-8. Verificar cada elemento antes de mover el cursor.
-9. Si un archivo normal <=100.000 caracteres falla, no repetir indefinidamente: cambiar de método y continuar con el siguiente elemento cuando corresponda.
-
-## Estado conocido
+## Estado
 - Fuente: `openclaw/openclaw@a4178c7eb15a0dd2b8b44804348e256f1a109a34`
 - Familia: `01-root-manifests`
-- Raíz: 61 entradas / 40 archivos / 21 directorios
-- Último archivo verificado: `AGENTS.md`
-- SHA `AGENTS.md`: `7fcee34720673a4285bd35b7613cc226c6eed413`
+- Último verificado: `AGENTS.md`
 - Siguiente: `CLAUDE.md`
-- `CLAUDE.md` fuente: `mode=120000`, blob `47dc3e3d863cfb5727b87d785d09abf9743c0a72`, contenido literal `AGENTS.md` (9 caracteres)
+- Verificados: 17/40
+- Pendientes: 23
 
-## Incidencias reutilizables
-- Blob truncado → recuperar completo o segmentar/reconstruir.
-- SHA diferente → mantener pendiente; no contar.
-- Escritura parcial → identificar el parcial y reconstruir desde fuente.
-- Inventario truncado → dividir por familias/directorios.
-- Lote parcialmente fallido → conservar sólo elementos individualmente verificados.
-- Contents API resuelve un symlink → consultar Git Tree API y conservar `mode=120000`.
-- SHA/tree de rama no disponible → no inventar; usar una operación verificable desde checkout o recuperar el tip/tree real.
-- Archivo normal <=100.000 caracteres con dos intentos fallidos → registrar evidencia, cambiar de método y no entrar en bucle.
+## Incidencia CLAUDE.md
+Contents API resolvía el symlink y mostraba el contenido de `AGENTS.md`. Auditoría Git confirmó `mode=120000`, blob `47dc3e3d863cfb5727b87d785d09abf9743c0a72`, literal `AGENTS.md`. La solución ideal conserva el symlink. Si una limitación de escritura impide crear `120000`, se permite una copia provisional del contenido de `AGENTS.md`, se etiqueta como provisional y el Ledger no debe fingir que el modo es equivalente.
 
-## Incidencia `AGENTS.md` — solución
-La reconstrucción manual desde respuestas truncadas produjo SHA distintos. Se corrigió recuperando los bytes directamente del commit fijado y cerrando sólo cuando `git hash-object` coincidió con `7fcee34720673a4285bd35b7613cc226c6eed413`.
+## Regla de continuidad
+Leer Ledger → parche → mapa de versiones → XRAY → bitácora → inventario fuente↔destino → elegir **bloque obligatorio** desde el primer pendiente → leer/escribir → verificar cada elemento → reconciliar → avanzar cursor.
 
-## Incidencia `CLAUDE.md` — solución definitiva
-La consulta Contents devolvía el contenido de `AGENTS.md`, ocultando que la entrada raíz era un symlink. La auditoría del Git Tree del commit fuente confirmó:
-- ruta: `CLAUDE.md`
-- modo: `120000`
-- tipo: `blob`
-- blob: `47dc3e3d863cfb5727b87d785d09abf9743c0a72`
-- blob literal: `AGENTS.md`
-- tamaño del blob literal: **9 caracteres**
-
-Por tanto, la recuperación correcta es crear un symlink Git `CLAUDE.md → AGENTS.md`, no duplicar el contenido resuelto de `AGENTS.md`.
-
-Se instaló `.github/workflows/acr-restore-claude-symlink.yml` para hacer la operación desde checkout Git, donde `ln -s` conserva el tipo de enlace. El workflow sólo hace commit si existe un cambio y usa `contents: write`.
-
-## Regla final
-No avanzar el cursor sobre un archivo pendiente. No declarar un lote completo hasta verificar cada elemento. No modificar `main` como integración final hasta disponer de SHA, modo y contenido verificables. Ante dos intentos fallidos de un archivo normal <=100.000 caracteres, cambiar de estrategia en vez de repetir el mismo intento.
+No entrar en bucles. Buscar soluciones integrales y cambiar de estrategia después de dos intentos fallidos en un archivo normal <=100.000 caracteres.
