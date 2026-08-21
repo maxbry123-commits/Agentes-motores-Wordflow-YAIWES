@@ -3,6 +3,7 @@ name: Final OpenClaw forensic verification
 on:
   push:
     branches: [main]
+  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -72,13 +73,12 @@ jobs:
           mkdir -p FORENSIC-ZIP
           python3 - <<'PY'
           from pathlib import Path
-          import hashlib, os
+          import hashlib
           root=Path('ROOTS/openclaw')
           critical=['package.json','pnpm-workspace.yaml','pnpm-lock.yaml','node-version.mjs','openclaw.mjs','ui/package.json']
           lines=['# FINAL OPENCLAW FORENSIC XRAY','', '- Canonical ref: `a4178c7eb15a0dd2b8b44804348e256f1a109a34`','- Root: `ROOTS/openclaw/`','- Critical canonical files verified: PASS','- Workspace paths verified: PASS','- Generated dependency directories excluded: PASS','- Root isolation: PASS','', '| File | SHA-256 |','|---|---|']
           for f in critical:
-              p=root/f
-              lines.append(f'| `{f}` | `{hashlib.sha256(p.read_bytes()).hexdigest()}` |')
+              p=root/f; lines.append(f'| `{f}` | `{hashlib.sha256(p.read_bytes()).hexdigest()}` |')
           count=sum(1 for p in root.rglob('*') if p.is_file() or p.is_symlink())
           lines += ['',f'- Root file/symlink entries: **{count}**','- Final verification: **PASS**']
           Path('FORENSIC-AUDIT-XRAY.md').write_text('\n'.join(lines)+'\n',encoding='utf-8')
@@ -90,4 +90,7 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add ROOTS/openclaw/pnpm-lock.yaml FORENSIC-AUDIT-XRAY.md FORENSIC-ZIP/ZIP-SOURCE-STATUS.txt
-          if ! git diff --cached --quiet; then git commit -m 'fix: restore canonical OpenClaw lockfile and audit evidence'; git push origin HEAD:main; fi
+          if ! git diff --cached --quiet; then
+            git commit -m 'fix: restore canonical OpenClaw lockfile and audit evidence'
+            if [ -n "${GITHUB_HEAD_REF:-}" ]; then git push origin "HEAD:${GITHUB_HEAD_REF}"; else git push origin HEAD:main; fi
+          fi
