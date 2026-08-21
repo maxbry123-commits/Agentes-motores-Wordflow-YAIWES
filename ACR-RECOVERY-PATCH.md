@@ -1,27 +1,30 @@
 # ACR Recovery Patch — OpenClaw Motor
 
-## Método de descarga por lotes adaptativos
-ACR puede procesar varios archivos en un lote cuando el tamaño total sea seguro para el canal. La unidad de integridad sigue siendo **cada archivo**, nunca el lote.
+## Método ACR por lotes adaptativos
+ACR debe intentar primero lotes de varios archivos cuando el tamaño agregado sea seguro para el canal. La integridad nunca es del lote: es **por archivo**.
 
-### Reglas
-1. Inventariar ruta, tamaño y SHA fuente antes de agrupar.
-2. Agrupar archivos pequeños/medianos sólo cuando la suma estimada permanezca dentro del límite seguro del canal.
-3. Archivos grandes: lote individual o grupo pequeño; si exceden el límite, segmentar.
-4. Cada archivo mantiene estado independiente: `PENDING`, `FETCHED`, `WRITTEN`, `VERIFIED`, `FAILED`, `SHA_MISMATCH`.
-5. El lote sólo queda `VERIFIED` cuando todos sus archivos están individualmente verificados.
-6. Un fallo no invalida los archivos ya verificados del lote; sólo se reintenta el elemento fallido.
-7. Registrar por archivo: `batch_id`, ruta, bytes fuente, SHA fuente, bytes destino, SHA destino, commit destino, estado y errores.
-8. Tras cada lote, reconciliar fuente↔destino y mover el cursor al primer archivo no verificado.
-9. Nunca contar contenido parcial, una ruta existente o un intento de escritura como descarga completada.
-10. Los umbrales de tamaño son adaptativos: se determinan por el límite efectivo del canal y el tamaño real del archivo, no por un número fijo inventado.
-11. Archivos muy grandes deben recuperarse por segmentos deterministas y reconstruirse antes de verificar SHA.
-12. Antes de cerrar una familia, reconciliar todos sus archivos por ruta + SHA y detectar faltantes/extras.
-
-## Objetivo
-Aumentar el rendimiento de ACR sin perder trazabilidad: un lote puede acelerar la transferencia, pero **SHA individual + evidencia de GitHub siguen siendo la autoridad**.
+### Reglas operativas
+1. Fijar commit fuente antes de leer.
+2. Inventariar ruta, tamaño, modo Git y SHA fuente antes de agrupar.
+3. Agrupar archivos pequeños/medianos cuando la suma real permanezca dentro del límite efectivo del canal.
+4. Archivos grandes: lote individual o grupo pequeño; segmentar sólo cuando sea necesario.
+5. Cada archivo conserva estado independiente: `PENDING`, `FETCHED`, `WRITTEN`, `VERIFIED`, `FAILED`, `SHA_MISMATCH`.
+6. Un lote sólo queda `VERIFIED` cuando todos sus elementos están individualmente verificados.
+7. Un fallo no invalida elementos ya verificados; reintentar sólo el elemento fallido.
+8. Registrar por archivo: `batch_id`, ruta, bytes, modo, SHA fuente, SHA destino, commit destino, estado y errores.
+9. Después de cada lote, reconciliar fuente↔destino y mover el cursor al primer archivo no verificado.
+10. Nunca contar una ruta existente, contenido parcial o intento de escritura como descarga completada.
+11. Para archivos muy grandes usar segmentos deterministas y reconstruir antes de verificar SHA.
+12. Antes de cerrar una familia, reconciliar rutas, modos y SHA y detectar faltantes/extras.
+13. Si un archivo es un symlink Git (`mode=120000`), no copiar el contenido resuelto por Contents API como archivo normal.
+14. Para symlinks usar Git Tree API: blob = texto literal del destino del enlace; entrada del tree = `mode=120000`, `type=blob`, `sha=<blob>`; conservar el tree existente como `base_tree`.
+15. Verificar symlink con árbol Git: ruta + `mode=120000` + blob de destino. No inferir el tipo por el contenido mostrado por Contents API.
+16. Si falta el SHA del tip/tree de la rama destino, no inventarlo ni crear un tree sin `base_tree`; recuperar el tip mediante una fuente GitHub verificable o usar un workflow con checkout de la rama.
+17. Toda anomalía se registra en bitácora antes de avanzar.
+18. Cada modificación real debe quedar asociada a evidencia de commit/push; un trigger sólo se declara ejecutado cuando existe evidencia de run y resultado.
 
 ## Inventario de raíz confirmado
-`openclaw/openclaw` contiene **61 entradas en la raíz: 40 archivos + 21 directorios**. Los directorios no se cuentan como archivos descargados; se inventarían recursivamente por separado.
+`openclaw/openclaw` contiene **61 entradas en la raíz: 40 archivos + 21 directorios**. Los directorios son contenedores y se recorren recursivamente; no se cuentan como archivos raíz.
 
 ## Código operativo ACR
 - `ACR/recovery/ACR_OpenClaw_Recovery_Patch_XRAY_1.0.json`
@@ -35,16 +38,17 @@ Aumentar el rendimiento de ACR sin perder trazabilidad: un lote puede acelerar l
 - `ACR/source/extensions/`
 - `ACR/validation/`
 
-**Regla:** existir en destino no implica estar transferido. Sólo `ruta + SHA fuente + evidencia de destino` puede cerrar un archivo.
+**Regla:** existir en destino no implica transferencia. Sólo `ruta + modo + SHA fuente + evidencia destino` puede cerrar un archivo.
 
 ## Protocolo de continuidad
 1. Leer `LEDGER.json`.
 2. Leer este parche.
 3. Leer `ACR-VERSION-MAP.md`.
 4. Leer XRAY JSON.
-5. Revisar bitácora para errores/soluciones.
-6. Comprobar inventario fuente↔destino.
-7. Continuar desde el primer archivo no verificado del ledger.
+5. Leer bitácora.
+6. Auditar inventario fuente↔destino.
+7. Elegir lote seguro desde el primer archivo no verificado.
+8. Verificar cada elemento antes de mover el cursor.
 
 ## Estado conocido
 - Fuente: `openclaw/openclaw@a4178c7eb15a0dd2b8b44804348e256f1a109a34`
@@ -53,20 +57,31 @@ Aumentar el rendimiento de ACR sin perder trazabilidad: un lote puede acelerar l
 - Último archivo verificado: `AGENTS.md`
 - SHA `AGENTS.md`: `7fcee34720673a4285bd35b7613cc226c6eed413`
 - Siguiente: `CLAUDE.md`
+- `CLAUDE.md` fuente: `mode=120000`, blob `47dc3e3d863cfb5727b87d785d09abf9743c0a72`, contenido literal `AGENTS.md`
 
 ## Incidencias reutilizables
 - Blob truncado → recuperar completo o segmentar/reconstruir.
 - SHA diferente → mantener pendiente; no contar.
 - Escritura parcial → identificar el parcial y reconstruir desde fuente.
 - Inventario truncado → dividir por familias/directorios.
-- Lote parcialmente fallido → conservar sólo elementos individualmente verificados y reintentar los fallidos.
+- Lote parcialmente fallido → conservar sólo elementos individualmente verificados.
+- Contents API resuelve un symlink → consultar Git Tree API y conservar `mode=120000`.
+- SHA/tree de rama no disponible → no inventar; usar una operación verificable desde checkout o recuperar el tip/tree real.
 
-### Incidencia `AGENTS.md` — solución aplicada
-Durante la transferencia de `AGENTS.md` se produjeron varias copias con SHA diferente al blob fijado. La causa fue reconstrucción manual a partir de respuestas truncadas/ventanas de contenido, que omitió líneas en límites de paginación.
+## Incidencia `AGENTS.md` — solución
+La reconstrucción manual desde respuestas truncadas produjo SHA distintos. Se corrigió recuperando los bytes directamente del commit fijado y cerrando sólo cuando `git hash-object` coincidió con `7fcee34720673a4285bd35b7613cc226c6eed413`.
 
-La solución robusta fue dejar de reconstruir manualmente y añadir un workflow de GitHub Actions que descarga directamente el `AGENTS.md` del commit fijado mediante la URL raw, calcula `git hash-object` y exige exactamente `7fcee34720673a4285bd35b7613cc226c6eed413` antes de hacer commit. La verificación final del destino confirmó ese SHA exacto.
+## Incidencia `CLAUDE.md` — solución definitiva
+La consulta Contents devolvía el contenido de `AGENTS.md`, ocultando que la entrada raíz era un symlink. La auditoría del Git Tree del commit fuente confirmó:
+- ruta: `CLAUDE.md`
+- modo: `120000`
+- tipo: `blob`
+- blob: `47dc3e3d863cfb5727b87d785d09abf9743c0a72`
+- blob literal: `AGENTS.md`
 
-Aprendizaje: cuando se requiere identidad criptográfica exacta, la transferencia debe conservar bytes directamente desde la fuente; las reconstrucciones basadas en texto truncado no son equivalentes.
+Por tanto, la recuperación correcta es crear un symlink Git `CLAUDE.md → AGENTS.md`, no duplicar los 62 KB de `AGENTS.md`.
+
+Se instaló `.github/workflows/acr-restore-claude-symlink.yml` para hacer la operación desde checkout Git, donde `ln -s` conserva el tipo de enlace. El workflow sólo hace commit si existe un cambio y usa `contents: write`.
 
 ## Regla final
-No avanzar el cursor sobre un archivo pendiente. No declarar un lote completo hasta verificar cada elemento. No modificar `main` como integración final hasta disponer de SHA y contenido verificables.
+No avanzar el cursor sobre un archivo pendiente. No declarar un lote completo hasta verificar cada elemento. No modificar `main` como integración final hasta disponer de SHA, modo y contenido verificables.
