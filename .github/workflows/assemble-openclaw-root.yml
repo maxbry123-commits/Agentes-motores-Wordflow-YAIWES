@@ -1,0 +1,166 @@
+name: Assemble verified OpenClaw root
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  assemble:
+    runs-on: ubuntu-latest
+    env:
+      CANONICAL_REPO: https://github.com/openclaw/openclaw.git
+      CANONICAL_REF: a4178c7eb15a0dd2b8b44804348e256f1a109a34
+      SOURCE_RUN_ID: "32529275113"
+    steps:
+      - name: Checkout destination repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download all verified ZIP extraction artifacts
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: ${{ env.SOURCE_RUN_ID }}
+          pattern: acr-zip*-extracted
+          path: /tmp/zip-artifacts
+          merge-multiple: false
+
+      - name: Clone canonical OpenClaw ref
+        run: |
+          git clone --no-checkout "$CANONICAL_REPO" /tmp/openclaw
+          cd /tmp/openclaw
+          git checkout --detach "$CANONICAL_REF"
+          git rev-parse HEAD
+
+      - name: Verify ZIP evidence against canonical ref
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/zip-evidence
+          mkdir -p /tmp/zip-evidence
+          : > /tmp/zip-evidence/results.tsv
+          shopt -s nullglob
+          for artifact in /tmp/zip-artifacts/acr-zip*-extracted; do
+            name="$(basename "$artifact")"
+            mkdir -p "/tmp/zip-evidence/$name"
+            if [ -f "$artifact"/*.zip ]; then
+              unzip -q "$artifact"/*.zip -d "/tmp/zip-evidence/$name"
+            else
+              cp -a "$artifact"/. "/tmp/zip-evidence/$name/"
+            fi
+          done
+          python3 - <<'PY'
+          import hashlib, os, pathlib
+          root=pathlib.Path('/tmp/openclaw')
+          base=pathlib.Path('/tmp/zip-evidence')
+          rows=[]
+          mismatches=[]
+          seen={}
+          for art in sorted(base.iterdir()):
+              if not art.is_dir(): continue
+              ex=art/'extracted'
+              if not ex.exists():
+                  ex=art
+              for p in ex.rglob('*'):
+                  if not p.is_file(): continue
+                  rel=p.relative_to(ex).as_posix()
+                  # Ignore workflow metadata if it exists outside extracted/.
+                  if rel.startswith('.git/'): continue
+                  target=root/rel
+                  h=hashlib.sha256(p.read_bytes()).hexdigest()
+                  if not target.is_file():
+                      mismatches.append((art.name,rel,'MISSING_CANONICAL',h,''))
+                      continue
+                  ch=hashlib.sha256(target.read_bytes()).hexdigest()
+                  seen.setdefault(rel,[]).append((art.name,h))
+                  if h!=ch:
+                      mismatches.append((art.name,rel,'CONTENT_MISMATCH',h,ch))
+          for rel, vals in seen.items():
+              hs={h for _,h in vals}
+              if len(hs)>1:
+                  mismatches.append(('CROSS-ZIP',rel,'ZIP_CONTENT_CONFLICT','|'.join(sorted(hs)),''))
+          for k,v in sorted(seen.items()):
+              rows.append((k,';'.join(a for a,_ in v),v[0][1]))
+          out=pathlib.Path('FORENSIC-ZIP/FINAL-CROSSCHECK.md')
+          out.parent.mkdir(parents=True,exist_ok=True)
+          with out.open('w',encoding='utf-8') as f:
+              f.write('# Final ZIP ↔ canonical OpenClaw cross-check\n\n')
+              f.write(f'- Canonical ref: `{os.environ["CANONICAL_REF"]}`\n')
+              f.write(f'- ZIP-derived unique paths checked: **{len(seen)}**\n')
+              f.write(f'- Conflicts/missing canonical paths: **{len(mismatches)}**\n\n')
+              if mismatches:
+                  f.write('## FAILURES\n')
+                  for r in mismatches:
+                      f.write('- `'+'` | `'.join(r)+'`\n')
+              else:
+                  f.write('## RESULT\n\n**PASS: every extracted ZIP file matches the canonical ref byte-for-byte, and overlapping ZIP files have no content conflicts.**\n')
+          if mismatches:
+              raise SystemExit(1)
+          print(f'PASS: {len(seen)} ZIP-derived paths verified')
+          PY
+
+      - name: Build complete isolated ROOTS/openclaw from canonical ref
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf ROOTS/openclaw
+          mkdir -p ROOTS/openclaw
+          rsync -a --exclude='.git/' --exclude='node_modules/' --exclude='.pnpm-store/' --exclude='dist/' --exclude='build/' --exclude='coverage/' --exclude='.cache/' --exclude='.tmp/' --exclude='logs/' /tmp/openclaw/ ROOTS/openclaw/
+          rm -rf ROOTS/openclaw/.git
+          find ROOTS/openclaw -type d \( -name node_modules -o -name .pnpm-store -o -name dist -o -name build -o -name coverage -o -name .cache -o -name .tmp \) -prune -exec rm -rf {} +
+          printf '%s\n' "$CANONICAL_REF" > ROOTS/openclaw/.acr-canonical-ref
+
+      - name: Generate root manifest and forensic audit
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, pathlib, os
+          root=pathlib.Path('ROOTS/openclaw')
+          files=[p for p in root.rglob('*') if p.is_file()]
+          with open('OPENCLAW-ROOT-MANIFEST.md','w',encoding='utf-8') as f:
+              f.write('# OPENCLAW ROOT MANIFEST\n\n')
+              f.write(f'- Canonical ref: `{os.environ["CANONICAL_REF"]}`\n')
+              f.write(f'- Files in `ROOTS/openclaw`: **{len(files)}**\n')
+              f.write('- Generated dependencies/build artifacts excluded.\n\n')
+              f.write('| Path | SHA-256 | Size | Mode |\n|---|---|---:|---|\n')
+              for p in sorted(files):
+                  rel=p.relative_to(root).as_posix()
+                  h=hashlib.sha256(p.read_bytes()).hexdigest()
+                  f.write(f'| `{rel}` | `{h}` | {p.stat().st_size} | `{p.stat().st_mode & 0o777:03o}` |\n')
+          with open('FORENSIC-AUDIT-XRAY.md','w',encoding='utf-8') as f:
+              f.write('# FINAL FORENSIC XRAY AUDIT\n\n')
+              f.write(f'- Canonical OpenClaw: `{os.environ["CANONICAL_REF"]}`\n')
+              f.write(f'- Root file count: **{len(files)}**\n')
+              f.write('- ZIP evidence cross-check: PASS\n')
+              f.write('- ROOTS isolation: PASS (`ROOTS/openclaw/`)\n')
+              f.write('- Generated dependency directories excluded: PASS\n')
+              f.write('- Status: **READY FOR REMOTE READ-BACK**\n')
+          PY
+
+      - name: Persist root, manifests, and audit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add ROOTS/openclaw OPENCLAW-ROOT-MANIFEST.md FORENSIC-ZIP/FINAL-CROSSCHECK.md FORENSIC-AUDIT-XRAY.md
+          git diff --cached --quiet || git commit -m "build: reconstruct verified OpenClaw root"
+          git push
+
+      - name: Remote read-back
+        run: |
+          set -euo pipefail
+          test -f ROOTS/openclaw/package.json
+          test -f ROOTS/openclaw/pnpm-workspace.yaml
+          test -f ROOTS/openclaw/node-version.mjs
+          test ! -d ROOTS/openclaw/node_modules
+          test ! -d ROOTS/openclaw/.pnpm-store
+          git status --short
+          git rev-parse HEAD
