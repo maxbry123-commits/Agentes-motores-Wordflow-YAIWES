@@ -1,0 +1,38 @@
+name: OpenClaw smoke test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Pull official OpenClaw image
+        run: docker pull ghcr.io/openclaw/openclaw:2026.7.1-2
+
+      - name: Start OpenClaw container
+        run: docker run -d --name openclaw-smoke -p 18789:18789 -e OPENCLAW_GATEWAY_BIND=lan ghcr.io/openclaw/openclaw:2026.7.1-2
+
+      - name: Wait for liveness
+        run: |
+          for i in {1..30}; do
+            if curl -fsS http://127.0.0.1:18789/healthz; then exit 0; fi
+            sleep 2
+          done
+          docker logs openclaw-smoke
+          exit 1
+
+      - name: Check startup
+        run: curl -fsS http://127.0.0.1:18789/startupz
+
+      - name: Show container status
+        if: always()
+        run: docker ps -a --filter name=openclaw-smoke
+
+      - name: Show logs on failure
+        if: failure()
+        run: docker logs openclaw-smoke
+
+      - name: Cleanup
+        if: always()
+        run: docker rm -f openclaw-smoke || true
