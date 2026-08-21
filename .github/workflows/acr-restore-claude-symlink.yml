@@ -10,6 +10,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Restore Git symlink
         run: |
           set -euo pipefail
@@ -17,7 +19,9 @@ jobs:
           rm -f ACR/source/root/CLAUDE.md
           ln -s AGENTS.md ACR/source/root/CLAUDE.md
           test "$(readlink ACR/source/root/CLAUDE.md)" = "AGENTS.md"
-      - name: Verify and commit symlink
+          test "$(git ls-files -s -- ACR/source/root/CLAUDE.md | awk '{print $1}')" = "120000"
+          test "$(git cat-file blob :ACR/source/root/CLAUDE.md)" = "AGENTS.md"
+      - name: Commit and push only if changed
         run: |
           set -euo pipefail
           git config user.name "acr-recovery-bot"
@@ -25,6 +29,9 @@ jobs:
           git add ACR/source/root/CLAUDE.md
           git diff --cached --summary
           git diff --cached --check
-          git diff --cached --quiet && exit 0
+          if git diff --cached --quiet; then
+            echo "CLAUDE_SYMLINK_ALREADY_VERIFIED"
+            exit 0
+          fi
           git commit -m "fix(acr): restore CLAUDE.md symlink"
           git push
