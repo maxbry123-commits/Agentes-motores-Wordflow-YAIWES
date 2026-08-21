@@ -23,6 +23,11 @@ ACR debe intentar primero lotes de varios archivos cuando el tamaño agregado se
 17. Toda anomalía se registra en bitácora antes de avanzar.
 18. Cada modificación real debe quedar asociada a evidencia de commit/push; un trigger sólo se declara ejecutado cuando existe evidencia de run y resultado.
 
+## Regla de lectura/escritura rápida — archivos normales <=100.000 caracteres
+Si un archivo fuente es un archivo Git normal (`mode=100644` u otro modo regular), mide **<=100.000 caracteres** y no requiere segmentación, ACR debe intentar una transferencia directa en un máximo de **2 intentos**: lectura completa → escritura completa. No entrar en bucle. En la siguiente salida se verifica bytes/SHA/ruta y, si falla, se registra la causa y se cambia de estrategia (blob directo, lote más pequeño, workflow/checkout o segmentación determinista). Los archivos ya verificados del lote nunca se rehacen sólo porque otro elemento falló.
+
+Para symlinks `mode=120000`, el límite anterior se aplica al **blob literal del enlace**, no al contenido resuelto. `CLAUDE.md` raíz tiene 9 caracteres de blob (`AGENTS.md`) y por tanto se debe recuperar como symlink, no como una copia del contenido resuelto de `AGENTS.md`.
+
 ## Inventario de raíz confirmado
 `openclaw/openclaw` contiene **61 entradas en la raíz: 40 archivos + 21 directorios**. Los directorios son contenedores y se recorren recursivamente; no se cuentan como archivos raíz.
 
@@ -49,6 +54,7 @@ ACR debe intentar primero lotes de varios archivos cuando el tamaño agregado se
 6. Auditar inventario fuente↔destino.
 7. Elegir lote seguro desde el primer archivo no verificado.
 8. Verificar cada elemento antes de mover el cursor.
+9. Si un archivo normal <=100.000 caracteres falla, no repetir indefinidamente: cambiar de método y continuar con el siguiente elemento cuando corresponda.
 
 ## Estado conocido
 - Fuente: `openclaw/openclaw@a4178c7eb15a0dd2b8b44804348e256f1a109a34`
@@ -57,7 +63,7 @@ ACR debe intentar primero lotes de varios archivos cuando el tamaño agregado se
 - Último archivo verificado: `AGENTS.md`
 - SHA `AGENTS.md`: `7fcee34720673a4285bd35b7613cc226c6eed413`
 - Siguiente: `CLAUDE.md`
-- `CLAUDE.md` fuente: `mode=120000`, blob `47dc3e3d863cfb5727b87d785d09abf9743c0a72`, contenido literal `AGENTS.md`
+- `CLAUDE.md` fuente: `mode=120000`, blob `47dc3e3d863cfb5727b87d785d09abf9743c0a72`, contenido literal `AGENTS.md` (9 caracteres)
 
 ## Incidencias reutilizables
 - Blob truncado → recuperar completo o segmentar/reconstruir.
@@ -67,6 +73,7 @@ ACR debe intentar primero lotes de varios archivos cuando el tamaño agregado se
 - Lote parcialmente fallido → conservar sólo elementos individualmente verificados.
 - Contents API resuelve un symlink → consultar Git Tree API y conservar `mode=120000`.
 - SHA/tree de rama no disponible → no inventar; usar una operación verificable desde checkout o recuperar el tip/tree real.
+- Archivo normal <=100.000 caracteres con dos intentos fallidos → registrar evidencia, cambiar de método y no entrar en bucle.
 
 ## Incidencia `AGENTS.md` — solución
 La reconstrucción manual desde respuestas truncadas produjo SHA distintos. Se corrigió recuperando los bytes directamente del commit fijado y cerrando sólo cuando `git hash-object` coincidió con `7fcee34720673a4285bd35b7613cc226c6eed413`.
@@ -78,10 +85,11 @@ La consulta Contents devolvía el contenido de `AGENTS.md`, ocultando que la ent
 - tipo: `blob`
 - blob: `47dc3e3d863cfb5727b87d785d09abf9743c0a72`
 - blob literal: `AGENTS.md`
+- tamaño del blob literal: **9 caracteres**
 
-Por tanto, la recuperación correcta es crear un symlink Git `CLAUDE.md → AGENTS.md`, no duplicar los 62 KB de `AGENTS.md`.
+Por tanto, la recuperación correcta es crear un symlink Git `CLAUDE.md → AGENTS.md`, no duplicar el contenido resuelto de `AGENTS.md`.
 
 Se instaló `.github/workflows/acr-restore-claude-symlink.yml` para hacer la operación desde checkout Git, donde `ln -s` conserva el tipo de enlace. El workflow sólo hace commit si existe un cambio y usa `contents: write`.
 
 ## Regla final
-No avanzar el cursor sobre un archivo pendiente. No declarar un lote completo hasta verificar cada elemento. No modificar `main` como integración final hasta disponer de SHA, modo y contenido verificables.
+No avanzar el cursor sobre un archivo pendiente. No declarar un lote completo hasta verificar cada elemento. No modificar `main` como integración final hasta disponer de SHA, modo y contenido verificables. Ante dos intentos fallidos de un archivo normal <=100.000 caracteres, cambiar de estrategia en vez de repetir el mismo intento.
