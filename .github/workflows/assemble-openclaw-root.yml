@@ -4,11 +4,14 @@ on:
   push:
     branches: [main]
   pull_request:
+  issues:
+    types: [opened]
   workflow_dispatch:
 
 permissions:
   contents: write
   actions: read
+  issues: read
 
 env:
   TARGET_CANONICAL_REF: a4178c7eb15a0dd2b8b44804348e256f1a109a34
