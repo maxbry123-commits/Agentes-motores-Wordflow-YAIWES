@@ -1,4 +1,4 @@
-name: OpenClaw Option A - Image Smoke Test
+name: OpenClaw Option B - Gateway Smoke Test
 
 on:
   workflow_dispatch:
@@ -7,16 +7,42 @@ on:
       - '.github/workflows/openclaw-smoke-test.yml'
 
 jobs:
-  option-a:
+  gateway-test:
     runs-on: ubuntu-latest
     steps:
-      - name: Pull exact OpenClaw image
+      - name: Pull OpenClaw image
         run: docker pull ghcr.io/openclaw/openclaw:2026.7.1-2
 
-      - name: Verify image metadata
+      - name: Start Gateway
         run: |
-          docker image inspect ghcr.io/openclaw/openclaw:2026.7.1-2
+          docker run -d --name openclaw-test \
+            -p 18789:18789 \
+            ghcr.io/openclaw/openclaw:2026.7.1-2 \
+            gateway --port 18789 --allow-unconfigured
+          sleep 5
+          docker ps -a
+          docker logs openclaw-test || true
 
-      - name: Verify OpenClaw executable
+      - name: Test healthz
         run: |
-          docker run --rm ghcr.io/openclaw/openclaw:2026.7.1-2 --version
+          for i in $(seq 1 20); do
+            if curl -fsS http://127.0.0.1:18789/healthz; then
+              echo
+              echo 'HEALTHZ PASS'
+              exit 0
+            fi
+            sleep 3
+          done
+          echo 'HEALTHZ FAIL'
+          docker logs openclaw-test || true
+          exit 1
+
+      - name: Test readyz
+        run: |
+          curl -fsS http://127.0.0.1:18789/readyz
+          echo
+          echo 'READYZ PASS'
+
+      - name: Cleanup
+        if: always()
+        run: docker rm -f openclaw-test || true
