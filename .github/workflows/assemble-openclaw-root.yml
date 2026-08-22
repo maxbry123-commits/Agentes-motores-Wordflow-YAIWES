@@ -1,6 +1,8 @@
 name: Assemble and verify OpenClaw root
 
 on:
+  push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
