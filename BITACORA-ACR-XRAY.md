@@ -97,3 +97,36 @@ Tarea en curso / Total de tareas / Tareas terminadas al 100% / Tareas pendientes
 
 ## Regla final
 No DONE hasta completar T01–T15 con evidencia, publicación, read-back, verificación cruzada y auditoría forense XRAY. Si una subtarea está bloqueada, continuar tareas independientes y registrar BLOCKED; nunca inventar DONE.
+
+## ACTUALIZACIÓN INTEGRAL — PIPELINE Y BENCHMARK CPU
+Fecha de actualización: 2026-08-21/22.
+
+### Gap y solución: lockfile
+Se encontró `pnpm-lock.yaml.txt` y un ZIP en la raíz en lugar de `ROOTS/openclaw/pnpm-lock.yaml`. El lockfile canónico de OpenClaw se verificó por SHA esperado `cefd1fdf77f5c170ffacfad4b75e03c4c33345cf`. Se corrigió la ubicación dentro de `ROOTS/openclaw/` y se retiraron los duplicados temporales. El `pnpm-lock.yaml` global no se trató como duplicado porque su SHA era diferente.
+
+### Pipeline de pruebas CPU
+Se creó un mini-workflow independiente en `.github/workflows/cpu-benchmark.yml`, separado de `ROOTS/openclaw/`, para reutilizarlo con OpenClaw y futuros agentes/modelos.
+
+El diseño final es UNA ejecución, UNA cadena y UN artifact. Las 10 pruebas son: CPU identification; Sysbench CPU; OpenSSL SHA-256; 7-Zip multi-thread; Integer/C; Floating point; stress-ng CPU; SHA-256 throughput; JSON processing; thread scaling 1/2/4.
+
+El workflow usa `set -euo pipefail`, registra la evidencia en `benchmark-results/benchmark.log` y sube `cpu-benchmark-results`. La configuración fue simplificada desde una propuesta anterior de tres pasadas porque el requisito operativo es una sola batería completa. Commits relevantes: `e99539c856bcc0dcbd9f5250d3d6c8041e672d4f`, `8296133bf49e67a17bdf751f57ffda90c96d3a88`, `a20565fc9e20800b5448b15bd373897979ea9018`.
+
+### Regla de evidencia del benchmark
+La presencia del workflow no significa que el benchmark haya corrido. Solo se marca PASS cuando existe un run/job real de GitHub Actions y sus logs/artifact son inspeccionados. Si no existe `run_id`, estado o artifact, el estado correcto es PENDIENTE.
+
+### Lecciones para futuros agentes
+- No usar `raw.githubusercontent.com` cuando el usuario pide la vista del archivo en GitHub: usar `/blob/<ref>/<path>`.
+- No inventar URLs de Release assets que no existan.
+- No declarar una operación de GitHub Actions iniciada si la integración disponible no expone `workflow_dispatch`.
+- Cuando un ZIP contiene solo una pieza, no asumir que es la raíz completa.
+- Preservar las rutas relativas y verificar hashes después de mover/extractar.
+- Mantener raíces de agentes como hermanas bajo `ROOTS/` y dejar pipeline, bitácora y manifests fuera de ellas.
+- Consolidar muchas pruebas en un workflow encadenado cuando el objetivo es ahorrar ejecuciones/salidas.
+
+## Estado de esta actualización
+- Bitácora consolidada: ACTUALIZADA.
+- Método reproducible: DOCUMENTADO.
+- Flujo ZIP→extracción→raíz→verificación: DOCUMENTADO.
+- Pipeline CPU de 10 pruebas: DOCUMENTADO.
+- Evidencia de ejecución física del benchmark: PENDIENTE hasta disponer de run/job/artifact real.
+- Auditoría final de todos los gaps OpenClaw: PENDIENTE mientras T09–T16 no tengan evidencia completa.
