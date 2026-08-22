@@ -1,8 +1,11 @@
 name: Temporary download pnpm-lock
 on:
+  pull_request:
+    types: [opened, synchronize]
   push:
     branches:
       - tmp/download-pnpm-lock
+      - main
 jobs:
   download:
     runs-on: ubuntu-latest
