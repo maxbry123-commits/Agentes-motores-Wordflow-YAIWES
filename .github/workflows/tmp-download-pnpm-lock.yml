@@ -1,20 +1,39 @@
-name: Temporary download pnpm-lock
+name: Extract canonical pnpm-lock
 on:
   push:
     branches:
       - main
+permissions:
+  contents: write
+
 jobs:
-  download:
+  extract:
+    if: github.event.head_commit.message != 'ACR: extract pnpm-lock from zip [skip ci]'
     runs-on: ubuntu-latest
     steps:
-      - name: Download canonical lockfile
+      - uses: actions/checkout@v4
+      - name: Extract lockfile from zip
+        shell: bash
         run: |
-          curl -L --fail --retry 3 -o pnpm-lock.yaml 'https://raw.githubusercontent.com/openclaw/openclaw/a4178c7eb15a0dd2b8b44804348e256f1a109a34/pnpm-lock.yaml'
-          sha256sum pnpm-lock.yaml | tee pnpm-lock.sha256
-      - name: Upload lockfile artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: openclaw-pnpm-lock-canonical
-          path: |
-            pnpm-lock.yaml
-            pnpm-lock.sha256
+          set -euo pipefail
+          test -f pnpm-lock.yaml.zip
+          rm -rf /tmp/pnpm-lock-extract
+          mkdir -p /tmp/pnpm-lock-extract
+          unzip -q pnpm-lock.yaml.zip -d /tmp/pnpm-lock-extract
+          test -f /tmp/pnpm-lock-extract/pnpm-lock.yaml.txt
+          cp /tmp/pnpm-lock-extract/pnpm-lock.yaml.txt ROOTS/openclaw/pnpm-lock.yaml
+          sha256sum ROOTS/openclaw/pnpm-lock.yaml | tee /tmp/lock.sha256
+          grep -q 'cefd1fdf77f5c170ffacfad4b75e03c4c33345cf' /tmp/lock.sha256
+      - name: Remove duplicate archive and root duplicate
+        shell: bash
+        run: |
+          rm -f pnpm-lock.yaml.zip pnpm-lock.yaml.txt
+      - name: Commit extracted canonical lockfile
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add ROOTS/openclaw/pnpm-lock.yaml
+          git rm -f --ignore-unmatch pnpm-lock.yaml.zip pnpm-lock.yaml.txt
+          git commit -m 'ACR: extract pnpm-lock from zip [skip ci]'
+          git push
