@@ -89,9 +89,12 @@ jobs:
           PY
       - name: Persist lockfile, cleanup and forensic evidence
         run: |
+          set -euo pipefail
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add -A ROOTS/openclaw/pnpm-lock.yaml FORENSIC-AUDIT-XRAY.md pnpm-lock.yaml.zip pnpm-lock.yaml.txt
+          git add -f ROOTS/openclaw/pnpm-lock.yaml
+          git add FORENSIC-AUDIT-XRAY.md
+          git add -A pnpm-lock.yaml.zip pnpm-lock.yaml.txt || true
           if ! git diff --cached --quiet; then
             git commit -m 'fix: extract canonical OpenClaw lockfile and remove duplicate [skip ci]'
             git push origin "HEAD:${GITHUB_HEAD_REF:-main}"
