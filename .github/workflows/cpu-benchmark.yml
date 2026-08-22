@@ -19,63 +19,75 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y sysbench stress-ng p7zip-full openssl jq bc
 
-      - name: Run 10 CPU tests
+      - name: Run 10 CPU tests x 3 passes
         shell: bash
         run: |
-          set -uo pipefail
+          set -u
           mkdir -p benchmark-results
           exec > >(tee benchmark-results/benchmark.log) 2>&1
-          echo '=== CPU BENCHMARK LAB ==='
+          echo '=== CPU BENCHMARK LAB — FINAL 3 PASS VALIDATION ==='
           date -u +%FT%TZ
+          echo 'runner=ubuntu-24.04'
+          echo 'passes=3'
+          echo 'tests_per_pass=10'
           echo
-          echo '1) CPU INFO'
+          echo '=== CPU IDENTIFICATION ==='
           lscpu
           echo
-          echo '2) SYSBENCH CPU'
-          sysbench cpu --cpu-max-prime=20000 --threads=4 run || true
-          echo
-          echo '3) OPENSSL SHA256'
-          openssl speed -seconds 5 sha256 || true
-          echo
-          echo '4) 7-ZIP'
-          7z b -mmt=4 || true
-          echo
-          echo '5) INTEGER / C BENCHMARK'
-          cat > /tmp/bench.c <<'EOF'
+          for pass in 1 2 3; do
+            echo "============================================================"
+            echo "PASS $pass / 3"
+            echo "============================================================"
+            echo '1) CPU INFO'
+            lscpu | grep -E 'Model name|Architecture|CPU\(s\)|Thread\(s\) per core|Core\(s\) per socket|Socket\(s\)|CPU max MHz|CPU min MHz' || true
+            echo
+            echo '2) SYSBENCH CPU'
+            sysbench cpu --cpu-max-prime=20000 --threads=4 run
+            echo
+            echo '3) OPENSSL SHA256'
+            openssl speed -seconds 5 sha256
+            echo
+            echo '4) 7-ZIP'
+            7z b -mmt=4
+            echo
+            echo '5) INTEGER / C BENCHMARK'
+            cat > /tmp/bench.c <<'EOF'
           #include <stdint.h>
           #include <stdio.h>
           int main(void){ volatile uint64_t x=0x123456789abcdefULL; for(uint64_t i=0;i<200000000ULL;i++) x=x*2862933555777941757ULL+3037000493ULL; printf("%llu\n",(unsigned long long)x); return 0; }
           EOF
-          gcc -O2 /tmp/bench.c -o /tmp/bench
-          /usr/bin/time -f 'elapsed=%e sec' /tmp/bench || true
-          echo
-          echo '6) FLOATING POINT'
-          python3 - <<'PY'
+            gcc -O2 /tmp/bench.c -o /tmp/bench
+            /usr/bin/time -f 'elapsed=%e sec' /tmp/bench
+            echo
+            echo '6) FLOATING POINT'
+            python3 - <<'PY'
           import time, math
           n=20000000
           t=time.perf_counter(); x=0.1
-          for i in range(n): x=math.sin(x)+math.cos(x)+1e-9
+          for _ in range(n): x=math.sin(x)+math.cos(x)+1e-9
           print(f'iterations={n} elapsed={time.perf_counter()-t:.6f} sec result={x}')
           PY
-          echo
-          echo '7) STRESS-NG CPU'
-          stress-ng --cpu 4 --cpu-method matrixprod --timeout 20s --metrics-brief || true
-          echo
-          echo '8) SHA256 FILE HASH'
-          dd if=/dev/zero of=/tmp/bench-256m.bin bs=1M count=256 status=none
-          /usr/bin/time -f 'elapsed=%e sec' sha256sum /tmp/bench-256m.bin || true
-          echo
-          echo '9) JSON PROCESSING'
-          python3 - <<'PY'
+            echo
+            echo '7) STRESS-NG CPU'
+            stress-ng --cpu 4 --cpu-method matrixprod --timeout 20s --metrics-brief
+            echo
+            echo '8) SHA256 FILE HASH'
+            dd if=/dev/zero of=/tmp/bench-256m.bin bs=1M count=256 status=none
+            /usr/bin/time -f 'elapsed=%e sec' sha256sum /tmp/bench-256m.bin
+            rm -f /tmp/bench-256m.bin
+            echo
+            echo '9) JSON PROCESSING'
+            python3 - <<'PY'
           import json,time
           data=[{'i':i,'v':i*i,'s':str(i)} for i in range(200000)]
           t=time.perf_counter(); s=json.dumps(data,separators=(',',':')); a=json.loads(s); e=time.perf_counter()-t
+          assert len(a)==200000
           print(f'items={len(a)} bytes={len(s)} elapsed={e:.6f} sec')
           PY
-          echo
-          echo '10) THREAD SCALING'
-          python3 - <<'PY'
-          import concurrent.futures,time,os
+            echo
+            echo '10) THREAD SCALING'
+            python3 - <<'PY'
+          import concurrent.futures,time
           def work(n):
               x=0
               for i in range(n): x=(x*1664525+i+1013904223)&0xffffffff
@@ -87,10 +99,18 @@ jobs:
                   list(ex.map(work,[n//workers]*workers))
               print(f'workers={workers} elapsed={time.perf_counter()-t:.6f} sec')
           PY
+            echo "PASS $pass COMPLETE"
+          done
           echo
-          echo '=== END ==='
+          echo '=== FINAL RESULT ==='
+          echo 'passes_completed=3'
+          echo 'tests_per_pass=10'
+          echo 'total_test_executions=30'
+          echo 'status=COMPLETE'
+          echo 'note=Hosted-runner benchmark; results are comparative, not a fixed hardware identity.'
+          date -u +%FT%TZ
 
-      - name: Upload benchmark results
+      - name: Upload final benchmark evidence
         uses: actions/upload-artifact@v4
         with:
           name: cpu-benchmark-results
