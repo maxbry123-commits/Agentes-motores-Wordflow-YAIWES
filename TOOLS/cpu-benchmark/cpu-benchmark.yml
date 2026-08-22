@@ -1,0 +1,96 @@
+name: CPU Benchmark Lab
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'TOOLS/cpu-benchmark/**'
+
+permissions:
+  contents: read
+
+jobs:
+  cpu-benchmark:
+    name: CPU benchmark suite
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install benchmark tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sysbench p7zip-full stress-ng jq
+
+      - name: Run 10 CPU tests sequentially
+        shell: bash
+        run: |
+          set -u
+          mkdir -p results
+          exec > >(tee results/console.log) 2>&1
+          echo "CPU-BENCHMARK-LAB"
+          date -u +%FT%TZ
+          uname -a
+          lscpu | tee results/cpu-info.txt
+
+          run_test() {
+            n="$1"; title="$2"; shift 2
+            echo
+            echo "===== TEST ${n}: ${title} ====="
+            start=$(date +%s.%N)
+            if "$@"; then rc=0; else rc=$?; fi
+            end=$(date +%s.%N)
+            python3 - "$start" "$end" "$n" "$title" "$rc" <<'PY' | tee -a results/timings.csv
+import sys
+s,e,n,t,r=sys.argv[1:]
+print(f'{n},{t},{float(e)-float(s):.6f},{r}')
+PY
+            return 0
+          }
+          echo 'test,title,seconds,exit_code' > results/timings.csv
+
+          run_test 01 'CPU identification' bash -c 'nproc; lscpu | grep -E "Model name|Architecture|CPU\(s\)|Thread|Core|MHz" || true'
+          run_test 02 'Sysbench integer CPU' sysbench cpu --cpu-max-prime=20000 --threads=$(nproc) run
+          run_test 03 'OpenSSL SHA256' openssl speed -seconds 5 sha256
+          run_test 04 '7-Zip compression benchmark' 7z b -mmt=$(nproc)
+          run_test 05 'Prime-number C benchmark' bash -c 'cat > /tmp/cpubench.c <<"EOF"
+#include <stdio.h>
+#include <stdint.h>
+int main(){uint64_t count=0; for(uint64_t n=2;n<1200000;n++){int p=1; for(uint64_t d=2;d*d<=n;d++) if(n%d==0){p=0;break;} count+=p;} printf("primes=%llu\n",(unsigned long long)count);}
+EOF
+gcc -O3 /tmp/cpubench.c -o /tmp/cpubench && for i in 1 2 3; do /usr/bin/time -f "%e sec" /tmp/cpubench >/dev/null; done'
+          run_test 06 'Floating-point matrix benchmark' python3 - <<'PY'
+import time, math
+n=700; a=[[((i*17+j*13)%97)/97 for j in range(n)] for i in range(n)]; b=[[((i*11+j*7)%89)/89 for j in range(n)] for i in range(n)]
+t=time.perf_counter(); s=0.0
+for i in range(n):
+  for k in range(n):
+    x=a[i][k]
+    for j in range(n): s += x*b[k][j]
+print('checksum=',s,'seconds=',time.perf_counter()-t)
+PY
+          run_test 07 'stress-ng CPU matrix product' stress-ng --cpu $(nproc) --cpu-method matrixprod --metrics-brief --timeout 10s
+          run_test 08 'SHA256 file hashing' bash -c 'dd if=/dev/zero of=/tmp/cpu-test.bin bs=1M count=256 status=none; sha256sum /tmp/cpu-test.bin'
+          run_test 09 'JSON data processing' python3 - <<'PY'
+import json,time
+x=[{"id":i,"value":i*i,"text":"github-cpu-benchmark"} for i in range(200000)]
+t=time.perf_counter(); s=json.dumps(x); y=json.loads(s); print('items=',len(y),'bytes=',len(s),'seconds=',time.perf_counter()-t)
+PY
+          run_test 10 'Single vs multi-core scaling' bash -c 'echo "cores=$(nproc)"; for t in 1 2 4; do [ "$t" -le "$(nproc)" ] || continue; echo "threads=$t"; sysbench cpu --cpu-max-prime=20000 --threads=$t run | grep -E "events per second|total time"; done'
+
+          echo
+          echo '===== SUMMARY ====='
+          cat results/timings.csv
+          echo "runner=$RUNNER_NAME" | tee results/environment.txt
+          echo "os=$RUNNER_OS" | tee -a results/environment.txt
+          echo "arch=$(uname -m)" | tee -a results/environment.txt
+          echo "cpus=$(nproc)" | tee -a results/environment.txt
+
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cpu-benchmark-${{ github.run_id }}
+          path: results/
+          retention-days: 30
