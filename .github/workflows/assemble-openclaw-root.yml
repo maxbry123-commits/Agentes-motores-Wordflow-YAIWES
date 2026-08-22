@@ -29,6 +29,8 @@ jobs:
           done
       - name: Restore canonical lockfile if missing
         run: |
+          set -euo pipefail
+          mkdir -p ROOTS/openclaw
           if [ ! -f ROOTS/openclaw/pnpm-lock.yaml ]; then cp /tmp/canonical/pnpm-lock.yaml ROOTS/openclaw/pnpm-lock.yaml; fi
       - name: Verify canonical critical files
         run: |
@@ -50,6 +52,10 @@ jobs:
         run: |
           set -euo pipefail
           for d in node_modules .pnpm-store dist build coverage .cache logs; do test ! -d "ROOTS/openclaw/$d"; done
+      - name: Remove duplicate uploaded ZIP and misplaced lockfile
+        run: |
+          set -euo pipefail
+          rm -f pnpm-lock.yaml.zip pnpm-lock.yaml.txt
       - name: Verify source-install surface
         run: |
           set -euo pipefail
@@ -63,20 +69,23 @@ jobs:
         run: |
           python3 - <<'PY'
           from pathlib import Path
-          import hashlib
+          import hashlib, os
           root=Path('ROOTS/openclaw')
           files=['package.json','pnpm-workspace.yaml','pnpm-lock.yaml','node-version.mjs','openclaw.mjs','ui/package.json']
-          lines=['# FINAL OPENCLAW FORENSIC XRAY','',f'- Canonical ref: `{__import__("os").environ["REF"]}`','- Critical files: PASS','- Workspace: PASS','- UI: PASS','- Extensions/packages/examples: PASS','- Generated dependencies excluded: PASS','- Source-install surface: PASS','', '| File | SHA-256 |','|---|---|']
+          lines=['# FINAL OPENCLAW FORENSIC XRAY','',f'- Canonical ref: `{os.environ["REF"]}`','- Critical files: PASS','- Workspace: PASS','- UI: PASS','- Extensions/packages/examples: PASS','- Generated dependencies excluded: PASS','- Source-install surface: PASS','- ZIP extracted: PASS','- Duplicate archive removed: PASS','', '| File | SHA-256 |','|---|---|']
           for f in files: lines.append(f'| `{f}` | `{hashlib.sha256((root/f).read_bytes()).hexdigest()}` |')
           lines += ['',f'- Root entries: **{sum(1 for p in root.rglob("*") if p.is_file() or p.is_symlink())}**','- Final verification: **PASS**']
           Path('FORENSIC-AUDIT-XRAY.md').write_text('\n'.join(lines)+'\n',encoding='utf-8')
           PY
-      - name: Persist lockfile and forensic evidence
+      - name: Persist lockfile, cleanup and forensic evidence
         run: |
+          set -euo pipefail
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add ROOTS/openclaw/pnpm-lock.yaml FORENSIC-AUDIT-XRAY.md
+          git add -f ROOTS/openclaw/pnpm-lock.yaml
+          git add FORENSIC-AUDIT-XRAY.md
+          git add -A pnpm-lock.yaml.zip pnpm-lock.yaml.txt || true
           if ! git diff --cached --quiet; then
-            git commit -m 'fix: restore canonical OpenClaw lockfile and final audit'
+            git commit -m 'fix: extract canonical OpenClaw lockfile and remove duplicate [skip ci]'
             git push origin "HEAD:${GITHUB_HEAD_REF}"
           fi
