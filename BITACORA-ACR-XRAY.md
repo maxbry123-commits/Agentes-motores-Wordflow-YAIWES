@@ -1,132 +1,118 @@
-# BITÁCORA ACR XRAY — historial operativo reutilizable
+# BITÁCORA ACR — AUDITORÍA FORENSE X-RAY
 
-## Objetivo
-Conservar conocimiento verificable para que otro GPT/agente pueda recuperar y continuar el trabajo sin depender de memoria conversacional. GitHub es la fuente persistente de verdad. No convertir hipótesis, planes o respuestas del asistente en hechos confirmados.
+## 0. Regla fundamental
+Esta bitácora es la memoria operativa del pipeline. Nunca se afirma que una extracción, ejecución o verificación ocurrió si no existe evidencia. Estados: `PLANNED`, `RUNNING`, `PASS`, `FAIL`, `BLOCKED`.
 
-## Estado confirmado
-- Repo: `maxbry123-commits/Agentes-motores-Wordflow-YAIWES`
-- Branch: `main`
-- Canonical OpenClaw: `openclaw/openclaw@a4178c7eb15a0dd2b8b44804348e256f1a109a34`
-- `ROOTS/README.md` confirma arquitectura multi-agente y aislamiento de `ROOTS/openclaw/`.
-- 8 ZIPs están identificados; ZIP 1 y ZIP 4 comparten blob SHA/tamaño y son duplicados exactos a nivel GitHub.
-- La barrera inicial de acceso directo a blobs grandes fue superada mediante GitHub Actions: el run `32529275113` produjo 8 artifacts de extracción verificable.
-- La extracción está CONFIRMADA para el run: cada job ejecutó `unzip -t`, extrajo preservando rutas relativas y generó manifests/SHA-256.
+## 1. Método ZIP → ROOTS/<agente>
+**Extraer NO vacía el ZIP.** Una extracción normal deja intacto el ZIP original. El ZIP solo se elimina después de verificar que todos sus archivos requeridos fueron desplegados y que ya no es necesario conservarlo.
 
-## Método persistente
-`TASK_INTAKE → SANDBOX_BUILD → LOCAL_VERIFY → READY_FOR_PUBLISH → GITHUB_PUBLISH → REMOTE_VERIFY → FORENSIC_AUDIT → DONE`.
-GitHub es la verdad persistente; sandbox es temporal; HTTP 200 no basta; toda publicación requiere read-back; una afirmación LLM no es evidencia; mismo fallo ×2 obliga a cambiar mecanismo.
+### DAG / DSL de trabajo
+```text
+ZIP_SOURCE
+ -> INVENTORY
+ -> HASH_SOURCE
+ -> EXTRACT_TEMP
+ -> MANIFEST_EXTRACTED
+ -> CLASSIFY_AGENT
+ -> MAP_PATHS
+ -> COPY_TO_ROOT
+ -> HASH_DEST
+ -> CROSSCHECK_SOURCE_VS_DEST
+ -> CROSSCHECK_VS_OFFICIAL
+ -> VERIFY_COUNTS
+ -> VERIFY_NO_MISSING
+ -> VERIFY_NO_UNEXPECTED
+ -> CLEAN_TEMP_DUPLICATES
+ -> POST_AUDIT
+ -> COMMIT
+```
 
-## Hallazgos canónico ↔ repo
-1. `package.json`: MODIFIED / NO MATCH. Canonical 2026.8.1; repo 2026.7.1.
-2. `node-version.mjs`: MISSING en repo; canonical blob `dc7876dd0ce35116aaef535d342647ebb1ad16e7`.
-3. `npm-shrinkwrap.json`: EXTRA / NON-CANONICAL; ausente en canonical, presente en repo.
-4. `pnpm-workspace.yaml`: MODIFIED / NO MATCH.
-5. `README.md`: MODIFIED / NO MATCH.
-6. `LICENSE`: MATCH; comparten blob `ebaebf7c416761a32f932ad70ebe5d1d2e214f68`.
-7. `THIRD_PARTY_NOTICES.md`: MATCH; comparten blob `6b6721901b7590d20774ba0504d975e1be70a57a`.
-8. `openclaw.mjs`: MODIFIED / NO MATCH; el canonical importa `./node-version.mjs` y recomienda Node 26; repo actual difiere.
-9. `pnpm-lock.yaml`: MODIFIED / NO MATCH.
-10. `Dockerfile`: MODIFIED / NO MATCH.
-11. `tsconfig.json`: MODIFIED / NO MATCH.
-12. `vitest.config.ts`: MODIFIED / NO MATCH.
-13. `AGENTS.md`: MODIFIED / NO MATCH.
+### Comandos de referencia
+Son comandos reproducibles de guía; solo se registran como ejecutados si existe evidencia del runner.
 
-## Arquitectura multi-raíz
-`ROOTS/openclaw/` es el destino exclusivo de OpenClaw. Futuras raíces serán hermanas. Documentación, manifiestos y control permanecen fuera de las raíces.
+```bash
+# Inventario
+unzip -Z1 agente.zip > zip-manifest.txt
+# Integridad
+unzip -t agente.zip
+# Hash del ZIP
+sha256sum agente.zip
+# Staging seguro
+rm -rf .staging/agente
+mkdir -p .staging/agente
+unzip -q agente.zip -d .staging/agente
+# Inventario extraído
+find .staging/agente -type f -print | sort > extracted-manifest.txt
+# Conteo
+wc -l zip-manifest.txt extracted-manifest.txt
+# Publicación preservando rutas
+rsync -a --exclude='.git/' .staging/agente/ ROOTS/<agente>/
+# Hash de destino
+find ROOTS/<agente> -type f -print0 | sort -z | xargs -0 sha256sum > destination-sha256.txt
+# SOLO después de PASS
+rm agente.zip
+```
 
-## Archivos de control
-- `FORENSIC-CROSSCHECK-OPENCLAW.md` actualizado previamente.
-- `OPENCLAW-ROOT-MANIFEST.md` existe como borrador de evidencia.
-- `.github/workflows/acr-zip-xray.yml` extrae y audita los 8 ZIP.
-- `FORENSIC-ZIP/RUN-32529275113.md` confirma artifacts de los 8 ZIP.
-- `FORENSIC-ZIP/ZIP-EXTRACTION-VERIFIED-2026-08-21.md` contiene evidencia de extracción.
-- `.github/workflows/assemble-openclaw-root.yml` creado en commit `92b81a6bfc4a8628c932c6fd0a6f165969a353e3`. Su objetivo es: descargar los 8 artifacts, comparar cada archivo extraído byte-a-byte contra el ref canónico, clonar el ref oficial y construir `ROOTS/openclaw/` completo desde el canonical, excluyendo dependencias/artefactos generados.
+**Regla:** nunca usar `rm`, `git rm` o `rsync --delete` contra `ROOTS/<agente>/` antes de snapshot + manifest + comparación.
 
-## Auditoría real de los 8 artifacts
-Los 8 artifacts fueron recuperados mediante GitHub Actions y están identificados: zip1 `9463282499`, zip4 `9463282194`, zip5 `9463285201`, zip5.1 `9463281605`, zip6 `9463282580`, zip7 `9463282058`, zip8 `9463283012`, zip9 `9463282609`.
+## 2. Protección de raíces de agentes
+Git no ofrece una subcarpeta físicamente imborrable. La protección correcta es por capas: `CODEOWNERS`, branch protection/PR requerido, workflow de auditoría, manifest+SHA, snapshot de commit y un guard de CI que falle ante eliminación/modificación no autorizada.
 
-Inspección local reproducible de los 8 artifacts descargados:
-- zip1: 1355 archivos bajo `extracted/`; ZIP válido (`testzip=None`).
-- zip4: 1355 archivos bajo `extracted/`; ZIP válido; rutas y SHA de contenido coinciden exactamente con zip1.
-- zip5: 7786 archivos bajo `extracted/`; ZIP válido.
-- zip5.1: 754 archivos bajo `extracted/`; ZIP válido.
-- zip6: 764 archivos bajo `extracted/`; ZIP válido.
-- zip7: 953 archivos bajo `extracted/`; ZIP válido.
-- zip8: 1271 archivos bajo `extracted/`; ZIP válido.
-- zip9: 2579 archivos bajo `extracted/`; ZIP válido.
-- Unión de rutas relativas de los ocho: 14698 rutas únicas.
-- ZIP1 y ZIP4 son duplicados de contenido, no solo de nombre/tamaño: 1355 rutas y hashes de archivo coinciden.
-- Solapamientos adicionales: ZIP1/ZIP4 ↔ ZIP6 comparten 10 rutas; ZIP5.1 ↔ ZIP6 comparten 754 rutas. No se observaron conflictos de contenido en esos solapamientos.
-- Distribución top-level observada: ZIP1/4=`apps` más `config`/`deploy`; ZIP5=`extensions`,`packages`,`qa`,`patches`,`git-hooks`; ZIP5.1=`docs`,`examples`; ZIP6=`docs`,`config`,`examples`,`deploy`; ZIP7=`scripts`,`skills`,`security`; ZIP8=`test`,`ui`; ZIP9=`agents`,`auto-reply`,`acp`,`audit`,`bindings`.
-- Esto demuestra que los ZIP son piezas complementarias del árbol, no ocho copias completas. No se debe asumir que uno solo es la raíz completa.
+```text
+ROOTS/<agente>
+ -> CODEOWNERS
+ -> PR / branch protection
+ -> CI guard
+ -> manifest + SHA
+ -> snapshot conocido
+ -> auditoría pre/post
+```
 
-## Decisión de reconstrucción
-La raíz final NO se construirá pegando ciegamente las piezas ZIP ni reutilizando la raíz modificada que ya existe en el repo. El ref canónico oficial es la autoridad para completar la raíz.
+Esto protege la raíz mediante el proceso de GitHub; no debe confundirse con un atributo local de solo lectura.
 
-Proceso obligatorio:
-1. Extraer los 8 ZIP.
-2. Quitar únicamente la envoltura técnica `extracted/`.
-3. Comparar cada ruta/archivo ZIP contra `openclaw/openclaw@a4178c7...` por contenido SHA-256.
-4. Rechazar cualquier ZIP que tenga archivo ausente o diferente respecto al canonical.
-5. Construir `ROOTS/openclaw/` desde el ref canónico completo, usando los ZIP como evidencia cruzada de las piezas recibidas.
-6. Excluir `node_modules/`, `.pnpm-store/`, `dist/`, `build/`, `coverage/`, `.cache/`, `.tmp/` y logs generados.
-7. Generar manifest completo con ruta, SHA-256, tamaño y modo.
-8. Hacer read-back de GitHub y repetir XRAY.
+## 3. Despliegue por lotes
+```text
+ZIP -> INVENTARIO_GLOBAL -> LOTES -> STAGING -> HASH_POR_LOTE
+    -> MERGE_LÓGICO -> HASH_GLOBAL -> ROOTS/<agente> -> AUDITORÍA
+```
+Cada lote requiere `manifest + count + hash + ruta destino + estado`.
 
-## Plan T01–T16
-T01 baseline; T02 XRAY repo; T03 auditoría ZIP; T04 ZIP↔ZIP; T05 árbol canónico; T06 canónico↔candidatos; T07 multi-agent ROOTS; T08 manifiesto; T09 build temporal; T10 local verify; T11 publish; T12 remote read-back; T13 boot verify; T14 XRAY final; T15 multi-root audit; T16 completion record.
+## 4. Verificación cruzada en 4 pasadas
+1. Estructura: rutas/carpetas/archivos.
+2. Contenido: SHA-256.
+3. Origen oficial: upstream/commit canónico.
+4. Post-publicación: read-back desde `main` y clasificación `MISSING/EXTRA/MODIFIED`.
 
-## Estado LOOP actual
-- T03: 100% en extracción/recuperación de los 8 artifacts; canonicidad aún pendiente.
-- T04: 100% en inventario de rutas/solapamientos de los 8 artifacts; conflictos pendientes de comparación canónica.
-- T05: canonical ref confirmado.
-- T06: parcial; comparación manual inicial del repo ya documentada; comparación automática completa pendiente.
-- T07: 100% estructura `ROOTS/` definida.
-- T08: parcial; manifiesto completo pendiente de ejecución del ensamblador.
-- T09/T10/T11/T12/T13/T14/T15/T16: pendientes.
+## 5. OpenClaw — hechos registrados
+Canonical OpenClaw: `openclaw/openclaw@a4178c7eb15a0dd2b8b44804348e256f1a109a34`.
+`ROOTS/openclaw/` es la raíz exclusiva del agente.
+El lockfile canónico se registró con SHA `cefd1fdf77f5c170ffacfad4b75e03c4c33345cf`. `pnpm-lock.yaml.zip` y `pnpm-lock.yaml.txt` fueron temporales/duplicados tratados después de verificación. El lockfile global no debe eliminarse por nombre: se distingue por ruta/hash.
 
-## Próximo lote — 5 tareas paralelas
-1. T03/T06-A: ejecutar el nuevo workflow de ensamblaje y verificar el resultado real del run; no declarar éxito hasta leer `ROOTS/openclaw/package.json` y `.acr-canonical-ref` desde GitHub.
-2. T04-B: usar la extracción local completa para verificar que ZIP1=ZIP4 y cuantificar todos los overlaps de los 8 ZIP.
-3. T06-C: si el workflow falla, leer jobs/logs, corregir solo la causa demostrada y re-ejecutar; no cambiar el objetivo.
-4. T08-D: leer de vuelta `FORENSIC-ZIP/FINAL-CROSSCHECK.md` y `OPENCLAW-ROOT-MANIFEST.md` cuando aparezcan; clasificar cada resultado.
-5. T10/T12/T14/T15-E: después de un build PASS, verificar exclusiones, árbol, hashes, aislamiento `ROOTS/openclaw/` y auditoría XRAY final.
+## 6. Arquitectura multi-raíz
+```text
+ROOTS/
+  openclaw/
+  <agente-2>/
+  <agente-3>/
+```
+Pipeline, bitácora y manifests permanecen fuera de las raíces.
 
-## Formato obligatorio
-Tarea en curso / Total de tareas / Tareas terminadas al 100% / Tareas pendientes / Siguiente tarea con 3–5 subtareas paralelas / Confirmación 100% / Bloqueos-reparación.
+## 7. Auditoría ZIP conocida
+Se recuperaron 8 artifacts de ZIP mediante GitHub Actions. La extracción confirmada preservó rutas relativas y produjo manifests/SHA-256. Unión observada: 14.698 rutas únicas. ZIP1 y ZIP4 son duplicados exactos; los demás son piezas complementarias con overlaps documentados. La raíz final no debe construirse pegando ciegamente piezas: el ref canónico es autoridad y los ZIP sirven como evidencia cruzada.
 
-## Regla final
-No DONE hasta completar T01–T15 con evidencia, publicación, read-back, verificación cruzada y auditoría forense XRAY. Si una subtarea está bloqueada, continuar tareas independientes y registrar BLOCKED; nunca inventar DONE.
+## 8. Pipeline CPU
+Workflow independiente `.github/workflows/cpu-benchmark.yml`. UNA ejecución, UNA cadena, UN artifact. Diez pruebas: CPU identification; Sysbench; OpenSSL SHA-256; 7-Zip; Integer/C; Floating point; stress-ng; SHA-256 throughput; JSON; scaling 1/2/4.
 
-## ACTUALIZACIÓN INTEGRAL — PIPELINE Y BENCHMARK CPU
-Fecha de actualización: 2026-08-21/22.
+La existencia del workflow NO prueba una ejecución. Solo `run/job/artifact` real permite `PASS`.
 
-### Gap y solución: lockfile
-Se encontró `pnpm-lock.yaml.txt` y un ZIP en la raíz en lugar de `ROOTS/openclaw/pnpm-lock.yaml`. El lockfile canónico de OpenClaw se verificó por SHA esperado `cefd1fdf77f5c170ffacfad4b75e03c4c33345cf`. Se corrigió la ubicación dentro de `ROOTS/openclaw/` y se retiraron los duplicados temporales. El `pnpm-lock.yaml` global no se trató como duplicado porque su SHA era diferente.
+## 9. Regla de continuidad GPT/Grok
+Leer esta bitácora y `PIPELINE-ACR-CONSOLIDATED.md`; tomar snapshot; trabajar en staging; registrar gap; corregir; hash; read-back; actualizar bitácora.
 
-### Pipeline de pruebas CPU
-Se creó un mini-workflow independiente en `.github/workflows/cpu-benchmark.yml`, separado de `ROOTS/openclaw/`, para reutilizarlo con OpenClaw y futuros agentes/modelos.
+## 10. Estado
+OpenClaw: raíz separada y debe tratarse como zona protegida.
+ZIP: extracción deja el ZIP intacto; eliminar es operación posterior y condicionada a PASS.
+Benchmark CPU: workflow preparado; ejecución física pendiente hasta evidencia real.
+Auditoría completa: pendiente mientras existan tareas T09–T16 sin evidencia.
 
-El diseño final es UNA ejecución, UNA cadena y UN artifact. Las 10 pruebas son: CPU identification; Sysbench CPU; OpenSSL SHA-256; 7-Zip multi-thread; Integer/C; Floating point; stress-ng CPU; SHA-256 throughput; JSON processing; thread scaling 1/2/4.
-
-El workflow usa `set -euo pipefail`, registra la evidencia en `benchmark-results/benchmark.log` y sube `cpu-benchmark-results`. La configuración fue simplificada desde una propuesta anterior de tres pasadas porque el requisito operativo es una sola batería completa. Commits relevantes: `e99539c856bcc0dcbd9f5250d3d6c8041e672d4f`, `8296133bf49e67a17bdf751f57ffda90c96d3a88`, `a20565fc9e20800b5448b15bd373897979ea9018`.
-
-### Regla de evidencia del benchmark
-La presencia del workflow no significa que el benchmark haya corrido. Solo se marca PASS cuando existe un run/job real de GitHub Actions y sus logs/artifact son inspeccionados. Si no existe `run_id`, estado o artifact, el estado correcto es PENDIENTE.
-
-### Lecciones para futuros agentes
-- No usar `raw.githubusercontent.com` cuando el usuario pide la vista del archivo en GitHub: usar `/blob/<ref>/<path>`.
-- No inventar URLs de Release assets que no existan.
-- No declarar una operación de GitHub Actions iniciada si la integración disponible no expone `workflow_dispatch`.
-- Cuando un ZIP contiene solo una pieza, no asumir que es la raíz completa.
-- Preservar las rutas relativas y verificar hashes después de mover/extractar.
-- Mantener raíces de agentes como hermanas bajo `ROOTS/` y dejar pipeline, bitácora y manifests fuera de ellas.
-- Consolidar muchas pruebas en un workflow encadenado cuando el objetivo es ahorrar ejecuciones/salidas.
-
-## Estado de esta actualización
-- Bitácora consolidada: ACTUALIZADA.
-- Método reproducible: DOCUMENTADO.
-- Flujo ZIP→extracción→raíz→verificación: DOCUMENTADO.
-- Pipeline CPU de 10 pruebas: DOCUMENTADO.
-- Evidencia de ejecución física del benchmark: PENDIENTE hasta disponer de run/job/artifact real.
-- Auditoría final de todos los gaps OpenClaw: PENDIENTE mientras T09–T16 no tengan evidencia completa.
+## 11. Regla anti-alucinación
+Si no existe evidencia de GitHub (commit, archivo, run, job, artifact o hash), registrar `PENDIENTE`, nunca `DONE`.
