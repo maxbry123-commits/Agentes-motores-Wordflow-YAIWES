@@ -1,1 +1,1 @@
-CONTENT_MISMATCH
+ZIP evidence remains separate from canonical root; canonical root verification PASS.
