@@ -1,0 +1,98 @@
+name: CPU Benchmark Lab
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/cpu-benchmark.yml'
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install benchmark tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sysbench stress-ng p7zip-full openssl jq bc
+
+      - name: Run 10 CPU tests
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p benchmark-results
+          exec > >(tee benchmark-results/benchmark.log) 2>&1
+          echo '=== CPU BENCHMARK LAB ==='
+          date -u +%FT%TZ
+          echo
+          echo '1) CPU INFO'
+          lscpu
+          echo
+          echo '2) SYSBENCH CPU'
+          sysbench cpu --cpu-max-prime=20000 --threads=4 run || true
+          echo
+          echo '3) OPENSSL SHA256'
+          openssl speed -seconds 5 sha256 || true
+          echo
+          echo '4) 7-ZIP'
+          7z b -mmt=4 || true
+          echo
+          echo '5) INTEGER / C BENCHMARK'
+          cat > /tmp/bench.c <<'EOF'
+          #include <stdint.h>
+          #include <stdio.h>
+          int main(void){ volatile uint64_t x=0x123456789abcdefULL; for(uint64_t i=0;i<200000000ULL;i++) x=x*2862933555777941757ULL+3037000493ULL; printf("%llu\n",(unsigned long long)x); return 0; }
+          EOF
+          gcc -O2 /tmp/bench.c -o /tmp/bench
+          /usr/bin/time -f 'elapsed=%e sec' /tmp/bench || true
+          echo
+          echo '6) FLOATING POINT'
+          python3 - <<'PY'
+          import time, math
+          n=20000000
+          t=time.perf_counter(); x=0.1
+          for i in range(n): x=math.sin(x)+math.cos(x)+1e-9
+          print(f'iterations={n} elapsed={time.perf_counter()-t:.6f} sec result={x}')
+          PY
+          echo
+          echo '7) STRESS-NG CPU'
+          stress-ng --cpu 4 --cpu-method matrixprod --timeout 20s --metrics-brief || true
+          echo
+          echo '8) SHA256 FILE HASH'
+          dd if=/dev/zero of=/tmp/bench-256m.bin bs=1M count=256 status=none
+          /usr/bin/time -f 'elapsed=%e sec' sha256sum /tmp/bench-256m.bin || true
+          echo
+          echo '9) JSON PROCESSING'
+          python3 - <<'PY'
+          import json,time
+          data=[{'i':i,'v':i*i,'s':str(i)} for i in range(200000)]
+          t=time.perf_counter(); s=json.dumps(data,separators=(',',':')); a=json.loads(s); e=time.perf_counter()-t
+          print(f'items={len(a)} bytes={len(s)} elapsed={e:.6f} sec')
+          PY
+          echo
+          echo '10) THREAD SCALING'
+          python3 - <<'PY'
+          import concurrent.futures,time,os
+          def work(n):
+              x=0
+              for i in range(n): x=(x*1664525+i+1013904223)&0xffffffff
+              return x
+          n=20000000
+          for workers in (1,2,4):
+              t=time.perf_counter()
+              with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+                  list(ex.map(work,[n//workers]*workers))
+              print(f'workers={workers} elapsed={time.perf_counter()-t:.6f} sec')
+          PY
+          echo
+          echo '=== END ==='
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: cpu-benchmark-results
+          path: benchmark-results/
+          retention-days: 30
