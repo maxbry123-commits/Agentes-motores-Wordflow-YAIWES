@@ -1,0 +1,20 @@
+name: Temporary download pnpm-lock
+on:
+  push:
+    branches:
+      - main
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download canonical lockfile
+        run: |
+          curl -L --fail --retry 3 -o pnpm-lock.yaml 'https://raw.githubusercontent.com/openclaw/openclaw/a4178c7eb15a0dd2b8b44804348e256f1a109a34/pnpm-lock.yaml'
+          sha256sum pnpm-lock.yaml | tee pnpm-lock.sha256
+      - name: Upload lockfile artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: openclaw-pnpm-lock-canonical
+          path: |
+            pnpm-lock.yaml
+            pnpm-lock.sha256
