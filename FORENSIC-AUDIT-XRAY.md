@@ -1,11 +1,14 @@
 # FINAL OPENCLAW FORENSIC XRAY
 
 - Canonical ref: `a4178c7eb15a0dd2b8b44804348e256f1a109a34`
-- Root: `ROOTS/openclaw/`
-- Critical canonical files verified: PASS
-- Workspace paths verified: PASS
-- Generated dependency directories excluded: PASS
-- Root isolation: PASS
+- Critical files: PASS
+- Workspace: PASS
+- UI: PASS
+- Extensions/packages/examples: PASS
+- Generated dependencies excluded: PASS
+- Source-install surface: PASS
+- ZIP extracted: PASS
+- Duplicate archive removed: PASS
 
 | File | SHA-256 |
 |---|---|
@@ -16,5 +19,5 @@
 | `openclaw.mjs` | `04f4b7850965fae95716b8d39a937bf2ae7a5ae25d5862a075a2774153fd3c31` |
 | `ui/package.json` | `3fbc920d5c055ce71f7d4d8d62f063f868fbd2632d5d24b42b4ea849d698ad6f` |
 
-- Root file/symlink entries: **33256**
+- Root entries: **33256**
 - Final verification: **PASS**
