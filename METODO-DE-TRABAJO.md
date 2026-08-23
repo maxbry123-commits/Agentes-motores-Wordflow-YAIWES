@@ -171,3 +171,1066 @@ remote_op("verify_file", owner="...", repo="...", path="Cerebro/GUIA_CUENTAS_REM
 ### Resumen en una línea
 **La AI borra el path duplicado con DELETE/Contents o `delete_paths`, comprueba que ese path ya no existe y que el canónico sigue, y solo entonces cierra el trabajo.**
 
+Sí. La mejoro para que funcione como plantilla universal operativa para un agente de IA trabajando sobre GitHub, con memoria persistente en PIPELINE + BITÁCORA, ejecución por lotes, LOOP continuo, resolución de GAPs y verificación cruzada.
+
+PLANTILLA UNIVERSAL — GITHUB AI LOOP ENGINE
+
+Método operativo de ejecución continua — NO-STOP / GAP-RESOLUTION / X-RAY
+
+
+---
+
+0. REGLA MAESTRA DEL SISTEMA
+
+INPUT BLOCK
+     ↓
+LEER
+     ↓
+ANOTAR EN PIPELINE
+     ↓
+AUDITORÍA FORENSE X-RAY
+     ↓
+PLANIFICACIÓN COMPLETA POR LOTES
+     ↓
+EJECUCIÓN EN LOOP
+     ↓
+VERIFICACIÓN
+     ↓
+GAP
+ ┌───┴───────────────────────┐
+ │                           │
+NO                          SÍ
+ │                           │
+ ↓                           ↓
+CONTINUAR              INVESTIGAR 20 SOLUCIONES
+                             ↓
+                        DIAGNOSTICAR
+                             ↓
+                          RESOLVER
+                             ↓
+                         VERIFICAR
+                             ↓
+                         CONTINUAR
+                             │
+                             └──────────→ LOOP
+                                         ↓
+                              SEGUNDA PASADA
+                                         ↓
+                              X-RAY FORENSE
+                                         ↓
+                              VERIFICACIÓN CRUZADA
+                                         ↓
+                              INPUT BLOCK FINAL
+                                         ↓
+                                  100% PASS
+
+REGLA ABSOLUTA
+
+NO STOP.
+
+Un GAP no termina el procesamiento.
+
+Un error no termina el procesamiento.
+
+Un fallo de GitHub no termina el procesamiento.
+
+Un commit pendiente no termina el procesamiento.
+
+Una espera de GitHub no termina el procesamiento.
+
+Una tarea bloqueada temporalmente no bloquea las tareas independientes.
+
+El agente debe:
+
+> diagnosticar → resolver → verificar → continuar → volver al GAP → repetir hasta PASS.
+
+
+
+
+---
+
+1. INPUT BLOCK — CONTRATO DE ENTRADA
+
+Antes de hacer cualquier cosa, el agente debe crear un bloque de entrada:
+
+INPUT BLOCK
+
+TAREA:
+[texto exacto recibido]
+
+OBJETIVO:
+[resultado requerido]
+
+FUENTE:
+[repo / archivo / URL / commit]
+
+DESTINOS:
+[repositorios / archivos / ramas]
+
+ALCANCE:
+[qué puede modificar]
+
+FUERA DE ALCANCE:
+[qué NO puede modificar]
+
+REGLAS ESPECIALES:
+[restricciones]
+
+CRITERIO PASS:
+[condición exacta]
+
+CRITERIO FINAL:
+[qué significa 100% terminado]
+
+Regla
+
+El INPUT BLOCK es el contrato de la tarea.
+
+No debe reinterpretarse durante el procesamiento.
+
+Si existe ambigüedad:
+
+INPUT BLOCK
+↓
+IDENTIFICAR AMBIGÜEDAD
+↓
+INVESTIGAR CONTEXTO DISPONIBLE
+↓
+PIPELINE
+↓
+MÉTODO DE TRABAJO
+↓
+DECIDIR DENTRO DEL ALCANCE
+
+No inventar requisitos.
+
+
+---
+
+2. PRIMERA SALIDA OBLIGATORIA — X-RAY
+
+La primera salida operativa no ejecuta cambios.
+
+Debe hacer:
+
+INPUT BLOCK
++
+MÉTODO DE TRABAJO
++
+PIPELINE
++
+BITÁCORA
++
+REPOSITORIO
+        ↓
+AUDITORÍA FORENSE X-RAY
+
+Comprobar:
+
+1. Método de trabajo vigente.
+
+
+2. Pipeline existente.
+
+
+3. Bitácora existente.
+
+
+4. Estado anterior de la tarea.
+
+
+5. Commits anteriores.
+
+
+6. Cambios ya realizados.
+
+
+7. Tareas completadas.
+
+
+8. Tareas pendientes.
+
+
+9. GAPs anteriores.
+
+
+10. Errores anteriores.
+
+
+11. Intentos anteriores.
+
+
+12. Criterios de PASS.
+
+
+13. Alcance.
+
+
+14. Archivos autorizados.
+
+
+15. Archivos protegidos.
+
+
+16. Dependencias.
+
+
+17. Estado de GitHub.
+
+
+18. Evidencia disponible.
+
+
+19. Último punto de continuidad.
+
+
+20. Riesgo de duplicar trabajo.
+
+
+
+Resultado obligatorio
+
+X-RAY STATUS
+
+TASK:
+[ ]
+
+PREVIOUS STATE:
+[ ]
+
+COMPLETED:
+[ ]
+
+PENDING:
+[ ]
+
+GAPS:
+[ ]
+
+LAST VERIFIED POINT:
+[ ]
+
+NEXT VALID ACTION:
+[ ]
+
+SCOPE:
+[ ]
+
+PASS CRITERIA:
+[ ]
+
+
+---
+
+3. REGISTRO INMEDIATO EN PIPELINE
+
+Antes de ejecutar, escribir/anotar la tarea en el PIPELINE.
+
+Debe quedar:
+
+TASK ID:
+T-XXXX
+
+TASK:
+[ ]
+
+INPUT BLOCK:
+[ ]
+
+OBJECTIVE:
+[ ]
+
+SOURCE:
+[ ]
+
+DESTINATIONS:
+[ ]
+
+SCOPE:
+[ ]
+
+PASS CRITERIA:
+[ ]
+
+X-RAY:
+PASS
+
+CURRENT STATE:
+[ ]
+
+NEXT ACTION:
+[ ]
+
+El Pipeline se convierte en memoria externa de respaldo.
+
+Regla anti-alucinación
+
+El agente no debe confiar solamente en su memoria conversacional.
+
+En cada nueva tarea:
+
+NUEVA TAREA
+ ↓
+LEER INPUT BLOCK
+ ↓
+LEER PIPELINE
+ ↓
+LEER BITÁCORA
+ ↓
+LEER MÉTODO
+ ↓
+X-RAY
+ ↓
+CONTINUAR
+
+
+---
+
+4. PASO 1 — PLANIFICACIÓN EN LOTES
+
+No empezar ejecutando tarea por tarea sin planificación.
+
+Primero crear el mapa completo.
+
+Ejemplo:
+
+LOTE 1 — INVENTARIO
+LOTE 2 — AUDITORÍA
+LOTE 3 — PREPARACIÓN
+LOTE 4 — EJECUCIÓN
+LOTE 5 — VERIFICACIÓN
+LOTE 6 — SEGUNDA PASADA
+LOTE 7 — X-RAY
+LOTE 8 — AUDITORÍA FINAL
+
+Si existen hasta 20 tareas:
+
+T01
+T02
+T03
+...
+T20
+
+Cada tarea debe tener:
+
+ID
+OBJETIVO
+REPO
+ARCHIVO
+ACCIÓN
+DEPENDENCIAS
+PASS
+ESTADO
+
+
+---
+
+5. PASO 2 — EJECUCIÓN TOTAL EN LOOP
+
+Una vez terminada la planificación:
+
+PLAN
+ ↓
+T01
+ ↓
+T02
+ ↓
+T03
+ ↓
+...
+ ↓
+T20
+
+Pero no se permite salir del LOOP porque una tarea tenga GAP.
+
+Ejemplo:
+
+T01 → PASS
+T02 → PASS
+T03 → GAP
+       ↓
+   INVESTIGAR
+       ↓
+   RESOLVER
+       ↓
+   VERIFICAR
+       ↓
+   PASS
+       ↓
+T04
+
+Y si T03 necesita esperar a GitHub:
+
+T03 → WAIT
+       ↓
+T04 → ejecutar
+T05 → ejecutar
+T06 → verificar
+       ↓
+T03 → comprobar nuevamente
+       ↓
+PASS
+
+
+---
+
+6. MOTOR DE GAP — 20 VÍAS DE SOLUCIÓN
+
+Cuando aparece un GAP, el agente no debe detenerse inmediatamente.
+
+Debe investigar hasta 20 vías razonables de resolución, priorizadas.
+
+GAP
+ ↓
+DIAGNÓSTICO
+ ↓
+CAUSA RAÍZ
+ ↓
+SOLUCIÓN 1
+SOLUCIÓN 2
+SOLUCIÓN 3
+...
+SOLUCIÓN 20
+ ↓
+COMPARAR
+ ↓
+ELEGIR SOLUCIÓN SEGURA
+ ↓
+EJECUTAR
+ ↓
+VERIFICAR
+
+Las 20 vías no significan ejecutar cambios destructivos indiscriminadamente.
+
+Significan investigar 20 rutas posibles, por ejemplo:
+
+1. revisar documentación;
+
+
+2. revisar API;
+
+
+3. revisar permisos;
+
+
+4. revisar rama;
+
+
+5. revisar SHA;
+
+
+6. revisar árbol;
+
+
+7. revisar blob;
+
+
+8. revisar commit;
+
+
+9. revisar endpoint;
+
+
+10. revisar estado remoto;
+
+
+11. revisar historial;
+
+
+12. comparar otro repositorio;
+
+
+13. probar operación equivalente;
+
+
+14. dividir operación;
+
+
+15. cambiar estrategia de escritura;
+
+
+16. reintentar operación segura;
+
+
+17. comprobar eventual consistency;
+
+
+18. usar mecanismo alternativo permitido;
+
+
+19. verificar resultado desde otra ruta;
+
+
+20. reconstruir operación desde la causa raíz.
+
+
+
+Regla
+
+No probar soluciones destructivas solo para “hacer que pase”.
+
+Toda solución debe respetar:
+
+alcance;
+
+seguridad;
+
+integridad;
+
+método de trabajo;
+
+criterio PASS.
+
+
+
+---
+
+7. GAP NO BLOQUEA EL RESTO
+
+Si una tarea está esperando:
+
+T03 = WAIT
+
+y T04–T10 son independientes:
+
+T03 WAIT
+   ║
+   ╠══ T04 RUN
+   ╠══ T05 RUN
+   ╠══ T06 RUN
+   ╠══ T07 VERIFY
+   ╚══ T08 RUN
+
+Después:
+
+VOLVER A T03
+ ↓
+RECHECK
+ ↓
+RESOLVE
+ ↓
+VERIFY
+
+
+---
+
+8. ESPERA DE GITHUB
+
+Si una operación necesita commit, push, actualización remota o propagación:
+
+COMMIT / PUSH
+ ↓
+ESPERAR 10–20 SEGUNDOS
+
+Durante esa espera:
+
+no quedarse inactivo si existen tareas independientes.
+
+GITHUB WAIT
+ ↓
+TAREA INDEPENDIENTE
+ ↓
+AUDITORÍA / VERIFICACIÓN
+ ↓
+OTRA TAREA
+ ↓
+VOLVER A GITHUB
+ ↓
+READ-BACK
+
+Nunca declarar PASS solamente porque GitHub aceptó el commit.
+
+Debe hacerse:
+
+WRITE
+ ↓
+WAIT
+ ↓
+READ-BACK
+ ↓
+COMPARE
+ ↓
+PASS
+
+
+---
+
+9. VERIFICACIÓN INMEDIATA
+
+Cada modificación debe tener su propio ciclo:
+
+WRITE
+ ↓
+COMMIT
+ ↓
+PUSH
+ ↓
+WAIT
+ ↓
+READ
+ ↓
+COMPARE
+ ↓
+PASS
+
+Si falla:
+
+FAIL
+ ↓
+GAP ENGINE
+ ↓
+RESOLVE
+ ↓
+RETRY
+ ↓
+VERIFY
+
+
+---
+
+10. PIPELINE COMO MEMORIA EXTERNA
+
+Después de cada cambio importante:
+
+actualizar el Pipeline.
+
+Registrar:
+
+TASK ID
+TIME
+REPO
+FILE
+ACTION
+OLD STATE
+NEW STATE
+COMMIT
+SHA
+VERIFICATION
+GAP
+SOLUTION
+NEXT ACTION
+
+Ejemplo:
+
+T07
+Repo: X
+File: Y
+Action: UPDATE
+Commit: abc123
+Read-back: PASS
+Content verification: PASS
+Next: T08
+
+Esto evita que el agente tenga que reconstruir el estado desde memoria interna.
+
+
+---
+
+11. BITÁCORA
+
+La bitácora registra el historial completo:
+
+FECHA
+TAREA
+ACCIÓN
+RESULTADO
+GAP
+DIAGNÓSTICO
+SOLUCIÓN
+COMMIT
+VERIFICACIÓN
+SIGUIENTE PASO
+
+Regla
+
+Pipeline = estado actual.
+
+Bitácora = historial.
+
+Input Block = contrato original.
+
+Método de trabajo = reglas del sistema.
+
+
+---
+
+12. RELECTURA OBLIGATORIA EN CADA NUEVA TAREA
+
+Antes de comenzar T02:
+
+LEER INPUT BLOCK
+ ↓
+LEER PIPELINE
+ ↓
+LEER BITÁCORA
+ ↓
+COMPROBAR T01
+ ↓
+X-RAY
+ ↓
+T02
+
+Antes de T03:
+
+LEER INPUT BLOCK
+ ↓
+LEER PIPELINE
+ ↓
+LEER BITÁCORA
+ ↓
+COMPROBAR T02
+ ↓
+X-RAY
+ ↓
+T03
+
+Y así sucesivamente.
+
+Esto evita:
+
+perder el objetivo;
+
+duplicar trabajo;
+
+olvidar un GAP;
+
+mezclar tareas;
+
+inventar estados.
+
+
+
+---
+
+13. CONTROL DE ENFOQUE
+
+En cada transición:
+
+¿ESTOY HACIENDO PARTE DEL INPUT BLOCK?
+          ↓
+       SÍ → CONTINUAR
+          ↓
+       NO → NO EJECUTAR
+
+Si aparece una tarea nueva:
+
+TAREA NUEVA
+ ↓
+NO MEZCLAR
+ ↓
+REGISTRAR COMO NUEVA TAREA
+ ↓
+CONTINUAR TAREA ACTUAL
+
+
+---
+
+14. SEGUNDA PASADA OBLIGATORIA
+
+Nunca declarar terminado después de la primera pasada.
+
+PRIMERA PASADA
+ ↓
+TODAS LAS TAREAS
+ ↓
+SEGUNDA PASADA
+ ↓
+TODAS LAS TAREAS NUEVAMENTE
+
+Buscar:
+
+archivos faltantes;
+
+cambios incompletos;
+
+commits incorrectos;
+
+SHA incorrectos;
+
+contenido diferente;
+
+tareas olvidadas;
+
+GAPs ocultos.
+
+
+
+---
+
+15. FORENSE X-RAY FINAL
+
+Comprobar simultáneamente:
+
+INPUT BLOCK
+     ↕
+PIPELINE
+     ↕
+BITÁCORA
+     ↕
+GITHUB
+     ↕
+COMMITS
+     ↕
+ARCHIVOS
+     ↕
+SHA
+
+Debe existir coherencia completa.
+
+
+---
+
+16. VERIFICACIÓN CRUZADA FINAL
+
+La última auditoría debe responder:
+
+INPUT BLOCK
+
+¿Se cumplió exactamente?
+
+PIPELINE
+
+¿Todos los estados están registrados?
+
+BITÁCORA
+
+¿Todos los cambios están documentados?
+
+GITHUB
+
+¿Los cambios realmente existen?
+
+COMMITS
+
+¿Cada cambio tiene evidencia?
+
+ENLACES
+
+¿Cada cambio puede abrirse y comprobarse?
+
+ALCANCE
+
+¿No se modificó nada ajeno?
+
+TAREAS
+
+¿Las 20 tareas, si existen, están en PASS?
+
+
+---
+
+17. ENLACE OBLIGATORIO POR CAMBIO
+
+Para cada modificación GitHub:
+
+REPO:
+[ ]
+
+ARCHIVO:
+[ ]
+
+COMMIT:
+[ ]
+
+ENLACE:
+[ ]
+
+VERIFICACIÓN:
+PASS
+
+El enlace debe permitir comprobar directamente el cambio.
+
+No decir:
+
+> “Está hecho.”
+
+
+
+Debe existir evidencia navegable.
+
+
+---
+
+18. ESTADO DE CADA TAREA
+
+Estados permitidos:
+
+QUEUED
+RUNNING
+WAITING
+GAP
+RESEARCHING
+RESOLVING
+VERIFYING
+PASS
+
+DONE solamente después de PASS.
+
+
+---
+
+19. CONDICIÓN DE NO-STOP
+
+El agente no puede abandonar el LOOP simplemente porque:
+
+apareció un GAP;
+
+GitHub respondió con error;
+
+una API tardó;
+
+un commit está propagándose;
+
+una operación falló;
+
+una tarea necesita otra estrategia;
+
+un repositorio está temporalmente inaccesible;
+
+una primera solución no funcionó.
+
+
+Debe:
+
+ERROR
+ ↓
+DIAGNÓSTICO
+ ↓
+20 VÍAS DE INVESTIGACIÓN
+ ↓
+SOLUCIÓN
+ ↓
+VERIFICACIÓN
+ ↓
+CONTINUAR
+
+Excepción real
+
+Si existe una imposibilidad externa auténtica que no puede resolverse mediante las herramientas disponibles, no inventar PASS.
+
+Registrar:
+
+EXTERNAL BLOCK
+EVIDENCE
+ATTEMPTS
+20-WAY ANALYSIS
+CURRENT STATE
+NEXT RECOVERY POINT
+
+y conservar todo en Pipeline/Bitácora.
+
+Pero no convertir un error ordinario en “bloqueo externo” para escapar del LOOP.
+
+
+---
+
+20. CIERRE DEL CICLO
+
+Solo cerrar cuando:
+
+T01 PASS
+T02 PASS
+T03 PASS
+...
+T20 PASS
+       ↓
+SEGUNDA PASADA PASS
+       ↓
+X-RAY PASS
+       ↓
+INPUT BLOCK PASS
+       ↓
+PIPELINE PASS
+       ↓
+BITÁCORA PASS
+       ↓
+GITHUB PASS
+       ↓
+ENLACES VERIFICADOS
+       ↓
+SIN GAPS
+       ↓
+SIN PENDIENTES
+       ↓
+100% PASS
+
+LOOP MAESTRO FINAL
+
+┌───────────────────────────────────────────────┐
+│                 INPUT BLOCK                   │
+└──────────────────────┬────────────────────────┘
+                       ↓
+              LEER MÉTODO DE TRABAJO
+                       ↓
+                 LEER PIPELINE
+                       ↓
+                 LEER BITÁCORA
+                       ↓
+                FORENSE X-RAY
+                       ↓
+             PLANIFICAR POR LOTES
+                       ↓
+             ┌─────────────────┐
+             │   LOOP TAREAS   │
+             └────────┬────────┘
+                      ↓
+                EJECUTAR TAREA
+                      ↓
+                   VERIFY
+                      ↓
+               ┌──────┴──────┐
+               │             │
+             PASS           GAP
+               │             │
+               │             ↓
+               │       DIAGNOSTICAR
+               │             ↓
+               │      INVESTIGAR ×20
+               │             ↓
+               │         RESOLVER
+               │             ↓
+               │         VERIFICAR
+               │             │
+               │             └──────→ LOOP
+               ↓
+          REGISTRAR PIPELINE
+               ↓
+          REGISTRAR BITÁCORA
+               ↓
+          SIGUIENTE TAREA
+               ↓
+          LEER INPUT BLOCK
+               ↓
+          LEER PIPELINE
+               ↓
+          REVISAR ENFOQUE
+               ↓
+          CONTINUAR LOOP
+               ↓
+        SEGUNDA PASADA COMPLETA
+               ↓
+         FORENSE X-RAY FINAL
+               ↓
+       VERIFICACIÓN CRUZADA FINAL
+               ↓
+      INPUT BLOCK ↔ PIPELINE ↔ GITHUB
+               ↓
+       ENLACES DE CADA CAMBIO
+               ↓
+            100% PASS
+               ↓
+          CERRAR TAREA
+
+PRINCIPIO FUNDAMENTAL
+
+> El agente no trabaja para producir una respuesta; trabaja para llevar el estado real de GitHub desde el estado inicial del INPUT BLOCK hasta el estado final verificable de 100% PASS.
+
+
+
+Y:
+
+> La memoria de trabajo no puede depender de lo que el agente “recuerde”: debe quedar reconstruible desde INPUT BLOCK + PIPELINE + BITÁCORA + GitHub.
+
+
+
+Esta versión ya incorpora planificación en lote + ejecución continua + hasta 20 tareas + GAP engine + investigación de 20 soluciones + espera activa + paralelización de tareas independientes + doble pasada + X-Ray + memoria persistente + enlaces de evidencia + verificación cruzada final.
