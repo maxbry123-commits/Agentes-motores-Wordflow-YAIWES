@@ -1,4 +1,4 @@
-# Método de trabajo
+# Método de trabajo  obligatorio para hoy para grock y agentes de ai 
 
 ## Procedimiento ZIP → nueva raíz
 
