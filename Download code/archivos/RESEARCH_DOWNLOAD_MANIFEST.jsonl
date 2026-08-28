@@ -14,3 +14,5 @@
 {"number": 14, "parts": 2, "slug": "Argo-Workflows", "source": "https://github.com/argoproj/argo-workflows.git", "source_commit": "bde5adf915fbc2600a49e6e864a699544fb91368", "status": "COMPLETE"}
 {"number": 15, "parts": 2, "slug": "Kestra", "source": "https://github.com/kestra-io/kestra.git", "source_commit": "f508ee5b6861a4318b3caa5a0896ff15a7f22976", "status": "COMPLETE"}
 {"number": 16, "parts": 1, "slug": "LangGraph", "source": "https://github.com/langchain-ai/langgraph.git", "source_commit": "11ee185999b86bfea2d8c0e69cef9a5e37acf686", "status": "COMPLETE"}
+{"number": 17, "parts": 9, "slug": "Hatchet", "source": "https://github.com/hatchet-dev/hatchet.git", "source_commit": "32c55370ae4214ebe739fa98cbdc5001a655f8ab", "status": "COMPLETE"}
+{"number": 18, "parts": 4, "slug": "Windmill", "source": "https://github.com/windmill-labs/windmill.git", "source_commit": "7a0c81d7222f3e7bb971c3cb9baeb82f153ba749", "status": "COMPLETE"}
