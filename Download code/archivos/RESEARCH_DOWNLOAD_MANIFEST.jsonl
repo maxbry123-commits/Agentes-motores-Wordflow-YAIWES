@@ -8,3 +8,9 @@
 {"number": 8, "parts": 3, "slug": "Haystack", "source": "https://github.com/deepset-ai/haystack.git", "source_commit": "30d7506d0b692dd1ac67eae62a77f50fdc9bd4db", "status": "COMPLETE"}
 {"number": 9, "parts": 1, "slug": "Crawl4AI", "source": "https://github.com/unclecode/crawl4ai.git", "source_commit": "7e801521428ee12509994d39151006f64055ebe3", "status": "COMPLETE"}
 {"number": 10, "parts": 2, "slug": "Perplexica", "source": "https://github.com/cognitive-builder/Perplexica.git", "source_commit": "0737701de0b541b1761c38420033f87a6c7297cd", "status": "COMPLETE"}
+{"number": 11, "parts": 2, "slug": "Dagu", "source": "https://github.com/dagucloud/dagu.git", "source_commit": "ca41eac9b044f5493b3cc692fdb260ded2579835", "status": "COMPLETE"}
+{"number": 12, "parts": 2, "slug": "Conductor", "source": "https://github.com/conductor-oss/conductor.git", "source_commit": "ce46eac3303a77ba2d7e4a34ebb47730743387b7", "status": "COMPLETE"}
+{"number": 13, "parts": 1, "slug": "Temporal", "source": "https://github.com/temporalio/temporal.git", "source_commit": "c044bf16b1cc47a4db80669a987484dba6145331", "status": "COMPLETE"}
+{"number": 14, "parts": 2, "slug": "Argo-Workflows", "source": "https://github.com/argoproj/argo-workflows.git", "source_commit": "bde5adf915fbc2600a49e6e864a699544fb91368", "status": "COMPLETE"}
+{"number": 15, "parts": 2, "slug": "Kestra", "source": "https://github.com/kestra-io/kestra.git", "source_commit": "f508ee5b6861a4318b3caa5a0896ff15a7f22976", "status": "COMPLETE"}
+{"number": 16, "parts": 1, "slug": "LangGraph", "source": "https://github.com/langchain-ai/langgraph.git", "source_commit": "11ee185999b86bfea2d8c0e69cef9a5e37acf686", "status": "COMPLETE"}
