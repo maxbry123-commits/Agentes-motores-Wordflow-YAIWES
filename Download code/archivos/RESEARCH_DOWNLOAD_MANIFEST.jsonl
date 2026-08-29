@@ -34,3 +34,7 @@
 {"number": 34, "parts": 1, "slug": "MiroThinker", "source": "https://github.com/MiroMindAI/MiroThinker.git", "source_commit": "1c4253f6774bf40314271a827304b842100e054c", "status": "COMPLETE"}
 {"number": 35, "parts": 3, "slug": "Agents-A1", "source": "https://github.com/InternScience/Agents-A1.git", "source_commit": "ff57c5f2d2819c918a20281a3da76990cd82b554", "status": "COMPLETE"}
 {"number": 36, "parts": 3, "slug": "Yunjue-Agent", "source": "https://github.com/YunjueTech/Yunjue-Agent.git", "source_commit": "ecdf1406e0a467a2fbc6b77ce9e0bfe641aebe50", "status": "COMPLETE"}
+{"number": 37, "parts": 2, "slug": "OpenClaw-RL", "source": "https://github.com/Gen-Verse/OpenClaw-RL.git", "source_commit": "f48ac358adf9873b5cb2210f1cb234a52ed8a8a3", "status": "COMPLETE"}
+{"number": 38, "parts": 1, "slug": "SETA", "source": "https://github.com/camel-ai/seta.git", "source_commit": "e4715b01174e6c9503fc46120d81dd692ced75e6", "status": "COMPLETE"}
+{"number": 39, "parts": 2, "slug": "ATLAS", "source": "https://github.com/itigges22/ATLAS.git", "source_commit": "ef616c5d2797f3e54dbe2aa33f8159049e144965", "status": "COMPLETE"}
+{"number": 40, "parts": 2, "slug": "OpenDev", "source": "https://github.com/opendev-to/opendev.git", "source_commit": "d32c660e4eed1a8e988d1fd58da88e41ba641d08", "status": "COMPLETE"}
