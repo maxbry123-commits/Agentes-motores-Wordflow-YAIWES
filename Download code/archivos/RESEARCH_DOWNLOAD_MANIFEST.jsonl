@@ -30,3 +30,7 @@
 {"number": 30, "parts": 1, "slug": "Zuora-Coding-Agent", "source": "https://github.com/zuora/zuora-coding-agent.git", "source_commit": "a521f1b65e63a4eed7c45fd7419172b3b085a8f8", "status": "COMPLETE"}
 {"number": 31, "parts": 1, "slug": "Oh-My-Agents", "source": "https://github.com/visualiaconsulting/oh-my-agents.git", "source_commit": "f72fafafd32e224fa15b9686d5d43ae5743c58d1", "status": "COMPLETE"}
 {"number": 32, "parts": 1, "slug": "Agent-Skill-Lab", "source": "https://github.com/ricardoml96/agent-skill-lab.git", "source_commit": "c279a3d8da246f6cc55bbd7a16d38b81a0780f6c", "status": "COMPLETE"}
+{"number": 33, "parts": 2, "slug": "AI-Agent-Lab", "source": "https://github.com/quantiota/AI-Agent-Lab.git", "source_commit": "85eaff0e0fa0047ab6ef7f6230cbe9f0b9324975", "status": "COMPLETE"}
+{"number": 34, "parts": 1, "slug": "MiroThinker", "source": "https://github.com/MiroMindAI/MiroThinker.git", "source_commit": "1c4253f6774bf40314271a827304b842100e054c", "status": "COMPLETE"}
+{"number": 35, "parts": 3, "slug": "Agents-A1", "source": "https://github.com/InternScience/Agents-A1.git", "source_commit": "ff57c5f2d2819c918a20281a3da76990cd82b554", "status": "COMPLETE"}
+{"number": 36, "parts": 3, "slug": "Yunjue-Agent", "source": "https://github.com/YunjueTech/Yunjue-Agent.git", "source_commit": "ecdf1406e0a467a2fbc6b77ce9e0bfe641aebe50", "status": "COMPLETE"}
