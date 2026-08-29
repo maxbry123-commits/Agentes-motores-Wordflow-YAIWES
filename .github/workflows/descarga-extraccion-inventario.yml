@@ -21,105 +21,47 @@ jobs:
           cd repo
           mkdir -p .download-queue
           cat > .download-queue/repos.tsv <<'EOF'
-Guardians	https://github.com/metareflection/guardians
-Loop Engineer	https://github.com/SollanSystems/loop-engineer
-Agent-Zero	https://github.com/agent0ai/agent-zero
-Awesome Agent Workflows	https://github.com/Richicinschi/awesome-agent-workflows
-Agent Capability Standard	https://github.com/synaptiai/agent-capability-standard
-Microsoft Agent Framework	https://github.com/microsoft/agent-framework
-LangGraph	https://github.com/langchain-ai/langgraph
-Open Verification Kernel	https://github.com/fraware/open-verification-kernel
-Agentic Workflow Framework	https://github.com/JRA-CodingLab/agentic-workflow-framework
-MetaAgent	https://github.com/SaFo-Lab/MetaAgent
-Rasa	https://github.com/RasaHQ/rasa
-Semantic Kernel	https://github.com/microsoft/semantic-kernel
-DSPy	https://github.com/stanfordnlp/dspy
-Agno	https://github.com/agno-agi/agno
-Haystack	https://github.com/deepset-ai/haystack
-SwarmClaw	https://github.com/swarmclawai/swarmclaw
-SwarmDock	https://github.com/swarmclawai/swarmdock
-Agent Framework Samples	https://github.com/microsoft/Agent-Framework-Samples
-IntentKit	https://github.com/crestalnetwork/intentkit
-PraisonAI	https://github.com/MervinPraison/PraisonAI
-Trigger.dev	https://github.com/triggerdotdev/trigger.dev
-Solace Agent Mesh	https://github.com/SolaceLabs/solace-agent-mesh
-OpenRSI / Frontis-MA1 / OpenMLE	https://github.com/FrontisAI/openrsi
-Claw AI Lab	https://github.com/Claw-AI-Lab/Claw-AI-Lab
-Hivemind	https://github.com/hivementality-ai/hivemind
-Research Agent Lab	https://github.com/binary-ciao/research_agent_lab
-AI4S Agent Lab	https://github.com/Goldenmonstew/ai4s-agent-lab
-Evolver / EvolveR	https://github.com/KnowledgeXLab/EvolveR
-Ghost in the Droid	https://github.com/ghost-in-the-droid/android-agent
-Zuora Coding Agent	https://github.com/zuora/zuora-coding-agent
-Oh-My-Agents	https://github.com/visualiaconsulting/oh-my-agents
-Agent Skill Lab	https://github.com/ricardoml96/agent-skill-lab
-AI Agent Lab	https://github.com/quantiota/AI-Agent-Lab
-MiroThinker	https://github.com/MiroMindAI/MiroThinker
-Agents-A1	https://github.com/InternScience/Agents-A1
-Yunjue Agent	https://github.com/YunjueTech/Yunjue-Agent
-OpenClaw-RL	https://github.com/Gen-Verse/OpenClaw-RL
-SETA	https://github.com/camel-ai/seta
-ATLAS	https://github.com/itigges22/ATLAS
-OpenDev	https://github.com/opendev-to/opendev
-Shofer	https://github.com/shofer-dev/shofer
-Safe Lab Agents	https://github.com/MaxNaeg/safe_lab_agents
-CORAL	https://github.com/Human-Agent-Society/CORAL
-NVIDIA OpenShell	https://github.com/NVIDIA/OpenShell
-NVIDIA NeMo Agent Toolkit	https://github.com/NVIDIA/NeMo-Agent-Toolkit
-Kimi Code	https://github.com/MoonshotAI/kimi-cli
+MiniMax Code	https://github.com/MiniMax-AI/minimax-code
+OpenRoom	https://github.com/MiniMax-AI/OpenRoom
 Mini-Agent	https://github.com/MiniMax-AI/Mini-Agent
-Xiaomi Miloco	https://github.com/XiaoMi/xiaomi-miloco
-Meta OpenEnv	https://github.com/meta-pytorch/OpenEnv
-Kimi K2.5 / Agent Swarm	https://github.com/MoonshotAI/Kimi-K2.5
-MiniMax Provider Verifier	https://github.com/MiniMax-AI/MiniMax-Provider-Verifier
-Z.ai GLM Skills	https://github.com/zai-org/GLM-skills
-Xiaomi MiMo-V2-Flash	https://github.com/xiaomimimo/MiMo-V2-Flash
-Qwen-Agent / DeepPlanning	https://github.com/QwenLM/Qwen-Agent
-Agent Contracts	https://github.com/relari-ai/agent-contracts
-Bound	https://github.com/Danny-de-bree/bound
-Agent Handoff	https://github.com/artyomboyko/Agent_Handoff
-Agent Checkpoint	https://github.com/akz4ol/agent-checkpoint
-LangChain Task Steering	https://github.com/edvinhallvaxhiu/langchain-task-steering
-ToolOrchestra	https://github.com/NVlabs/ToolOrchestra
-Sovereign-OS	https://github.com/Justin0504/Sovereign-OS
-Reyn	https://github.com/tya5/reyn
-Kaji	https://github.com/apokamo/kaji
-Prime Agent	https://github.com/PrimeIntellect-ai/prime-agent
+MiniMax Skills	https://github.com/MiniMax-AI/skills
+Kimi Code CLI	https://github.com/MoonshotAI/kimi-code
+Kimi CLI	https://github.com/MoonshotAI/kimi-cli
+Kimi Agent SDK	https://github.com/MoonshotAI/kimi-agent-sdk
+Kimi K2	https://github.com/MoonshotAI/Kimi-K2
+Kimi K3	https://github.com/MoonshotAI/Kimi-K3
+DeepSeek Harness (dsh)	https://github.com/deepseek-ai/deepseek-harness
+Awesome DeepSeek Agent	https://github.com/deepseek-ai/awesome-deepseek-agent
+GitHub Copilot CLI	https://github.com/github/copilot-cli
+GitHub Copilot SDK	https://github.com/github/copilot-sdk
+GitHub Copilot App	https://github.com/github/app
 Grok Build	https://github.com/xai-org/grok-build
-MiniMax Agent Team / Mavis	
-Qwen-UI-Agent	https://github.com/Tongyi-MAI/MAI-UI
-Codex Security	https://github.com/openai/codex-security
-Kimi K2.6 Agent Swarm	
-Kimi K3 Agent Swarm	https://github.com/MoonshotAI/Kimi-K3
-GLM-5V-Turbo	
-GLM-5.3-Flash	https://github.com/zai-org/glm-5
-DeepSeek-V4	
-Qwen3.5 Agent	https://github.com/QwenLM/Qwen3.5
-Hyundai Physical-AI Stack	https://github.com/boston-dynamics/spot-sdk
-Artificial Agent Lab	https://github.com/BY571/artificial-agent-lab
-Swarm Agent	https://github.com/desplega-ai/agent-swarm
-Bernstein	https://github.com/sipyourdrink-ltd/bernstein
-Arena of Autonomous Threads	https://github.com/rafaelmateo123/Arena-of-Autonomous-Threads
-OSS Agent Lab	https://github.com/jeremylongshore/oss-agent-lab
-Aiyu Multi-Agent	https://github.com/teeprakorn1/aiyu-multi-agent
-OpenAlice	https://github.com/TraderAlice/OpenAlice
-Dr. Claw	https://github.com/OpenLAIR/dr-claw
-AgentSPEX	https://github.com/ScaleML/AgentSPEX
-CODE LAYER 11 — Thinking Workflow	
-Atomic	
-Agent Resume	
-Thinking Workflow 10 — Research Bundle	
-Agents Universe	https://github.com/agentuniverse-ai/agentUniverse
-Spice Agent Coding	https://github.com/spiceai/skills
-Jidoka	https://github.com/agentjido/jidoka
-Plugin Marketplace	https://github.com/anthropics/claude-plugins-official
-AgentOS	https://github.com/rivet-dev/agentos
-ORCA	https://github.com/stablyai/orca
-OpenRSI/OpenMLE research stack	https://github.com/FrontisAI/OpenRSI
+Qwen Code	https://github.com/QwenLM/qwen-code
+Qwen-Agent	https://github.com/QwenLM/Qwen-Agent
+Codex	https://github.com/openai/codex
+OpenAI Skills	https://github.com/openai/skills
+Claude Code	https://github.com/anthropics/claude-code
+Claude Agent SDK — TypeScript	https://github.com/anthropics/claude-agent-sdk-typescript
+Claude Agent SDK — Python	https://github.com/anthropics/claude-agent-sdk-python
+Gemini CLI	https://github.com/google-gemini/gemini-cli
+Google Agent Skills	https://github.com/google/skills
+MiMo Code	https://github.com/XiaomiMiMo/MiMo-Code
+MiMo Skills	https://github.com/XiaomiMiMo/MiMo-Skills
+Llama Agentic System	https://github.com/meta-llama/llama-agentic-system
+Llama Stack	https://github.com/meta-llama/llama-stack
+Llama Cookbook	https://github.com/meta-llama/llama-cookbook
+NeMo Agent Toolkit	https://github.com/NVIDIA/NeMo-Agent-Toolkit
+NVIDIA Agent Skills	https://github.com/NVIDIA/skills
+NVIDIA-labs Object Oriented Agents (NOOA)	https://github.com/NVIDIA-NeMo/labs-OO-Agents
+NVIDIA AI-Q	https://github.com/NVIDIA-AI-Blueprints/aiq
+Atomic Agent	https://github.com/AtomicBot-ai/atomic-agent
+Atomic Chat	https://github.com/AtomicBot-ai/Atomic-Chat
+Atomic Hermes	https://github.com/AtomicBot-ai/atomic-hermes
+Atomic llama.cpp TurboQuant	https://github.com/AtomicBot-ai/atomic-llama-cpp-turboquant
 EOF
           while IFS=$'\t' read -r name repo; do
             test -n "$name"
-            if test -z "${repo:-}"; then echo "SIN_ZIP_PUBLICO: $name"; continue; fi
+            test -n "$repo"
             slug=$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]' | sed 's#[^a-z0-9][^a-z0-9]*#-#g; s#^-##; s#-$##')
             owner_repo=$(printf '%s' "$repo" | sed 's#https://github.com/##')
             branch=$(git ls-remote --symref "$repo.git" HEAD 2>/dev/null | awk '/^ref:/ {sub("refs/heads/", "", $2); print $2; exit}')
@@ -134,58 +76,52 @@ EOF
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import shutil, zipfile
+          import shutil
           from pathlib import Path
+          from zipfile import ZipFile, BadZipFile
           root = Path('.')
           tsv = root / '.download-queue' / 'repos.tsv'
           for line in tsv.read_text(encoding='utf-8').splitlines():
               if not line.strip():
                   continue
-              parts = line.split('\t', 1)
-              name = parts[0]
-              repo = parts[1].strip() if len(parts) > 1 else ''
-              if not repo:
-                  continue
+              name, repo = line.split('\t', 1)
               slug = ''.join((c.lower() if c.isalnum() else '-') for c in name).strip('-')
               while '--' in slug:
                   slug = slug.replace('--', '-')
               zp = root / '.download-queue' / f'{slug}.zip'
               if not zp.is_file() or zp.stat().st_size == 0:
-                  raise SystemExit(f'ZIP ausente: {name}')
+                  raise SystemExit(f'ZIP ausente o vacío: {name}')
               dest = root / name
-              if dest.exists():
-                  shutil.rmtree(dest)
-              dest.mkdir(parents=True)
-              with zipfile.ZipFile(zp) as z:
-                  bad = z.testzip()
-                  if bad is not None:
-                      raise SystemExit(f'CRC fail {name}: {bad}')
-                  names = z.namelist()
-                  tops = {n.split('/')[0] for n in names if n and not n.startswith('__MACOSX')}
-                  if len(tops) != 1:
-                      raise SystemExit(f'ZIP no tiene una sola raíz: {name} {tops}')
-                  top = next(iter(tops))
-                  seen = set()
-                  for info in z.infolist():
-                      raw = info.filename.replace('\\', '/')
-                      if not raw or raw.endswith('/') or raw.startswith('__MACOSX') or raw.endswith('.DS_Store'):
-                          continue
-                      p = Path(raw)
-                      if p.is_absolute() or '..' in p.parts:
-                          raise SystemExit(f'unsafe ZIP path: {raw}')
-                      if raw in seen:
-                          raise SystemExit(f'duplicate member: {raw}')
-                      seen.add(raw)
-                      rel = Path(*p.parts[1:]) if p.parts and p.parts[0] == top else p
-                      if not rel.parts:
-                          continue
-                      target = (dest / rel).resolve()
-                      if dest.resolve() not in target.parents:
-                          raise SystemExit(f'extraction escape: {raw}')
-                      target.parent.mkdir(parents=True, exist_ok=True)
-                      with z.open(info) as src, target.open('wb') as dst:
-                          shutil.copyfileobj(src, dst, length=1024 * 1024)
-              print(f'PASS EXTRACT: {name}')
+              shutil.rmtree(dest, ignore_errors=True)
+              dest.mkdir(parents=True, exist_ok=True)
+              try:
+                  with ZipFile(zp) as z:
+                      if z.testzip() is not None:
+                          raise SystemExit(f'CRC failure in {name}')
+                      seen = set()
+                      count = 0
+                      for info in z.infolist():
+                          raw = info.filename.replace('\\', '/')
+                          if not raw or raw.endswith('/'):
+                              continue
+                          p = Path(raw)
+                          if p.is_absolute() or '..' in p.parts:
+                              raise SystemExit(f'{name}: unsafe ZIP path: {raw}')
+                          if raw in seen:
+                              raise SystemExit(f'{name}: duplicate member: {raw}')
+                          seen.add(raw)
+                          target = (dest / raw).resolve()
+                          if dest.resolve() not in target.parents:
+                              raise SystemExit(f'{name}: extraction escape: {raw}')
+                          target.parent.mkdir(parents=True, exist_ok=True)
+                          with z.open(info) as src, target.open('wb') as dst:
+                              shutil.copyfileobj(src, dst, length=1024 * 1024)
+                          count += 1
+                      if count == 0:
+                          raise SystemExit(f'{name}: zero files extracted')
+              except BadZipFile as exc:
+                  raise SystemExit(f'{name}: invalid ZIP: {exc}')
+              print(f'PASS EXTRACT: {name} files={count}')
           PY
           rm -rf .download-queue
           git config user.name "github-actions[bot]"
