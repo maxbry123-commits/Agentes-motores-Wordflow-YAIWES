@@ -1,4 +1,10 @@
 name: Descarga y extracción inventario
+# INPUT BLOCK literal: 5 puntos del plan.
+# 1 Destino Agentes-motores-Wordflow-YAIWES main; raíz = nombre exacto; ZIP completo; nada suelto; no mezclar.
+# 2 Lista = inventario completo; sin filtrar; sin quitar; sin URL inventada.
+# 3 Action solo esa lista; no reutilizar action anterior; no añadir repos fuera de lista.
+# 4 Solo procedimiento del skill; ejemplo no es otro repo; sin tercer proceso.
+# 5 PASO 1 ZIP → PASO 2 extraer en raíz exacta → main.
 
 on:
   workflow_dispatch:
@@ -15,15 +21,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
-      - name: Checkout destino
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
-
       - name: Paso 1 - Descargar ZIP
         shell: bash
         run: |
           set -euo pipefail
+          git clone --depth 1 "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" repo
+          cd repo
           mkdir -p .download-queue
           cat > .download-queue/repos.tsv <<'EOF'
 Guardians	https://github.com/metareflection/guardians
@@ -126,7 +129,7 @@ EOF
           while IFS=$'\t' read -r name repo; do
             test -n "$name"
             if test -z "${repo:-}"; then
-              echo "PENDIENTE_SIN_URL: $name"
+              echo "SIN_URL_NO_INVENTADA: $name"
               continue
             fi
             slug=$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]' | sed 's#[^a-z0-9][^a-z0-9]*#-#g; s#^-##; s#-$##')
@@ -135,33 +138,77 @@ EOF
             test -n "$branch"
             curl --fail --location --retry 3 --retry-delay 2 -o ".download-queue/$slug.zip" "https://github.com/$owner_repo/archive/refs/heads/$branch.zip"
           done < .download-queue/repos.tsv
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Paso 2 - Extraer cada ZIP en su raíz
         shell: bash
+        working-directory: repo
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          while IFS=$'\t' read -r name repo; do
-            test -n "$name"
-            if test -z "${repo:-}"; then
-              continue
-            fi
-            slug=$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]' | sed 's#[^a-z0-9][^a-z0-9]*#-#g; s#^-##; s#-$##')
-            zip=".download-queue/$slug.zip"
-            test -f "$zip"
-            rm -rf "$name"
-            mkdir -p "$name"
-            tmp=$(mktemp -d)
-            unzip -q "$zip" -d "$tmp"
-            entries=("$tmp"/*)
-            test "${#entries[@]}" -eq 1
-            cp -a "${entries[0]}"/. "$name"/
-            rm -rf "$tmp"
-          done < .download-queue/repos.tsv
+          python3 - <<'PY'
+          import shutil, zipfile
+          from pathlib import Path
+          root = Path('.')
+          tsv = root / '.download-queue' / 'repos.tsv'
+          for line in tsv.read_text(encoding='utf-8').splitlines():
+              if not line.strip():
+                  continue
+              parts = line.split('\t', 1)
+              name = parts[0]
+              repo = parts[1].strip() if len(parts) > 1 else ''
+              if not repo:
+                  continue
+              slug = ''.join((c.lower() if c.isalnum() else '-') for c in name).strip('-')
+              while '--' in slug:
+                  slug = slug.replace('--', '-')
+              zp = root / '.download-queue' / f'{slug}.zip'
+              if not zp.is_file() or zp.stat().st_size == 0:
+                  raise SystemExit(f'ZIP ausente: {name}')
+              dest = root / name
+              if dest.exists():
+                  shutil.rmtree(dest)
+              dest.mkdir(parents=True)
+              seen = set()
+              with zipfile.ZipFile(zp) as z:
+                  bad = z.testzip()
+                  if bad is not None:
+                      raise SystemExit(f'CRC fail {name}: {bad}')
+                  names = z.namelist()
+                  tops = {n.split('/')[0] for n in names if n and not n.startswith('__MACOSX')}
+                  if len(tops) != 1:
+                      raise SystemExit(f'ZIP no tiene una sola raíz: {name} {tops}')
+                  top = next(iter(tops))
+                  for info in z.infolist():
+                      raw = info.filename.replace('\\', '/')
+                      if not raw or raw.endswith('/') or raw.startswith('__MACOSX') or raw.endswith('.DS_Store'):
+                          continue
+                      p = Path(raw)
+                      if p.is_absolute() or '..' in p.parts:
+                          raise SystemExit(f'unsafe ZIP path: {raw}')
+                      if raw in seen:
+                          raise SystemExit(f'duplicate member: {raw}')
+                      seen.add(raw)
+                      rel = Path(*p.parts[1:]) if p.parts and p.parts[0] == top else p
+                      if not rel.parts:
+                          continue
+                      target = (dest / rel).resolve()
+                      if dest.resolve() not in target.parents:
+                          raise SystemExit(f'extraction escape: {raw}')
+                      target.parent.mkdir(parents=True, exist_ok=True)
+                      with z.open(info) as src, target.open('wb') as dst:
+                          shutil.copyfileobj(src, dst, length=1024 * 1024)
+              if not any(dest.rglob('*')):
+                  raise SystemExit(f'raíz vacía: {name}')
+              print(f'PASS EXTRACT: {name}')
+          PY
           rm -rf .download-queue
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
-          git diff --cached --quiet && exit 0
+          if git diff --cached --quiet; then exit 0; fi
           git commit -m "extract: raices individuales inventario en main"
           git pull --rebase origin main
-          git push
+          git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:main
