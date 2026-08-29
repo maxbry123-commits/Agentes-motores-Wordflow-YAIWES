@@ -1,33 +1,33 @@
-# Plantilla de plan — Download ZIP → Extract raíz
+# INPUT BLOCK — plantilla de plan (leer literal)
 
-Usar esta plantilla en todos los planes. No incrustar aquí el inventario numerado.
+## 1. Destino y extracción
+- Repo destino: `Agentes-motores-Wordflow-YAIWES`, rama `main`.
+- Cada elemento tendrá una única raíz propia.
+- La raíz usará el nombre exacto del repositorio/agente indicado en el inventario.
+- Dentro de esa raíz estará el contenido completo extraído del ZIP.
+- Nada de archivos/repositorios sueltos fuera de la raíz correspondiente.
+- No se mezclan contenidos entre repos.
 
-## Destino y extracción
-- Repo destino y rama: los que fije el plan vigente.
-- Cada elemento tiene una única raíz propia.
-- La raíz usa el nombre exacto del ítem en el inventario del plan.
-- Dentro de esa raíz va el contenido completo extraído del ZIP.
-- Nada suelto fuera de su raíz. No mezclar contenidos entre repos.
+## 2. Lista
+- La fuente de verdad será exactamente el inventario del plan vigente.
+- Se procesan todos los elementos de la lista, incluidos los que aparecen al final.
+- No se aplican filtros por popularidad, categoría, antigüedad o utilidad.
+- No se eliminan elementos de la lista por decisión propia.
+- No se asigna URL inventada.
 
-## Lista
-- Fuente de verdad: el inventario del plan vigente.
-- Se procesan todos los elementos, incluidos los del final.
-- Sin filtros por popularidad, categoría, antigüedad o utilidad.
-- No se elimina ningún elemento por decisión propia.
-- Si un ítem no tiene URL fijada, queda en la lista y no se inventa URL.
-
-## GitHub Action
-- La acción apunta solo al inventario de ese plan.
-- No se reutiliza una acción anterior como si fuera la nueva descarga.
+## 3. GitHub Action
+- La acción tiene como objetivo exclusivamente los elementos del inventario.
+- No se reutiliza accidentalmente la acción anterior como si fuera la nueva descarga.
 - No se añaden repositorios que no estén en la lista.
 
-## Código
-- Solo el procedimiento de referencia de este skill.
-- El código de ejemplo no se trata como otro repositorio a descargar.
-- No se inventa downloader, extractor, arquitectura ni tercer proceso.
+## 4. Código
+- Solo el código/skills y el procedimiento de referencia.
+- El código mostrado como ejemplo no se trata como otro repositorio para descargar.
+- No se inventa un downloader, extractor, arquitectura ni tercer proceso.
+- La implementación respeta el código de referencia del skill.
 
-## Únicos 2 pasos
-1. Descargar en ZIP los repos del inventario que tengan URL fijada.
-2. Extraer cada ZIP en su propia raíz con el nombre exacto correspondiente.
+## 5. Los únicos 2 pasos del Wordflow
+PASO 1 Descargar en ZIP todos los repos de la lista
+PASO 2 Extraer cada ZIP en su propia raíz con el nombre exacto correspondiente
 
-Cadena: `INVENTARIO → DOWNLOAD ZIP → EXTRACT → raíz individual → main`
+Plan de ejecución: `INVENTARIO → DOWNLOAD ZIP → EXTRACT → raíz individual por repo → main`
