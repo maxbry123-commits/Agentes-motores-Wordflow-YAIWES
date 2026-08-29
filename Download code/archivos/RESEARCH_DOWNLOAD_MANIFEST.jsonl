@@ -40,3 +40,8 @@
 {"number": 40, "parts": 2, "slug": "OpenDev", "source": "https://github.com/opendev-to/opendev.git", "source_commit": "d32c660e4eed1a8e988d1fd58da88e41ba641d08", "status": "COMPLETE"}
 {"number": 41, "parts": 13, "slug": "Shofer", "source": "https://github.com/shofer-dev/shofer.git", "source_commit": "892a8ea32b8be33324a9e6242fef8ee6910ca13a", "status": "COMPLETE"}
 {"number": 42, "parts": 4, "slug": "Safe-Lab-Agents", "source": "https://github.com/MaxNaeg/safe_lab_agents.git", "source_commit": "e4a71147c219caf8867a135ab1fbd4c26e35d43b", "status": "COMPLETE"}
+{"number": 43, "parts": 7, "slug": "CORAL", "source": "https://github.com/Human-Agent-Society/CORAL.git", "source_commit": "1235510133c7db38b24d28316256f8766ef7e03f", "status": "COMPLETE"}
+{"number": 44, "parts": 1, "slug": "NVIDIA-OpenShell", "source": "https://github.com/NVIDIA/OpenShell.git", "source_commit": "69a05ebb3b154e304a66fe80eed8504e889abc6d", "status": "COMPLETE"}
+{"number": 45, "parts": 3, "slug": "NVIDIA-NeMo-Agent-Toolkit", "source": "https://github.com/NVIDIA/NeMo-Agent-Toolkit.git", "source_commit": "1aa105b09a499bac9eec251f0fe3ce998b4ce7df", "status": "COMPLETE"}
+{"number": 46, "parts": 1, "slug": "Kimi-CLI", "source": "https://github.com/MoonshotAI/kimi-cli.git", "source_commit": "cbc15c076d17f70fec9f89c90c0502e68657f505", "status": "COMPLETE"}
+{"number": 47, "parts": 1, "slug": "Mini-Agent", "source": "https://github.com/MiniMax-AI/Mini-Agent.git", "source_commit": "d76a4f6389688cabda39c224a6cdfa274215d47c", "status": "COMPLETE"}
