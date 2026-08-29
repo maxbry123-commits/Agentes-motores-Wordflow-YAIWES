@@ -13,3 +13,10 @@
 {"number": 13, "parts": 1, "slug": "openmythos-vega", "source": "https://github.com/vegafoundation/openmythos.git", "source_commit": "299a0cdb0ae0c0df23fa34e4dc829230a979d87a", "status": "COMPLETE"}
 {"number": 14, "parts": 3, "slug": "deer-flow", "source": "https://github.com/bytedance/deer-flow.git", "source_commit": "bf740ffa9077f55661fce80186b656651f497c89", "status": "COMPLETE"}
 {"number": 15, "parts": 1, "slug": "OpenManus", "source": "https://github.com/FoundationAgents/OpenManus.git", "source_commit": "3309bf4e416fb1c74b008f3e86494439a31bad53", "status": "COMPLETE"}
+{"number": 27, "parts": 1, "slug": "deepdive", "source": "https://github.com/Socialpranker/deepdive.git", "source_commit": "07d0c9b86228e04726ef9bcd230916981132c2d5", "status": "COMPLETE"}
+{"number": 28, "parts": 5, "slug": "binex", "source": "https://github.com/Alexli18/binex.git", "source_commit": "6316fcadcbdb13a04ab63915c4b421b63c6237de", "status": "COMPLETE"}
+{"number": 29, "parts": 1, "slug": "pi-task", "source": "https://github.com/mjasnikovs/pi-task.git", "source_commit": "c3d2e8e41519f99cdb44d0b36ef03741757b1179", "status": "COMPLETE"}
+{"number": 30, "parts": 1, "slug": "LoomFlow", "source": "https://github.com/Anurich/LoomFlow.git", "source_commit": "d51f402833570fa85eb59fb1087cb0f67947ea00", "status": "COMPLETE"}
+{"number": 31, "parts": 1, "slug": "ux-research-pipeline", "source": "https://github.com/shipaleks/ux-research-pipeline.git", "source_commit": "1827e1c076cbe822b34cf41f883508757db06884", "status": "COMPLETE"}
+{"number": 32, "parts": 1, "slug": "framework-of-thoughts", "source": "https://github.com/fjfricke/framework-of-thoughts.git", "source_commit": "93cb04b655ac0111a310dfefd3497f05c35975e4", "status": "COMPLETE"}
+{"number": 33, "parts": 1, "slug": "Self-consistency", "source": "https://github.com/akpe12/Self-consistency.git", "source_commit": "0bdac1c4117ee6ae028725363870e4ff33e67f72", "status": "COMPLETE"}
