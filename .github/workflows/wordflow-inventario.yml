@@ -10,6 +10,9 @@ jobs:
   descarga-extraccion:
     runs-on: ubuntu-latest
     timeout-minutes: 360
+    env:
+      GIT_LFS_SKIP_SMUDGE: "1"
+      GIT_LFS_SKIP_PUSH: "1"
     steps:
       - name: Paso 1 - Descargar ZIP
         shell: bash
@@ -17,8 +20,17 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          export GIT_LFS_SKIP_SMUDGE=1
+          export GIT_LFS_SKIP_PUSH=1
           sudo apt-get update -y
           sudo apt-get install -y zip unzip
+          sudo apt-get remove -y git-lfs || true
+          git lfs uninstall --system || true
+          git lfs uninstall || true
+          git config --global filter.lfs.required false
+          git config --global filter.lfs.smudge cat
+          git config --global filter.lfs.clean cat
+          git config --global filter.lfs.process ''
           GIT_LFS_SKIP_SMUDGE=1 git clone --depth 1 --no-tags "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" repo
           cd repo
           mkdir -p .download-queue/src
@@ -167,6 +179,8 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          export GIT_LFS_SKIP_SMUDGE=1
+          export GIT_LFS_SKIP_PUSH=1
           python3 - <<'PY'
           import shutil
           from pathlib import Path
@@ -230,7 +244,7 @@ jobs:
           while test "$n" -le 3; do
             git fetch origin main
             git rebase origin/main
-            if git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:main; then
+            if GIT_LFS_SKIP_PUSH=1 git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:main; then
               echo "PUSH PASS attempt $n"
               break
             fi
