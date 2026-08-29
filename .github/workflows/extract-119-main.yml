@@ -4,7 +4,7 @@ on:
 permissions:
   contents: write
 concurrency:
-  group: extract-119-main
+  group: dest-main-serial
   cancel-in-progress: false
 env:
   GIT_LFS_SKIP_SMUDGE: '1'
