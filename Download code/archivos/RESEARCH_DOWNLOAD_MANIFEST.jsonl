@@ -26,3 +26,7 @@
 {"number": 26, "parts": 1, "slug": "Research-Agent-Lab", "source": "https://github.com/binary-ciao/research_agent_lab.git", "source_commit": "6d712ddf9013e5ec1d8275f705aaa316a70ad06e", "status": "COMPLETE"}
 {"number": 27, "parts": 1, "slug": "AI4S-Agent-Lab", "source": "https://github.com/Goldenmonstew/ai4s-agent-lab.git", "source_commit": "fe1427c9b479060a4c035b5777ee70ef85ec806f", "status": "COMPLETE"}
 {"number": 28, "parts": 1, "slug": "EvolveR", "source": "https://github.com/KnowledgeXLab/EvolveR.git", "source_commit": "63834b727ee6e7af3410657de36eb845814249ba", "status": "COMPLETE"}
+{"number": 29, "parts": 13, "slug": "Ghost-in-the-Droid", "source": "https://github.com/ghost-in-the-droid/android-agent.git", "source_commit": "7c09f6cd14b6f9890517f2bbf19fb92f0970f8fc", "status": "COMPLETE"}
+{"number": 30, "parts": 1, "slug": "Zuora-Coding-Agent", "source": "https://github.com/zuora/zuora-coding-agent.git", "source_commit": "a521f1b65e63a4eed7c45fd7419172b3b085a8f8", "status": "COMPLETE"}
+{"number": 31, "parts": 1, "slug": "Oh-My-Agents", "source": "https://github.com/visualiaconsulting/oh-my-agents.git", "source_commit": "f72fafafd32e224fa15b9686d5d43ae5743c58d1", "status": "COMPLETE"}
+{"number": 32, "parts": 1, "slug": "Agent-Skill-Lab", "source": "https://github.com/ricardoml96/agent-skill-lab.git", "source_commit": "c279a3d8da246f6cc55bbd7a16d38b81a0780f6c", "status": "COMPLETE"}
