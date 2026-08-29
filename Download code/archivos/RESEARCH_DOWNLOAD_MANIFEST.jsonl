@@ -9,3 +9,6 @@
 {"number": 9, "parts": 1, "slug": "Agentic-Workflow-Framework", "source": "https://github.com/JRA-CodingLab/agentic-workflow-framework.git", "source_commit": "24ffe0a7249224081212292586f6d7892e684d07", "status": "COMPLETE"}
 {"number": 10, "parts": 1, "slug": "MetaAgent", "source": "https://github.com/SaFo-Lab/MetaAgent.git", "source_commit": "597469fc7d296d95da41196c0f5a663c6a77982e", "status": "COMPLETE"}
 {"number": 11, "parts": 2, "slug": "Rasa", "source": "https://github.com/RasaHQ/rasa.git", "source_commit": "60a3cff9c08183760355b07bd60f5223d8916d6b", "status": "COMPLETE"}
+{"number": 12, "parts": 3, "slug": "Semantic-Kernel", "source": "https://github.com/microsoft/semantic-kernel.git", "source_commit": "a64827ec8c5621eeaf7c4c5dabdb5355bb253177", "status": "COMPLETE"}
+{"number": 13, "parts": 2, "slug": "DSPy", "source": "https://github.com/stanfordnlp/dspy.git", "source_commit": "3f06959ebbb80fb0bda001e1f802d70c2d5be7f7", "status": "COMPLETE"}
+{"number": 14, "parts": 2, "slug": "Agno", "source": "https://github.com/agno-agi/agno.git", "source_commit": "c96291cbd0f644774d48a398c30101e90c947354", "status": "COMPLETE"}
