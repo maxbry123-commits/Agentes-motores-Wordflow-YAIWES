@@ -1,0 +1,35 @@
+contrato: 2
+skill_url: https://github.com/maxbry123-commits/Agentes-motores-Wordflow-YAIWES/blob/main/tarea%20en%20curso%20grock%20gpt%20skills/skills%20grock%20tarea%201/SKILL.md
+token: INICIA
+
+dest:
+  A: main/<nombre> una raiz por agente
+  B: main/Core kernel razonamiento repo para Yaiwes/<slug>
+  C: agentes/Download code FREEZE
+
+hecho:
+  zip_A: 119/119
+  raices_A_parcial: 01-22 + OpenHands OpenCode Temporal
+  zip_B: K01-K15 COMPLETE; camel parcial no manifest; K17 simply-code FAIL 128
+  extra: PASS
+
+pendiente:
+  A1_extract119: raices 23-119 (OpenRSI..Atomic)
+  A2_extractB: unzip K01-K15 zips a slugs kernel
+  A3_kernelA: camel + K18-K26 (sin simply-code)
+  A4_kernelB: K27-K35
+
+gap:
+  - openai/simply-code 128
+  - deep-research-agent-langchain
+  - Dabo
+  - ejentum
+  - Fable-5-traces HF
+
+actions:
+  1: extract-119-main.yml
+  2: extract-kernel.yml
+  3: kernel-gap-a.yml
+  4: kernel-gap-b.yml
+concurrency: dest-main-serial
+estado: INICIA
