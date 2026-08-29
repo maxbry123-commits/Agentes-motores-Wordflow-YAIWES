@@ -10,9 +10,6 @@ jobs:
   descarga-extraccion:
     runs-on: ubuntu-latest
     timeout-minutes: 360
-    env:
-      GIT_LFS_SKIP_SMUDGE: "1"
-      GIT_LFS_SKIP_PUSH: "1"
     steps:
       - name: Checkout main
         uses: actions/checkout@v4
@@ -24,14 +21,9 @@ jobs:
           set -euo pipefail
           sudo apt-get update -y
           sudo apt-get install -y zip unzip
-          sudo apt-get remove -y git-lfs || true
-          python3 scripts/research_download_chain.py '_work/zips' '_work/research-download'
+          python3 scripts/research_download_chain.py 'Download code/archivos' '_work/research-download'
       - name: Paso 2 - Extraer cada ZIP en su raiz
         shell: bash
         run: |
           set -euo pipefail
-          git config http.postBuffer 524288000
-          git config http.version HTTP/1.1
-          git config lfs.allowincompletepush true
-          find . -name .gitattributes -type f -print0 | xargs -0 -r sed -i '/filter=lfs/d' || true
-          python3 scripts/extract_inventory.py '_work/zips'
+          python3 scripts/extract_inventory.py 'Download code/archivos'
