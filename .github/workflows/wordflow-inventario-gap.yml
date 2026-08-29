@@ -1,0 +1,77 @@
+name: Wordflow inventario gap
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: wordflow-inventario
+  cancel-in-progress: false
+env:
+  GIT_LFS_SKIP_SMUDGE: '1'
+  GIT_LFS_SKIP_PUSH: '1'
+jobs:
+  strip-lfs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Buscar y borrar LFS
+        shell: bash
+        run: |
+          set -euo pipefail
+          git lfs uninstall --local || true
+          git lfs uninstall || true
+          git config --global filter.lfs.smudge 'git-lfs smudge --skip -- %f' || true
+          git config --global filter.lfs.process 'git-lfs filter-process --skip' || true
+          found=0
+          while IFS= read -r -d '' f; do
+            if grep -q 'filter=lfs' "$f"; then
+              sed -i '/filter=lfs/d' "$f" || true
+              found=1
+              echo "STRIP ATTR $f"
+            fi
+          done < <(find . -name .gitattributes -not -path './.git/*' -print0)
+          while IFS= read -r -d '' f; do
+            if head -c 200 "$f" | grep -q 'git-lfs.github.com'; then
+              echo "DEL POINTER $f"
+              rm -f "$f"
+              found=1
+            fi
+          done < <(find . -type f -size -400c -not -path './.git/*' -print0)
+          if [ "$found" -eq 1 ]; then
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git add -A
+            git diff --cached --quiet || git commit -m 'del: LFS pointers y filter=lfs'
+            git fetch origin main
+            git rebase origin/main || true
+            git push origin HEAD:main || true
+          else
+            echo 'NO LFS EN DEST'
+          fi
+  descarga-extraccion:
+    needs: strip-lfs
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Paso 1 - Descargar ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          git lfs uninstall --local || true
+          git lfs uninstall || true
+          sudo apt-get update -y
+          sudo apt-get install -y zip unzip
+          python3 scripts/research_download_chain.py 'Download code/archivos' '_work/research-download'
+      - name: Paso 2 - Extraer cada ZIP en su raiz
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/extract_inventory.py 'Download code/archivos'
