@@ -114,3 +114,4 @@
 {"number": 114, "parts": 1, "slug": "NVIDIA-NOOA", "source": "https://github.com/NVIDIA-NeMo/labs-OO-Agents.git", "source_commit": "0d3b03c6844681fb0a07efb564206b03aefe37e3", "status": "COMPLETE"}
 {"number": 115, "parts": 1, "slug": "NVIDIA-AI-Q", "source": "https://github.com/NVIDIA-AI-Blueprints/aiq.git", "source_commit": "bf4e67d1564ef8d2ec8f65b5f9001e512befc095", "status": "COMPLETE"}
 {"number": 116, "parts": 1, "slug": "Atomic-Agent", "source": "https://github.com/AtomicBot-ai/atomic-agent.git", "source_commit": "4caff55e6afb9d9a61b36e9fa98bf9afd7531582", "status": "COMPLETE"}
+{"number": 117, "parts": 20, "slug": "Atomic-Chat", "source": "https://github.com/AtomicBot-ai/Atomic-Chat.git", "source_commit": "073c88534542a654d47ddf9afa9bc470c89b2304", "status": "COMPLETE"}
