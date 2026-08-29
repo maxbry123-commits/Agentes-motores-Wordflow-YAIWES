@@ -1,0 +1,23 @@
+[
+  {
+    "repo": "LanguageAgentTreeSearch",
+    "path": "programming/root/test_mcts_hard_acc_full_4tst_temp/mbpp-py._mcts_8_gpt-3.5-turbo_pass_at_k_1_py.jsonl",
+    "chunks_dir": "LanguageAgentTreeSearch/programming/root/test_mcts_hard_acc_full_4tst_temp/mbpp-py._mcts_8_gpt-3.5-turbo_pass_at_k_1_py.jsonl.chunks",
+    "bytes": 8684887,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "LanguageAgentTreeSearch",
+    "path": "programming/root/test_mcts_hard_acc_full_4tst_temp_2/humaneval-py._mcts_8_gpt-3.5-turbo_pass_at_k_1_py.jsonl",
+    "chunks_dir": "LanguageAgentTreeSearch/programming/root/test_mcts_hard_acc_full_4tst_temp_2/humaneval-py._mcts_8_gpt-3.5-turbo_pass_at_k_1_py.jsonl.chunks",
+    "bytes": 11049627,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "LanguageAgentTreeSearch",
+    "path": "hotpot/data/hotpot_train_v1.1_simplified.json",
+    "chunks_dir": "LanguageAgentTreeSearch/hotpot/data/hotpot_train_v1.1_simplified.json.chunks",
+    "bytes": 15461857,
+    "chunk_bytes": 8388608
+  }
+]

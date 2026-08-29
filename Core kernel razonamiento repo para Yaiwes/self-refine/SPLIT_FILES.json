@@ -1,0 +1,9 @@
+[
+  {
+    "repo": "self-refine",
+    "path": "data/tasks/codeclean/code_readability/codenet-python-train.jsonl.zip",
+    "chunks_dir": "self-refine/data/tasks/codeclean/code_readability/codenet-python-train.jsonl.zip.chunks",
+    "bytes": 18249780,
+    "chunk_bytes": 8388608
+  }
+]

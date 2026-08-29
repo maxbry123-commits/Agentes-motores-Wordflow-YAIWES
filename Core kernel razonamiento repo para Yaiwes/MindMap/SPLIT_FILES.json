@@ -1,0 +1,23 @@
+[
+  {
+    "repo": "MindMap",
+    "path": "data/cmcqa/word2vec.model",
+    "chunks_dir": "MindMap/data/cmcqa/word2vec.model.chunks",
+    "bytes": 14271532,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "MindMap",
+    "path": "data/chatdoctor5k/keyword_embeddings.pkl",
+    "chunks_dir": "MindMap/data/chatdoctor5k/keyword_embeddings.pkl.chunks",
+    "bytes": 13626265,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "MindMap",
+    "path": "data/explainpe/word2vec.model",
+    "chunks_dir": "MindMap/data/explainpe/word2vec.model.chunks",
+    "bytes": 11000080,
+    "chunk_bytes": 8388608
+  }
+]
