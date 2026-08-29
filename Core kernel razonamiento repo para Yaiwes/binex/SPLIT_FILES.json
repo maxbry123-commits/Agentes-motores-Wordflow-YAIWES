@@ -1,0 +1,16 @@
+[
+  {
+    "repo": "binex",
+    "path": "assets/demo-custom.gif",
+    "chunks_dir": "binex/assets/demo-custom.gif.chunks",
+    "bytes": 9507064,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "binex",
+    "path": "docs/demo/binex_EN.mp4",
+    "chunks_dir": "binex/docs/demo/binex_EN.mp4.chunks",
+    "bytes": 24696480,
+    "chunk_bytes": 8388608
+  }
+]

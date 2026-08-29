@@ -1,0 +1,139 @@
+# Research config — the only file you must fill in by hand.
+
+name: "TODO: project name"
+# Short name in kebab-case, e.g.: onboarding-study-2026q2.
+# The agent fills this in when creating the project (see AGENT.md §11.1).
+
+status: active
+# active   — project in progress (default on creation)
+# shipped  — report delivered, study closed
+# archived — closed without delivery; folder moved to `_archive/`
+# No need to change by hand — the agent toggles it via triggers (see AGENT.md §5, §11.2).
+
+mode: assistive
+# assistive — default. The agent works step by step, asking before substantive
+#             methodological forks. Use this for normal projects.
+# autonomous — the agent runs the whole pipeline on its own and produces a
+#             handoff.md at the end. Applicable to: auditing an external vendor,
+#             desk research, drafting key findings from ready-made transcripts.
+
+session_budget: low
+# Budget for a single chat session. Determines how the agent splits up work and
+# how aggressively it suggests moving to a new session (see AGENT.md §14).
+#
+# low    — for users on a plan with limits (Claude Pro, Claude Free, etc.).
+#          Batches of 3–4 interviews during coding; a checkpoint after every
+#          coded interview; handoff is mandatory at any "weight boundary"
+#          from §14.1, not just after stages 09 and 17. Default for new
+#          installs and for anyone unsure of their limits.
+# normal — for users on a Max plan or API. Batches of up to 8 interviews;
+#          handoff at the §14.1 boundaries per their standard logic (after 09,
+#          after the analysis block 13–16, after 18.5).
+# high   — for experienced users deliberately running one project in a single
+#          session (internal experiments, dogfooding). Minimal stops; handoff
+#          only on objective heuristics ("context is bloated"). Use with the
+#          understanding that one mistake is costly.
+#
+# Toggled by the researcher by hand (it's their call, not the agent's). The
+# agent only mentions in its first greeting that the parameter exists.
+
+# Research questions and hypotheses — filled in after stage 1.2,
+# not before the start. You can leave this empty; the agent will ask when needed.
+research_questions: []
+# Example of a filled-in entry:
+# research_questions:
+#   - id: RQ1
+#     question: How do users find feature X in the product?
+#     metric_or_artifact: time-to-first-success, verbal descriptions of the path
+#   - id: RQ2
+#     question: What obstacles arise during onboarding?
+#     metric_or_artifact: list of obstacles with frequency
+
+hypotheses: []
+# hypotheses:
+#   - id: H1
+#     statement: Users don't notice feature X because of where it's placed
+#     falsifiable_by: half or more of respondents found the feature without a hint
+
+# Sample segments and quotas
+# segments:
+#   - name: new
+#     quota: 6
+#     stop_criteria: have used the product for less than a month
+#   - name: experienced
+#     quota: 6
+#     stop_criteria: have used the product for more than six months
+
+# Project team (optional — the agent needs it to know who to address the summary to)
+# team:
+#   lead: TODO
+#   stakeholders: []
+
+# ---------------- Analysis parameters ----------------
+#
+# You can leave these UNTOUCHED — the defaults work for most projects.
+# Change them only if you know why.
+
+analysis:
+  # Who does the flat coding (stage 7, `09-flat-coding`).
+  #
+  # The default depends on sample size:
+  #   1–3 interviews   → agent without subagents (fast, everything in-context)
+  #   4–9 interviews   → agent + use_subagents: true (parallel Sonnet workers)
+  #   ≥10 interviews   → the agent **proposes switching to external**.
+  #                      If the researcher agrees — an API key is needed (see below).
+  #
+  # Mode descriptions:
+  #   agent    — the assistant codes within its own context. No external API keys.
+  #              Long interviews are coded in chunks; parallelization is via
+  #              subagents (see AGENT.md §9 — worker_model **must** be specified
+  #              explicitly in the Agent call, it is not inherited!).
+  #   external — delegate to the vendored skill `skills/transcript-coding/`
+  #              (or an external one if the vendored one is absent). Pydantic
+  #              validator, its own backend via OpenAI/Anthropic/Gemini. Requires
+  #              an API key in `.env` (OPENAI_API_KEY / ANTHROPIC_API_KEY / GEMINI_API_KEY).
+  #              Makes sense at ≥10 interviews or when strict schema validation is
+  #              needed. At large N — cheaper and more predictable than Claude subagents.
+  coding_mode: agent
+
+  # Options for coding_mode: agent
+  agent_coding:
+    # Parallel subagents. true — the manager splits the transcript into chunks,
+    # workers code in parallel, the manager stitches the result together and
+    # validates verbatim. Makes sense for interviews > 1 hour or for batch
+    # processing of 5+ interviews. The default is automatically switched to true
+    # by the agent at N≥4 interviews.
+    use_subagents: false
+    # Target chunk size in utterances. Smaller — better detail,
+    # larger — lower cost.
+    chunk_size_utterances: 40
+    # Worker model when use_subagents: true. null = default claude-sonnet-4-6
+    # (see AGENT.md §9). worker_model: null in `project-config` does NOT mean "no
+    # explicit model in the Agent call" — the manager must substitute the default before the call.
+    worker_model: null
+    # Judge model for verbatim-check / anti-pattern check. null = default haiku-4-6.
+    judge_model: null
+
+  # Options for coding_mode: external
+  external_coding:
+    # Backend for `transcript-coding`. See `skills/transcript-coding/SKILL.md`.
+    backend: openai
+    # Hermeneutic preset: default | full.
+    hermeneutic_preset: default
+    # Expected name of the API-key variable in `.env`. The agent will check that
+    # it's present before running. If not — it will ask the researcher and help obtain one.
+    api_key_env_var: OPENAI_API_KEY
+
+  # After how many coded interviews to generate the first findings draft.
+  draft_findings_after_n_interviews: 5
+
+  # Whether to enable VLM analysis of screenshots (`08-screen-vlm`). More expensive and slower.
+  enable_screen_vlm: false
+
+# Technical settings. No need to change unless necessary.
+tech:
+  # Path to your own additional prompts, if you want to override the defaults.
+  custom_prompts_path: null
+  # Version of the JSON schemas this project runs on. On a pipeline upgrade —
+  # checked by the agent so formats don't get mixed up. No need to change by hand.
+  schemas_version: v1

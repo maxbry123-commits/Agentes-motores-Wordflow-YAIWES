@@ -1,0 +1,178 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ux-research-pipeline.local/schemas/typology-type.v1.json",
+  "title": "Typology Type",
+  "description": "A behavioral type of respondent. Produced by `16-typology`. Stored as the Markdown card `3-analysis/types/<slug>.md` + aggregated in `3-analysis/typology.md`. Anti-pattern: substituting demographics for behavior.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "type_id",
+    "name",
+    "behavior_markers",
+    "anti_markers",
+    "representative_respondents",
+    "illustrating_quotes",
+    "anti_pattern_check"
+  ],
+  "properties": {
+    "type_id": {
+      "type": "string",
+      "pattern": "^TY[0-9]{2}$",
+      "description": "TY01, TY02, ..."
+    },
+    "name": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 80,
+      "description": "Type name — a short phrase describing the behavior. Not 'novices' / 'experts' (those are segments). For example, 'optimum hunter', 'cautious explorer'."
+    },
+    "slug": {
+      "type": "string",
+      "pattern": "^[a-z0-9-]+$"
+    },
+    "summary": {
+      "type": "string",
+      "description": "2–4 sentences on how the type behaves, what matters to it, what it reacts to."
+    },
+    "behavior_markers": {
+      "type": "array",
+      "minItems": 3,
+      "items": {
+        "type": "string",
+        "minLength": 5
+      },
+      "description": "What the respondent DOES. Actions and motivations, not moods. At least 3 markers."
+    },
+    "anti_markers": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "minLength": 5
+      },
+      "description": "What a respondent of this type definitely does NOT do or avoids. Helps distinguish it from neighboring types."
+    },
+    "representative_respondents": {
+      "type": "array",
+      "minItems": 2,
+      "items": {
+        "type": "string",
+        "pattern": "^R[0-9]{2,3}$"
+      },
+      "description": "Representative respondents. At least 2 — otherwise it is a case, not a type."
+    },
+    "illustrating_quotes": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["segment_id", "respondent_id", "verbatim", "timecode"],
+        "properties": {
+          "segment_id": {"type": "string", "pattern": "^seg-[0-9]{4}$"},
+          "respondent_id": {"type": "string", "pattern": "^R[0-9]{2,3}$"},
+          "verbatim": {"type": "string", "minLength": 1},
+          "timecode": {"type": "string", "pattern": "^[0-9]{2}:[0-9]{2}:[0-9]{2}$"}
+        }
+      },
+      "description": "Verbatim quotes illustrating the type. At least 1, ideally 2–3."
+    },
+    "distribution_in_sample": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["count", "of_total"],
+      "properties": {
+        "count": {"type": "integer", "minimum": 1},
+        "of_total": {"type": "integer", "minimum": 1},
+        "note": {
+          "type": "string",
+          "description": "A qualitative comment, not a percentage: 'most of the new-user segment'."
+        }
+      }
+    },
+    "product_implication": {
+      "type": "string",
+      "minLength": 10,
+      "description": "What to DO DIFFERENTLY for this type. If there is nothing — the type is useless and should not be emitted."
+    },
+    "linked_categories": {
+      "type": "array",
+      "items": {"type": "string", "pattern": "^C[0-9]{2}$"}
+    },
+    "linked_paradigm_nodes": {
+      "type": "array",
+      "items": {"type": "string", "pattern": "^N[0-9]{2}$"}
+    },
+    "anti_pattern_check": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["passed", "checks"],
+      "description": "Result of the built-in anti-pattern check. If passed=false — the type is not emitted into the final artifact and goes into `concerns.md`.",
+      "properties": {
+        "passed": {"type": "boolean"},
+        "checks": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "not_demographic",
+            "exclusive_core",
+            "min_representatives",
+            "has_illustrating_quote",
+            "useful_downstream"
+          ],
+          "properties": {
+            "not_demographic": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["pass", "note"],
+              "properties": {
+                "pass": {"type": "boolean"},
+                "note": {"type": "string", "description": "If pass=false — which markers slid into demographics."}
+              },
+              "description": "Markers are actions and motivations, not age/gender/city/experience."
+            },
+            "exclusive_core": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["pass", "note"],
+              "properties": {
+                "pass": {"type": "boolean"},
+                "note": {"type": "string"}
+              },
+              "description": "The core markers are mutually exclusive with other types."
+            },
+            "min_representatives": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["pass", "note"],
+              "properties": {
+                "pass": {"type": "boolean"},
+                "note": {"type": "string"}
+              },
+              "description": "≥2 representative respondents."
+            },
+            "has_illustrating_quote": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["pass", "note"],
+              "properties": {
+                "pass": {"type": "boolean"},
+                "note": {"type": "string"}
+              }
+            },
+            "useful_downstream": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["pass", "note"],
+              "properties": {
+                "pass": {"type": "boolean"},
+                "note": {"type": "string"}
+              },
+              "description": "The type is used for findings or recommendations (has a product_implication)."
+            }
+          }
+        }
+      }
+    }
+  }
+}

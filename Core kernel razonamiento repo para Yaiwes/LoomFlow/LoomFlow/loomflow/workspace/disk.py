@@ -1,0 +1,1173 @@
+"""Local-disk :class:`Workspace` backend.
+
+Layout per user_id partition (anonymous bucket is the empty string)::
+
+    <root>/<user_id>/
+        WORKSPACE.md            ← auto-regenerated index
+        seeds/                  ← read-only user-provided refs (optional)
+        notes/<author>/<slug>.md
+        .loom/audit.jsonl       ← reserved for future audit hook
+
+Slugs are ``<NNN>-<slugified-title>`` where ``NNN`` is a per-author
+zero-padded counter that survives across writes within the same run.
+Counters live on disk (in the existing file count) so cross-run
+reuse keeps numbering monotonic.
+
+Write atomicity:
+
+* Note files are written to a temp file in the same dir and
+  ``Path.replace()``'d into place — atomic on POSIX, mostly atomic
+  on Windows.
+* ``WORKSPACE.md`` is regenerated after every write using the same
+  temp-file + replace pattern.
+
+An ``anyio.Lock`` serialises index regeneration AND the
+slug-counter-computation + file-creation step of ``write_note`` —
+without the latter, two concurrent writes by the same author could
+pick the same counter and silently clobber each other. Per-author
+counters and parsed notes are cached in memory (keyed by
+``(mtime_ns, size)``) so repeated reads / writes don't re-walk and
+re-parse the whole tree.
+
+Text encoding is FORCED to UTF-8 on every read and write. The
+``Path.read_text`` / ``write_text`` defaults pick up the system
+locale codec — on Windows that's ``cp1252`` ("charmap"), which
+can't encode many of the Unicode characters models like to emit
+(``≥``, em-dashes, smart quotes, ...). Forcing UTF-8 here means
+the same notebook works identically across Windows, macOS, and
+Linux hosts, and notebooks created on one platform are readable
+on another.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import shutil
+from collections.abc import Iterable
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+import anyio
+
+from ._common import apply_relevance_boost as _apply_relevance_boost
+from ._common import cosine_similarity as _cosine
+from ._common import drain_citations as _drain_citations
+from ._common import (
+    extract_lede,
+    note_from_frontmatter,
+    parse_note_file,
+    render_note_file,
+    render_workspace_index,
+    slugify_title,
+    summary_from_note,
+)
+from ._common import log_citation as _log_citation
+from ._common import rrf_fuse as _rrf_fuse
+from ._common import score_bm25 as _score_bm25
+from ._common import score_semantic as _score_semantic
+from .types import (
+    Note,
+    NoteKind,
+    NoteMatch,
+    NoteSummary,
+    NoteVersion,
+    PruneResult,
+    WorkspaceMembership,
+)
+
+if TYPE_CHECKING:
+    # Only needed for type annotations. Imports are deferred under
+    # TYPE_CHECKING because:
+    #   1. ``from __future__ import annotations`` makes every annotation
+    #      a string at runtime, so these don't need to be resolvable
+    #      at import time.
+    #   2. Importing ``Tool`` eagerly would pull in the ``tools``
+    #      subpackage just to type one return annotation. Worth
+    #      the deferred-import pattern.
+    #   3. ``Embedder`` is used only when the optional ``embedder=``
+    #      ctor param is wired; lazy-import keeps the workspace
+    #      module light.
+    from ..core.protocols import Embedder
+    from ..tools.registry import Tool
+
+INDEX_FILENAME = "WORKSPACE.md"
+NOTES_DIR = "notes"
+SEEDS_DIR = "seeds"
+LOOM_META_DIR = ".loom"
+
+
+def _read_utf8(path: Path) -> str:
+    """Read a text file as UTF-8, regardless of system locale.
+
+    Used inside ``anyio.to_thread.run_sync(...)`` because
+    ``run_sync(func, *args)`` doesn't forward kwargs in all anyio
+    versions — wrapping the kwarg in a positional helper keeps
+    the callsites simple while forcing the codec.
+    """
+    return path.read_text(encoding="utf-8")
+
+
+def _write_utf8(path: Path, content: str) -> None:
+    """Write text as UTF-8, regardless of system locale.
+
+    On Windows the default ``Path.write_text`` uses ``cp1252``
+    ("charmap"), which can't encode many of the Unicode characters
+    models routinely emit (``≥``, em-dashes, smart quotes,
+    arrows, emoji). Forcing UTF-8 here means notebooks stay
+    portable across Windows / macOS / Linux hosts.
+    """
+    path.write_text(content, encoding="utf-8")
+# Subdir name under each note's parent that holds revision history.
+# Excluded from `_walk_note_files` so historical revisions never
+# appear in `list_notes` / `search_notes` / index renders.
+HISTORY_DIR = ".history"
+
+
+class LocalDiskWorkspace:
+    """File-backed :class:`Workspace` with a per-user partition.
+
+    Construct via :meth:`__init__` with an absolute path, or via
+    one of the classmethod sugar constructors:
+
+    * :meth:`temp` — fresh temp directory; auto-cleaned on
+      :meth:`aclose` when ``cleanup=True``.
+    * :meth:`open` — open or create at a fixed path; never cleans
+      up (the user owns the directory).
+    """
+
+    def __init__(
+        self,
+        root: str | Path,
+        *,
+        seed_paths: Iterable[str | Path] | None = None,
+        cleanup_on_close: bool = False,
+        embedder: Embedder | None = None,
+    ) -> None:
+        self._root = Path(root).expanduser().resolve()
+        self._root.mkdir(parents=True, exist_ok=True)
+        self._cleanup_on_close = cleanup_on_close
+        # One lock for index regeneration AND for note writes /
+        # history snapshots. Renaming the old ``_index_lock`` to
+        # ``_write_lock`` would break subclasses; keep the old
+        # name as the canonical write lock. Concurrent updates of
+        # the same slug now correctly serialise behind this.
+        self._index_lock = anyio.Lock()
+        # Parsed-note cache keyed by path → ((mtime_ns, size), Note).
+        # read_note / list_notes / search_notes / index regeneration
+        # all funnel through ``_load_note``; without this every call
+        # re-read and re-parsed the entire tree. Entries self-
+        # invalidate when the file's (mtime_ns, size) key changes.
+        self._note_cache: dict[Path, tuple[tuple[int, int], Note]] = {}
+        # Per-author next-slug counter cache (author root → highest
+        # counter handed out). First write per author scans the disk
+        # once; subsequent writes increment in memory. Counters are
+        # monotonic, so the cache never needs invalidating on
+        # deletes — a too-high counter is always safe.
+        self._counter_cache: dict[Path, int] = {}
+        # Per-partition index entries (user root → (author, slug) →
+        # NoteSummary) so ``_regenerate_index`` patches one entry
+        # per write instead of re-reading every note.
+        self._index_cache: dict[
+            Path, dict[tuple[str, str], NoteSummary]
+        ] = {}
+        # Optional embedder for semantic search. When set, every
+        # write_note also computes + persists an embedding sidecar;
+        # search_notes uses cosine similarity (or hybrid RRF) when
+        # mode allows. Default ``None`` preserves BM25-only behavior.
+        self._embedder = embedder
+        if seed_paths is not None:
+            self._copy_seeds(seed_paths)
+
+    # ---- constructors ----------------------------------------------------
+
+    @classmethod
+    def temp(
+        cls,
+        *,
+        prefix: str = "loom-workspace-",
+        seed_paths: Iterable[str | Path] | None = None,
+        cleanup: bool = True,
+    ) -> LocalDiskWorkspace:
+        """Build a fresh temp-directory workspace.
+
+        ``cleanup=True`` (the default) wipes the directory on
+        :meth:`aclose`. Pass ``cleanup=False`` to keep the
+        directory for post-run inspection.
+        """
+        import tempfile
+
+        path = Path(tempfile.mkdtemp(prefix=prefix))
+        return cls(
+            path,
+            seed_paths=seed_paths,
+            cleanup_on_close=cleanup,
+        )
+
+    @classmethod
+    def open(
+        cls,
+        path: str | Path,
+        *,
+        seed_paths: Iterable[str | Path] | None = None,
+    ) -> LocalDiskWorkspace:
+        """Open or create a workspace at ``path``. Never auto-cleans."""
+        return cls(path, seed_paths=seed_paths, cleanup_on_close=False)
+
+    # ---- properties ------------------------------------------------------
+
+    @property
+    def root(self) -> Path:
+        """Absolute path to the workspace root."""
+        return self._root
+
+    # ---- internal layout helpers ----------------------------------------
+
+    def _user_root(self, user_id: str | None) -> Path:
+        # Anonymous bucket goes in ``_anon`` so paths are deterministic
+        # and don't collide with named users.
+        bucket = user_id if user_id else "_anon"
+        return self._root / _sanitise_user_id(bucket)
+
+    def _notes_dir(
+        self,
+        user_id: str | None,
+        author: str,
+        namespace: str | None = None,
+    ) -> Path:
+        """Per-author notes dir, optionally scoped to a namespace.
+
+        Path shape:
+
+        * ``namespace is None``: ``<root>/<user>/notes/<author>/`` —
+          the v0.9 layout, preserved for back-compat.
+        * ``namespace`` set: ``<root>/<user>/notes/<author>/<namespace>/``
+          — files under a sub-bucket. Counter for slug numbering is
+          still author-global (NOT reset per namespace) so a slug
+          uniquely identifies a note within an author across
+          namespaces.
+        """
+        base = self._user_root(user_id) / NOTES_DIR / _sanitise_author(author)
+        if namespace:
+            return base / _sanitise_author(namespace)
+        return base
+
+    def _index_path(self, user_id: str | None) -> Path:
+        return self._user_root(user_id) / INDEX_FILENAME
+
+    # ---- seeds -----------------------------------------------------------
+
+    def _copy_seeds(self, seed_paths: Iterable[str | Path]) -> None:
+        """Drop pre-existing reference docs into ``seeds/`` for
+        agents to read. Copied at construction time; agents do NOT
+        write to ``seeds/`` (it's read-only by convention)."""
+        seeds_root = self._root / SEEDS_DIR
+        seeds_root.mkdir(parents=True, exist_ok=True)
+        for src in seed_paths:
+            src_path = Path(src).expanduser().resolve()
+            if not src_path.exists():
+                continue
+            dest = seeds_root / src_path.name
+            if src_path.is_dir():
+                shutil.copytree(src_path, dest, dirs_exist_ok=True)
+            else:
+                shutil.copy2(src_path, dest)
+
+    # ---- write paths -----------------------------------------------------
+
+    async def write_note(
+        self,
+        *,
+        author: str,
+        title: str,
+        body: str,
+        kind: NoteKind = "finding",
+        tags: list[str] | None = None,
+        user_id: str | None = None,
+        run_id: str | None = None,
+        namespace: str | None = None,
+        answered: bool | None = None,
+        parent_slug: str | None = None,
+    ) -> Note:
+        # The author's slug counter is GLOBAL across namespaces —
+        # walking the bare author dir (no namespace) gives the max
+        # NNN seen anywhere under that author. This keeps slugs
+        # globally unique within ``(user_id, author)``, simplifying
+        # the in-memory dict key and any future "find by slug
+        # without namespace hint" lookups.
+        author_root = self._notes_dir(user_id, author, namespace=None)
+        author_root.mkdir(parents=True, exist_ok=True)
+        ns_dir = self._notes_dir(user_id, author, namespace=namespace)
+        ns_dir.mkdir(parents=True, exist_ok=True)
+        slug_frag = slugify_title(title)
+        # Counter computation + file creation happen under the write
+        # lock: without it, two concurrent writers could compute the
+        # same counter and the second ``os.replace`` would silently
+        # clobber the first note.
+        async with self._index_lock:
+            counter = self._next_counter_across_namespaces(author_root)
+            slug = f"{counter:03d}-{slug_frag}"
+            dest = ns_dir / f"{slug}.md"
+            # Belt-and-braces against on-disk collisions from
+            # OUTSIDE this process (another workspace instance /
+            # process writing the same author): bump the counter
+            # until the path is free. In-process races are already
+            # excluded by the lock.
+            while await anyio.to_thread.run_sync(dest.exists):
+                counter += 1
+                self._counter_cache[author_root] = counter
+                slug = f"{counter:03d}-{slug_frag}"
+                dest = ns_dir / f"{slug}.md"
+            now = datetime.now(UTC)
+            note = Note(
+                slug=slug,
+                author=author,
+                title=title,
+                body=body,
+                kind=kind,
+                tags=list(tags or []),
+                created_at=now,
+                updated_at=now,
+                user_id=user_id,
+                run_id=run_id,
+                namespace=namespace,
+                answered=answered,
+                parent_slug=parent_slug,
+            )
+            await self._write_note_atomic(dest, note)
+            await self._maybe_write_embedding(dest, note)
+        await self._regenerate_index(user_id, changed=[note])
+        return note
+
+    async def update_note(
+        self,
+        *,
+        author: str,
+        slug: str,
+        body: str,
+        tags: list[str] | None = None,
+        user_id: str | None = None,
+        mark_answered: str | None = None,
+    ) -> Note:
+        note_path = self._find_note_path(user_id, author, slug)
+        if note_path is None:
+            raise FileNotFoundError(
+                f"note {slug!r} not found under author {author!r}"
+            )
+        existing = await self._load_note(note_path)
+        # The ``mark_answered`` cross-author carve-out: any agent
+        # can flip ``answered=True`` + ``answered_by=<slug>`` on a
+        # question they didn't author. This is the single
+        # exception to the "author owns updates" rule and is
+        # documented in the protocol. All OTHER fields stay the
+        # asker's property.
+        if mark_answered is not None and existing.author != author:
+            # Cross-author mark — preserve original body + tags,
+            # only update the answered flags. Write a history
+            # snapshot anyway so the answered transition is
+            # auditable.
+            async with self._index_lock:
+                await self._snapshot_history(note_path, existing)
+                updated = existing.model_copy(
+                    update={
+                        "answered": True,
+                        "answered_by": mark_answered,
+                        "updated_at": datetime.now(UTC),
+                    }
+                )
+                await self._write_note_atomic(note_path, updated)
+                await self._maybe_write_embedding(note_path, updated)
+            await self._regenerate_index(user_id, changed=[updated])
+            return updated
+        if existing.author != author:
+            raise PermissionError(
+                f"agent {author!r} cannot update note {slug!r} "
+                f"owned by {existing.author!r}"
+            )
+        # Normal author update: snapshot prior body before
+        # overwriting. The history snapshot is under the index
+        # lock so concurrent updates serialise their version
+        # numbers correctly.
+        async with self._index_lock:
+            await self._snapshot_history(note_path, existing)
+            update_dict: dict[str, object] = {
+                "body": body,
+                "tags": list(tags) if tags is not None else list(existing.tags),
+                "updated_at": datetime.now(UTC),
+            }
+            if mark_answered is not None:
+                update_dict["answered"] = True
+                update_dict["answered_by"] = mark_answered
+            updated = existing.model_copy(update=update_dict)
+            await self._write_note_atomic(note_path, updated)
+            await self._maybe_write_embedding(note_path, updated)
+        await self._regenerate_index(user_id, changed=[updated])
+        return updated
+
+    async def archive_note(
+        self,
+        *,
+        author: str,
+        slug: str,
+        user_id: str | None = None,
+    ) -> Note:
+        note_path = self._find_note_path(user_id, author, slug)
+        if note_path is None:
+            raise FileNotFoundError(
+                f"note {slug!r} not found under author {author!r}"
+            )
+        existing = await self._load_note(note_path)
+        if existing.author != author:
+            raise PermissionError(
+                f"agent {author!r} cannot archive note {slug!r} "
+                f"owned by {existing.author!r}"
+            )
+        archived = existing.model_copy(
+            update={
+                "archived_at": datetime.now(UTC),
+                "updated_at": datetime.now(UTC),
+            }
+        )
+        # No history snapshot for archive — archiving is metadata-
+        # only, the body doesn't change.
+        await self._write_note_atomic(note_path, archived)
+        await self._regenerate_index(user_id, changed=[archived])
+        return archived
+
+    async def list_versions(
+        self,
+        slug: str,
+        *,
+        author: str,
+        user_id: str | None = None,
+    ) -> list[NoteVersion]:
+        history_dir = self._history_dir(user_id, author, slug)
+        if not history_dir.exists():
+            return []
+        out: list[NoteVersion] = []
+        for path in sorted(history_dir.iterdir()):
+            if not path.is_file() or path.suffix != ".md":
+                continue
+            try:
+                version = int(path.stem)
+            except ValueError:
+                continue
+            text = await anyio.to_thread.run_sync(_read_utf8, path)
+            fm, body = parse_note_file(text)
+            note = note_from_frontmatter(fm, body)
+            out.append(
+                NoteVersion(
+                    slug=slug,
+                    author=author,
+                    version=version,
+                    created_at=note.updated_at,
+                    body_preview=extract_lede(note.body),
+                )
+            )
+        return out
+
+    async def read_version(
+        self,
+        slug: str,
+        version: int,
+        *,
+        author: str,
+        user_id: str | None = None,
+    ) -> Note | None:
+        history_dir = self._history_dir(user_id, author, slug)
+        path = history_dir / f"{version:04d}.md"
+        if not path.exists():
+            return None
+        text = await anyio.to_thread.run_sync(_read_utf8, path)
+        fm, body = parse_note_file(text)
+        note = note_from_frontmatter(fm, body)
+        _log_citation(slug)
+        return note
+
+    async def attribute_outcome(
+        self,
+        *,
+        success: bool,
+        slugs: list[str] | None = None,
+        user_id: str | None = None,
+    ) -> int:
+        # Explicit slugs (from RunResult.cited_slugs) win — that's
+        # the reliable post-run path. Fall back to draining the
+        # contextvar only when no slugs were passed (in-run case).
+        cited = set(slugs) if slugs is not None else _drain_citations()
+        if not cited:
+            return 0
+        now = datetime.now(UTC)
+        updated = 0
+        patched_notes: list[Note] = []
+        # Citations don't carry author identity, so notes must be
+        # found across authors. ONE walk of the notes tree builds a
+        # slug -> path map reused for every cited slug — the old
+        # per-slug ``rglob`` re-walked the whole tree N times.
+        paths_by_slug: dict[str, Path] = {}
+        for p in self._walk_note_files(user_id):
+            paths_by_slug.setdefault(p.stem, p)
+        for slug in cited:
+            path = paths_by_slug.get(slug)
+            if path is None:
+                continue
+            existing = await self._load_note(path)
+            patched = existing.model_copy(
+                update={
+                    "cited_count": existing.cited_count + 1,
+                    "success_count": (
+                        existing.success_count + 1 if success
+                        else existing.success_count
+                    ),
+                    "last_cited_at": now,
+                }
+            )
+            # Write in-place — citation update is not a "user edit"
+            # so we don't snapshot history.
+            await self._write_note_atomic(path, patched)
+            patched_notes.append(patched)
+            updated += 1
+        if updated:
+            await self._regenerate_index(user_id, changed=patched_notes)
+        return updated
+
+    async def prune(
+        self,
+        *,
+        older_than: timedelta | None = None,
+        min_cited_count: int = 1,
+        keep_kinds: list[NoteKind] | None = None,
+        keep_last_versions: int | None = None,
+        user_id: str | None = None,
+    ) -> PruneResult:
+        now = datetime.now(UTC)
+        keep_kind_set = set(keep_kinds or [])
+        notes_deleted = 0
+        notes_kept = 0
+        versions_deleted = 0
+        async with self._index_lock:
+            for path in self._walk_note_files(user_id):
+                note = await self._load_note(path)
+                if _should_prune(
+                    note,
+                    now=now,
+                    older_than=older_than,
+                    min_cited_count=min_cited_count,
+                    keep_kind_set=keep_kind_set,
+                ):
+                    # Hard-delete the note file + its embedding
+                    # sidecar + its entire history dir.
+                    await anyio.to_thread.run_sync(path.unlink, True)
+                    self._note_cache.pop(path, None)
+                    sidecar = path.with_suffix(".embedding.json")
+                    await anyio.to_thread.run_sync(sidecar.unlink, True)
+                    hist = self._history_dir(
+                        user_id, note.author, note.slug
+                    )
+                    if hist.exists():
+                        await anyio.to_thread.run_sync(
+                            shutil.rmtree, str(hist), True
+                        )
+                    notes_deleted += 1
+                else:
+                    notes_kept += 1
+                    # Surviving note: optionally trim its history
+                    # to the most recent N revisions.
+                    if keep_last_versions is not None:
+                        versions_deleted += await self._trim_history(
+                            user_id, note.author, note.slug,
+                            keep_last_versions,
+                        )
+        if notes_deleted:
+            # Full rebuild (changed=None) — deletes are cheaper to
+            # re-scan than to patch entry-by-entry.
+            await self._regenerate_index(user_id)
+        return PruneResult(
+            notes_deleted=notes_deleted,
+            versions_deleted=versions_deleted,
+            notes_kept=notes_kept,
+        )
+
+    async def _trim_history(
+        self,
+        user_id: str | None,
+        author: str,
+        slug: str,
+        keep_last: int,
+    ) -> int:
+        """Delete all but the most recent ``keep_last`` revision
+        files for one note. Returns the count deleted."""
+        history_dir = self._history_dir(user_id, author, slug)
+        if not history_dir.exists():
+            return 0
+        versioned: list[tuple[int, Path]] = []
+        for p in history_dir.iterdir():
+            if not p.is_file() or p.suffix != ".md":
+                continue
+            try:
+                versioned.append((int(p.stem), p))
+            except ValueError:
+                continue
+        if len(versioned) <= keep_last:
+            return 0
+        versioned.sort(key=lambda t: t[0])
+        to_delete = versioned[: len(versioned) - keep_last]
+        for _, p in to_delete:
+            await anyio.to_thread.run_sync(p.unlink, True)
+        return len(to_delete)
+
+    def _history_dir(
+        self, user_id: str | None, author: str, slug: str
+    ) -> Path:
+        # History lives under the AUTHOR root (not namespaced) so
+        # `read_version`/`list_versions` work regardless of which
+        # namespace the live note is in. Single source of truth
+        # per (user, author, slug).
+        return (
+            self._notes_dir(user_id, author, namespace=None)
+            / HISTORY_DIR
+            / slug
+        )
+
+    async def _snapshot_history(self, live_path: Path, note: Note) -> None:
+        """Copy the live note body to the next version file in
+        ``<author>/.history/<slug>/NNNN.md`` before overwriting.
+
+        Counter is monotonic per-slug; zero-padded to 4 digits so
+        agents on long-running tasks can hit 1000+ revisions
+        without collision. Caller must hold the index lock.
+        """
+        user_id = note.user_id
+        history_dir = self._history_dir(user_id, note.author, note.slug)
+        history_dir.mkdir(parents=True, exist_ok=True)
+        # Find the highest existing version number; next = +1.
+        existing_max = 0
+        for p in history_dir.iterdir():
+            if not p.is_file() or p.suffix != ".md":
+                continue
+            try:
+                n = int(p.stem)
+            except ValueError:
+                continue
+            existing_max = max(existing_max, n)
+        next_version = existing_max + 1
+        dest = history_dir / f"{next_version:04d}.md"
+        # Copy the live file's CURRENT content to the version slot.
+        # We can't render(note) here because the caller might have
+        # already mutated `note` — copy the existing file bytes.
+        content = await anyio.to_thread.run_sync(_read_utf8, live_path)
+        await anyio.to_thread.run_sync(_write_utf8, dest, content)
+
+    def _find_note_path(
+        self, user_id: str | None, author: str, slug: str
+    ) -> Path | None:
+        """Locate a note's live .md file, regardless of namespace.
+
+        Walks the author's notes dir (excluding ``.history`` /
+        ``.embeddings``) looking for ``<slug>.md``. Returns the
+        first match or None. Cheap because each author has a
+        small subtree.
+        """
+        author_root = self._notes_dir(user_id, author, namespace=None)
+        if not author_root.exists():
+            return None
+        for p in author_root.rglob(f"{slug}.md"):
+            if not _is_in_meta_dir(p):
+                return p
+        return None
+
+    def _next_counter_across_namespaces(self, author_root: Path) -> int:
+        """Highest ``NNN-`` prefix seen anywhere under the author
+        root, across every namespace. +1. Excludes history dirs.
+
+        The disk scan runs ONCE per author per workspace instance;
+        after that the counter lives in ``_counter_cache`` and each
+        call is a dict increment. Counters are monotonic, so the
+        cache never goes stale on deletes (a skipped number is
+        fine, a reused one is not). Caller must hold the write lock
+        so two concurrent writers can't hand out the same value.
+        """
+        cached = self._counter_cache.get(author_root)
+        if cached is not None:
+            nxt = cached + 1
+            self._counter_cache[author_root] = nxt
+            return nxt
+        counter = 0
+        if author_root.exists():
+            for p in author_root.rglob("*.md"):
+                if not p.is_file() or _is_in_meta_dir(p):
+                    continue
+                m = re.match(r"^(\d{3,})-", p.stem)
+                if m:
+                    counter = max(counter, int(m.group(1)))
+        nxt = counter + 1
+        self._counter_cache[author_root] = nxt
+        return nxt
+
+    async def _write_note_atomic(self, dest: Path, note: Note) -> None:
+        body = render_note_file(note)
+        tmp = dest.with_suffix(dest.suffix + ".tmp")
+        await anyio.to_thread.run_sync(_write_utf8, tmp, body)
+        await anyio.to_thread.run_sync(os.replace, str(tmp), str(dest))
+        # Drop any cached parse of the old contents; the next read
+        # re-parses (the (mtime_ns, size) key would usually catch
+        # this anyway — popping makes it unconditional).
+        self._note_cache.pop(dest, None)
+
+    async def _maybe_write_embedding(
+        self, note_path: Path, note: Note
+    ) -> None:
+        """When an embedder is wired, persist the note's embedding
+        as a JSON sidecar next to the .md file. The sidecar carries
+        the embedder model name so swapping embedders silently
+        invalidates stale vectors (cosine on different model spaces
+        is meaningless).
+        """
+        if self._embedder is None:
+            return
+        try:
+            text = f"{note.title}\n\n{note.body}"
+            vector = await self._embedder.embed(text)
+            if not vector:
+                return
+            import json
+            model = getattr(self._embedder, "name", "unknown")
+            sidecar = note_path.with_suffix(".embedding.json")
+            payload = {
+                "model": model,
+                "dim": len(vector),
+                "vector": list(vector),
+            }
+            await anyio.to_thread.run_sync(
+                _write_utf8,
+                sidecar,
+                json.dumps(payload, ensure_ascii=False),
+            )
+        except anyio.get_cancelled_exc_class():
+            raise
+        except Exception:  # noqa: BLE001 — embedding is best-effort
+            # An embedder failure should never break the note
+            # write. Fall back to BM25 silently for this note.
+            pass
+
+    # ---- read paths ------------------------------------------------------
+
+    async def read_note(
+        self,
+        slug_or_title: str,
+        *,
+        user_id: str | None = None,
+    ) -> Note | None:
+        result: Note | None = None
+        # First, try slug match across every author dir under this user.
+        for path in self._walk_note_files(user_id):
+            if path.stem == slug_or_title:
+                result = await self._load_note(path)
+                break
+        if result is None:
+            # Then case-insensitive title substring match.
+            needle = slug_or_title.lower()
+            candidates: list[Note] = []
+            for path in self._walk_note_files(user_id):
+                note = await self._load_note(path)
+                if needle in note.title.lower():
+                    candidates.append(note)
+            if not candidates:
+                return None
+            candidates.sort(key=lambda n: n.updated_at, reverse=True)
+            result = candidates[0]
+        _log_citation(result.slug)
+        return result
+
+    async def list_notes(
+        self,
+        *,
+        author: str | None = None,
+        kind: NoteKind | None = None,
+        user_id: str | None = None,
+        namespace: str | None = None,
+        include_archived: bool = False,
+        limit: int = 50,
+    ) -> list[NoteSummary]:
+        notes: list[Note] = []
+        for path in self._walk_note_files(user_id):
+            note = await self._load_note(path)
+            if author is not None and note.author != author:
+                continue
+            if kind is not None and note.kind != kind:
+                continue
+            if namespace is not None and note.namespace != namespace:
+                continue
+            if not include_archived and note.archived_at is not None:
+                continue
+            notes.append(note)
+        notes.sort(key=lambda n: n.updated_at, reverse=True)
+        return [summary_from_note(n) for n in notes[:limit]]
+
+    async def search_notes(
+        self,
+        query: str,
+        *,
+        user_id: str | None = None,
+        namespace: str | None = None,
+        include_archived: bool = False,
+        mode: str = "auto",
+        boost_relevance: bool = False,
+        limit: int = 10,
+    ) -> list[NoteMatch]:
+        q = query.lower().strip()
+        if not q:
+            return []
+        # Decide scoring mode. ``auto`` = hybrid when embedder is
+        # wired, BM25 otherwise. ``semantic`` / ``hybrid`` fall back
+        # to BM25 silently when no embedder is wired — preserves the
+        # backward-compat default-no-embedder behavior.
+        has_embedder = self._embedder is not None
+        effective_mode = mode
+        if effective_mode == "auto":
+            effective_mode = "hybrid" if has_embedder else "bm25"
+        if effective_mode in ("semantic", "hybrid") and not has_embedder:
+            effective_mode = "bm25"
+        candidates: list[Note] = []
+        for path in self._walk_note_files(user_id):
+            note = await self._load_note(path)
+            if namespace is not None and note.namespace != namespace:
+                continue
+            if not include_archived and note.archived_at is not None:
+                continue
+            candidates.append(note)
+        if effective_mode == "bm25":
+            results = _score_bm25(q, candidates, limit)
+            return (
+                _apply_relevance_boost(results, candidates, limit)
+                if boost_relevance else results
+            )
+        # Semantic / hybrid: compute query embedding once.
+        assert self._embedder is not None  # narrow for type-checker
+        try:
+            qvec = await self._embedder.embed(query)
+        except anyio.get_cancelled_exc_class():
+            raise
+        except Exception:  # noqa: BLE001 — fall back to BM25 on embed failure
+            results = _score_bm25(q, candidates, limit)
+            return (
+                _apply_relevance_boost(results, candidates, limit)
+                if boost_relevance else results
+            )
+        if not qvec:
+            results = _score_bm25(q, candidates, limit)
+            return (
+                _apply_relevance_boost(results, candidates, limit)
+                if boost_relevance else results
+            )
+        sem_scores = await self._semantic_scores(qvec, candidates, user_id)
+        if effective_mode == "semantic":
+            results = _score_semantic(sem_scores, candidates, limit)
+            return (
+                _apply_relevance_boost(results, candidates, limit)
+                if boost_relevance else results
+            )
+        # Hybrid: reciprocal rank fusion of BM25 + semantic rankings.
+        bm25 = _score_bm25(q, candidates, limit=len(candidates))
+        results = _rrf_fuse(bm25, sem_scores, candidates, limit)
+        return (
+            _apply_relevance_boost(results, candidates, limit)
+            if boost_relevance else results
+        )
+
+    async def _semantic_scores(
+        self,
+        qvec: list[float],
+        notes: list[Note],
+        user_id: str | None,
+    ) -> dict[str, float]:
+        """Load each candidate's persisted embedding and cosine-
+        score against ``qvec``. Notes without a sidecar (legacy or
+        embed-failure) score zero and effectively fall back to
+        BM25 ranking when hybrid mode fuses the results.
+
+        ONE walk of the notes tree builds an ``(author, slug) ->
+        path`` map reused for every candidate — the old per-
+        candidate ``_find_note_path`` re-walked the author's
+        subtree N times.
+        """
+        import json
+        notes_root = self._user_root(user_id) / NOTES_DIR
+        path_by_key: dict[tuple[str, str], Path] = {}
+        for p in self._walk_note_files(user_id):
+            rel_parts = p.relative_to(notes_root).parts
+            if len(rel_parts) < 2:
+                continue  # not under an author dir
+            path_by_key.setdefault((rel_parts[0], p.stem), p)
+        out: dict[str, float] = {}
+        for note in notes:
+            path = path_by_key.get(
+                (_sanitise_author(note.author), note.slug)
+            )
+            if path is None:
+                continue
+            sidecar = path.with_suffix(".embedding.json")
+            if not sidecar.exists():
+                continue
+            try:
+                text = await anyio.to_thread.run_sync(_read_utf8, sidecar)
+                payload = json.loads(text)
+                stored_model = payload.get("model")
+                this_model = getattr(self._embedder, "name", "unknown")
+                if stored_model != this_model:
+                    # Stale vector from a different embedder space.
+                    continue
+                vector = payload.get("vector") or []
+                if len(vector) != len(qvec):
+                    continue
+                out[note.slug] = _cosine(qvec, vector)
+            except Exception:  # noqa: BLE001
+                continue
+        return out
+
+    def _walk_note_files(self, user_id: str | None) -> list[Path]:
+        """Walk live note files, EXCLUDING ``.history`` revisions
+        and any other meta dirs. Without this filter, every
+        revision would appear in ``list_notes`` / ``search_notes``
+        as if it were a separate live note — silently breaking
+        every existing test that asserts on count.
+        """
+        notes_root = self._user_root(user_id) / NOTES_DIR
+        if not notes_root.exists():
+            return []
+        return [
+            p for p in notes_root.rglob("*.md")
+            if p.is_file() and not _is_in_meta_dir(p)
+        ]
+
+    async def _load_note(self, path: Path) -> Note:
+        """Load one note, going through the (mtime_ns, size) parse
+        cache. Unchanged files cost a single ``stat`` instead of a
+        read + frontmatter parse — list_notes / search_notes /
+        read_note no longer re-parse the whole tree per call.
+        """
+        def _load() -> Note:
+            # stat BEFORE read: if a writer swaps the file between
+            # the two calls we cache the NEW content under the OLD
+            # key, and the next stat sees a fresh key and re-reads
+            # — self-healing rather than persistently stale.
+            st = path.stat()
+            key = (st.st_mtime_ns, st.st_size)
+            cached = self._note_cache.get(path)
+            if cached is not None and cached[0] == key:
+                return cached[1]
+            text = path.read_text(encoding="utf-8")
+            fm, body = parse_note_file(text)
+            note = note_from_frontmatter(fm, body)
+            self._note_cache[path] = (key, note)
+            return note
+
+        return await anyio.to_thread.run_sync(_load)
+
+    # ---- index regeneration ---------------------------------------------
+
+    async def _regenerate_index(
+        self,
+        user_id: str | None,
+        *,
+        changed: list[Note] | None = None,
+    ) -> None:
+        """Atomically rewrite ``WORKSPACE.md`` for one partition.
+
+        Incremental: the partition's index entries are kept in
+        ``_index_cache`` after the first full build, and a write
+        passes the note(s) it touched via ``changed`` so only those
+        entries are patched — the old implementation re-read and
+        re-parsed EVERY note on EVERY write. ``changed=None``
+        forces a full rebuild (used by prune, and on the first
+        write per partition per instance).
+
+        Callers must NOT hold ``_index_lock`` — it's taken here.
+        """
+        async with self._index_lock:
+            user_root = self._user_root(user_id)
+            entries = self._index_cache.get(user_root)
+            if entries is None or changed is None:
+                summaries = await self.list_notes(
+                    user_id=user_id, limit=10_000
+                )
+                entries = {(s.author, s.slug): s for s in summaries}
+                self._index_cache[user_root] = entries
+            else:
+                for note in changed:
+                    note_key = (note.author, note.slug)
+                    if note.archived_at is not None:
+                        # Archived notes drop out of the index,
+                        # matching list_notes' default filter.
+                        entries.pop(note_key, None)
+                    else:
+                        entries[note_key] = summary_from_note(note)
+            ordered = sorted(
+                entries.values(),
+                key=lambda s: s.updated_at,
+                reverse=True,
+            )
+            rendered = render_workspace_index(ordered)
+            user_root.mkdir(parents=True, exist_ok=True)
+            dest = user_root / INDEX_FILENAME
+            tmp = dest.with_suffix(dest.suffix + ".tmp")
+            await anyio.to_thread.run_sync(_write_utf8, tmp, rendered)
+            await anyio.to_thread.run_sync(os.replace, str(tmp), str(dest))
+
+    async def render_index(
+        self,
+        *,
+        user_id: str | None = None,
+    ) -> str:
+        # Re-render from current state (don't trust the on-disk
+        # cache); cheap because we already walked the tree in
+        # ``list_notes``.
+        summaries = await self.list_notes(user_id=user_id, limit=10_000)
+        return render_workspace_index(summaries)
+
+    # ---- lifecycle -------------------------------------------------------
+
+    async def aclose(self) -> None:
+        if self._cleanup_on_close and self._root.exists():
+            await anyio.to_thread.run_sync(
+                shutil.rmtree, str(self._root), True
+            )
+
+    async def __aenter__(self) -> LocalDiskWorkspace:
+        return self
+
+    async def __aexit__(self, *_: object) -> None:
+        await self.aclose()
+
+    def member(
+        self,
+        name: str | None = None,
+        *,
+        teammates: list[str] | None = None,
+    ) -> WorkspaceMembership:
+        return WorkspaceMembership(
+            workspace=self,
+            name=name,
+            teammates=list(teammates) if teammates else None,
+        )
+
+    # ---- bridge to the builtin file tools --------------------------------
+
+    def filesystem_tools(
+        self,
+        *,
+        include_bash: bool = False,
+        user_id: str | None = None,
+    ) -> list[Tool]:
+        """Return the framework's existing :func:`read_tool` /
+        :func:`write_tool` / :func:`edit_tool` rooted at this
+        workspace's directory.
+
+        Use case: a power-user agent that wants raw file access
+        (drop binaries, read pre-seeded reference docs, edit a
+        large artifact) alongside the high-level notebook tools.
+
+        ``include_bash=True`` also returns :func:`bash_tool` rooted
+        at the workspace — useful when an agent needs to run
+        scripts against its own artifacts. Off by default because
+        bash is destructive-capable.
+
+        ``user_id`` scopes the workdir to the per-user partition
+        so raw file access respects the same multi-tenant isolation
+        as the notebook tools. Pass the agent's ``RunContext.user_id``
+        (or rely on :func:`get_run_context` from inside a run).
+        """
+        from ..tools.builtin import (
+            bash_tool,
+            edit_tool,
+            read_tool,
+            write_tool,
+        )
+
+        scope = self._user_root(user_id)
+        scope.mkdir(parents=True, exist_ok=True)
+        tools: list[Tool] = [
+            read_tool(scope),
+            write_tool(scope),
+            edit_tool(scope),
+        ]
+        if include_bash:
+            tools.append(bash_tool(scope))
+        return tools
+
+
+# ---------------------------------------------------------------------------
+# Sanitisation — keep paths safe for any filesystem
+# ---------------------------------------------------------------------------
+
+_PATH_UNSAFE = re.compile(r"[^\w.\-]")
+
+
+def _sanitise_user_id(value: str) -> str:
+    """User-supplied identifiers get path-sanitised before going on
+    disk. ``..``  and slashes can't escape the workspace root."""
+    cleaned = _PATH_UNSAFE.sub("_", value)
+    if not cleaned or cleaned in (".", ".."):
+        return "_anon"
+    return cleaned
+
+
+def _sanitise_author(value: str) -> str:
+    cleaned = _PATH_UNSAFE.sub("_", value)
+    return cleaned or "agent"
+
+
+# ---------------------------------------------------------------------------
+# Walk filters — exclude meta dirs
+# ---------------------------------------------------------------------------
+
+
+def _should_prune(
+    note: Note,
+    *,
+    now: datetime,
+    older_than: timedelta | None,
+    min_cited_count: int,
+    keep_kind_set: set[NoteKind],
+) -> bool:
+    """Decide whether a note is GC-eligible. A note is pruned only
+    when ALL hold: not a protected kind, cited below the
+    threshold, and (if ``older_than`` is set) idle longer than the
+    window. Shared by both backends so prune semantics stay
+    identical.
+    """
+    # Protected kind — never pruned.
+    if note.kind in keep_kind_set:
+        return False
+    # Valuable — cited enough times.
+    if note.cited_count >= min_cited_count:
+        return False
+    # Age filter. When ``older_than`` is None, age is not a factor
+    # — every note is age-eligible (the caller opted into that).
+    if older_than is not None:
+        last_activity = note.last_cited_at or note.updated_at
+        if now - last_activity < older_than:
+            return False
+    return True
+
+
+def _is_in_meta_dir(path: Path) -> bool:
+    """``True`` when ``path`` is inside the ``.history`` revision
+    store. Used to filter ``rglob("*.md")`` so historical
+    revisions never surface as live notes in ``list_notes`` /
+    ``search_notes`` / the index.
+
+    NOTE: this checks specifically for the ``.history`` segment,
+    NOT "any dot-prefixed part". An earlier version flagged every
+    dot-dir — which silently broke any workspace rooted under a
+    dot-directory (``.loom/notebook``, ``.claude/workspace``,
+    ...), because then every note path contains a dotted segment
+    and every note got filtered out of listings.
+    """
+    return HISTORY_DIR in path.parts
+
+
+# Scoring helpers (BM25 / semantic cosine / RRF fusion / relevance
+# boost) live in ``_common`` and are shared with the in-memory
+# backend — see the aliased imports at the top of this module.

@@ -1,0 +1,67 @@
+# Secrets
+.env
+.env.local
+*.key
+*.pem
+
+# Research data — never commit confidential interview material
+research-projects/
+**/0-input/*.mp3
+**/0-input/*.mp4
+**/0-input/*.wav
+**/0-input/*.m4a
+**/0-input/*.mov
+**/0-input/*.mkv
+**/2-interviews/*.mp3
+**/2-interviews/*.mp4
+**/2-interviews/*.wav
+**/2-interviews/*.m4a
+**/2-interviews/*.mov
+**/2-interviews/*.mkv
+
+# Transcripts and coded interviews of real projects — not in the framework repo
+**/2-interviews/*.txt
+**/2-interviews/*.json
+**/2-interviews/*-summary.md
+**/.system/coded/
+**/.system/runs/
+
+# But keep prompt snapshots and the codebook — useful for debugging and retros
+!**/.system/prompts-versions/
+!**/.system/codebook/
+
+# Keep templates and the golden set
+!project-template/**
+!tests/golden/**
+!examples/**
+
+# Obsidian: workspace and cache are local
+**/.obsidian/workspace
+**/.obsidian/workspace.json
+**/.obsidian/workspace-mobile.json
+**/.obsidian/cache
+**/.obsidian/graph.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+
+# Node
+node_modules/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Build artifacts
+dist/
+build/
+*.plugin

@@ -1,0 +1,129 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ux-research-pipeline.local/schemas/paradigmatic-node.v1.json",
+  "title": "Paradigmatic Model Node",
+  "description": "A node of the grounded-theory paradigm model. Produced by `14-paradigmatic-model`. The set of nodes + arcs forms `3-analysis/model.canvas` + `3-analysis/model.md`.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "node_id",
+    "role",
+    "name",
+    "supporting_segments"
+  ],
+  "properties": {
+    "node_id": {
+      "type": "string",
+      "pattern": "^N[0-9]{2}$",
+      "description": "N01, N02, ..."
+    },
+    "role": {
+      "type": "string",
+      "enum": ["causal_condition", "context", "intervening_condition", "action_strategy", "consequence"],
+      "description": "Paradigmatic role of the node. causal_condition — what triggers the phenomenon. context — the circumstances. intervening_condition — modulators (that enable or block actions). action_strategy — what the respondent does. consequence — the consequences of actions."
+    },
+    "name": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 120,
+      "description": "Node name — a process label (for example, 'a lack of clear cues to choose by'), not a taxonomic category."
+    },
+    "linked_themes": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^T[0-9]{2,3}$"
+      },
+      "description": "Themes the node draws on. Often, but not always, the same as a theme from a category."
+    },
+    "linked_categories": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^C[0-9]{2}$"
+      }
+    },
+    "description": {
+      "type": "string",
+      "description": "1–3 sentences on what the node means in this model."
+    },
+    "supporting_segments": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["segment_id", "respondent_id"],
+        "properties": {
+          "segment_id": {"type": "string", "pattern": "^seg-[0-9]{4}$"},
+          "respondent_id": {"type": "string", "pattern": "^R[0-9]{2,3}$"}
+        }
+      },
+      "description": "Pin to the data. A node with no pinned segment is an interpretation without evidence and is not allowed."
+    },
+    "confidence": {
+      "type": "string",
+      "enum": ["low", "medium", "high"],
+      "description": "Confidence that the node exists. low = a hypothetical node (supported by 1–2 respondents); high = confirmed many times over."
+    },
+    "is_hypothetical": {
+      "type": "boolean",
+      "description": "Explicit flag for a hypothetical node. true = the node is needed for the model but the data is thin; it must be marked in `model.md`."
+    },
+    "canvas_position": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Node coordinates on the Obsidian canvas. Optional — controls the visual layout.",
+      "properties": {
+        "x": {"type": "number"},
+        "y": {"type": "number"},
+        "width": {"type": "number"},
+        "height": {"type": "number"},
+        "color": {
+          "type": "string",
+          "enum": ["1", "2", "3", "4", "5", "6"],
+          "description": "Obsidian canvas color. By convention: 1=causal_condition (red), 2=context (orange), 3=action_strategy (yellow), 4=consequence (green), 5=intervening_condition (cyan), 6=gap/hypothetical (purple)."
+        }
+      }
+    }
+  },
+  "$defs": {
+    "arc": {
+      "title": "Paradigmatic Model Arc",
+      "description": "An arc between model nodes. Stored in `model.md` under the 'Main arcs' section or in `model-arcs.v1.json`.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["arc_id", "from_node", "to_node", "kind"],
+      "properties": {
+        "arc_id": {"type": "string", "pattern": "^E[0-9]{2}$"},
+        "from_node": {"type": "string", "pattern": "^N[0-9]{2}$"},
+        "to_node": {"type": "string", "pattern": "^N[0-9]{2}$"},
+        "kind": {
+          "type": "string",
+          "enum": ["causes", "modulates", "blocks", "co-occurs"],
+          "description": "causes — causal (solid line). modulates — supports/amplifies (dashed). blocks — impedes (dashed with a marker). co-occurs — co-occurs without causality."
+        },
+        "claim": {
+          "type": "string",
+          "description": "A statement in the form 'under condition X, in context Y, action Z happens with consequence W'."
+        },
+        "confidence": {
+          "type": "string",
+          "enum": ["low", "medium", "high"]
+        },
+        "supporting_segments": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["segment_id", "respondent_id"],
+            "properties": {
+              "segment_id": {"type": "string", "pattern": "^seg-[0-9]{4}$"},
+              "respondent_id": {"type": "string", "pattern": "^R[0-9]{2,3}$"}
+            }
+          }
+        }
+      }
+    }
+  }
+}

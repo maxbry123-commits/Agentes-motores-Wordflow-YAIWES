@@ -1,0 +1,43 @@
+Test ID,Category,Test Case,Priority,Status,Result,Date,Tester,Bug ID,Notes
+TC-GAP-001,CAT-6,Dispatcher legacy list[Artifact] wrap,P1,DONE,PASS,2026-03-10,Claude,,test_qa_v3_cost_tracking.py
+TC-GAP-002,CAT-6,Dispatcher new adapter pass-through,P1,DONE,PASS,2026-03-10,Claude,,test_qa_v3_cost_tracking.py
+TC-GAP-003,CAT-6,Dispatcher retry preserves ExecutionResult,P2,DONE,PASS,2026-03-10,Claude,,test_qa_v3_cost_tracking.py
+TC-GAP-004,CAT-6,Replay engine cost recording,P1,DONE,PASS,2026-03-10,Claude,,test_qa_v3_cost_tracking.py
+TC-GAP-005,CAT-6,RunSummary.skipped_nodes default,P2,DONE,PASS,2026-03-10,Claude,,test_qa_v3_cost_tracking.py
+TC-GAP-006,CAT-6,RunSummary.skipped_nodes set,P2,DONE,PASS,2026-03-10,Claude,,test_qa_v3_cost_tracking.py
+TC-GAP-007,CAT-6,RunSummary.total_cost default,P2,DONE,PASS,2026-03-10,Claude,,test_qa_v3_cost_tracking.py
+TC-GAP-008,CAT-6,CLI run JSON budget fields,P1,DONE,PASS,2026-03-10,Claude,,test_qa_v3_cost_tracking.py
+TC-GAP-009,CAT-6,CLI run JSON no budget,P1,DONE,PASS,2026-03-10,Claude,,test_qa_v3_cost_tracking.py
+TC-GAP-010,CAT-6,A2A zero cost from response,P2,DONE,PASS,2026-03-10,Claude,,test_qa_v3_cost_tracking.py
+TC-GAP-011,CAT-6,A2A string cost conversion,P2,DONE,PASS,2026-03-10,Claude,,test_qa_v3_cost_tracking.py
+TC-GAP-012,CAT-6,Parallel nodes under budget,P1,DONE,PASS,2026-03-10,Claude,,test_qa_v3_cost_tracking.py
+TC-GAP-013,CAT-6,Parallel nodes no budget tracked,P1,DONE,PASS,2026-03-10,Claude,,test_qa_v3_cost_tracking.py
+TC-GAP-014,CAT-6,SQLite double-init idempotent,P2,DONE,PASS,2026-03-10,Claude,,test_qa_v3_cost_tracking.py
+TC-GAP-015,CAT-6,SQLite cost_records table created,P1,DONE,PASS,2026-03-10,Claude,,test_qa_v3_cost_tracking.py
+TC-GAP-016,CAT-6,SQLite total_cost column migration,P1,DONE,PASS,2026-03-10,Claude,,test_qa_v3_cost_tracking.py
+TC-GAP-017,CAT-6,CLI cost group registered,P1,DONE,PASS,2026-03-10,Claude,,test_qa_v3_cost_tracking.py
+TC-GAP-018,CAT-6,CLI cost show help,P2,DONE,PASS,2026-03-10,Claude,,test_qa_v3_cost_tracking.py
+TC-GAP-019,CAT-6,CLI cost history help,P2,DONE,PASS,2026-03-10,Claude,,test_qa_v3_cost_tracking.py
+TC-GAP-020,CAT-6,Failed node no cost record,P1,DONE,PASS,2026-03-10,Claude,,test_qa_v3_cost_tracking.py
+TC-GAP-021,CAT-6,Partial failure only successful costs,P1,DONE,PASS,2026-03-10,Claude,,test_qa_v3_cost_tracking.py
+TC-GAP-022,CAT-6,Memory store protocol compliance,P2,DONE,PASS,2026-03-10,Claude,,test_qa_v3_cost_tracking.py
+TC-GAP-023,CAT-6,SQLite store protocol compliance,P2,DONE,PASS,2026-03-10,Claude,,test_qa_v3_cost_tracking.py
+TC-GAP-024,CAT-6,Very small cost preserved,P2,DONE,PASS,2026-03-10,Claude,,test_qa_v3_cost_tracking.py
+TC-GAP-025,CAT-6,Very large cost preserved,P2,DONE,PASS,2026-03-10,Claude,,test_qa_v3_cost_tracking.py
+TC-GAP-026,CAT-6,Memory store float accumulation,P1,DONE,PASS,2026-03-10,Claude,,test_qa_v3_cost_tracking.py
+TC-GAP-027,CAT-6,SQLite store float accumulation,P1,DONE,PASS,2026-03-10,Claude,,test_qa_v3_cost_tracking.py
+TC-GAP-028,CAT-6,CostRecord importable,P2,DONE,PASS,2026-03-10,Claude,,test_qa_v3_cost_tracking.py
+TC-GAP-029,CAT-6,BudgetConfig importable,P2,DONE,PASS,2026-03-10,Claude,,test_qa_v3_cost_tracking.py
+TC-GAP-030,CAT-6,ExecutionResult importable,P2,DONE,PASS,2026-03-10,Claude,,test_qa_v3_cost_tracking.py
+TC-GAP-031,CAT-6,NodeCostHint importable,P2,DONE,PASS,2026-03-10,Claude,,test_qa_v3_cost_tracking.py
+TC-GAP-032,CAT-6,RunCostSummary importable,P2,DONE,PASS,2026-03-10,Claude,,test_qa_v3_cost_tracking.py
+TC-GAP-033,CAT-6,cost history run not found,P1,DONE,PASS,2026-03-10,Claude,,test_qa_v3_cost_tracking.py
+TC-GAP-034,CAT-6,cost show JSON with budget,P2,DONE,PASS,2026-03-10,Claude,,test_qa_v3_cost_tracking.py
+TC-GAP-035,CAT-6,cost history JSON empty records,P2,DONE,PASS,2026-03-10,Claude,,test_qa_v3_cost_tracking.py
+TC-GAP-036,CAT-6,Budget from dict YAML-like,P1,DONE,PASS,2026-03-10,Claude,,test_qa_v3_cost_tracking.py
+TC-GAP-037,CAT-6,Budget warn from dict default,P2,DONE,PASS,2026-03-10,Claude,,test_qa_v3_cost_tracking.py
+TC-GAP-038,CAT-6,Node cost hint from dict,P2,DONE,PASS,2026-03-10,Claude,,test_qa_v3_cost_tracking.py
+TC-GAP-039,CAT-6,Valid CostSource parametrized x5,P2,DONE,PASS,2026-03-10,Claude,,test_qa_v3_cost_tracking.py
+TC-GAP-040,CAT-6,Invalid CostSource rejected,P1,DONE,PASS,2026-03-10,Claude,,test_qa_v3_cost_tracking.py
+TC-GAP-041,CAT-6,ExecutionResult artifacts and cost,P2,DONE,PASS,2026-03-10,Claude,,test_qa_v3_cost_tracking.py
+TC-GAP-042,CAT-6,ExecutionResult serializable,P2,DONE,PASS,2026-03-10,Claude,,test_qa_v3_cost_tracking.py

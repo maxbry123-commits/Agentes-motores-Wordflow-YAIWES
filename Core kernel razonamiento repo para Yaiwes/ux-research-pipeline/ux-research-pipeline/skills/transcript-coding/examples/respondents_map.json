@@ -1,0 +1,6 @@
+{
+  "_comment": "Mapping of transcript filename → respondent id from brief.json. Used only in batch mode (run-batch).",
+  "interview_01.json": "r_1",
+  "interview_02.json": "r_2",
+  "interview_03.json": "r_3"
+}

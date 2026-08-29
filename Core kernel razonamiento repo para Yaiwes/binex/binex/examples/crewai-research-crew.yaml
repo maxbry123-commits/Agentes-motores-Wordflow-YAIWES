@@ -1,0 +1,63 @@
+# CrewAI Research Crew
+# =====================
+# Demonstrates using a CrewAI Crew as a workflow agent.
+# Binex imports your Crew object and calls .kickoff_async()/.kickoff().
+#
+# Topology:  planner (LLM) -> research_crew (CrewAI) -> editor (LLM)
+#
+# Prerequisites:
+#   pip install binex[crewai]
+#   export OPENAI_API_KEY=sk-...
+#
+# The CrewAI Crew is defined in myproject/crews.py (included).
+# Agent prefix: crewai://<module.path.crew_object>
+#
+# Run (from examples/ directory):
+#   cd examples
+#   binex plugins check crewai-research-crew.yaml
+#   binex run crewai-research-crew.yaml topic="AI in healthcare"
+#
+# Or from project root:
+#   PYTHONPATH=examples binex run examples/crewai-research-crew.yaml topic="AI in healthcare"
+#
+# Debug: binex debug <run_id>
+
+name: crewai-research-crew
+description: "Research pipeline with CrewAI multi-agent crew"
+
+nodes:
+  # Step 1: LLM creates a research plan
+  planner:
+    agent: "llm://gpt-4o-mini"
+    system_prompt: |
+      You are a research planner. Given a topic, create a structured
+      research plan with 3-5 key questions to investigate.
+    inputs:
+      topic: "${user.topic}"
+    outputs: [plan]
+    config:
+      temperature: 0.4
+
+  # Step 2: CrewAI crew executes the research
+  research_crew:
+    agent: "crewai://myproject.crews.research_crew"
+    inputs:
+      plan: "${planner.plan}"
+    outputs: [report]
+    depends_on: [planner]
+
+  # Step 3: LLM edits and polishes the final output
+  editor:
+    agent: "llm://gpt-4o-mini"
+    system_prompt: |
+      You are a senior editor. Polish the report for clarity, fix any
+      inconsistencies, and ensure professional tone throughout.
+    inputs:
+      draft: "${research_crew.report}"
+    outputs: [final_report]
+    depends_on: [research_crew]
+    config:
+      temperature: 0.2
+
+defaults:
+  deadline_ms: 300000          # 5 min — CrewAI crews can take a while

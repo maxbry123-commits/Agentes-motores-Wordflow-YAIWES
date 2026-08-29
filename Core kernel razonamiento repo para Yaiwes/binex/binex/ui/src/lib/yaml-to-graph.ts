@@ -1,0 +1,98 @@
+import yaml from 'js-yaml';
+import ELK, { type ElkNode } from 'elkjs/lib/elk.bundled.js';
+
+export interface WorkflowNode {
+  id: string;
+  label: string;
+  type: string;
+  status?: string;
+  patternGroup?: string;
+  patternType?: string;
+  foreach?: string; // mapper node — this node fans out at runtime (#77)
+}
+
+export interface WorkflowEdge {
+  id: string;
+  source: string;
+  target: string;
+}
+
+export interface GraphLayout {
+  nodes: Array<{ id: string; position: { x: number; y: number }; data: WorkflowNode }>;
+  edges: WorkflowEdge[];
+}
+
+interface ParsedWorkflow {
+  name?: string;
+  nodes?: Record<
+    string,
+    { agent: string; depends_on?: string[]; config?: Record<string, unknown>; foreach?: string }
+  >;
+}
+
+const elk = new ELK();
+
+export function parseWorkflowYaml(yamlContent: string): { nodes: WorkflowNode[]; edges: WorkflowEdge[] } {
+  const parsed = yaml.load(yamlContent) as ParsedWorkflow;
+  if (!parsed?.nodes) return { nodes: [], edges: [] };
+
+  const nodes: WorkflowNode[] = Object.entries(parsed.nodes).map(([id, spec]) => {
+    const agent = spec.agent ?? '';
+    const prefix = agent.split('://')[0] ?? 'local';
+    const type = prefix === 'cao' ? 'cao' : prefix;
+    const config = spec.config;
+    return {
+      id,
+      label: id,
+      type,
+      patternGroup: config?._pattern_group as string | undefined,
+      patternType: config?._pattern_type as string | undefined,
+      foreach: spec.foreach,
+    };
+  });
+
+  const edges: WorkflowEdge[] = [];
+  for (const [id, spec] of Object.entries(parsed.nodes)) {
+    if (spec.depends_on) {
+      for (const dep of spec.depends_on) {
+        edges.push({ id: `${dep}->${id}`, source: dep, target: id });
+      }
+    }
+  }
+
+  return { nodes, edges };
+}
+
+export async function layoutGraph(
+  nodes: WorkflowNode[],
+  edges: WorkflowEdge[],
+): Promise<GraphLayout> {
+  const nodeIds = new Set(nodes.map((n) => n.id));
+  // Filter edges to only include those whose source and target exist in nodes
+  const validEdges = edges.filter((e) => nodeIds.has(e.source) && nodeIds.has(e.target));
+
+  const elkGraph: ElkNode = {
+    id: 'root',
+    layoutOptions: {
+      'elk.algorithm': 'layered',
+      'elk.direction': 'DOWN',
+      'elk.spacing.nodeNode': '50',
+      'elk.layered.spacing.nodeNodeBetweenLayers': '80',
+    },
+    children: nodes.map((n) => ({ id: n.id, width: 180, height: 50 })),
+    edges: validEdges.map((e) => ({ id: e.id, sources: [e.source], targets: [e.target] })),
+  };
+
+  const layout = await elk.layout(elkGraph);
+
+  const layoutNodes = (layout.children || []).map((child) => {
+    const nodeData = nodes.find((n) => n.id === child.id)!;
+    return {
+      id: child.id,
+      position: { x: child.x || 0, y: child.y || 0 },
+      data: nodeData,
+    };
+  });
+
+  return { nodes: layoutNodes, edges };
+}

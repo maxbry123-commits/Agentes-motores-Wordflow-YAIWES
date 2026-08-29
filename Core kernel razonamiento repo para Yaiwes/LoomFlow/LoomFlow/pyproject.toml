@@ -1,0 +1,249 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "loomflow"
+version = "0.12.0"
+description = "Production workflow + agent framework. Multi-tenant, MCP-native, model-agnostic."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Jeeves" }]
+dependencies = [
+    "anyio>=4.4.0",
+    "pydantic>=2.6.0",
+    "python-ulid>=2.2.0",
+]
+
+[project.optional-dependencies]
+anthropic = ["anthropic>=0.40.0"]
+openai = ["openai>=1.30.0"]
+litellm = ["litellm>=1.40.0"]
+mcp = ["mcp>=1.0.0", "httpx>=0.27.0"]
+postgres = ["asyncpg>=0.29.0", "pgvector>=0.2.5"]
+chroma = ["chromadb>=0.5.0"]
+redis = ["redis>=5.0.0"]
+voyage = ["voyageai>=0.2.0"]
+cohere = ["cohere>=5.0.0"]
+dbos = ["dbos>=0.7.0"]
+temporal = ["temporalio>=1.7.0"]
+# ASGI server for `loom serve` / running loomflow.serve.create_app.
+# The app itself is framework-free pure ASGI — any server works;
+# this extra just pulls the recommended one.
+serve = ["uvicorn>=0.30"]
+# A2A protocol client (loomflow.a2a.A2AClient). The server side
+# (serve_a2a) is dependency-free pure ASGI; httpx is only needed
+# to CALL remote A2A agents.
+a2a = ["httpx>=0.27.0"]
+otel = [
+    "opentelemetry-api>=1.24.0",
+    "opentelemetry-sdk>=1.24.0",
+]
+# Web-search tool (loomflow.tools.web_tool). Two backends, install
+# whichever you intend to use — or `loomflow[web]` for both. Lazy
+# imports inside the tool fn, so neither extra is pulled in at
+# `import loomflow.tools` time.
+#   - serper: Google search via https://serper.dev. Needs httpx
+#     for the API client + a SERPER_API_KEY env var (or api_key=
+#     kwarg). Free tier = 2,500 lifetime searches.
+#   - duckduckgo: free, no key, lower / more variable quality.
+serper = ["httpx>=0.27.0"]
+duckduckgo = ["duckduckgo-search>=6.0"]
+web = ["httpx>=0.27.0", "duckduckgo-search>=6.0"]
+# PDF loader has two interchangeable backends, picked at load
+# time via `backend="unstructured" | "docling"`. Both produce the
+# same `Document` shape so downstream code doesn't care which
+# was used.
+#
+#   - unstructured (Apache 2.0): default. Element-level parsing
+#     (Title / NarrativeText / Table / ListItem / Image) with
+#     per-page metadata; what LangChain's UnstructuredPDFLoader
+#     wraps. Three strategy modes: "fast" (pdfminer.six, default),
+#     "hi_res" (YOLO layout model), "ocr_only" (Tesseract).
+#   - docling (MIT, IBM Research): 2026 best-in-class on native
+#     PDFs per published benchmarks. Slightly slower first run
+#     (downloads layout model on first use, then cached).
+#
+# Either path is a strict upgrade over the pypdf-backed loader
+# that shipped through 0.10 — pypdf's "lower-half pages render
+# as `(no extractable text)`" footgun is gone in both.
+loader-pdf = ["unstructured[pdf]>=0.15"]
+loader-pdf-docling = ["docling>=2.0"]
+loader-docx = ["python-docx>=1.0"]
+loader-excel = ["openpyxl>=3.1"]
+loader-html = ["beautifulsoup4>=4.12"]
+loader-token = ["tiktoken>=0.7"]
+loader = [
+    "unstructured[pdf]>=0.15",
+    "python-docx>=1.0",
+    "openpyxl>=3.1",
+    "beautifulsoup4>=4.12",
+    "tiktoken>=0.7",
+]
+vectorstore-chroma = ["chromadb>=0.5.0"]
+vectorstore-postgres = ["asyncpg>=0.29.0", "pgvector>=0.2.5"]
+vectorstore-faiss = ["faiss-cpu>=1.8.0", "numpy>=1.26"]
+vectorstore = [
+    "chromadb>=0.5.0",
+    "asyncpg>=0.29.0",
+    "pgvector>=0.2.5",
+    "faiss-cpu>=1.8.0",
+    "numpy>=1.26",
+]
+dev = [
+    "pytest>=8.0",
+    "anyio[trio]>=4.4.0",
+    "hypothesis>=6.100",
+    "mypy>=1.10",
+    "ruff>=0.4",
+    "import-linter>=2.0",
+    "bump-my-version>=0.30",
+]
+docs = [
+    "sphinx>=7.0",
+    "furo>=2024.0",
+    "sphinx-autoapi>=3.0",
+    "myst-parser>=2.0",
+    "linkify-it-py>=2.0",
+]
+
+[project.scripts]
+loom = "loomflow.cli:main"
+
+[tool.hatch.build.targets.sdist]
+# The sdist defaults to sweeping the whole repo, which dragged in the
+# pre-built Sphinx site (``docs/_build/``, ~10MB of generated HTML
+# carrying the OLD ``jeevesagent`` name) plus dev cruft. Ship only the
+# package, tests, and the docs/example SOURCES — a lean, reproducible
+# source archive.
+include = [
+    "loomflow",
+    "tests",
+    "examples",
+    "docs",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "pyproject.toml",
+]
+exclude = [
+    "docs/_build",
+    "**/__pycache__",
+    "**/*.pyc",
+    ".env",
+    "dist",
+    "build",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["loomflow"]
+# Never sweep local dotfiles (e.g. an accidental .env), generated
+# vector-store data, or stray nested dirs into a built artifact.
+exclude = [
+    "**/.env",
+    "**/.env.*",
+    "**/*.sqlite3",
+    "**/.chroma_*",
+    "loomflow/loomflow",
+    "loomflow/tests",
+    "loomflow/docs",
+    "loomflow/examples",
+]
+# PEP 561: ``py.typed`` marker tells IDEs and type-checkers
+# (Pylance, Pyright, mypy) that this package ships inline type
+# hints. Without it, autocomplete and go-to-definition for our
+# public APIs don't work in IDEs that consume the installed
+# wheel — even though every public function is fully typed in
+# source. See https://peps.python.org/pep-0561/
+[tool.hatch.build.targets.wheel.force-include]
+"loomflow/py.typed" = "loomflow/py.typed"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "I",   # isort
+    "B",   # bugbear
+    "UP",  # pyupgrade
+    "ASYNC",  # flake8-async
+]
+ignore = [
+    "E501",  # line length handled by formatter
+]
+
+[tool.mypy]
+strict = true
+# No ``python_version`` pin: mypy targets the interpreter it runs under.
+# Pinning 3.11 made mypy parse installed stubs with the 3.11 grammar, and
+# numpy 2.3+ stubs use PEP 695 ``type X = ...`` statements — which crash
+# the parser under 3.11 ("Type statement is only supported in Python 3.12
+# and greater"). On each CI leg the locally-installed numpy stubs match
+# that leg's Python, so following the runtime version is correct. We still
+# require 3.11 at runtime via ``requires-python`` and CI's 3.11 matrix leg.
+# ``unused-ignore`` is suppressed because lazy SDK imports
+# (asyncpg, pgvector, mcp.client.*, redis.asyncio) raise different
+# mypy error codes depending on whether the package is installed in
+# the env (``import-not-found`` vs ``import-untyped``). Multi-code
+# ignores cover both cases, but mypy then flags the unused half.
+# ``disable_error_code`` (unlike ``warn_unused_ignores``) is not
+# overridden by ``--strict``.
+disable_error_code = ["unused-ignore"]
+warn_redundant_casts = true
+warn_unreachable = true
+disallow_untyped_decorators = false  # pydantic decorators
+
+[tool.pytest.ini_options]
+# ``live`` tests hit paid endpoints and are deselected by default;
+# run them explicitly with ``pytest -m live`` once OPENAI_API_KEY
+# is set. Everything else runs offline against ScriptedModel /
+# in-process fakes.
+addopts = "--strict-markers -m 'not live'"
+markers = [
+    "anyio: mark test as async (anyio backend)",
+    "live: hits a paid model endpoint; opt-in via -m live",
+]
+
+# ---------------------------------------------------------------------------
+# Version bumping (used by ``make release BUMP=...``)
+# ---------------------------------------------------------------------------
+# ``bump-my-version`` reads ``current_version`` here, edits every file
+# listed below in lockstep, commits, and tags. The Makefile target
+# ``release`` calls it then pushes commit + tag, which fires
+# ``.github/workflows/release.yml`` for the PyPI upload.
+#
+# Daily flow stays as plain ``git commit`` / ``git push``. ``make
+# release BUMP=patch|minor|major`` is the explicit "this is a release"
+# flag — see the Makefile for usage.
+[tool.bumpversion]
+current_version = "0.12.0"
+parse = """(?x)
+    (?P<major>0|[1-9]\\d*)\\.(?P<minor>0|[1-9]\\d*)\\.(?P<patch>0|[1-9]\\d*)
+    (?:\\.(?P<dev_label>dev)(?P<dev_n>\\d+))?
+"""
+serialize = [
+    "{major}.{minor}.{patch}.{dev_label}{dev_n}",
+    "{major}.{minor}.{patch}",
+]
+search = "{current_version}"
+replace = "{new_version}"
+commit = true
+tag = true
+tag_name = "v{new_version}"
+tag_message = "Release v{new_version}"
+message = "Release v{new_version}"
+allow_dirty = false  # refuses to bump if working tree has uncommitted changes
+
+[[tool.bumpversion.files]]
+filename = "pyproject.toml"
+search = 'version = "{current_version}"'
+replace = 'version = "{new_version}"'
+
+[[tool.bumpversion.files]]
+filename = "loomflow/__init__.py"
+search = '__version__ = "{current_version}"'
+replace = '__version__ = "{new_version}"'

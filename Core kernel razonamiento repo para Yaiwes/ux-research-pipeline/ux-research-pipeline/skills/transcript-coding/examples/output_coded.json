@@ -1,0 +1,124 @@
+{
+  "interview_id": "input_transcript",
+  "project_id": "TICKET-123",
+  "global_context": {
+    "summary": "Exploratory interview about reviews and news. In the first third of the conversation the interviewer explains the context and format, then asks the respondent to recall the survey he took part in. After that the discussion shifts to review-reading practices: how the respondent decides whether to trust a review, what he looks at first, how he tells paid reviews from genuine ones. The respondent shows a pronounced reading strategy — he orients not toward the stars but toward the number and substantiveness of the reviews.",
+    "themes": [
+      "criteria for trusting reviews",
+      "stars vs content",
+      "spotting signals of a paid review",
+      "prioritizing negative reviews",
+      "quantity as a reliability signal"
+    ],
+    "participants": {
+      "Interviewer": "interviewer leading the conversation about reviews and news",
+      "Respondent": "active user who previously took part in a survey about reviews"
+    },
+    "key_tasks": [
+      "recall the experience of taking part in the survey about reviews",
+      "describe how he decides whether to read reviews",
+      "describe what exactly he looks for in reviews"
+    ],
+    "notable_dynamics": "The respondent warmed up quickly — by his third turn he is already articulating an elaborated strategy rather than just answering the question. This may have been helped by the fact that this is his repeat contact with the topic (he took part in the survey)."
+  },
+  "segments": [
+    {
+      "segment_id": "seg_0001",
+      "interview_id": "input_transcript",
+      "timecode_start": 1.1,
+      "timecode_end": 75.0,
+      "guide_block": "introductions",
+      "quote": "Yeah, there was some big survey, a long one, I think.",
+      "quote_cleaned": null,
+      "subject_codes": ["recollection of the survey"],
+      "content_type": "state",
+      "research_question_ids": [],
+      "hypothesis_support": [],
+      "respondent_id": "r_1",
+      "respondent_segment": "active users",
+      "respondent_city": "metro area",
+      "screen_state": null,
+      "interpretive_notes": "Epistemic modality ('I think'), low certainty. The respondent remembers the fact but not the details — consistent with the 'active user' role, for whom the survey was one of many touchpoints.",
+      "meta": {
+        "model": "gpt-5.4-2026-03-05",
+        "prompt_version": "1.0",
+        "retries": 0,
+        "validation_warnings": []
+      }
+    },
+    {
+      "segment_id": "seg_0002",
+      "interview_id": "input_transcript",
+      "timecode_start": 95.3,
+      "timecode_end": 128.4,
+      "guide_block": "reading reviews",
+      "quote": "And you know, what matters to me isn't so much the stars as what people actually write. When it's five stars but only two reviews, that's suspicious, I don't trust that. But when it's four or three stars with about a hundred reviews, that's a whole different story.",
+      "quote_cleaned": null,
+      "subject_codes": [
+        "number of reviews as a trust signal",
+        "stars without volume — suspicious",
+        "content matters more than rating"
+      ],
+      "content_type": "insight",
+      "research_question_ids": ["rq_1"],
+      "hypothesis_support": [
+        {
+          "hypothesis_id": "h_1",
+          "direction": "mixed",
+          "note": "The number of reviews matters more to him than the stars, but he talks about quantity as a trust signal, not as the first thing he notices visually. The link to the 'noticed first' hypothesis is indirect."
+        }
+      ],
+      "respondent_id": "r_1",
+      "respondent_segment": "active users",
+      "respondent_city": "metro area",
+      "screen_state": null,
+      "interpretive_notes": "Speech act — articulating an explicit strategy (not just an answer but a lesson). Opposition of 'stars vs content', with a semiotic shift: 'five stars with two reviews' is reclassified as 'suspicious' (not 'bad', but 'not-good'). Distrust is attributed to the review system, not to a specific store.",
+      "meta": {
+        "model": "gpt-5.4-2026-03-05",
+        "prompt_version": "1.0",
+        "retries": 0,
+        "validation_warnings": []
+      }
+    },
+    {
+      "segment_id": "seg_0003",
+      "interview_id": "input_transcript",
+      "timecode_start": 129.0,
+      "timecode_end": 153.5,
+      "guide_block": "reading reviews",
+      "quote": "But if it's just 'everything's great, highly recommend,' then it's most likely either paid or just written without much thought. And I always read the negative ones first. It's important for me to understand what I should be wary of.",
+      "quote_cleaned": null,
+      "subject_codes": [
+        "short praise-only review — sign of a paid one",
+        "detail as a signal of a genuine review",
+        "prioritizing negative reviews"
+      ],
+      "content_type": "action",
+      "research_question_ids": ["rq_1"],
+      "hypothesis_support": [
+        {
+          "hypothesis_id": "h_2",
+          "direction": "none",
+          "note": "The respondent is talking not about which reviews he writes but about which ones he reads. It doesn't bear on the hypothesis about the motivation to write."
+        }
+      ],
+      "respondent_id": "r_1",
+      "respondent_segment": "active users",
+      "respondent_city": "metro area",
+      "screen_state": null,
+      "interpretive_notes": "Binary opposition 'specifics (genuine) vs template (paid)'. Boulomaic modality ('important to understand what I should be wary of') — an orientation toward minimizing risk rather than maximizing pleasure. A typical cultural script of 'trust, but verify'.",
+      "meta": {
+        "model": "gpt-5.4-2026-03-05",
+        "prompt_version": "1.0",
+        "retries": 0,
+        "validation_warnings": []
+      }
+    }
+  ],
+  "prompt_versions": {
+    "segmentation": "1.0",
+    "global_pass": "1.0",
+    "local_coding": "1.0",
+    "interpretive_frames_preset": "default"
+  }
+}

@@ -1,0 +1,25 @@
+case_name: example-case
+created_date: TODO
+created_by: TODO
+
+source_project: TODO
+n_interviews: 0
+sample_segments: []
+
+what_to_check:
+  # List the features that are especially important to check in this case
+  - verbatim_quote_integrity
+  - hypothesis_mapping
+  - typology_anti_pattern_check
+
+skills_under_test:
+  # Which skills we run against this case
+  - 09-flat-coding
+  - 13-axial-coding
+  - 17-key-findings
+  - 18-report-draft
+
+anonymization_status: TODO  # full / partial / none
+
+notes: |
+  Optional: what is unique about this case, what edge cases it covers.

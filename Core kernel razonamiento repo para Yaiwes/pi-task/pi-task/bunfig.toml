@@ -1,0 +1,9 @@
+[test]
+pathIgnorePatterns = ["dist/**", "**/__fixtures__/**"]
+# test-ambient-isolation must stay FIRST: it runs before anything imports
+# src/config/config.ts.
+preload = [
+    "./scripts/test-ambient-isolation.ts",
+    "./scripts/test-file-progress.ts",
+    "./scripts/test-timeout.ts"
+]

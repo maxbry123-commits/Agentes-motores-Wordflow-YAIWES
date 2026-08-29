@@ -1,0 +1,99 @@
+# transcript-coding default configuration
+# Override any key in your working-folder file `transcript-coding.yaml`.
+# Keys not overridden fall back to this file.
+
+# Which backend and model for each pipeline stage.
+# Supported backends: openai, anthropic, gemini. See references/model_backends.md.
+stages:
+  segmentation:
+    backend: openai
+    model: gpt-5.4-mini
+    reasoning_effort: low        # none/low/medium/high/xhigh (OpenAI reasoning models only)
+    max_completion_tokens: 4000
+
+  global_pass:
+    backend: openai
+    model: gpt-5.4-mini
+    reasoning_effort: medium
+    max_completion_tokens: 3000
+
+  local_coding:
+    backend: openai
+    model: gpt-5.4
+    reasoning_effort: medium
+    max_completion_tokens: 4000
+
+  unification:
+    backend: openai
+    model: gpt-5.4-mini
+    reasoning_effort: low
+    max_completion_tokens: 4000
+
+# Local-coding prompt parameters (stage 7.3).
+local_coding:
+  # How many preceding coded segments to pass as nearest context.
+  context_window_size: 3
+  # Max retries per segment on invalid JSON or citation mismatch.
+  max_retries: 3
+  # Preset of hermeneutic lenses for the `interpretive_notes` field.
+  # See references/interpretive_frames.md.
+  # Values: minimal | default | full | custom:<path-to-md-file>
+  interpretive_preset: default
+
+# Vision enrichment for the local-coding stage.
+vision:
+  # How screenshots are passed to the local-coding prompt:
+  # - always:    pass image whenever the segment has screen_state
+  # - triggered: pass image only if segment text contains a trigger word
+  # - never:     text description only; never pass the image
+  mode: triggered
+  # Trigger words for `triggered` mode — case-insensitive substring match.
+  # These are actual words researchers observe in interview transcripts.
+  trigger_words:
+    - here
+    - this one
+    - i click
+    - i tap
+    - i press
+    - i see
+    - look
+    - it opens
+    - it shows
+    - it looks
+
+# Segmentation parameters (stage 7.1).
+segmentation:
+  target_duration_seconds: 45
+  max_duration_seconds: 120
+  min_duration_seconds: 15    # shorter blocks get merged forward
+
+# Validation parameters (stage 7.9).
+validation:
+  # Tolerance for matching the model's quote against the source transcript:
+  # - exact:      strict substring
+  # - normalized: case / whitespace / punctuation normalized (default)
+  # - fuzzy:      SequenceMatcher ratio over a sliding window
+  citation_match_mode: normalized
+  fuzzy_threshold: 0.92
+  # What to do on citation mismatch:
+  # - retry: re-run the segment (up to max_retries)
+  # - warn:  mark the segment and proceed
+  # - fail:  raise and stop the whole pipeline
+  on_citation_mismatch: retry
+
+# Unification parameters (stage 7.9).
+unification:
+  # Cosine similarity threshold passed to the prompt (informational only).
+  similarity_threshold: 0.85
+  # If true, emit a CSV proposal for human review; apply nothing automatically.
+  require_human_review: true
+
+# Checkpoints and paths.
+paths:
+  coding_subdir: coding                 # subdir inside the interview folder for intermediates
+  codebook_filename: project_codebook.json
+
+# Logging.
+logging:
+  level: INFO                           # DEBUG | INFO | WARNING | ERROR
+  log_llm_calls: false                  # full request/response to log file (verbose, big files)

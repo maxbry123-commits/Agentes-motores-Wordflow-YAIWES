@@ -1,0 +1,1063 @@
+"""Orchestrator — load workflow, build DAG, schedule, dispatch, collect results."""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import logging
+import os
+import uuid
+from collections.abc import Callable, Coroutine
+from datetime import UTC, datetime
+from typing import Any
+
+import click
+import yaml  # type: ignore[import-untyped]
+
+from binex.graph.dag import DAG
+from binex.graph.scheduler import Scheduler
+from binex.models.artifact import Artifact, Lineage
+from binex.models.cache import CacheEntry
+from binex.models.cost import CostRecord
+from binex.models.execution import RunSummary
+from binex.models.task import RetryPolicy, TaskNode, TaskStatus
+from binex.models.workflow import NodeSpec, WorkflowSpec
+from binex.runtime._node_executor import collect_input_artifacts, now_ms, record_execution
+from binex.runtime.back_edge import evaluate_back_edge, evaluate_when
+from binex.runtime.budget import (
+    check_batch_budget,
+    get_effective_policy,
+    get_node_max_cost,
+    skip_all_remaining,
+)
+from binex.runtime.concurrency import ConcurrencyLimiter
+from binex.runtime.dispatcher import Dispatcher, _backoff_delay
+from binex.settings import Settings
+from binex.stores.artifact_store import ArtifactStore
+from binex.stores.execution_store import ExecutionStore
+from binex.telemetry import get_tracer
+from binex.webhook import WebhookSender
+
+logger = logging.getLogger(__name__)
+
+
+class Orchestrator:
+    """Runs a workflow: parse -> DAG -> schedule -> dispatch -> collect."""
+
+    def __init__(
+        self,
+        artifact_store: ArtifactStore,
+        execution_store: ExecutionStore,
+        *,
+        stream: bool = False,
+        stream_callback: Callable[[str], None] | None = None,
+        event_callback: Callable[[dict[str, Any]], Any] | None = None,
+        interactive: bool = True,
+        cache: bool = False,
+        offline: bool = False,
+    ) -> None:
+        self.artifact_store = artifact_store
+        self.execution_store = execution_store
+        self.dispatcher = Dispatcher(event_callback=self._emit_event)
+        self._pending_feedback: dict[str, list[Artifact]] = {}
+        # Dynamic fan-out (#77): per-run foreach bookkeeping.
+        self._foreach_groups: dict[str, Any] = {}  # aggregator_id -> ForeachGroup
+        self._worker_group: dict[str, Any] = {}     # worker_id -> ForeachGroup
+        self._tolerated_failures: set[str] = set()  # continue-worker failures
+        # Shared workspace (#75): per-run git-backed dir + writer serialization.
+        self._workspace: Any = None
+        self._workspace_lock: Any = None
+        self._stream = stream
+        self._stream_callback = stream_callback
+        self._event_callback = event_callback
+        self._interactive = interactive
+        # Node caching: run-level flags. Per-node `cache: true` also opts in.
+        self._cache = cache
+        self._offline = offline  # only-from-cache; a miss fails the node
+        # Default cap; replaced per-run once the workflow spec is known.
+        self._limiter = ConcurrencyLimiter(Settings().max_concurrency)
+
+    async def _emit_event(self, event: dict[str, Any]) -> None:
+        """Emit a lifecycle event if a callback is configured."""
+        if self._event_callback is not None:
+            result = self._event_callback(event)
+            if asyncio.iscoroutine(result):
+                await result
+
+    async def run_workflow(
+        self,
+        workflow: dict[str, Any] | WorkflowSpec,
+        *,
+        user_vars: dict[str, str] | None = None,
+        run_id: str | None = None,
+    ) -> RunSummary:
+        if isinstance(workflow, dict):
+            spec = WorkflowSpec(**workflow)
+        else:
+            spec = workflow
+
+        tracer = get_tracer()
+        with tracer.start_as_current_span("binex.run") as span:
+            span.set_attribute("workflow.name", spec.name)
+            return await self._run_workflow_inner(spec, span, run_id=run_id)
+
+    async def _run_workflow_inner(
+        self,
+        spec: WorkflowSpec,
+        span: Any,
+        *,
+        run_id: str | None = None,
+    ) -> RunSummary:
+        dag = DAG.from_workflow(spec)
+        scheduler = Scheduler(dag)
+        self._foreach_groups = {}
+        self._worker_group = {}
+        self._tolerated_failures = set()
+        run_id = run_id or f"run_{uuid.uuid4().hex[:12]}"
+        trace_id = f"trace_{uuid.uuid4().hex[:12]}"
+
+        # Shared workspace (#75): materialize a git-backed dir for this run.
+        self._workspace = None
+        self._workspace_lock = None
+        if spec.workspace is not None:
+            from binex.runtime.rwlock import AsyncRWLock
+            from binex.runtime.workspace import Workspace, WorkspaceConfig
+
+            cfg = WorkspaceConfig.from_obj(spec.workspace)
+            if cfg is not None:
+                self._workspace = Workspace.create(run_id, cfg)
+                self._workspace_lock = AsyncRWLock()
+
+        # Cap concurrent node execution: workflow field > env > default.
+        self._limiter = ConcurrencyLimiter.from_spec(
+            spec.concurrency, Settings().max_concurrency,
+        )
+
+        # Store workflow snapshot
+        workflow_yaml = yaml.dump(
+            spec.model_dump(exclude={"source_path"}), sort_keys=True,
+        )
+        workflow_hash = await self.execution_store.store_workflow_snapshot(
+            workflow_yaml, version=spec.version,
+        )
+
+        # Check if run was pre-created (e.g. by Web UI for human workflows)
+        existing = await self.execution_store.get_run(run_id) if run_id else None
+        if existing:
+            summary = existing
+            summary.status = "running"
+            summary.total_nodes = len(spec.nodes)
+            summary.workflow_hash = workflow_hash
+            await self.execution_store.update_run(summary)
+        else:
+            from binex.git_info import capture_git_meta
+
+            git_sha, git_dirty = capture_git_meta(spec.source_path)
+            summary = RunSummary(
+                run_id=run_id,
+                workflow_name=spec.name,
+                workflow_path=spec.source_path,
+                workflow_hash=workflow_hash,
+                status="running",
+                total_nodes=len(spec.nodes),
+                git_sha=git_sha,
+                git_dirty=git_dirty,
+            )
+            await self.execution_store.create_run(summary)
+
+        # node_id -> list of output artifacts
+        node_artifacts: dict[str, list[Artifact]] = {}
+        node_artifacts_history: dict[str, list[list[Artifact]]] = {}
+        accumulated_cost = 0.0
+        budget_exceeded = False
+        budget_warned = False
+
+        # Event-driven loop: dispatch every ready node immediately (the
+        # concurrency limiter caps how many actually run), then wake on the
+        # first completion \u2014 no batch barrier, no polling. A slow node no
+        # longer blocks nodes whose dependencies already completed.
+        in_flight: set[asyncio.Task[None]] = set()
+        while True:
+            # Budget gates only the dispatch of *new* work; skip the check when
+            # nothing is ready so a floating-point overshoot on the final node
+            # doesn't flip a finished run to over_budget.
+            if not budget_exceeded and scheduler.ready_nodes():
+                budget_action = check_batch_budget(spec, accumulated_cost)
+                if budget_action == "stop":
+                    budget_exceeded = True
+                    skip_all_remaining(scheduler, scheduler.ready_nodes())
+                elif budget_action == "warn" and spec.budget and not budget_warned:
+                    budget_warned = True
+                    msg = (
+                        f"Budget exceeded: ${accumulated_cost:.2f} / "
+                        f"${spec.budget.max_cost:.2f} (policy: warn, continuing)"
+                    )
+                    logger.warning(msg)
+                    click.echo(f"\u26a0 {msg}", err=True)
+
+            # Dispatch the whole ready frontier. Re-check after each batch
+            # because when-skips synchronously unblock further nodes.
+            if not budget_exceeded:
+                while ready := scheduler.ready_nodes():
+                    # Dynamic fan-out (#77): expand foreach templates and run
+                    # aggregators inline (they mutate dag/scheduler, so must not
+                    # race concurrent dispatch). Re-loop so the freshly added
+                    # workers / unblocked nodes get dispatched next pass.
+                    if await self._process_foreach_ready(
+                        spec, dag, scheduler, run_id, trace_id,
+                        ready, node_artifacts, accumulated_cost,
+                    ):
+                        continue
+                    coros = self._schedule_ready_nodes(
+                        spec, dag, scheduler, run_id, trace_id,
+                        ready, node_artifacts, accumulated_cost,
+                        node_artifacts_history,
+                    )
+                    if not coros:
+                        continue  # every ready node was skipped
+                    for coro in coros:
+                        in_flight.add(asyncio.ensure_future(coro))
+
+            if not in_flight:
+                break
+
+            done, in_flight = await asyncio.wait(
+                in_flight, return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in done:
+                exc = task.exception()
+                if exc is not None:
+                    logger.error("Node execution task crashed: %s", exc)
+
+            # Update accumulated cost from store
+            cost_summary = await self.execution_store.get_run_cost_summary(run_id)
+            accumulated_cost = cost_summary.total_cost
+
+        summary.completed_at = datetime.now(UTC)
+        summary.completed_nodes = len(scheduler.completed)
+        summary.failed_nodes = len(scheduler.failed)
+        summary.skipped_nodes = len(scheduler.skipped)
+        summary.total_cost = accumulated_cost
+        summary.status = self._determine_final_status(
+            budget_exceeded, scheduler, self._tolerated_failures,
+        )
+
+        span.set_attribute("run.id", summary.run_id)
+        span.set_attribute("run.status", summary.status)
+        span.set_attribute("run.total_cost", summary.total_cost)
+        span.set_attribute("run.node_count", summary.total_nodes)
+
+        await self.execution_store.update_run(summary)
+
+        # Fire webhook if configured
+        webhook_url = (
+            spec.webhook.url if spec.webhook
+            else os.environ.get("BINEX_WEBHOOK_URL")
+        )
+        sender = WebhookSender.from_config(url=webhook_url)
+        if sender is not None:
+            await self._fire_webhook(sender, spec, summary)
+
+        # Close MCP server connections if any
+        mcp_mgr = getattr(self.dispatcher, "_mcp_manager", None)
+        if mcp_mgr is not None:
+            await mcp_mgr.close_all()
+
+        # Close CAO adapter HTTP clients if any
+        for adapter in self.dispatcher._adapters.values():
+            close_fn = getattr(adapter, "close", None)
+            if close_fn is not None and callable(close_fn):
+                try:
+                    await close_fn()
+                except Exception:
+                    logger.debug("Failed to close adapter %s", adapter, exc_info=True)
+
+        return summary
+
+    def _workspace_access(self, node_spec: NodeSpec) -> Any:
+        """Return the read/write workspace lock for a node, or a no-op context."""
+        if self._workspace_lock is None or node_spec.workspace is None:
+            return contextlib.nullcontext()
+        if node_spec.workspace == "write":
+            return self._workspace_lock.write()
+        return self._workspace_lock.read()
+
+    # ------------------------------------------------------------------
+    # Dynamic fan-out (#77)
+    # ------------------------------------------------------------------
+
+    async def _process_foreach_ready(
+        self,
+        spec: WorkflowSpec,
+        dag: DAG,
+        scheduler: Scheduler,
+        run_id: str,
+        trace_id: str,
+        ready: list[str],
+        node_artifacts: dict[str, list[Artifact]],
+        accumulated_cost: float,
+    ) -> bool:
+        """Expand ready foreach templates and run ready aggregators inline.
+
+        Returns True if anything was handled (so the caller re-loops).
+        """
+        handled = False
+        for node_id in list(ready):
+            if node_id in self._foreach_groups:
+                await self._run_aggregator(
+                    scheduler, run_id, trace_id, node_id, node_artifacts,
+                )
+                handled = True
+            elif node_id in spec.nodes and spec.nodes[node_id].foreach:
+                await self._expand_foreach(
+                    spec, dag, scheduler, run_id, trace_id,
+                    node_id, node_artifacts, accumulated_cost,
+                )
+                handled = True
+        return handled
+
+    async def _expand_foreach(
+        self,
+        spec: WorkflowSpec,
+        dag: DAG,
+        scheduler: Scheduler,
+        run_id: str,
+        trace_id: str,
+        foreach_id: str,
+        node_artifacts: dict[str, list[Artifact]],
+        accumulated_cost: float,
+    ) -> None:
+        from binex.runtime.foreach import (
+            ForeachError,
+            ForeachGroup,
+            aggregator_node_id,
+            build_aggregator_spec,
+            build_worker_spec,
+            estimate_expansion_cost,
+            item_identity,
+            make_item_artifact,
+            parse_items,
+            worker_node_id,
+        )
+
+        fnode = spec.nodes[foreach_id]
+        mapper_arts = node_artifacts.get(fnode.foreach or "", [])
+        try:
+            content = mapper_arts[0].content if mapper_arts else None
+            items = parse_items(content)
+        except (ForeachError, IndexError) as exc:
+            await self._fail_foreach(
+                scheduler, run_id, trace_id, foreach_id,
+                f"foreach mapper '{fnode.foreach}': {exc}",
+            )
+            return
+
+        if len(items) > fnode.max_items:
+            await self._fail_foreach(
+                scheduler, run_id, trace_id, foreach_id,
+                f"mapper returned {len(items)} items > max_items "
+                f"{fnode.max_items} (raise max_items to allow)",
+            )
+            return
+
+        est = estimate_expansion_cost(fnode, len(items))
+        if (
+            est is not None and spec.budget is not None
+            and accumulated_cost + est > spec.budget.max_cost
+        ):
+            await self._fail_foreach(
+                scheduler, run_id, trace_id, foreach_id,
+                f"expanding {len(items)} workers (est. ${est:.2f}) would exceed "
+                f"budget ${spec.budget.max_cost:.2f} "
+                f"(${accumulated_cost:.2f} already spent)",
+            )
+            return
+
+        agg_id = aggregator_node_id(foreach_id)
+        worker_ids: list[str] = []
+        seen: set[str] = set()
+        for i, item in enumerate(items):
+            ident = item_identity(item, fnode.item_key, i)
+            wid = worker_node_id(foreach_id, ident)
+            if wid in seen:
+                wid = f"{wid}-{i}"  # identity collision → disambiguate
+            seen.add(wid)
+            worker_ids.append(wid)
+            spec.nodes[wid] = build_worker_spec(fnode, wid)
+            dag.add_node(wid, set())
+            scheduler.add_node(wid, 0)
+            item_art = make_item_artifact(run_id, wid, item)
+            await self.artifact_store.store(item_art)
+            self._pending_feedback.setdefault(wid, []).append(item_art)
+
+        spec.nodes[agg_id] = build_aggregator_spec(fnode, agg_id, worker_ids)
+        dag.add_node(agg_id, set(worker_ids))
+        dag.rewire_dependents(foreach_id, agg_id)
+        scheduler.add_node(agg_id, len(worker_ids))
+
+        group = ForeachGroup(
+            foreach_id=foreach_id, mapper_id=fnode.foreach or "",
+            aggregator_id=agg_id, worker_ids=worker_ids,
+            on_item_failure=fnode.on_item_failure, outputs=list(fnode.outputs),
+        )
+        self._foreach_groups[agg_id] = group
+        for wid in worker_ids:
+            self._worker_group[wid] = group
+
+        # The placeholder is done; its dependents now wait on the aggregator.
+        scheduler.mark_completed(foreach_id)
+        node_artifacts[foreach_id] = []
+        await self._emit_event({
+            "type": "foreach:expanded", "run_id": run_id, "node_id": foreach_id,
+            "workers": len(worker_ids),
+            "timestamp": datetime.now(UTC).isoformat(),
+        })
+        await record_execution(
+            self.execution_store, run_id=run_id, node_id=foreach_id,
+            agent_id="internal://foreach", status=TaskStatus.COMPLETED,
+            input_artifacts=[], output_artifacts=[], latency_ms=0,
+            trace_id=trace_id, error=None,
+        )
+
+    async def _run_aggregator(
+        self,
+        scheduler: Scheduler,
+        run_id: str,
+        trace_id: str,
+        agg_id: str,
+        node_artifacts: dict[str, list[Artifact]],
+    ) -> None:
+        from binex.runtime.foreach import build_aggregate_content
+
+        group = self._foreach_groups[agg_id]
+        content = build_aggregate_content(group, node_artifacts)
+        derived = [
+            a.id for wid in group.worker_ids for a in node_artifacts.get(wid, [])
+        ]
+        art = Artifact(
+            id=f"art_{uuid.uuid4().hex[:12]}", run_id=run_id, type="result",
+            content=content,
+            lineage=Lineage(produced_by=agg_id, derived_from=derived),
+        )
+        await self.artifact_store.store(art)
+        node_artifacts[agg_id] = [art]
+        scheduler.mark_completed(agg_id)
+        await self._emit_event({
+            "type": "foreach:aggregated", "run_id": run_id, "node_id": agg_id,
+            "succeeded": content["succeeded"], "failed": len(content["failed"]),
+            "total": content["total"],
+            "timestamp": datetime.now(UTC).isoformat(),
+        })
+        await record_execution(
+            self.execution_store, run_id=run_id, node_id=agg_id,
+            agent_id="internal://foreach-aggregator", status=TaskStatus.COMPLETED,
+            input_artifacts=[], output_artifacts=[art], latency_ms=0,
+            trace_id=trace_id, error=None,
+        )
+
+    async def _fail_foreach(
+        self,
+        scheduler: Scheduler,
+        run_id: str,
+        trace_id: str,
+        foreach_id: str,
+        error: str,
+    ) -> None:
+        """Fail a foreach node (bad mapper output / guardrail tripped)."""
+        scheduler.mark_failed(foreach_id)
+        await self._emit_event({
+            "type": "node:failed", "run_id": run_id, "node_id": foreach_id,
+            "error": error, "timestamp": datetime.now(UTC).isoformat(),
+        })
+        await record_execution(
+            self.execution_store, run_id=run_id, node_id=foreach_id,
+            agent_id="internal://foreach", status=TaskStatus.FAILED,
+            input_artifacts=[], output_artifacts=[], latency_ms=0,
+            trace_id=trace_id, error=error,
+        )
+
+    def _schedule_ready_nodes(
+        self,
+        spec: WorkflowSpec,
+        dag: DAG,
+        scheduler: Scheduler,
+        run_id: str,
+        trace_id: str,
+        ready: list[str],
+        node_artifacts: dict[str, list[Artifact]],
+        accumulated_cost: float,
+        node_artifacts_history: dict[str, list[list[Artifact]]] | None = None,
+    ) -> list[Coroutine[Any, Any, None]]:
+        """Evaluate when-conditions and schedule ready nodes for execution."""
+        if node_artifacts_history is None:
+            node_artifacts_history = {}
+        tasks = []
+        for node_id in ready:
+            node_spec = spec.nodes[node_id]
+            # foreach templates and aggregators are driven by the inline
+            # _process_foreach_ready pass, never dispatched as agent tasks.
+            if node_id in self._foreach_groups or node_spec.foreach:
+                continue
+            if node_spec.when:
+                if not evaluate_when(node_spec.when, node_artifacts):
+                    scheduler.mark_skipped(node_id)
+                    continue
+
+            scheduler.mark_running(node_id)
+            tasks.append(
+                self._execute_node(
+                    spec, dag, scheduler, run_id, trace_id,
+                    node_id, node_artifacts, accumulated_cost,
+                    node_artifacts_history,
+                )
+            )
+        return tasks
+
+    @staticmethod
+    def _determine_final_status(
+        budget_exceeded: bool, scheduler: Scheduler,
+        tolerated_failures: set[str] | None = None,
+    ) -> str:
+        """Determine the final run status.
+
+        Foreach-worker failures under ``on_item_failure: continue`` are tolerated
+        — they are reported in the aggregate, not treated as a run failure (#77).
+        """
+        if budget_exceeded:
+            return "over_budget"
+        real_failures = scheduler.failed - (tolerated_failures or set())
+        if real_failures:
+            return "failed"
+        if scheduler.is_complete():
+            return "completed"
+        return "failed"
+
+    @staticmethod
+    async def _fire_webhook(
+        sender: WebhookSender,
+        spec: WorkflowSpec,
+        summary: RunSummary,
+    ) -> None:
+        """Send webhook notification for run lifecycle event."""
+        event_map = {
+            "completed": "run.completed",
+            "failed": "run.failed",
+            "over_budget": "run.budget_exceeded",
+        }
+        event = event_map.get(summary.status)
+        if event is None:
+            return
+
+        data: dict[str, Any] = {
+            "status": summary.status,
+            "total_cost": summary.total_cost,
+            "total_nodes": summary.total_nodes,
+            "completed_nodes": summary.completed_nodes,
+            "failed_nodes": summary.failed_nodes,
+            "skipped_nodes": summary.skipped_nodes,
+        }
+        if summary.status == "over_budget" and spec.budget:
+            data["max_cost"] = spec.budget.max_cost
+
+        payload = {
+            "event": event,
+            "timestamp": datetime.now(UTC).isoformat(),
+            "run_id": summary.run_id,
+            "workflow_name": spec.name,
+            "data": data,
+        }
+
+        try:
+            await sender.send(payload)
+        except Exception as exc:
+            logger.warning("Webhook delivery error: %s", exc)
+
+    async def _budget_pre_check(
+        self,
+        spec: WorkflowSpec,
+        run_id: str,
+        node_id: str,
+        node_max: float,
+    ) -> str | None:
+        """Check node budget before a retry attempt.
+
+        Returns an error message if the retry should be skipped, None otherwise.
+        """
+        node_cost = await self.execution_store.get_node_cost(run_id, node_id)
+        remaining = node_max - node_cost
+
+        if remaining > 0:
+            return None
+
+        policy = get_effective_policy(spec)
+        if policy == "stop":
+            msg = (
+                f"Node '{node_id}': budget exhausted "
+                f"(${node_cost:.2f}/${node_max:.2f}), skipping retry"
+            )
+            logger.warning(msg)
+            click.echo(f"\u26a0 {msg}", err=True)
+            return msg
+
+        # warn — interactive prompt or safe default
+        if self._interactive:
+            proceed = click.confirm(
+                f"\u26a0 Node '{node_id}' retry will likely exceed budget "
+                f"(${remaining:.2f} remaining of ${node_max:.2f}). "
+                f"Continue?",
+                default=False,
+            )
+        else:
+            proceed = False
+            logger.info(
+                "Node '%s': non-interactive mode, declining over-budget retry",
+                node_id,
+            )
+        if not proceed:
+            return f"Node '{node_id}': retry cancelled by user (budget)"
+        return None
+
+    async def _budget_post_check(
+        self,
+        spec: WorkflowSpec,
+        run_id: str,
+        node_id: str,
+        node_max: float,
+    ) -> bool:
+        """Check node budget after execution. Returns True if budget exceeded with stop policy."""
+        node_cost = await self.execution_store.get_node_cost(run_id, node_id)
+
+        if node_cost <= node_max:
+            return False
+
+        policy = get_effective_policy(spec)
+        if policy == "stop":
+            msg = (
+                f"Node '{node_id}': exceeded budget "
+                f"${node_cost:.2f} / ${node_max:.2f}"
+            )
+            logger.warning(msg)
+            click.echo(f"\u26a0 {msg}", err=True)
+            return True
+
+        # warn policy — keep result
+        msg = (
+            f"Node '{node_id}': exceeded budget "
+            f"${node_cost:.2f} / ${node_max:.2f} "
+            f"(policy: warn, keeping result)"
+        )
+        logger.warning(msg)
+        click.echo(f"\u26a0 {msg}", err=True)
+        return False
+
+    async def _execute_node(
+        self,
+        spec: WorkflowSpec,
+        dag: DAG,
+        scheduler: Scheduler,
+        run_id: str,
+        trace_id: str,
+        node_id: str,
+        node_artifacts: dict[str, list[Artifact]],
+        accumulated_cost: float = 0.0,
+        node_artifacts_history: dict[str, list[list[Artifact]]] | None = None,
+    ) -> None:
+        if node_artifacts_history is None:
+            node_artifacts_history = {}
+        node_spec = spec.nodes[node_id]
+        retry_policy = node_spec.retry_policy or (
+            spec.defaults.retry_policy if spec.defaults else None
+        )
+        node_max = get_node_max_cost(node_spec, spec, accumulated_cost)
+
+        task, max_retries = self._build_task_node(
+            spec, run_id, node_id, node_spec, retry_policy, node_max,
+        )
+
+        input_artifacts = collect_input_artifacts(
+            dag, node_id, node_artifacts,
+            self._pending_feedback.pop(node_id, []),
+        )
+
+        start_ms = now_ms()
+        await self._emit_event({
+            "type": "node:started",
+            "run_id": run_id,
+            "node_id": node_id,
+            "timestamp": datetime.now(UTC).isoformat(),
+        })
+
+        # Node cache: reuse a prior result when nothing that affects this node's
+        # output has changed. Opt-in via run-level --cache or per-node cache:true.
+        cacheable = self._cache or node_spec.cache
+        cache_key: str | None = None
+        if cacheable:
+            from binex.runtime.cache_key import compute_cache_key
+
+            cache_key = compute_cache_key(task, input_artifacts)
+            hit = await self._load_cache(cache_key)
+            if hit is not None:
+                await self._apply_cache_hit(
+                    spec, dag, scheduler, run_id, trace_id, node_id, node_spec,
+                    input_artifacts, node_artifacts, node_artifacts_history,
+                    hit, start_ms,
+                )
+                return
+            if self._offline:
+                await self._fail_cache_offline(
+                    scheduler, run_id, trace_id, node_id, node_spec,
+                    input_artifacts, start_ms,
+                )
+                return
+
+        # Workspace serialization (#75): writers are mutually exclusive, readers
+        # share. Snapshot the workspace after a successful write, inside the lock.
+        async with self._workspace_access(node_spec):
+            async with self._limiter.slot(node_spec.agent):
+                succeeded, error_msg, output_artifacts = await self._retry_loop(
+                    spec, run_id, node_id, task, input_artifacts, trace_id,
+                    node_max, max_retries, retry_policy, node_artifacts,
+                )
+            if (
+                succeeded and self._workspace is not None
+                and node_spec.workspace == "write"
+            ):
+                self._workspace.snapshot(node_id)
+
+        # Post-execution assertions (issue #60): a declared contract that blocks
+        # the node — and its dependents — when the output/metrics violate it.
+        if succeeded and node_spec.assertions:
+            assert_error = await self._check_node_assertions(
+                run_id, node_id, node_spec, output_artifacts, start_ms,
+            )
+            if assert_error is not None:
+                succeeded = False
+                error_msg = assert_error
+
+        if succeeded and cache_key is not None:
+            await self._store_cache(cache_key, run_id, node_id, output_artifacts)
+
+        if succeeded:
+            scheduler.mark_completed(node_id)
+            status = task.status.__class__("completed")
+            # Evaluate back-edge after successful completion
+            await evaluate_back_edge(
+                spec, scheduler, dag, node_id,
+                node_artifacts, node_artifacts_history,
+                self._pending_feedback,
+                interactive=self._interactive,
+            )
+        else:
+            scheduler.mark_failed(node_id)
+            status = task.status.__class__("failed")
+            # Dynamic fan-out (#77): a failed worker under on_item_failure=continue
+            # must not block its aggregator — record the failure and let it proceed.
+            group = self._worker_group.get(node_id)
+            if group is not None and group.on_item_failure == "continue":
+                group.failed.append(node_id)
+                self._tolerated_failures.add(node_id)
+                scheduler.satisfy_dependents(node_id)
+
+        latency_ms = now_ms() - start_ms
+        # Surface model fallback (issue #66) from the produced artifact's metadata.
+        meta = output_artifacts[0].metadata if output_artifacts else None
+        requested_model = meta.get("requested_model") if meta else None
+        actual_model = meta.get("actual_model") if meta else None
+        event: dict[str, Any] = {
+            "type": f"node:{'completed' if succeeded else 'failed'}",
+            "run_id": run_id,
+            "node_id": node_id,
+            "timestamp": datetime.now(UTC).isoformat(),
+            "latency_ms": latency_ms,
+            **({"error": error_msg} if error_msg else {}),
+        }
+        if meta and meta.get("fallbacks"):
+            event["fallbacks"] = meta["fallbacks"]
+        await self._emit_event(event)
+        await record_execution(
+            self.execution_store,
+            run_id=run_id,
+            node_id=node_id,
+            agent_id=node_spec.agent,
+            status=status,
+            input_artifacts=input_artifacts,
+            output_artifacts=output_artifacts,
+            latency_ms=latency_ms,
+            trace_id=trace_id,
+            error=error_msg,
+            requested_model=requested_model,
+            actual_model=actual_model,
+        )
+
+    async def _check_node_assertions(
+        self,
+        run_id: str,
+        node_id: str,
+        node_spec: NodeSpec,
+        output_artifacts: list[Artifact],
+        start_ms: int,
+    ) -> str | None:
+        """Evaluate a node's declared assertions. Returns an error message if any
+        fail (so the caller can fail the node), or None when all pass.
+        """
+        from binex.eval.assertions import evaluate_assertions, summarize_failures
+        from binex.eval.judge import make_judge
+
+        content = output_artifacts[0].content if output_artifacts else ""
+        latency_ms = now_ms() - start_ms
+        node_cost = await self.execution_store.get_node_cost(run_id, node_id)
+        judge = make_judge() if any(a.judge for a in node_spec.assertions) else None
+
+        outcomes = await evaluate_assertions(
+            node_spec.assertions,
+            content=content,
+            cost=node_cost,
+            latency_ms=latency_ms,
+            judge=judge,
+        )
+        if all(o.passed for o in outcomes):
+            return None
+        return "assertion failed: " + summarize_failures(outcomes)
+
+    # ------------------------------------------------------------------
+    # Node cache
+    # ------------------------------------------------------------------
+
+    async def _load_cache(
+        self, cache_key: str,
+    ) -> tuple[CacheEntry, list[Artifact]] | None:
+        """Return (entry, artifacts) on a cache hit, or None (miss/dangling)."""
+        entry = await self.execution_store.get_cache_entry(cache_key)
+        if entry is None:
+            return None
+        artifacts: list[Artifact] = []
+        for art_id in entry.artifact_ids:
+            art = await self.artifact_store.get(art_id)
+            if art is None:
+                return None  # artifact was pruned — treat as a miss
+            artifacts.append(art)
+        return entry, artifacts
+
+    async def _store_cache(
+        self, cache_key: str, run_id: str, node_id: str,
+        output_artifacts: list[Artifact],
+    ) -> None:
+        """Record this node's result for reuse by future runs."""
+        saved_cost = await self.execution_store.get_node_cost(run_id, node_id)
+        await self.execution_store.put_cache_entry(CacheEntry(
+            cache_key=cache_key, run_id=run_id, node_id=node_id,
+            artifact_ids=[a.id for a in output_artifacts], saved_cost=saved_cost,
+        ))
+
+    async def _apply_cache_hit(
+        self,
+        spec: WorkflowSpec,
+        dag: DAG,
+        scheduler: Scheduler,
+        run_id: str,
+        trace_id: str,
+        node_id: str,
+        node_spec: NodeSpec,
+        input_artifacts: list[Artifact],
+        node_artifacts: dict[str, list[Artifact]],
+        node_artifacts_history: dict[str, list[list[Artifact]]],
+        hit: tuple[CacheEntry, list[Artifact]],
+        start_ms: int,
+    ) -> None:
+        """Reuse a cached result: no execution, $0 cost, distinct trace event."""
+        entry, artifacts = hit
+        node_artifacts[node_id] = artifacts
+        scheduler.mark_completed(node_id)
+
+        await self.execution_store.record_cost(CostRecord(
+            id=f"cost_{uuid.uuid4().hex[:12]}",
+            run_id=run_id, task_id=node_id, cost=0.0, source="cache",
+        ))
+        await evaluate_back_edge(
+            spec, scheduler, dag, node_id, node_artifacts,
+            node_artifacts_history, self._pending_feedback,
+            interactive=self._interactive,
+        )
+
+        latency_ms = now_ms() - start_ms
+        await self._emit_event({
+            "type": "node:cache_hit",
+            "run_id": run_id,
+            "node_id": node_id,
+            "source_run_id": entry.run_id,
+            "saved_cost": entry.saved_cost,
+            "timestamp": datetime.now(UTC).isoformat(),
+            "latency_ms": latency_ms,
+        })
+        await record_execution(
+            self.execution_store,
+            run_id=run_id, node_id=node_id, agent_id=node_spec.agent,
+            status=TaskStatus.COMPLETED,
+            input_artifacts=input_artifacts, output_artifacts=artifacts,
+            latency_ms=latency_ms, trace_id=trace_id, error=None,
+        )
+
+    async def _fail_cache_offline(
+        self,
+        scheduler: Scheduler,
+        run_id: str,
+        trace_id: str,
+        node_id: str,
+        node_spec: NodeSpec,
+        input_artifacts: list[Artifact],
+        start_ms: int,
+    ) -> None:
+        """Offline mode: a cache miss fails the node instead of executing it."""
+        scheduler.mark_failed(node_id)
+        error_msg = "cache miss in offline mode (--offline)"
+        latency_ms = now_ms() - start_ms
+        await self._emit_event({
+            "type": "node:failed",
+            "run_id": run_id, "node_id": node_id,
+            "timestamp": datetime.now(UTC).isoformat(),
+            "latency_ms": latency_ms, "error": error_msg,
+        })
+        await record_execution(
+            self.execution_store,
+            run_id=run_id, node_id=node_id, agent_id=node_spec.agent,
+            status=TaskStatus.FAILED,
+            input_artifacts=input_artifacts, output_artifacts=[],
+            latency_ms=latency_ms, trace_id=trace_id, error=error_msg,
+        )
+
+    def _build_task_node(
+        self,
+        spec: WorkflowSpec,
+        run_id: str,
+        node_id: str,
+        node_spec: NodeSpec,
+        retry_policy: RetryPolicy | None,
+        node_max: float | None,
+    ) -> tuple[TaskNode, int]:
+        """Build a TaskNode and determine max retries.
+
+        Returns (task, max_retries).
+        """
+        has_node_budget = node_spec.budget is not None
+        if has_node_budget:
+            max_retries = retry_policy.max_retries if retry_policy else 1
+            task_retry_policy = None  # orchestrator handles retry
+        else:
+            max_retries = 1  # single attempt, dispatcher handles retry
+            task_retry_policy = retry_policy
+
+        # Build config dict, injecting output_schema / repair if present
+        config = dict(node_spec.config)
+        if node_spec.output_schema is not None:
+            config["output_schema"] = node_spec.output_schema
+        if node_spec.repair is not None:
+            config["repair"] = node_spec.repair.model_dump()
+        if node_spec.fallbacks:
+            config["fallbacks"] = node_spec.fallbacks
+        if node_spec.heartbeat_timeout_ms is not None:
+            config["heartbeat_timeout_ms"] = node_spec.heartbeat_timeout_ms
+        if self._workspace is not None and node_spec.workspace is not None:
+            config["_workspace_root"] = str(self._workspace.root)
+
+        task = TaskNode(
+            id=f"{run_id}_{node_id}",
+            run_id=run_id,
+            node_id=node_id,
+            agent=node_spec.agent,
+            system_prompt=node_spec.system_prompt,
+            tools=node_spec.tools,
+            inputs=node_spec.inputs,
+            retry_policy=task_retry_policy,
+            deadline_ms=node_spec.deadline_ms or (
+                spec.defaults.deadline_ms if spec.defaults else None
+            ),
+            config=config,
+        )
+        return task, max_retries
+
+    async def _execute_single_attempt(
+        self,
+        spec: WorkflowSpec,
+        run_id: str,
+        node_id: str,
+        task: TaskNode,
+        input_artifacts: list[Artifact],
+        trace_id: str,
+        node_max: float | None,
+        node_artifacts: dict[str, list[Artifact]],
+    ) -> tuple[bool, str | None, list[Artifact]]:
+        """Execute a single dispatch attempt with cost recording and artifact storage.
+
+        Returns (succeeded, error_msg, output_artifacts).
+        Raises on dispatch failure so the caller can handle retries.
+        """
+        result = await self.dispatcher.dispatch(
+            task, input_artifacts, trace_id,
+            stream=self._stream,
+            stream_callback=self._stream_callback,
+        )
+        output_artifacts = result.artifacts
+
+        if result.cost:
+            if node_max is not None:
+                result.cost.node_budget = node_max
+            await self.execution_store.record_cost(result.cost)
+
+        if node_max is not None and result.cost:
+            if await self._budget_post_check(
+                spec, run_id, node_id, node_max,
+            ):
+                error_msg = (
+                    f"Node '{node_id}': exceeded budget "
+                    f"(stop policy)"
+                )
+                return False, error_msg, []
+
+        for art in output_artifacts:
+            await self.artifact_store.store(art)
+        node_artifacts[node_id] = output_artifacts
+        return True, None, output_artifacts
+
+    async def _retry_loop(
+        self,
+        spec: WorkflowSpec,
+        run_id: str,
+        node_id: str,
+        task: TaskNode,
+        input_artifacts: list[Artifact],
+        trace_id: str,
+        node_max: float | None,
+        max_retries: int,
+        retry_policy: RetryPolicy | None,
+        node_artifacts: dict[str, list[Artifact]],
+    ) -> tuple[bool, str | None, list[Artifact]]:
+        """Execute dispatch with retries and budget checks.
+
+        Returns (succeeded, error_msg, output_artifacts).
+        """
+        error_msg: str | None = None
+        output_artifacts: list[Artifact] = []
+
+        for attempt in range(1, max_retries + 1):
+            if attempt > 1 and node_max is not None:
+                pre_check_err = await self._budget_pre_check(
+                    spec, run_id, node_id, node_max,
+                )
+                if pre_check_err:
+                    return False, pre_check_err, output_artifacts
+
+            try:
+                return await self._execute_single_attempt(
+                    spec, run_id, node_id, task, input_artifacts,
+                    trace_id, node_max, node_artifacts,
+                )
+            except Exception as exc:
+                error_msg = str(exc)
+                if attempt < max_retries:
+                    backoff = (
+                        retry_policy.backoff if retry_policy else "exponential"
+                    )
+                    delay = _backoff_delay(attempt, backoff)
+                    await asyncio.sleep(delay)
+
+        return False, error_msg, output_artifacts

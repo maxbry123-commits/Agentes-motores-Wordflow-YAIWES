@@ -1,0 +1,47 @@
+"""Security harness: permissions, hooks, sandbox, audit."""
+
+from .audit import (
+    AuditLog,
+    AuditLogSpec,
+    FileAuditLog,
+    FullTranscriptAuditLog,
+    InMemoryAuditLog,
+    resolve_audit_log,
+    verify_signature,
+)
+from .hooks import HookRegistry, PostToolHook, PreToolHook
+from .permissions import AllowAll, Mode, PerUserPermissions, StandardPermissions
+from .permissions_resolver import resolve_permissions
+from .sandbox import (
+    FilesystemSandbox,
+    NoSandbox,
+    OSSandbox,
+    SandboxMode,
+    SubprocessSandbox,
+)
+from .secrets import DictSecrets, EnvSecrets
+
+__all__ = [
+    "AllowAll",
+    "AuditLog",
+    "AuditLogSpec",
+    "DictSecrets",
+    "EnvSecrets",
+    "FileAuditLog",
+    "FilesystemSandbox",
+    "FullTranscriptAuditLog",
+    "HookRegistry",
+    "InMemoryAuditLog",
+    "Mode",
+    "NoSandbox",
+    "OSSandbox",
+    "PerUserPermissions",
+    "PostToolHook",
+    "PreToolHook",
+    "SandboxMode",
+    "StandardPermissions",
+    "SubprocessSandbox",
+    "resolve_audit_log",
+    "resolve_permissions",
+    "verify_signature",
+]

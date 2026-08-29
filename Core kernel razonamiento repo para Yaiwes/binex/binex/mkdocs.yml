@@ -1,0 +1,109 @@
+site_name: Binex
+site_description: Debuggable runtime for AI agent pipelines
+site_url: https://alexli18.github.io/binex/docs/
+repo_url: https://github.com/Alexli18/binex
+repo_name: Alexli18/binex
+
+theme:
+  name: material
+  palette:
+    - scheme: slate
+      primary: custom
+      accent: custom
+  font: false
+  icon:
+    logo: material/bug-check
+  features:
+    - navigation.sections
+    - navigation.expand
+    - content.code.copy
+    - navigation.top
+    - header.autohide
+
+extra_css:
+  - stylesheets/extra.css
+
+plugins:
+  - search
+  - glightbox
+  - blog:
+      blog_dir: blog
+      post_date_format: long
+      post_url_format: "{slug}"
+      authors_file: "{blog}/.authors.yml"
+      pagination_per_page: 10
+
+markdown_extensions:
+  - pymdownx.highlight
+  - pymdownx.superfences
+  - admonition
+
+nav:
+  - Home: index.md
+  - Demo: demo.md
+  - Quickstart: quickstart.md
+  - vs LangGraph / CrewAI / AutoGen: comparison.md
+  - Guides:
+    - Debugging & Observability: guides/debugging.md
+  - Concepts:
+    - Agents: concepts/agents.md
+    - Workflows: concepts/workflows.md
+    - Artifacts: concepts/artifacts.md
+    - Execution: concepts/execution.md
+    - Lineage: concepts/lineage.md
+  - CLI Reference:
+    - run: cli/run.md
+    - debug: cli/debug.md
+    - trace: cli/trace.md
+    - replay: cli/replay.md
+    - resume: cli/resume.md
+    - diff: cli/diff.md
+    - eval: cli/eval.md
+    - freeze: cli/freeze.md
+    - artifacts: cli/artifacts.md
+    - dev: cli/dev.md
+    - doctor: cli/doctor.md
+    - validate: cli/validate.md
+    - scaffold: cli/scaffold.md
+    - cost: cli/cost.md
+    - clean: cli/clean.md
+    - list: cli/list.md
+    - start: cli/start.md
+    - explore: cli/explore.md
+    - diagnose: cli/diagnose.md
+    - bisect: cli/bisect.md
+    - gateway: cli/gateway.md
+    - plugins: cli/plugins.md
+    - export: cli/export.md
+    - workflow: cli/workflow.md
+    - ui: cli/ui.md
+    - scheduler: cli/scheduler.md
+  - Architecture:
+    - Overview: architecture/overview.md
+    - Runtime: architecture/runtime.md
+    - Stores: architecture/stores.md
+    - Adapters: architecture/adapters.md
+    - Telemetry: architecture/telemetry.md
+  - Features:
+    - Observer Mode: features/observer-mode.md
+    - Binary Artifacts: features/binary-artifacts.md
+    - Workspace: features/workspace.md
+    - Dynamic Fan-out (foreach): features/foreach.md
+    - Assertions & Golden Runs: features/eval.md
+    - Eval Suites: eval.md
+    - MCP Server: mcp-server.md
+    - Import from OTel: import.md
+    - Tools & MCP: features/tools-mcp.md
+    - CAO Adapter: features/cao-adapter.md
+    - vs LangSmith / Langfuse / n8n: comparisons.md
+  - Workflows:
+    - Format: workflows/format.md
+    - Examples: workflows/examples.md
+    - Cookbook: workflows/cookbook.md
+    - Multi-Provider: multi-provider.md
+  - Contributing:
+    - Development: contributing/development.md
+    - Testing: contributing/testing.md
+    - OTel Span Mapping: dev/otel-mapping.md
+    - Loop Container UI Design: dev/loop-container-design.md
+  - Blog: blog/index.md

@@ -1,0 +1,41 @@
+name: multi-provider-research
+description: "Research pipeline: Ollama plans & summarizes, Gemini researches"
+
+nodes:
+  user_input:
+    agent: "human://input"
+    system_prompt: "What would you like to research?"
+    outputs: [result]
+
+  planner:
+    agent: "llm://ollama/gemma3:4b"
+    system_prompt: "file://prompts/gen-research-planner.md"
+    inputs:
+      topic: "${user_input.result}"
+    outputs: [result]
+    depends_on: [user_input]
+
+  researcher1:
+    agent: "llm://openrouter/nvidia/nemotron-3-super-120b-a12b:free"
+    system_prompt: "file://prompts/gen-researcher.md"
+    inputs:
+      plan: "${planner.result}"
+    outputs: [result]
+    depends_on: [planner]
+
+  researcher2:
+    agent: "llm://openrouter/nvidia/nemotron-3-super-120b-a12b:free"
+    system_prompt: "file://prompts/gen-researcher.md"
+    inputs:
+      plan: "${planner.result}"
+    outputs: [result]
+    depends_on: [planner]
+
+  summarizer:
+    agent: "llm://gemini/gemini-2.5-flash"
+    system_prompt: "file://prompts/gen-research-synthesizer.md"
+    inputs:
+      research1: "${researcher1.result}"
+      research2: "${researcher2.result}"
+    outputs: [result]
+    depends_on: [researcher1, researcher2]
