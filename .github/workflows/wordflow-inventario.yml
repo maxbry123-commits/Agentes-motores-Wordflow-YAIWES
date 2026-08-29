@@ -19,7 +19,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update -y
           sudo apt-get install -y zip unzip
-          git clone --depth 1 --no-tags "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" repo
+          GIT_LFS_SKIP_SMUDGE=1 git clone --depth 1 --no-tags "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" repo
           cd repo
           mkdir -p .download-queue/src
           cat > .download-queue/repos.tsv <<'EOF'
@@ -152,7 +152,7 @@ jobs:
             owner_repo=$(printf '%s' "$repo" | sed 's#https://github.com/##')
             src=".download-queue/src/$slug"
             rm -rf "$src"
-            git clone --depth 1 --no-tags "https://x-access-token:${GITHUB_TOKEN}@github.com/${owner_repo}.git" "$src"
+            GIT_LFS_SKIP_SMUDGE=1 git clone --depth 1 --no-tags "https://x-access-token:${GITHUB_TOKEN}@github.com/${owner_repo}.git" "$src"
             rm -rf "$src/.git"
             rm -f ".download-queue/$slug.zip"
             ( cd "$src" && zip -q -r -9 -y "../../$slug.zip" . )
