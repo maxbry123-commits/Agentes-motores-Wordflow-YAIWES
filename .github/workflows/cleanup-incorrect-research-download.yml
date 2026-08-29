@@ -1,0 +1,47 @@
+name: Cleanup Incorrect Research Download
+run-name: Cleanup Incorrect Research Download • ${{ github.event_name }} • ${{ github.sha }}
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cleanup-incorrect-research-download
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    name: Remove incorrect research download artifacts
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Remove incorrect download artifacts only
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rm -r --ignore-unmatch 'Download code/archivos'
+          git rm --ignore-unmatch 'scripts/research_download_chain.py'
+          git rm --ignore-unmatch '.github/workflows/research-download-chain-final.yml'
+
+      - name: Commit cleanup
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git diff --cached --quiet; then
+            echo 'CLEANUP: nothing to remove.'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'cleanup: remove incorrect research download artifacts'
+          git fetch origin main
+          git rebase origin/main
+          git push origin HEAD:main
+          echo 'CLEANUP PASS: incorrect research download artifacts removed.'
