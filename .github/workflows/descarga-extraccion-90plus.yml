@@ -1,0 +1,14 @@
+name: Descarga y extracción 90+ repos
+
+on:
+  workflow_dispatch:
+
+jobs:
+  descarga-extraccion:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Paso 1 - Descargar ZIP
+        run: echo "Paso 1 - descarga de los repos de la lista 90+"
+
+      - name: Paso 2 - Extraer cada ZIP en su raíz
+        run: echo "Paso 2 - extracción de cada repo en su raíz correspondiente"
