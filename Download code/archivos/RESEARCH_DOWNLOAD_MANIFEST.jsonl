@@ -12,3 +12,8 @@
 {"number": 12, "parts": 3, "slug": "Semantic-Kernel", "source": "https://github.com/microsoft/semantic-kernel.git", "source_commit": "a64827ec8c5621eeaf7c4c5dabdb5355bb253177", "status": "COMPLETE"}
 {"number": 13, "parts": 2, "slug": "DSPy", "source": "https://github.com/stanfordnlp/dspy.git", "source_commit": "3f06959ebbb80fb0bda001e1f802d70c2d5be7f7", "status": "COMPLETE"}
 {"number": 14, "parts": 2, "slug": "Agno", "source": "https://github.com/agno-agi/agno.git", "source_commit": "c96291cbd0f644774d48a398c30101e90c947354", "status": "COMPLETE"}
+{"number": 15, "parts": 3, "slug": "Haystack", "source": "https://github.com/deepset-ai/haystack.git", "source_commit": "e318778c9bf60a1963e3b5f451359655dd696c30", "status": "COMPLETE"}
+{"number": 16, "parts": 1, "slug": "SwarmClaw", "source": "https://github.com/swarmclawai/swarmclaw.git", "source_commit": "ed38ba5329c20e48c03b4a4028f4a76a1a75e2d1", "status": "COMPLETE"}
+{"number": 17, "parts": 1, "slug": "SwarmDock", "source": "https://github.com/swarmclawai/swarmdock.git", "source_commit": "f95768a64a00cd30a1eda6dc9e108dce86d312a3", "status": "COMPLETE"}
+{"number": 18, "parts": 4, "slug": "Agent-Framework-Samples", "source": "https://github.com/microsoft/Agent-Framework-Samples.git", "source_commit": "5b854b7e1c3838f17f41bcf2412ef79d7662db37", "status": "COMPLETE"}
+{"number": 19, "parts": 1, "slug": "IntentKit", "source": "https://github.com/crestalnetwork/intentkit.git", "source_commit": "1f1ba5907884bee0e5d454d197e9e92c01628a66", "status": "COMPLETE"}
