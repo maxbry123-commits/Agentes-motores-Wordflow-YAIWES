@@ -1,8 +1,11 @@
 # Trazabilidad
 
-Inventario vigente: `Skills download code repo/INVENTARIO.md`
-Workflow: `.github/workflows/descarga-extraccion-inventario.yml`
-Extract skill origen: `Wordflow Code/skills/code Yaml sobre como se extrae los archivos del skills.yaml` en agentes
-Copia local extract: `Skills download code repo/code Yaml sobre como se extrae los archivos del skills.yaml`
+Total montable: **119**
+- 89 previos con ZIP
+- 37 de la lista limpia oficial
+- 6 ya estaban (Mini-Agent, Kimi CLI/kimi-cli, Kimi K3, Grok Build, Qwen-Agent, NeMo Agent Toolkit)
+- 31 URLs nuevas añadidas
+- 0 duplicados de URL
 
-37/37 con URL oficial del input. 0 vacíos. 0 duplicados. 0 URLs inventadas.
+Inventario: `Skills download code repo/INVENTARIO.md`
+Workflow: `.github/workflows/descarga-extraccion-inventario.yml`
