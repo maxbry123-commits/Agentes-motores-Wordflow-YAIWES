@@ -98,3 +98,10 @@
 {"number": 98, "parts": 1, "slug": "GitHub-Copilot-SDK", "source": "https://github.com/github/copilot-sdk.git", "source_commit": "50ce37e19258524c6de82651652971e96d7ae5f3", "status": "COMPLETE"}
 {"number": 99, "parts": 3, "slug": "GitHub-Copilot-App", "source": "https://github.com/github/app.git", "source_commit": "d9ccd4d77934e49d6d30bede693525e21d0be489", "status": "COMPLETE"}
 {"number": 100, "parts": 5, "slug": "Qwen-Code", "source": "https://github.com/QwenLM/qwen-code.git", "source_commit": "1fb4a4eb00368b0c5ef53408c10f8d5d1c979320", "status": "COMPLETE"}
+{"number": 101, "parts": 2, "slug": "Codex", "source": "https://github.com/openai/codex.git", "source_commit": "6478a751fde8884b2fdc76486fe23175a8e795d4", "status": "COMPLETE"}
+{"number": 102, "parts": 1, "slug": "OpenAI-Skills", "source": "https://github.com/openai/skills.git", "source_commit": "49f948faa9258a0c61caceaf225e179651397431", "status": "COMPLETE"}
+{"number": 103, "parts": 1, "slug": "Claude-Code", "source": "https://github.com/anthropics/claude-code.git", "source_commit": "f1af9b1f4b1fd4c776135381606edada82ef638e", "status": "COMPLETE"}
+{"number": 104, "parts": 1, "slug": "Claude-Agent-SDK-TypeScript", "source": "https://github.com/anthropics/claude-agent-sdk-typescript.git", "source_commit": "75667f1f76e800bb845b0a0e211df79fedfc9e86", "status": "COMPLETE"}
+{"number": 105, "parts": 1, "slug": "Claude-Agent-SDK-Python", "source": "https://github.com/anthropics/claude-agent-sdk-python.git", "source_commit": "af5ff1b9f2f279575f89b78f17572c6e35fbc2b6", "status": "COMPLETE"}
+{"number": 106, "parts": 3, "slug": "Gemini-CLI", "source": "https://github.com/google-gemini/gemini-cli.git", "source_commit": "0bd1d439751478771c45d3d0895a6a9760554bf4", "status": "COMPLETE"}
+{"number": 107, "parts": 1, "slug": "Google-Agent-Skills", "source": "https://github.com/google/skills.git", "source_commit": "a7123f80525a4438bc9601d7d6511dfde674b620", "status": "COMPLETE"}
