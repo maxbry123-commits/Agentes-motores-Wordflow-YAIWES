@@ -82,3 +82,4 @@
 {"number": 82, "parts": 1, "slug": "Spice-Agent-Coding", "source": "https://github.com/spiceai/skills.git", "source_commit": "eba5641ceafca40a70ff791618fc4ec59fbe946c", "status": "COMPLETE"}
 {"number": 83, "parts": 1, "slug": "Jidoka", "source": "https://github.com/agentjido/jidoka.git", "source_commit": "e339996a52fc6f90cb4f67481cd4eb874f6b68d0", "status": "COMPLETE"}
 {"number": 84, "parts": 1, "slug": "Plugin-Marketplace", "source": "https://github.com/anthropics/claude-plugins-official.git", "source_commit": "ed404106fcd80ba98ecb7c851e531dcb626d13b7", "status": "COMPLETE"}
+{"number": 85, "parts": 2, "slug": "AgentOS", "source": "https://github.com/rivet-dev/agentos.git", "source_commit": "1bf32804dbd36678dd536bfe68dbd773dad76d1b", "status": "COMPLETE"}
