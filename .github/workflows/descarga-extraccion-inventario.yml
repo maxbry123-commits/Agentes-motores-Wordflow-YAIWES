@@ -23,6 +23,8 @@ jobs:
     steps:
       - name: Paso 1 - Descargar ZIP
         shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           git clone --depth 1 "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" repo
@@ -92,10 +94,10 @@ ToolOrchestra	https://github.com/NVlabs/ToolOrchestra
 Sovereign-OS	https://github.com/Justin0504/Sovereign-OS
 Reyn	https://github.com/tya5/reyn
 Kaji	https://github.com/apokamo/kaji
-Prime Agent	
+Prime Agent	https://github.com/PrimeIntellect-ai/prime-agent
 Grok Build	
 MiniMax Agent Team / Mavis	
-Qwen-UI-Agent	
+Qwen-UI-Agent	https://github.com/Tongyi-MAI/MAI-UI
 Codex Security	
 Kimi K2.6 Agent Swarm	
 Kimi K3 Agent Swarm	
@@ -104,32 +106,32 @@ GLM-5.3-Flash
 DeepSeek-V4	
 Qwen3.5 Agent	
 Hyundai Physical-AI Stack	
-Artificial Agent Lab	
-Swarm Agent	
-Bernstein	
-Arena of Autonomous Threads	
-OSS Agent Lab	
-Aiyu Multi-Agent	
-OpenAlice	
-Dr. Claw	
-AgentSPEX	
+Artificial Agent Lab	https://github.com/BY571/artificial-agent-lab
+Swarm Agent	https://github.com/desplega-ai/agent-swarm
+Bernstein	https://github.com/sipyourdrink-ltd/bernstein
+Arena of Autonomous Threads	https://github.com/rafaelmateo123/Arena-of-Autonomous-Threads
+OSS Agent Lab	https://github.com/jeremylongshore/oss-agent-lab
+Aiyu Multi-Agent	https://github.com/teeprakorn1/aiyu-multi-agent
+OpenAlice	https://github.com/TraderAlice/OpenAlice
+Dr. Claw	https://github.com/OpenLAIR/dr-claw
+AgentSPEX	https://github.com/ScaleML/AgentSPEX
 CODE LAYER 11 — Thinking Workflow	
 Atomic	
 Agent Resume	
 Thinking Workflow 10 — Research Bundle	
-Agents Universe	
-Spice Agent Coding	
-Jidoka	
+Agents Universe	https://github.com/agentuniverse-ai/agentUniverse
+Spice Agent Coding	https://github.com/spiceai/skills
+Jidoka	https://github.com/agentjido/jidoka
 Plugin Marketplace	
-AgentOS	
-ORCA	
-Arena of Autonomous Threads	
+AgentOS	https://github.com/rivet-dev/agentos
+ORCA	https://github.com/stablyai/orca
+Arena of Autonomous Threads	https://github.com/rafaelmateo123/Arena-of-Autonomous-Threads
 OpenRSI/OpenMLE research stack	https://github.com/FrontisAI/OpenRSI
 EOF
           while IFS=$'\t' read -r name repo; do
             test -n "$name"
             if test -z "${repo:-}"; then
-              echo "SIN_URL_NO_INVENTADA: $name"
+              echo "SIN_ZIP_PUBLICO: $name"
               continue
             fi
             slug=$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]' | sed 's#[^a-z0-9][^a-z0-9]*#-#g; s#^-##; s#-$##')
@@ -138,8 +140,6 @@ EOF
             test -n "$branch"
             curl --fail --location --retry 3 --retry-delay 2 -o ".download-queue/$slug.zip" "https://github.com/$owner_repo/archive/refs/heads/$branch.zip"
           done < .download-queue/repos.tsv
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Paso 2 - Extraer cada ZIP en su raíz
         shell: bash
