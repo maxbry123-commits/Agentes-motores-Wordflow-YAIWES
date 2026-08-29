@@ -83,3 +83,15 @@
 {"number": 83, "parts": 1, "slug": "Jidoka", "source": "https://github.com/agentjido/jidoka.git", "source_commit": "e339996a52fc6f90cb4f67481cd4eb874f6b68d0", "status": "COMPLETE"}
 {"number": 84, "parts": 1, "slug": "Plugin-Marketplace", "source": "https://github.com/anthropics/claude-plugins-official.git", "source_commit": "ed404106fcd80ba98ecb7c851e531dcb626d13b7", "status": "COMPLETE"}
 {"number": 85, "parts": 2, "slug": "AgentOS", "source": "https://github.com/rivet-dev/agentos.git", "source_commit": "1bf32804dbd36678dd536bfe68dbd773dad76d1b", "status": "COMPLETE"}
+{"number": 86, "parts": 8, "slug": "ORCA", "source": "https://github.com/stablyai/orca.git", "source_commit": "a1f198be0d96c7152997a1fd178ad4f201fa7e67", "status": "COMPLETE"}
+{"number": 87, "parts": 1, "slug": "Agent-Resume", "source": "https://github.com/MukundaKatta/agent-resume.git", "source_commit": "f7cab5cdf9e84f8ca3fac45b3db5e13c626b1607", "status": "COMPLETE"}
+{"number": 88, "parts": 1, "slug": "GLM-5V-Turbo", "source": "https://github.com/zai-org/GLM-V.git", "source_commit": "726dac56ddde6d33f72bd62967322e15f61a8471", "status": "COMPLETE"}
+{"number": 89, "parts": 1, "slug": "MiniMax-Code", "source": "https://github.com/MiniMax-AI/minimax-code.git", "source_commit": "cd025375799a1360d499d5c06cfb2e1111a960fc", "status": "COMPLETE"}
+{"number": 90, "parts": 1, "slug": "OpenRoom", "source": "https://github.com/MiniMax-AI/OpenRoom.git", "source_commit": "02468154c4d99f8925916425bf444d672454fb3d", "status": "COMPLETE"}
+{"number": 91, "parts": 1, "slug": "MiniMax-Skills", "source": "https://github.com/MiniMax-AI/skills.git", "source_commit": "60aaae52bb2af8162732751a4332f62a5fef518b", "status": "COMPLETE"}
+{"number": 92, "parts": 3, "slug": "Kimi-Code-CLI", "source": "https://github.com/MoonshotAI/kimi-code.git", "source_commit": "961927739ef34819d67d76fa5870cbe4ba7a01ff", "status": "COMPLETE"}
+{"number": 93, "parts": 1, "slug": "Kimi-Agent-SDK", "source": "https://github.com/MoonshotAI/kimi-agent-sdk.git", "source_commit": "ed4be6be5280d02191da88bbafb3f828dcd33d72", "status": "COMPLETE"}
+{"number": 94, "parts": 1, "slug": "Kimi-K2", "source": "https://github.com/MoonshotAI/Kimi-K2.git", "source_commit": "1b4022bbb7187cf4011a8bdf0b4cd10e2daa26c4", "status": "COMPLETE"}
+{"number": 95, "parts": 2, "slug": "DeepSeek-Harness", "source": "https://github.com/deepseek-ai/deepseek-harness.git", "source_commit": "cd5ef8148158c3a752a658978873241fdf8e2bbc", "status": "COMPLETE"}
+{"number": 96, "parts": 1, "slug": "Awesome-DeepSeek-Agent", "source": "https://github.com/deepseek-ai/awesome-deepseek-agent.git", "source_commit": "9ae39209bbfd901b653003472c4b35de9e16ffdf", "status": "COMPLETE"}
+{"number": 97, "parts": 1, "slug": "GitHub-Copilot-CLI", "source": "https://github.com/github/copilot-cli.git", "source_commit": "024bf28728f3cc82365e0143f44d071ebafbce4d", "status": "COMPLETE"}
