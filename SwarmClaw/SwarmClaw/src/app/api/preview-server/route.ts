@@ -1,0 +1,369 @@
+import { NextResponse } from 'next/server'
+import { spawn, type ChildProcess } from 'child_process'
+import http from 'http'
+import fs from 'fs'
+import path from 'path'
+import { localIP } from '@/lib/server/runtime/network'
+import { resolveDevServerLaunchDir } from '@/lib/server/runtime/devserver-launch'
+import { resolvePathWithinBaseDir } from '@/lib/server/path-utils'
+import { safeParseBody } from '@/lib/server/safe-parse-body'
+import { hmrSingleton, sleep } from '@/lib/shared-utils'
+import { log } from '@/lib/server/logger'
+
+const TAG = 'api-preview-server'
+
+// ---------------------------------------------------------------------------
+// MIME types for static server
+// ---------------------------------------------------------------------------
+
+const MIME_MAP: Record<string, string> = {
+  '.html': 'text/html', '.htm': 'text/html', '.css': 'text/css',
+  '.js': 'application/javascript', '.mjs': 'application/javascript',
+  '.json': 'application/json', '.svg': 'image/svg+xml',
+  '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif', '.webp': 'image/webp', '.ico': 'image/x-icon',
+  '.woff': 'font/woff', '.woff2': 'font/woff2', '.ttf': 'font/ttf',
+  '.mp4': 'video/mp4', '.webm': 'video/webm',
+  '.txt': 'text/plain', '.md': 'text/plain',
+}
+
+// ---------------------------------------------------------------------------
+// Server tracking
+// ---------------------------------------------------------------------------
+
+interface PreviewServer {
+  type: 'static' | 'npm'
+  server?: http.Server   // static server
+  proc?: ChildProcess    // npm process
+  port: number
+  dir: string
+  startedAt: number
+  log: string
+}
+
+const servers: Map<string, PreviewServer> =
+  hmrSingleton('__swarmclaw_preview_servers__', () => new Map<string, PreviewServer>())
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function resolveServeDir(filePath: string): string {
+  const resolved = path.resolve(/*turbopackIgnore: true*/ filePath)
+  try {
+    return fs.statSync(/*turbopackIgnore: true*/ resolved).isDirectory()
+      ? resolved
+      : path.dirname(/*turbopackIgnore: true*/ resolved)
+  } catch {
+    return path.dirname(/*turbopackIgnore: true*/ resolved)
+  }
+}
+
+function dirKey(dir: string): string {
+  return dir.replace(/\//g, '_')
+}
+
+function findFreePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const srv = http.createServer()
+    srv.listen(0, () => {
+      const addr = srv.address()
+      const port = typeof addr === 'object' && addr ? addr.port : 0
+      srv.close(() => resolve(port))
+    })
+    srv.on('error', reject)
+  })
+}
+
+// ---------------------------------------------------------------------------
+// Project type detection
+// ---------------------------------------------------------------------------
+
+interface ProjectInfo {
+  type: 'npm' | 'static'
+  devCommand?: string[]   // e.g. ['npm', 'run', 'dev']
+  framework?: string      // e.g. 'vite', 'next', 'cra'
+}
+
+function buildFrameworkArgs(framework: string | undefined, port: number): string[] {
+  if (framework === 'next') {
+    return ['--', '--hostname', '0.0.0.0', '--port', String(port)]
+  }
+  return ['--', '--port', String(port), '--host', '0.0.0.0']
+}
+
+function detectProject(dir: string): ProjectInfo {
+  const pkgPath = path.join(/*turbopackIgnore: true*/ dir, 'package.json')
+  if (!fs.existsSync(/*turbopackIgnore: true*/ pkgPath)) {
+    return { type: 'static' }
+  }
+
+  try {
+    const pkg = JSON.parse(fs.readFileSync(/*turbopackIgnore: true*/ pkgPath, 'utf-8'))
+    const scripts = pkg.scripts || {}
+    const deps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) }
+
+    // Detect framework
+    let framework = 'node'
+    if (deps.next) framework = 'next'
+    else if (deps.vite || deps['@vitejs/plugin-react']) framework = 'vite'
+    else if (deps['react-scripts']) framework = 'cra'
+    else if (deps.astro) framework = 'astro'
+    else if (deps.nuxt) framework = 'nuxt'
+    else if (deps.svelte || deps['@sveltejs/kit']) framework = 'svelte'
+    else if (deps.vue) framework = 'vue'
+    else if (deps.angular || deps['@angular/core']) framework = 'angular'
+
+    // Pick the best dev command
+    if (scripts.dev) {
+      return { type: 'npm', devCommand: ['npm', 'run', 'dev'], framework }
+    }
+    if (scripts.start) {
+      return { type: 'npm', devCommand: ['npm', 'start'], framework }
+    }
+    if (scripts.serve) {
+      return { type: 'npm', devCommand: ['npm', 'run', 'serve'], framework }
+    }
+
+    return { type: 'static', framework }
+  } catch {
+    return { type: 'static' }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Static file server
+// ---------------------------------------------------------------------------
+
+function createStaticServer(dir: string): http.Server {
+  return http.createServer((req, res) => {
+    res.setHeader('Access-Control-Allow-Origin', '*')
+
+    let reqPath = decodeURIComponent((req.url || '/').split('?')[0])
+    if (reqPath === '/') reqPath = '/index.html'
+    const relativeReqPath = reqPath.replace(/^\/+/, '')
+    let normalizedFile = ''
+    try {
+      normalizedFile = resolvePathWithinBaseDir(dir, relativeReqPath)
+    } catch {
+      res.writeHead(403)
+      res.end('Forbidden')
+      return
+    }
+
+    const candidates = [
+      normalizedFile,
+      normalizedFile + '.html',
+      resolvePathWithinBaseDir(dir, `${relativeReqPath.replace(/\/+$/, '')}/index.html`),
+    ]
+
+    for (const candidate of candidates) {
+      if (
+        fs.existsSync(/*turbopackIgnore: true*/ candidate)
+        && fs.statSync(/*turbopackIgnore: true*/ candidate).isFile()
+      ) {
+        const ext = path.extname(candidate).toLowerCase()
+        res.writeHead(200, { 'Content-Type': MIME_MAP[ext] || 'application/octet-stream' })
+        fs.createReadStream(/*turbopackIgnore: true*/ candidate).pipe(res)
+        return
+      }
+    }
+
+    if (
+      fs.existsSync(/*turbopackIgnore: true*/ normalizedFile)
+      && fs.statSync(/*turbopackIgnore: true*/ normalizedFile).isDirectory()
+    ) {
+      const files = fs.readdirSync(/*turbopackIgnore: true*/ normalizedFile)
+      const links = files.map((f) => `<li><a href="${reqPath.replace(/\/$/, '')}/${f}">${f}</a></li>`).join('\n')
+      res.writeHead(200, { 'Content-Type': 'text/html' })
+      res.end(`<!DOCTYPE html><html><head><title>Index of ${reqPath}</title><style>body{font-family:monospace;padding:20px;background:#1a1a2e;color:#e0e0e0}a{color:#60a5fa}</style></head><body><h2>Index of ${reqPath}</h2><ul>${links}</ul></body></html>`)
+      return
+    }
+
+    res.writeHead(404)
+    res.end('Not found')
+  })
+}
+
+// ---------------------------------------------------------------------------
+// npm dev server
+// ---------------------------------------------------------------------------
+
+async function startNpmServer(dir: string, command: string[], port: number, framework?: string): Promise<PreviewServer> {
+  // Install deps if node_modules missing
+  if (!fs.existsSync(/*turbopackIgnore: true*/ path.join(/*turbopackIgnore: true*/ dir, 'node_modules'))) {
+    log.info(TAG, `Installing dependencies in ${dir}`)
+    await new Promise<void>((resolve, reject) => {
+      const install = spawn('npm', ['install'], { cwd: dir, stdio: 'pipe' })
+      install.on('close', (code) => code === 0 ? resolve() : reject(new Error(`npm install exited ${code}`)))
+      install.on('error', reject)
+    })
+  }
+
+  const env = {
+    ...process.env,
+    PORT: String(port),
+    FORCE_COLOR: '0',
+    BROWSER: 'none',  // CRA: don't open browser
+  }
+
+  // Add --port flag for common frameworks
+  const args = [...command.slice(1)]
+  const cmdName = command[0]
+
+  const proc = spawn(cmdName, [...args, ...buildFrameworkArgs(framework, port)], {
+    cwd: dir,
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env,
+  })
+
+  let processOutput = ''
+  let detectedPort = port
+  const urlRe = /https?:\/\/(?:localhost|0\.0\.0\.0|127\.0\.0\.1|[\d.]+):(\d+)/
+
+  const onData = (chunk: Buffer) => {
+    const text = chunk.toString()
+    processOutput += text
+    if (processOutput.length > 10000) processOutput = processOutput.slice(-5000)
+    const match = text.match(urlRe)
+    if (match) {
+      detectedPort = parseInt(match[1], 10)
+      const entry = servers.get(dirKey(dir))
+      if (entry) entry.port = detectedPort
+    }
+  }
+
+  proc.stdout?.on('data', onData)
+  proc.stderr?.on('data', onData)
+
+  const entry: PreviewServer = {
+    type: 'npm',
+    proc,
+    port,
+    dir,
+    startedAt: Date.now(),
+    log: '',
+  }
+
+  proc.on('close', () => {
+    servers.delete(dirKey(dir))
+    log.info(TAG, `npm server stopped for ${dir}`)
+  })
+  proc.on('error', () => servers.delete(dirKey(dir)))
+
+  servers.set(dirKey(dir), entry)
+
+  // Wait for the server to start and detect the actual port
+  await sleep(5000)
+  if (proc.exitCode !== null) {
+    servers.delete(dirKey(dir))
+    throw new Error(`npm dev server exited early with code ${proc.exitCode}\n${processOutput.slice(-4000)}`)
+  }
+  entry.port = detectedPort
+  entry.log = processOutput
+
+  return entry
+}
+
+// ---------------------------------------------------------------------------
+// API handler
+// ---------------------------------------------------------------------------
+
+function buildResponse(srv: PreviewServer) {
+  return {
+    running: true,
+    type: srv.type,
+    port: srv.port,
+    url: `http://localhost:${srv.port}`,
+    networkUrl: `http://${localIP()}:${srv.port}`,
+    dir: srv.dir,
+  }
+}
+
+export async function POST(req: Request) {
+  const { data: body, error } = await safeParseBody<{ action: string; path: string }>(req)
+  if (error) return error
+  const { action, path: filePath } = body
+
+  if (!filePath || typeof filePath !== 'string') {
+    return NextResponse.json({ error: 'Missing path' }, { status: 400 })
+  }
+
+  const dir = resolveServeDir(filePath)
+  const launch = resolveDevServerLaunchDir(dir)
+  const key = dirKey(launch.launchDir)
+
+  if (action === 'start') {
+    if (servers.has(key)) {
+      return NextResponse.json(buildResponse(servers.get(key)!))
+    }
+
+    if (!fs.existsSync(/*turbopackIgnore: true*/ dir)) {
+      return NextResponse.json({ error: 'Directory not found' }, { status: 404 })
+    }
+
+    const project = detectProject(launch.launchDir)
+    const port = await findFreePort()
+
+    if (project.type === 'npm' && project.devCommand) {
+      log.info(TAG, `Detected ${project.framework} project in ${launch.launchDir}, running: ${project.devCommand.join(' ')}`)
+      try {
+        const entry = await startNpmServer(launch.launchDir, project.devCommand, port, project.framework)
+        return NextResponse.json({
+          ...buildResponse(entry),
+          framework: project.framework,
+          inputDir: dir,
+          launchDir: launch.launchDir,
+        })
+      } catch (err: unknown) {
+        log.error(TAG, 'npm server failed, falling back to static:', err)
+        // Fall through to static server
+      }
+    }
+
+    // Static file server
+    const server = createStaticServer(dir)
+    await new Promise<void>((resolve, reject) => {
+      server.listen(port, '0.0.0.0', () => resolve())
+      server.on('error', reject)
+    })
+
+    const entry: PreviewServer = { type: 'static', server, port, dir, startedAt: Date.now(), log: '' }
+    servers.set(key, entry)
+    log.info(TAG, `Started static server for ${dir} on port ${port}`)
+
+    return NextResponse.json(buildResponse(entry))
+
+  } else if (action === 'stop') {
+    if (servers.has(key)) {
+      const srv = servers.get(key)!
+      if (srv.type === 'npm' && srv.proc) {
+        try { srv.proc.kill('SIGTERM') } catch {}
+        try { if (srv.proc.pid) process.kill(-srv.proc.pid, 'SIGTERM') } catch {}
+      }
+      if (srv.server) srv.server.close()
+      servers.delete(key)
+      log.info(TAG, `Stopped server for ${launch.launchDir}`)
+    }
+    return NextResponse.json({ running: false, dir: launch.launchDir })
+
+  } else if (action === 'status') {
+    if (servers.has(key)) {
+      return NextResponse.json(buildResponse(servers.get(key)!))
+    }
+    return NextResponse.json({ running: false, dir: launch.launchDir })
+
+  } else if (action === 'list') {
+    const list = Array.from(servers.values()).map((s) => ({
+      ...buildResponse(s),
+      startedAt: s.startedAt,
+    }))
+    return NextResponse.json({ servers: list })
+
+  } else if (action === 'detect') {
+    const project = detectProject(launch.launchDir)
+    return NextResponse.json({ dir, launchDir: launch.launchDir, frameworkHint: launch.framework, ...project })
+  }
+
+  return NextResponse.json({ error: 'Invalid action' }, { status: 400 })
+}

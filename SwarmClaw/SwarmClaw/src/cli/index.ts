@@ -1,0 +1,1457 @@
+#!/usr/bin/env -S node --experimental-strip-types
+
+import { Command } from 'commander'
+import { pathToFileURL } from 'node:url'
+import fs from 'node:fs'
+import path from 'node:path'
+import { errorMessage, sleep } from '../lib/shared-utils.ts'
+import {
+  SETUP_PROVIDERS,
+  DEFAULT_AGENTS,
+  STARTER_AGENT_TOOLS,
+  type SetupProvider,
+} from '../lib/setup-defaults.ts'
+
+interface CliContext {
+  baseUrl: string
+  accessKey: string
+  rawOutput: boolean
+}
+
+interface SetupAuthStatus {
+  firstTime?: boolean
+}
+
+interface SetupProviderCheckResponse {
+  ok?: boolean
+  message?: string
+  normalizedEndpoint?: string
+  recommendedModel?: string
+}
+
+const SUPPORTED_SETUP_PROVIDERS = new Set<SetupProvider>(SETUP_PROVIDERS.map((p) => p.id))
+
+const DEFAULT_BASE_URL =
+  process.env.SWARMCLAW_URL
+  || process.env.SWARMCLAW_BASE_URL
+  || 'http://localhost:3456'
+
+function resolveDefaultAccessKey(cwd: string = process.cwd()): string {
+  const envKey = (
+    process.env.SWARMCLAW_ACCESS_KEY
+    || process.env.SWARMCLAW_API_KEY
+    || process.env.SC_ACCESS_KEY
+    || ''
+  ).trim()
+  if (envKey) return envKey
+
+  const keyLocations = [
+    path.join(cwd, 'platform-api-key.txt'),
+  ]
+  const serviceHome = (process.env.SWARMCLAW_HOME || '').trim()
+  if (serviceHome) keyLocations.push(path.join(serviceHome, 'platform-api-key.txt'))
+
+  for (const keyFile of keyLocations) {
+    if (!fs.existsSync(keyFile)) continue
+    const value = fs.readFileSync(keyFile, 'utf8').trim()
+    if (value) return value
+  }
+  return ''
+}
+
+const DEFAULT_ACCESS_KEY = resolveDefaultAccessKey()
+
+function normalizeBaseUrl(value: string): string {
+  const trimmed = value.trim()
+  const withProtocol = /^https?:\/\//i.test(trimmed) ? trimmed : `http://${trimmed}`
+  return withProtocol.replace(/\/+$/, '')
+}
+
+function parseObject(value: unknown, label: string): Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(`${label} is not an object response`)
+  }
+  return value as Record<string, unknown>
+}
+
+function compactObject(value: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(value).filter(([, v]) => v !== undefined))
+}
+
+function parseMetadata(raw: string | undefined): Record<string, string> | undefined {
+  if (!raw) return undefined
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch (err) {
+    throw new Error(`Invalid --metadata JSON: ${errorMessage(err)}`)
+  }
+
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('--metadata must be a JSON object')
+  }
+
+  const out: Record<string, string> = {}
+  for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+    out[key] = String(value)
+  }
+  return out
+}
+
+function parseJsonValue(raw: string | undefined, label: string): unknown {
+  if (!raw) return undefined
+  try {
+    return JSON.parse(raw)
+  } catch (err) {
+    throw new Error(`Invalid ${label} JSON: ${errorMessage(err)}`)
+  }
+}
+
+function parseTimestamp(raw: string | undefined): number | undefined {
+  if (!raw) return undefined
+  if (/^\d+$/.test(raw)) return Number.parseInt(raw, 10)
+
+  const ms = Date.parse(raw)
+  if (!Number.isFinite(ms)) {
+    throw new Error(`Invalid timestamp for --run-at: ${raw}`)
+  }
+  return ms
+}
+
+function collectValues(value: string, previous: string[]): string[] {
+  previous.push(value)
+  return previous
+}
+
+function contextFromCommand(command: Command): CliContext {
+  const opts = command.optsWithGlobals<{
+    url?: string
+    key?: string
+    raw?: boolean
+  }>()
+
+  return {
+    baseUrl: normalizeBaseUrl(opts.url || DEFAULT_BASE_URL),
+    accessKey: (opts.key || DEFAULT_ACCESS_KEY).trim(),
+    rawOutput: Boolean(opts.raw),
+  }
+}
+
+function buildApiUrl(ctx: CliContext, routePath: string, query?: URLSearchParams): URL {
+  const apiBase = ctx.baseUrl.endsWith('/api') ? ctx.baseUrl : `${ctx.baseUrl}/api`
+  const normalizedPath = routePath.startsWith('/') ? routePath : `/${routePath}`
+  const url = new URL(`${apiBase}${normalizedPath}`)
+  if (query) {
+    query.forEach((value, key) => {
+      url.searchParams.set(key, value)
+    })
+  }
+  return url
+}
+
+async function apiRequest<T = unknown>(
+  ctx: CliContext,
+  method: string,
+  routePath: string,
+  body?: unknown,
+  query?: URLSearchParams,
+): Promise<T> {
+  return apiRequestWithAccessKey<T>(ctx, method, routePath, ctx.accessKey, body, query)
+}
+
+async function apiRequestWithAccessKey<T = unknown>(
+  ctx: CliContext,
+  method: string,
+  routePath: string,
+  accessKey: string | undefined,
+  body?: unknown,
+  query?: URLSearchParams,
+): Promise<T> {
+  const url = buildApiUrl(ctx, routePath, query)
+  const headers: Record<string, string> = {}
+
+  if (accessKey) headers['X-Access-Key'] = accessKey
+  if (body !== undefined) headers['Content-Type'] = 'application/json'
+
+  let response: Response
+  try {
+    response = await fetch(url, {
+      method,
+      headers,
+      body: body === undefined ? undefined : JSON.stringify(body),
+    })
+  } catch (err) {
+    const msg = errorMessage(err)
+    throw new Error(`Failed to reach ${ctx.baseUrl}. Is SwarmClaw running? (${msg})`)
+  }
+
+  const contentType = (response.headers.get('content-type') || '').toLowerCase()
+  let responseBody: unknown = null
+
+  if (contentType.includes('application/json')) {
+    responseBody = await response.json().catch(() => null)
+  } else {
+    const text = await response.text().catch(() => '')
+    responseBody = text.length > 0 ? text : null
+  }
+
+  if (!response.ok) {
+    const detail = typeof responseBody === 'string'
+      ? responseBody
+      : JSON.stringify(responseBody)
+    throw new Error(`HTTP ${response.status} ${response.statusText}: ${detail}`)
+  }
+
+  return responseBody as T
+}
+
+function normalizeSetupProvider(value: string | undefined): SetupProvider {
+  const lower = (value || '').trim().toLowerCase()
+  if (SUPPORTED_SETUP_PROVIDERS.has(lower as SetupProvider)) return lower as SetupProvider
+  const supported = SETUP_PROVIDERS.map((p) => p.id).join(', ')
+  throw new Error(`Unsupported provider "${value}". Supported: ${supported}`)
+}
+
+function maskToken(value: string): string {
+  const clean = value.trim()
+  if (clean.length <= 8) return '********'
+  return `${clean.slice(0, 4)}...${clean.slice(-4)}`
+}
+
+async function resolveSetupAccessKey(ctx: CliContext): Promise<{
+  accessKey: string
+  firstTime: boolean
+  autoDiscovered: boolean
+}> {
+  if (ctx.accessKey) {
+    await apiRequestWithAccessKey(ctx, 'POST', '/auth', ctx.accessKey, { key: ctx.accessKey })
+    return {
+      accessKey: ctx.accessKey,
+      firstTime: false,
+      autoDiscovered: false,
+    }
+  }
+
+  const status = await apiRequestWithAccessKey<SetupAuthStatus>(ctx, 'GET', '/auth', undefined)
+  const firstTime = status?.firstTime === true
+
+  if (firstTime) {
+    throw new Error('No access key provided. Read the generated key from the launch terminal or .env.local, then pass --key, set SWARMCLAW_ACCESS_KEY / SWARMCLAW_API_KEY, or use platform-api-key.txt.')
+  }
+
+  throw new Error('No access key provided. Pass --key, set SWARMCLAW_ACCESS_KEY / SWARMCLAW_API_KEY, or use platform-api-key.txt.')
+}
+
+function printResult(value: unknown, rawOutput: boolean): void {
+  if (value === undefined || value === null) {
+    console.log('null')
+    return
+  }
+
+  if (typeof value === 'string') {
+    console.log(value)
+    return
+  }
+
+  if (rawOutput) {
+    process.stdout.write(`${JSON.stringify(value)}\n`)
+    return
+  }
+
+  process.stdout.write(`${JSON.stringify(value, null, 2)}\n`)
+}
+
+async function resolveByIdFromCollection(
+  ctx: CliContext,
+  routePath: string,
+  id: string,
+): Promise<unknown> {
+  const collection = parseObject(await apiRequest(ctx, 'GET', routePath), routePath)
+  if (!(id in collection)) {
+    throw new Error(`Not found: ${routePath} id=${id}`)
+  }
+  return collection[id]
+}
+
+async function runWithHandler(command: Command, task: (ctx: CliContext) => Promise<unknown>): Promise<void> {
+  try {
+    const ctx = contextFromCommand(command)
+    const result = await task(ctx)
+    printResult(result, ctx.rawOutput)
+  } catch (err) {
+    const msg = errorMessage(err)
+    console.error(msg)
+    process.exitCode = 1
+  }
+}
+
+async function readSecret(prompt: string): Promise<string> {
+  const { stdin, stdout } = process
+  stdout.write(prompt)
+  return new Promise((resolve) => {
+    let buf = ''
+    const wasRaw = stdin.isRaw
+    stdin.setRawMode?.(true)
+    stdin.resume()
+    stdin.setEncoding('utf8')
+    const onData = (ch: string) => {
+      if (ch === '\n' || ch === '\r') {
+        stdin.setRawMode?.(wasRaw ?? false)
+        stdin.pause()
+        stdin.removeListener('data', onData)
+        stdout.write('\n')
+        resolve(buf)
+      } else if (ch === '\u0003') {
+        // Ctrl+C
+        process.exit(130)
+      } else if (ch === '\u007f' || ch === '\b') {
+        buf = buf.slice(0, -1)
+      } else {
+        buf += ch
+      }
+    }
+    stdin.on('data', onData)
+  })
+}
+
+async function runInteractiveSetup(ctx: CliContext): Promise<unknown> {
+  const { createInterface } = await import('node:readline/promises')
+
+  const auth = await resolveSetupAccessKey(ctx)
+  const configuredProviders: string[] = []
+  const createdAgents: Array<{ name: string; provider: string; model: string }> = []
+
+  // Wraps readline so we can destroy/recreate after raw-mode readSecret
+  let rl = createInterface({ input: process.stdin, output: process.stdout })
+
+  const freshRl = () => {
+    try { rl.close() } catch { /* already closed */ }
+    rl = createInterface({ input: process.stdin, output: process.stdout })
+  }
+
+  const ask = async (question: string, defaultValue?: string): Promise<string> => {
+    const suffix = defaultValue ? ` (${defaultValue})` : ''
+    const answer = (await rl.question(`${question}${suffix}: `)).trim()
+    return answer || defaultValue || ''
+  }
+
+  const askYN = async (question: string, defaultYes: boolean): Promise<boolean> => {
+    const hint = defaultYes ? 'Y/n' : 'y/N'
+    const answer = (await rl.question(`${question} [${hint}]: `)).trim().toLowerCase()
+    if (!answer) return defaultYes
+    return answer.startsWith('y')
+  }
+
+  const askSecret = async (prompt: string): Promise<string> => {
+    rl.close()
+    const value = await readSecret(prompt)
+    freshRl()
+    return value
+  }
+
+  console.log('\n  SwarmClaw Interactive Setup\n')
+
+  let addMore = true
+  while (addMore) {
+    console.log('  Available providers:\n')
+    const available = SETUP_PROVIDERS.filter((p) => !configuredProviders.includes(p.id))
+    if (available.length === 0) {
+      console.log('  All providers configured!\n')
+      break
+    }
+    available.forEach((p, i) => {
+      const badge = p.badge ? ` (${p.badge})` : ''
+      console.log(`  ${i + 1}. ${p.name}${badge}`)
+    })
+    console.log()
+
+    const choiceStr = await ask('Pick a provider', '1')
+    const choiceNum = parseInt(choiceStr, 10)
+    const selected = (choiceNum >= 1 && choiceNum <= available.length)
+      ? available[choiceNum - 1]
+      : available.find((p) => p.id === choiceStr.toLowerCase() || p.name.toLowerCase() === choiceStr.toLowerCase())
+
+    if (!selected) {
+      console.log(`  Invalid choice "${choiceStr}". Try again.\n`)
+      continue
+    }
+
+    const provider = selected.id
+    const defaults = DEFAULT_AGENTS[provider]
+    console.log(`\n  Setting up ${selected.name}...\n`)
+
+    // Collect inputs
+    let inputApiKey = ''
+    if (selected.requiresKey) {
+      inputApiKey = await askSecret('  API key: ')
+      if (!inputApiKey) {
+        console.log('  API key is required for this provider.\n')
+        continue
+      }
+    } else if (selected.optionalKey) {
+      inputApiKey = await askSecret('  Token (optional, press Enter to skip): ')
+    }
+
+    let inputEndpoint = ''
+    if (selected.supportsEndpoint) {
+      inputEndpoint = await ask('  Endpoint', selected.defaultEndpoint)
+    }
+
+    const agentName = await ask('  Agent name', defaults.name)
+    const runCheck = await askYN('  Run connection check?', true)
+
+    // Connection check
+    let normalizedEndpoint = inputEndpoint || undefined
+    let selectedModel: string | undefined
+
+    if (runCheck) {
+      process.stdout.write('  Checking connection...')
+      try {
+        const check = await apiRequestWithAccessKey<SetupProviderCheckResponse>(
+          ctx, 'POST', '/setup/check-provider', auth.accessKey,
+          compactObject({
+            provider,
+            apiKey: inputApiKey || undefined,
+            endpoint: selected.supportsEndpoint ? normalizedEndpoint : undefined,
+          }),
+        )
+        if (check?.ok) {
+          console.log(' OK')
+          if (check.normalizedEndpoint) normalizedEndpoint = check.normalizedEndpoint
+          if (check.recommendedModel) selectedModel = check.recommendedModel
+        } else {
+          console.log(` FAILED: ${check?.message || 'Unknown error'}`)
+        }
+      } catch (err: unknown) {
+        console.log(` FAILED: ${errorMessage(err)}`)
+      }
+    }
+
+    // Save credential
+    let credentialId: string | null = null
+    if (inputApiKey) {
+      const credential = await apiRequestWithAccessKey<{ id?: string }>(
+        ctx, 'POST', '/credentials', auth.accessKey,
+        { provider, name: `${selected.name} key`, apiKey: inputApiKey },
+      )
+      credentialId = typeof credential?.id === 'string' ? credential.id : null
+    }
+
+    // Create agent
+    await apiRequestWithAccessKey<Record<string, unknown>>(
+      ctx, 'POST', '/agents', auth.accessKey,
+      compactObject({
+        name: agentName || defaults.name,
+        description: defaults.description,
+        systemPrompt: defaults.systemPrompt,
+        provider,
+        model: selectedModel || defaults.model,
+        credentialId: credentialId || null,
+        apiEndpoint: selected.supportsEndpoint ? (normalizedEndpoint || undefined) : undefined,
+        tools: STARTER_AGENT_TOOLS,
+      }),
+    )
+
+    configuredProviders.push(provider)
+    createdAgents.push({ name: agentName || defaults.name, provider, model: selectedModel || defaults.model })
+    console.log(`  Agent "${agentName || defaults.name}" created.\n`)
+
+    addMore = await askYN('  Add another provider?', false)
+  }
+
+  rl.close()
+
+  await apiRequestWithAccessKey(ctx, 'PUT', '/settings', auth.accessKey, { setupCompleted: true })
+
+  console.log('\n  Setup complete!\n')
+  console.log('  Created agents:')
+  for (const a of createdAgents) {
+    console.log(`    - ${a.name} (${a.provider}, ${a.model})`)
+  }
+  console.log()
+
+  return {
+    ok: true,
+    interactive: true,
+    providers: configuredProviders,
+    agents: createdAgents,
+    accessKeyMasked: maskToken(auth.accessKey),
+    firstTimeSetup: auth.firstTime,
+  }
+}
+
+export function buildProgram(): Command {
+  const program = new Command()
+
+  program
+    .name('swarmclaw')
+    .description('SwarmClaw CLI')
+    .option('-u, --url <url>', 'SwarmClaw base URL', DEFAULT_BASE_URL)
+    .option('-k, --key <key>', 'SwarmClaw access key', DEFAULT_ACCESS_KEY)
+    .option('--raw, --json', 'Print compact JSON output')
+    .showHelpAfterError()
+
+  const agents = program.command('agents').description('Manage agents')
+
+  agents
+    .command('list')
+    .description('List agents')
+    .action(async function () {
+      await runWithHandler(this as Command, (ctx) => apiRequest(ctx, 'GET', '/agents'))
+    })
+
+  agents
+    .command('get')
+    .description('Get agent by id')
+    .argument('<id>', 'Agent id')
+    .action(async function (id: string) {
+      await runWithHandler(this as Command, (ctx) => resolveByIdFromCollection(ctx, '/agents', id))
+    })
+
+  const tasks = program.command('tasks').description('Manage tasks')
+
+  tasks
+    .command('list')
+    .description('List tasks')
+    .action(async function () {
+      await runWithHandler(this as Command, (ctx) => apiRequest(ctx, 'GET', '/tasks'))
+    })
+
+  tasks
+    .command('get')
+    .description('Get task by id')
+    .argument('<id>', 'Task id')
+    .action(async function (id: string) {
+      await runWithHandler(this as Command, (ctx) => apiRequest(ctx, 'GET', `/tasks/${encodeURIComponent(id)}`))
+    })
+
+  tasks
+    .command('create')
+    .description('Create task')
+    .requiredOption('--title <title>', 'Task title')
+    .option('--description <description>', 'Task description', '')
+    .option('--agent-id <agentId>', 'Agent id')
+    .option('--status <status>', 'Task status', 'backlog')
+    .action(async function (opts: { title: string; description: string; agentId?: string; status: string }) {
+      await runWithHandler(this as Command, (ctx) => apiRequest(ctx, 'POST', '/tasks', compactObject({
+        title: opts.title,
+        description: opts.description,
+        agentId: opts.agentId,
+        status: opts.status,
+      })))
+    })
+
+  tasks
+    .command('update')
+    .description('Update task')
+    .argument('<id>', 'Task id')
+    .option('--title <title>', 'Task title')
+    .option('--description <description>', 'Task description')
+    .option('--agent-id <agentId>', 'Agent id')
+    .option('--status <status>', 'Task status')
+    .option('--session-id <sessionId>', 'Session id')
+    .option('--result <result>', 'Task result summary')
+    .option('--error <error>', 'Task error summary')
+    .action(async function (
+      id: string,
+      opts: {
+        title?: string
+        description?: string
+        agentId?: string
+        status?: string
+        sessionId?: string
+        result?: string
+        error?: string
+      },
+    ) {
+      await runWithHandler(this as Command, (ctx) => apiRequest(ctx, 'PUT', `/tasks/${encodeURIComponent(id)}`, compactObject({
+        title: opts.title,
+        description: opts.description,
+        agentId: opts.agentId,
+        status: opts.status,
+        sessionId: opts.sessionId,
+        result: opts.result,
+        error: opts.error,
+      })))
+    })
+
+  tasks
+    .command('delete')
+    .description('Archive task')
+    .argument('<id>', 'Task id')
+    .action(async function (id: string) {
+      await runWithHandler(this as Command, (ctx) => apiRequest(ctx, 'DELETE', `/tasks/${encodeURIComponent(id)}`))
+    })
+
+  tasks
+    .command('archive')
+    .description('Archive task')
+    .argument('<id>', 'Task id')
+    .action(async function (id: string) {
+      await runWithHandler(this as Command, (ctx) => apiRequest(ctx, 'DELETE', `/tasks/${encodeURIComponent(id)}`))
+    })
+
+  const schedules = program.command('schedules').description('Manage schedules')
+
+  schedules
+    .command('list')
+    .description('List schedules')
+    .action(async function () {
+      await runWithHandler(this as Command, (ctx) => apiRequest(ctx, 'GET', '/schedules'))
+    })
+
+  schedules
+    .command('get')
+    .description('Get schedule by id')
+    .argument('<id>', 'Schedule id')
+    .action(async function (id: string) {
+      await runWithHandler(this as Command, (ctx) => resolveByIdFromCollection(ctx, '/schedules', id))
+    })
+
+  schedules
+    .command('history')
+    .description('Get schedule revision history')
+    .argument('<id>', 'Schedule id')
+    .action(async function (id: string) {
+      await runWithHandler(this as Command, (ctx) => apiRequest(ctx, 'GET', `/schedules/${encodeURIComponent(id)}/history`))
+    })
+
+  schedules
+    .command('create')
+    .description('Create schedule')
+    .requiredOption('--name <name>', 'Schedule name')
+    .requiredOption('--agent-id <agentId>', 'Agent id')
+    .requiredOption('--task-prompt <taskPrompt>', 'Task prompt for the scheduled run')
+    .option('--schedule-type <scheduleType>', 'cron | interval | once', 'cron')
+    .option('--cron <cron>', 'Cron expression')
+    .option('--interval-ms <intervalMs>', 'Interval in milliseconds')
+    .option('--run-at <runAt>', 'Timestamp (ms) or ISO time for once schedules')
+    .option('--status <status>', 'Schedule status', 'active')
+    .action(async function (opts: {
+      name: string
+      agentId: string
+      taskPrompt: string
+      scheduleType: string
+      cron?: string
+      intervalMs?: string
+      runAt?: string
+      status: string
+    }) {
+      const intervalMs = opts.intervalMs ? Number.parseInt(opts.intervalMs, 10) : undefined
+      if (opts.intervalMs && (!Number.isFinite(intervalMs) || intervalMs! <= 0)) {
+        throw new Error(`Invalid --interval-ms value: ${opts.intervalMs}`)
+      }
+
+      await runWithHandler(this as Command, (ctx) => apiRequest(ctx, 'POST', '/schedules', compactObject({
+        name: opts.name,
+        agentId: opts.agentId,
+        taskPrompt: opts.taskPrompt,
+        scheduleType: opts.scheduleType,
+        cron: opts.cron,
+        intervalMs,
+        runAt: parseTimestamp(opts.runAt),
+        status: opts.status,
+      })))
+    })
+
+  const runs = program.command('runs').description('Inspect queued/running/completed runs')
+
+  runs
+    .command('list')
+    .description('List runs')
+    .option('--session-id <sessionId>', 'Filter by session id')
+    .option('--status <status>', 'Filter by run status')
+    .option('--limit <limit>', 'Max rows to return (1-1000)')
+    .action(async function (opts: { sessionId?: string; status?: string; limit?: string }) {
+      const limit = opts.limit ? Number.parseInt(opts.limit, 10) : undefined
+      if (opts.limit && (!Number.isFinite(limit) || limit! <= 0)) {
+        throw new Error(`Invalid --limit value: ${opts.limit}`)
+      }
+      await runWithHandler(this as Command, (ctx) => {
+        const params = new URLSearchParams()
+        if (opts.sessionId) params.set('sessionId', opts.sessionId)
+        if (opts.status) params.set('status', opts.status)
+        if (typeof limit === 'number') params.set('limit', String(limit))
+        return apiRequest(ctx, 'GET', '/runs', undefined, params)
+      })
+    })
+
+  runs
+    .command('get')
+    .description('Get run by id')
+    .argument('<id>', 'Run id')
+    .action(async function (id: string) {
+      await runWithHandler(this as Command, (ctx) => apiRequest(ctx, 'GET', `/runs/${encodeURIComponent(id)}`))
+    })
+
+  const perf = program.command('perf').description('Inspect or control runtime perf tracing')
+
+  perf
+    .command('status')
+    .description('Get current perf tracing status and recent entries')
+    .action(async function () {
+      await runWithHandler(this as Command, (ctx) => apiRequest(ctx, 'GET', '/perf'))
+    })
+
+  perf
+    .command('enable')
+    .description('Enable perf tracing and clear existing entries')
+    .action(async function () {
+      await runWithHandler(this as Command, (ctx) => apiRequest(ctx, 'POST', '/perf', { action: 'enable' }))
+    })
+
+  perf
+    .command('disable')
+    .description('Disable perf tracing')
+    .action(async function () {
+      await runWithHandler(this as Command, (ctx) => apiRequest(ctx, 'POST', '/perf', { action: 'disable' }))
+    })
+
+  perf
+    .command('clear')
+    .description('Clear recent perf entries')
+    .action(async function () {
+      await runWithHandler(this as Command, (ctx) => apiRequest(ctx, 'POST', '/perf', { action: 'clear' }))
+    })
+
+  const chats = program.command('chats').description('Manage chats')
+  program.command('sessions').description('Manage chats (alias)').action(() => chats.help())
+
+  chats
+    .command('list')
+    .description('List chats')
+    .action(async function () {
+      await runWithHandler(this as Command, (ctx) => apiRequest(ctx, 'GET', '/chats'))
+    })
+
+  chats
+    .command('get')
+    .description('Get chat by id')
+    .argument('<id>', 'Chat id')
+    .action(async function (id: string) {
+      await runWithHandler(this as Command, (ctx) => resolveByIdFromCollection(ctx, '/chats', id))
+    })
+
+  chats
+    .command('create')
+    .description('Create chat')
+    .option('--name <name>', 'Chat name', 'New Chat')
+    .option('--user <user>', 'User name')
+    .option('--cwd <cwd>', 'Working directory')
+    .option('--provider <provider>', 'Provider id')
+    .option('--model <model>', 'Model name')
+    .option('--agent-id <agentId>', 'Agent id')
+    .option('--credential-id <credentialId>', 'Credential id')
+    .option('--api-endpoint <apiEndpoint>', 'API endpoint')
+    .option('--heartbeat-enabled <heartbeatEnabled>', 'Heartbeat enabled (true|false)')
+    .option('--heartbeat-interval-sec <heartbeatIntervalSec>', 'Heartbeat interval seconds')
+    .action(async function (opts: {
+      name: string
+      user?: string
+      cwd?: string
+      provider?: string
+      model?: string
+      agentId?: string
+      credentialId?: string
+      apiEndpoint?: string
+      heartbeatEnabled?: string
+      heartbeatIntervalSec?: string
+    }) {
+      const heartbeatEnabled = typeof opts.heartbeatEnabled === 'string'
+        ? opts.heartbeatEnabled.trim().toLowerCase() === 'true'
+        : undefined
+      const heartbeatIntervalSec = opts.heartbeatIntervalSec ? Number.parseInt(opts.heartbeatIntervalSec, 10) : undefined
+      if (opts.heartbeatIntervalSec && (!Number.isFinite(heartbeatIntervalSec) || heartbeatIntervalSec! < 0)) {
+        throw new Error(`Invalid --heartbeat-interval-sec value: ${opts.heartbeatIntervalSec}`)
+      }
+      await runWithHandler(this as Command, (ctx) => apiRequest(ctx, 'POST', '/chats', compactObject({
+        name: opts.name,
+        user: opts.user,
+        cwd: opts.cwd,
+        provider: opts.provider,
+        model: opts.model,
+        agentId: opts.agentId,
+        credentialId: opts.credentialId,
+        apiEndpoint: opts.apiEndpoint,
+        heartbeatEnabled: typeof opts.heartbeatEnabled === 'string' ? heartbeatEnabled : undefined,
+        heartbeatIntervalSec,
+      })))
+    })
+
+  chats
+    .command('update')
+    .description('Update chat')
+    .argument('<id>', 'Chat id')
+    .option('--name <name>', 'Chat name')
+    .option('--cwd <cwd>', 'Working directory')
+    .option('--agent-id <agentId>', 'Agent id')
+    .option('--tools <json>', 'Tools JSON array, e.g. ["shell","memory"]')
+    .option('--extensions <json>', 'Extensions JSON array, e.g. ["weather.mjs"]')
+    .option('--heartbeat-enabled <heartbeatEnabled>', 'Heartbeat enabled (true|false)')
+    .option('--heartbeat-interval-sec <heartbeatIntervalSec>', 'Heartbeat interval seconds')
+    .action(async function (
+      id: string,
+      opts: {
+        name?: string
+        cwd?: string
+        agentId?: string
+        tools?: string
+        extensions?: string
+        heartbeatEnabled?: string
+        heartbeatIntervalSec?: string
+      },
+    ) {
+      const heartbeatEnabled = typeof opts.heartbeatEnabled === 'string'
+        ? opts.heartbeatEnabled.trim().toLowerCase() === 'true'
+        : undefined
+      const heartbeatIntervalSec = opts.heartbeatIntervalSec ? Number.parseInt(opts.heartbeatIntervalSec, 10) : undefined
+      if (opts.heartbeatIntervalSec && (!Number.isFinite(heartbeatIntervalSec) || heartbeatIntervalSec! < 0)) {
+        throw new Error(`Invalid --heartbeat-interval-sec value: ${opts.heartbeatIntervalSec}`)
+      }
+      const tools = parseJsonValue(opts.tools, '--tools')
+      if (tools !== undefined && !Array.isArray(tools)) {
+        throw new Error('--tools must be a JSON array')
+      }
+      const extensions = parseJsonValue(opts.extensions, '--extensions')
+      if (extensions !== undefined && !Array.isArray(extensions)) {
+        throw new Error('--extensions must be a JSON array')
+      }
+      await runWithHandler(this as Command, (ctx) => apiRequest(ctx, 'PUT', `/chats/${encodeURIComponent(id)}`, compactObject({
+        name: opts.name,
+        cwd: opts.cwd,
+        agentId: opts.agentId,
+        tools,
+        extensions,
+        heartbeatEnabled: typeof opts.heartbeatEnabled === 'string' ? heartbeatEnabled : undefined,
+        heartbeatIntervalSec,
+      })))
+    })
+
+  chats
+    .command('delete')
+    .description('Delete chat')
+    .argument('<id>', 'Chat id')
+    .action(async function (id: string) {
+      await runWithHandler(this as Command, (ctx) => apiRequest(ctx, 'DELETE', `/chats/${encodeURIComponent(id)}`))
+    })
+
+  chats
+    .command('history')
+    .description('Get chat message history')
+    .argument('<id>', 'Chat id')
+    .action(async function (id: string) {
+      await runWithHandler(this as Command, (ctx) => apiRequest(ctx, 'GET', `/chats/${encodeURIComponent(id)}/messages`))
+    })
+
+  chats
+    .command('mailbox')
+    .description('List chat mailbox envelopes')
+    .argument('<id>', 'Chat id')
+    .option('--limit <limit>', 'Max envelopes to return (default: 50)')
+    .option('--include-acked', 'Include acknowledged envelopes')
+    .action(async function (
+      id: string,
+      opts: {
+        limit?: string
+        includeAcked?: boolean
+      },
+    ) {
+      const limit = opts.limit ? Number.parseInt(opts.limit, 10) : undefined
+      if (opts.limit && (!Number.isFinite(limit) || limit! <= 0)) {
+        throw new Error(`Invalid --limit value: ${opts.limit}`)
+      }
+      await runWithHandler(this as Command, (ctx) => {
+        const params = new URLSearchParams()
+        if (typeof limit === 'number') params.set('limit', String(limit))
+        if (opts.includeAcked) params.set('includeAcked', '1')
+        return apiRequest(ctx, 'GET', `/chats/${encodeURIComponent(id)}/mailbox`, undefined, params)
+      })
+    })
+
+  chats
+    .command('stop')
+    .description('Stop running work for a chat')
+    .argument('<id>', 'Chat id')
+    .action(async function (id: string) {
+      await runWithHandler(this as Command, (ctx) => apiRequest(ctx, 'POST', `/chats/${encodeURIComponent(id)}/stop`))
+    })
+
+  const memory = program.command('memory').description('Manage memory')
+
+  memory
+    .command('get')
+    .description('Get memory by id')
+    .argument('<id>', 'Memory id')
+    .action(async function (id: string) {
+      await runWithHandler(this as Command, (ctx) => apiRequest(ctx, 'GET', `/memory/${encodeURIComponent(id)}`))
+    })
+
+  memory
+    .command('search')
+    .description('Search memory')
+    .requiredOption('-q, --q <query>', 'Search query')
+    .option('--agent-id <agentId>', 'Filter by agent id')
+    .action(async function (opts: { q: string; agentId?: string }) {
+      await runWithHandler(this as Command, (ctx) => {
+        const params = new URLSearchParams()
+        params.set('q', opts.q)
+        if (opts.agentId) params.set('agentId', opts.agentId)
+        return apiRequest(ctx, 'GET', '/memory', undefined, params)
+      })
+    })
+
+  memory
+    .command('store')
+    .description('Store memory')
+    .requiredOption('--title <title>', 'Memory title')
+    .requiredOption('--content <content>', 'Memory content')
+    .option('--category <category>', 'Memory category', 'note')
+    .option('--agent-id <agentId>', 'Associated agent id')
+    .option('--session-id <sessionId>', 'Associated session id')
+    .option('--metadata <json>', 'Metadata JSON object, ex: {"priority":"high"}')
+    .action(async function (opts: {
+      title: string
+      content: string
+      category: string
+      agentId?: string
+      sessionId?: string
+      metadata?: string
+    }) {
+      const metadata = parseMetadata(opts.metadata)
+      await runWithHandler(this as Command, (ctx) => apiRequest(ctx, 'POST', '/memory', compactObject({
+        title: opts.title,
+        content: opts.content,
+        category: opts.category,
+        agentId: opts.agentId,
+        sessionId: opts.sessionId,
+        metadata,
+      })))
+    })
+
+  memory
+    .command('maintenance')
+    .description('Analyze or run memory maintenance')
+    .option('--run', 'Execute maintenance instead of analysis')
+    .option('--ttl-hours <ttlHours>', 'TTL hours used to prune stale working memories')
+    .option('--max-deletes <maxDeletes>', 'Maximum entries to delete when --run is set')
+    .option('--data <json>', 'Optional JSON payload for POST /memory/maintenance')
+    .action(async function (opts: { run?: boolean; ttlHours?: string; maxDeletes?: string; data?: string }) {
+      const payload = parseJsonValue(opts.data, '--data')
+      if (payload !== undefined && (!payload || typeof payload !== 'object' || Array.isArray(payload))) {
+        throw new Error('--data must be a JSON object')
+      }
+
+      const ttlHours = opts.ttlHours ? Number.parseInt(opts.ttlHours, 10) : undefined
+      if (opts.ttlHours && (!Number.isFinite(ttlHours) || ttlHours! <= 0)) {
+        throw new Error(`Invalid --ttl-hours value: ${opts.ttlHours}`)
+      }
+
+      const maxDeletes = opts.maxDeletes ? Number.parseInt(opts.maxDeletes, 10) : undefined
+      if (opts.maxDeletes && (!Number.isFinite(maxDeletes) || maxDeletes! <= 0)) {
+        throw new Error(`Invalid --max-deletes value: ${opts.maxDeletes}`)
+      }
+
+      await runWithHandler(this as Command, (ctx) => {
+        if (!opts.run) {
+          const params = new URLSearchParams()
+          if (typeof ttlHours === 'number') params.set('ttlHours', String(ttlHours))
+          return apiRequest(ctx, 'GET', '/memory/maintenance', undefined, params)
+        }
+
+        return apiRequest(ctx, 'POST', '/memory/maintenance', compactObject({
+          ...(payload as Record<string, unknown> | undefined),
+          ttlHours,
+          maxDeletes,
+        }))
+      })
+    })
+
+  const memoryImages = program.command('memory-images').description('Fetch memory image assets')
+
+  memoryImages
+    .command('get')
+    .description('Download memory image by filename')
+    .argument('<filename>', 'Memory image filename')
+    .action(async function (filename: string) {
+      await runWithHandler(this as Command, (ctx) => apiRequest(ctx, 'GET', `/memory-images/${encodeURIComponent(filename)}`))
+    })
+
+  const setup = program.command('setup').description('Setup and provider validation helpers')
+
+  setup
+    .command('init')
+    .description('Run command-line first-time setup (provider check, credential, starter agent)')
+    .option('--provider <provider>', 'Provider id (e.g. openai, anthropic, ollama, google)')
+    .option('--api-key <apiKey>', 'API key or token')
+    .option('--endpoint <endpoint>', 'Provider endpoint override')
+    .option('--model <model>', 'Model override')
+    .option('--agent-name <name>', 'Starter agent name')
+    .option('--agent-description <description>', 'Starter agent description')
+    .option('--system-prompt <systemPrompt>', 'Starter agent system prompt')
+    .option('--skip-check', 'Skip provider connection check')
+    .option('--no-create-agent', 'Do not create a starter agent')
+    .option('--no-interactive', 'Disable interactive prompts (flag-only mode)')
+    .action(async function (opts: {
+      provider?: string
+      apiKey?: string
+      endpoint?: string
+      model?: string
+      agentName?: string
+      agentDescription?: string
+      systemPrompt?: string
+      skipCheck?: boolean
+      createAgent?: boolean
+      interactive?: boolean
+    }) {
+      await runWithHandler(this as Command, async (ctx) => {
+        const hasFlags = !!(opts.provider && opts.provider !== 'openai') || !!opts.apiKey || !!opts.endpoint
+        const wantInteractive = opts.interactive !== false && !hasFlags && process.stdin.isTTY
+
+        if (wantInteractive) {
+          return runInteractiveSetup(ctx)
+        }
+
+        const provider = normalizeSetupProvider(opts.provider || 'openai')
+        const defaults = DEFAULT_AGENTS[provider]
+        const meta = SETUP_PROVIDERS.find((p) => p.id === provider)
+        const requiresApiKey = meta?.requiresKey ?? false
+        const supportsEndpoint = meta?.supportsEndpoint ?? false
+
+        const inputApiKey = (opts.apiKey || '').trim()
+        const inputEndpoint = (opts.endpoint || '').trim()
+        const inputModel = (opts.model || '').trim()
+
+        if (requiresApiKey && !inputApiKey) {
+          throw new Error(`${provider} requires --api-key`)
+        }
+
+        const auth = await resolveSetupAccessKey(ctx)
+
+        let normalizedEndpoint = inputEndpoint || undefined
+        let selectedModel = inputModel || undefined
+        let checkMessage: string | undefined
+
+        if (!opts.skipCheck) {
+          const check = await apiRequestWithAccessKey<SetupProviderCheckResponse>(
+            ctx,
+            'POST',
+            '/setup/check-provider',
+            auth.accessKey,
+            compactObject({
+              provider,
+              apiKey: inputApiKey || undefined,
+              endpoint: supportsEndpoint ? normalizedEndpoint : undefined,
+              model: selectedModel,
+            }),
+          )
+
+          if (!check?.ok) {
+            throw new Error(check?.message || `Provider check failed for ${provider}`)
+          }
+
+          checkMessage = check.message
+          if (!normalizedEndpoint && check.normalizedEndpoint) normalizedEndpoint = check.normalizedEndpoint
+          if (!selectedModel && check.recommendedModel) selectedModel = check.recommendedModel
+        }
+
+        let credentialId: string | null = null
+        if (inputApiKey && (requiresApiKey || meta?.optionalKey)) {
+          const credential = await apiRequestWithAccessKey<{ id?: string; name?: string }>(
+            ctx,
+            'POST',
+            '/credentials',
+            auth.accessKey,
+            {
+              provider,
+              name: `${meta?.name || provider} key`,
+              apiKey: inputApiKey,
+            },
+          )
+          credentialId = typeof credential?.id === 'string' ? credential.id : null
+        }
+
+        let createdAgent: Record<string, unknown> | null = null
+        if (opts.createAgent !== false) {
+          createdAgent = await apiRequestWithAccessKey<Record<string, unknown>>(
+            ctx,
+            'POST',
+            '/agents',
+            auth.accessKey,
+            compactObject({
+              name: (opts.agentName || '').trim() || defaults.name,
+              description: (opts.agentDescription || '').trim() || defaults.description,
+              systemPrompt: (opts.systemPrompt || '').trim() || defaults.systemPrompt,
+              provider,
+              model: selectedModel || defaults.model,
+              credentialId: credentialId || null,
+              apiEndpoint: supportsEndpoint ? (normalizedEndpoint || undefined) : undefined,
+              tools: STARTER_AGENT_TOOLS,
+            }),
+          )
+        }
+
+        await apiRequestWithAccessKey(
+          ctx,
+          'PUT',
+          '/settings',
+          auth.accessKey,
+          { setupCompleted: true },
+        )
+
+        return {
+          ok: true,
+          provider,
+          checkRan: !opts.skipCheck,
+          checkMessage: checkMessage || null,
+          accessKey: auth.autoDiscovered ? auth.accessKey : undefined,
+          accessKeyMasked: maskToken(auth.accessKey),
+          autoDiscoveredAccessKey: auth.autoDiscovered,
+          firstTimeSetup: auth.firstTime,
+          credentialId,
+          endpoint: normalizedEndpoint || null,
+          model: selectedModel || defaults.model,
+          createdAgent: createdAgent
+            ? {
+                id: createdAgent.id,
+                name: createdAgent.name,
+                provider: createdAgent.provider,
+                model: createdAgent.model,
+              }
+            : null,
+        }
+      })
+    })
+
+  setup
+    .command('check-provider')
+    .description('Validate provider credentials/endpoint')
+    .requiredOption('--provider <provider>', 'Provider id (openai|anthropic|ollama|openclaw)')
+    .option('--api-key <apiKey>', 'API key or token')
+    .option('--endpoint <endpoint>', 'Provider endpoint (for ollama/openclaw/custom openai)')
+    .option('--model <model>', 'Model override for the check request')
+    .action(async function (opts: { provider: string; apiKey?: string; endpoint?: string; model?: string }) {
+      await runWithHandler(this as Command, (ctx) => apiRequest(ctx, 'POST', '/setup/check-provider', compactObject({
+        provider: opts.provider,
+        apiKey: opts.apiKey,
+        endpoint: opts.endpoint,
+        model: opts.model,
+      })))
+    })
+
+  setup
+    .command('doctor')
+    .description('Run setup diagnostics')
+    .option('--remote', 'Include remote update check via git fetch')
+    .action(async function (opts: { remote?: boolean }) {
+      await runWithHandler(this as Command, (ctx) => {
+        const params = new URLSearchParams()
+        if (opts.remote) params.set('remote', '1')
+        return apiRequest(ctx, 'GET', '/setup/doctor', undefined, params)
+      })
+    })
+
+  setup
+    .command('openclaw-device')
+    .description('Show the local OpenClaw device ID')
+    .action(async function () {
+      await runWithHandler(this as Command, (ctx) => apiRequest(ctx, 'GET', '/setup/openclaw-device'))
+    })
+
+  const connectors = program.command('connectors').description('Manage connectors')
+
+  connectors
+    .command('list')
+    .description('List connectors')
+    .action(async function () {
+      await runWithHandler(this as Command, (ctx) => apiRequest(ctx, 'GET', '/connectors'))
+    })
+
+  connectors
+    .command('get')
+    .description('Get connector by id')
+    .argument('<id>', 'Connector id')
+    .action(async function (id: string) {
+      await runWithHandler(this as Command, (ctx) => apiRequest(ctx, 'GET', `/connectors/${encodeURIComponent(id)}`))
+    })
+
+  connectors
+    .command('create')
+    .description('Create connector')
+    .requiredOption('--platform <platform>', 'Connector platform (discord|telegram|slack|whatsapp|openclaw|bluebubbles|signal|teams|googlechat|matrix|email|filequeue|swarmdock)')
+    .requiredOption('--agent-id <agentId>', 'Agent id')
+    .option('--name <name>', 'Connector name')
+    .option('--credential-id <credentialId>', 'Credential id')
+    .option('--config <json>', 'Connector config JSON object')
+    .option('--auto-start <autoStart>', 'Auto-start connector (true|false)')
+    .action(async function (opts: {
+      platform: string
+      agentId: string
+      name?: string
+      credentialId?: string
+      config?: string
+      autoStart?: string
+    }) {
+      const config = parseJsonValue(opts.config, '--config')
+      if (config !== undefined && (!config || typeof config !== 'object' || Array.isArray(config))) {
+        throw new Error('--config must be a JSON object')
+      }
+      const autoStart = typeof opts.autoStart === 'string'
+        ? opts.autoStart.trim().toLowerCase() === 'true'
+        : undefined
+      await runWithHandler(this as Command, (ctx) => apiRequest(ctx, 'POST', '/connectors', compactObject({
+        platform: opts.platform,
+        agentId: opts.agentId,
+        name: opts.name,
+        credentialId: opts.credentialId,
+        config,
+        autoStart: typeof opts.autoStart === 'string' ? autoStart : undefined,
+      })))
+    })
+
+  connectors
+    .command('update')
+    .description('Update connector')
+    .argument('<id>', 'Connector id')
+    .option('--name <name>', 'Connector name')
+    .option('--agent-id <agentId>', 'Agent id')
+    .option('--credential-id <credentialId>', 'Credential id')
+    .option('--config <json>', 'Connector config JSON object')
+    .option('--enabled', 'Enable connector')
+    .option('--disabled', 'Disable connector')
+    .action(async function (
+      id: string,
+      opts: {
+        name?: string
+        agentId?: string
+        credentialId?: string
+        config?: string
+        enabled?: boolean
+        disabled?: boolean
+      },
+    ) {
+      const config = parseJsonValue(opts.config, '--config')
+      if (config !== undefined && (!config || typeof config !== 'object' || Array.isArray(config))) {
+        throw new Error('--config must be a JSON object')
+      }
+      const isEnabled = opts.enabled ? true : opts.disabled ? false : undefined
+      await runWithHandler(this as Command, (ctx) => apiRequest(ctx, 'PUT', `/connectors/${encodeURIComponent(id)}`, compactObject({
+        name: opts.name,
+        agentId: opts.agentId,
+        credentialId: opts.credentialId,
+        config,
+        isEnabled,
+      })))
+    })
+
+  connectors
+    .command('delete')
+    .description('Delete connector')
+    .argument('<id>', 'Connector id')
+    .action(async function (id: string) {
+      await runWithHandler(this as Command, (ctx) => apiRequest(ctx, 'DELETE', `/connectors/${encodeURIComponent(id)}`))
+    })
+
+  connectors
+    .command('start')
+    .description('Start connector runtime')
+    .argument('<id>', 'Connector id')
+    .action(async function (id: string) {
+      await runWithHandler(this as Command, (ctx) => apiRequest(ctx, 'PUT', `/connectors/${encodeURIComponent(id)}`, { action: 'start' }))
+    })
+
+  connectors
+    .command('stop')
+    .description('Stop connector runtime')
+    .argument('<id>', 'Connector id')
+    .action(async function (id: string) {
+      await runWithHandler(this as Command, (ctx) => apiRequest(ctx, 'PUT', `/connectors/${encodeURIComponent(id)}`, { action: 'stop' }))
+    })
+
+  connectors
+    .command('repair')
+    .description('Repair connector runtime (platform specific)')
+    .argument('<id>', 'Connector id')
+    .action(async function (id: string) {
+      await runWithHandler(this as Command, (ctx) => apiRequest(ctx, 'PUT', `/connectors/${encodeURIComponent(id)}`, { action: 'repair' }))
+    })
+
+  const webhooks = program.command('webhooks').description('Manage webhooks')
+
+  webhooks
+    .command('list')
+    .description('List webhooks')
+    .action(async function () {
+      await runWithHandler(this as Command, (ctx) => apiRequest(ctx, 'GET', '/webhooks'))
+    })
+
+  webhooks
+    .command('get')
+    .description('Get webhook by id')
+    .argument('<id>', 'Webhook id')
+    .action(async function (id: string) {
+      await runWithHandler(this as Command, (ctx) => apiRequest(ctx, 'GET', `/webhooks/${encodeURIComponent(id)}`))
+    })
+
+  webhooks
+    .command('create')
+    .description('Create webhook')
+    .option('--name <name>', 'Webhook name', 'Unnamed Webhook')
+    .option('--source <source>', 'Webhook source', 'custom')
+    .option('--event <event>', 'Webhook event filter (repeatable)', collectValues, [])
+    .option('--agent-id <agentId>', 'Agent id')
+    .option('--secret <secret>', 'Webhook secret')
+    .option('--disabled', 'Create webhook in disabled state')
+    .action(async function (opts: {
+      name: string
+      source: string
+      event: string[]
+      agentId?: string
+      secret?: string
+      disabled?: boolean
+    }) {
+      await runWithHandler(this as Command, (ctx) => apiRequest(ctx, 'POST', '/webhooks', compactObject({
+        name: opts.name,
+        source: opts.source,
+        events: opts.event,
+        agentId: opts.agentId,
+        secret: opts.secret,
+        isEnabled: opts.disabled ? false : true,
+      })))
+    })
+
+  webhooks
+    .command('update')
+    .description('Update webhook')
+    .argument('<id>', 'Webhook id')
+    .option('--name <name>', 'Webhook name')
+    .option('--source <source>', 'Webhook source')
+    .option('--event <event>', 'Webhook event filter (repeatable)', collectValues, [])
+    .option('--agent-id <agentId>', 'Agent id')
+    .option('--secret <secret>', 'Webhook secret')
+    .option('--enabled', 'Enable webhook')
+    .option('--disabled', 'Disable webhook')
+    .action(async function (
+      id: string,
+      opts: {
+        name?: string
+        source?: string
+        event: string[]
+        agentId?: string
+        secret?: string
+        enabled?: boolean
+        disabled?: boolean
+      },
+    ) {
+      const isEnabled = opts.enabled ? true : opts.disabled ? false : undefined
+      await runWithHandler(this as Command, (ctx) => apiRequest(ctx, 'PUT', `/webhooks/${encodeURIComponent(id)}`, compactObject({
+        name: opts.name,
+        source: opts.source,
+        events: opts.event.length ? opts.event : undefined,
+        agentId: opts.agentId,
+        secret: opts.secret,
+        isEnabled,
+      })))
+    })
+
+  webhooks
+    .command('delete')
+    .description('Delete webhook')
+    .argument('<id>', 'Webhook id')
+    .action(async function (id: string) {
+      await runWithHandler(this as Command, (ctx) => apiRequest(ctx, 'DELETE', `/webhooks/${encodeURIComponent(id)}`))
+    })
+
+  webhooks
+    .command('trigger')
+    .description('Trigger webhook by id')
+    .argument('<id>', 'Webhook id')
+    .option('--event <event>', 'Event type')
+    .option('--secret <secret>', 'Webhook secret')
+    .option('--payload <json>', 'JSON payload body')
+    .action(async function (
+      id: string,
+      opts: { event?: string; secret?: string; payload?: string },
+    ) {
+      const payload = parseJsonValue(opts.payload, '--payload') ?? {}
+      await runWithHandler(this as Command, (ctx) => {
+        const params = new URLSearchParams()
+        if (opts.event) params.set('event', opts.event)
+        if (opts.secret) params.set('secret', opts.secret)
+        return apiRequest(ctx, 'POST', `/webhooks/${encodeURIComponent(id)}`, payload, params)
+      })
+    })
+
+  program
+    .command('server')
+    .description('Start the SwarmClaw web server')
+    .action(() => {
+      console.log('The server command is handled directly by the swarmclaw binary.')
+      console.log('Run: swarmclaw server --help')
+    })
+
+  program
+    .command('update')
+    .description('Pull the latest SwarmClaw release via git')
+    .action(() => {
+      console.log('The update command is handled directly by the swarmclaw binary.')
+      console.log('Run: swarmclaw update --help')
+    })
+
+  return program
+}
+
+async function checkForUpdate(baseUrl: string, accessKey: string): Promise<void> {
+  try {
+    const url = `${baseUrl}/api/version`
+    const headers: Record<string, string> = {}
+    if (accessKey) headers['X-Access-Key'] = accessKey
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), 2000)
+    const res = await fetch(url, { headers, signal: controller.signal })
+    clearTimeout(timeout)
+    if (!res.ok) return
+    const data = (await res.json()) as { updateAvailable?: boolean; behindBy?: number }
+    if (data.updateAvailable && data.behindBy) {
+      process.stderr.write(`\n  Update available (${data.behindBy} behind). Run: swarmclaw update\n`)
+    }
+  } catch {
+    // Server unreachable or timed out — silently skip
+  }
+}
+
+export async function runCli(argv: string[] = process.argv.slice(2)): Promise<number> {
+  const program = buildProgram()
+  try {
+    // Skip update hint for commands that don't talk to the server
+    const skipHint = !argv.length || ['update', 'server', '--help', '-h'].includes(argv[0])
+    const hintPromise = skipHint
+      ? null
+      : checkForUpdate(
+          normalizeBaseUrl(process.env.SWARMCLAW_URL || process.env.SWARMCLAW_BASE_URL || 'http://localhost:3456'),
+          resolveDefaultAccessKey(),
+        )
+
+    await program.parseAsync(['node', 'swarmclaw', ...argv])
+    const code = (process.exitCode as number | undefined) ?? 0
+
+    // Wait briefly for the hint if the command succeeded
+    if (hintPromise && code === 0) {
+      await Promise.race([hintPromise, sleep(2000)])
+    }
+
+    return code
+  } catch (err) {
+    const msg = errorMessage(err)
+    console.error(msg)
+    return 1
+  }
+}
+
+async function main(): Promise<void> {
+  const code = await runCli(process.argv.slice(2))
+  if (code !== 0) process.exitCode = code
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1] || '').href) {
+  void main()
+}

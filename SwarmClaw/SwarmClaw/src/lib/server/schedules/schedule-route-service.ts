@@ -1,0 +1,264 @@
+import { buildAgentDisabledMessage, isAgentDisabled } from '@/lib/server/agents/agent-availability'
+import { loadAgents } from '@/lib/server/agents/agent-repository'
+import { logActivity } from '@/lib/server/activity/activity-log'
+import { enqueueTask } from '@/lib/server/runtime/queue'
+import { loadSessions } from '@/lib/server/sessions/session-repository'
+import { prepareScheduleUpdate, prepareScheduleCreate } from '@/lib/server/schedules/schedule-service'
+import {
+  archiveScheduleCluster,
+  purgeArchivedScheduleCluster,
+  restoreArchivedScheduleCluster,
+} from '@/lib/server/schedules/schedule-lifecycle'
+import { loadSchedule, loadSchedules, upsertSchedule, upsertSchedules } from '@/lib/server/schedules/schedule-repository'
+import { serviceFail, serviceOk } from '@/lib/server/service-result'
+import { errorMessage } from '@/lib/shared-utils'
+import { getScheduleSignatureKey } from '@/lib/schedules/schedule-dedupe'
+import { prepareScheduledTaskRun } from '@/lib/server/tasks/task-lifecycle'
+import { loadTasks, saveTask } from '@/lib/server/tasks/task-repository'
+import { pushMainLoopEventToMainSessions } from '@/lib/server/agents/main-agent-loop'
+import { WORKSPACE_DIR } from '@/lib/server/data-dir'
+import { notify } from '@/lib/server/ws-hub'
+import { appendScheduleHistoryEntry } from '@/lib/server/schedules/schedule-history'
+import { previewSchedulePayload } from '@/lib/server/schedules/schedule-preview'
+import type { Schedule, SchedulePreviewResponse } from '@/types'
+import type { ScheduleLike } from '@/lib/schedules/schedule-dedupe'
+import type { ServiceResult } from '@/lib/server/service-result'
+
+type InFlightTask = {
+  status?: string
+  sourceScheduleKey?: string | null
+}
+
+export function listSchedulesForApi(includeArchived: boolean) {
+  const schedules = loadSchedules()
+  if (includeArchived) return schedules
+  const filtered: typeof schedules = {}
+  for (const [id, schedule] of Object.entries(schedules)) {
+    if (schedule.status === 'archived') continue
+    filtered[id] = schedule
+  }
+  return filtered
+}
+
+export function previewScheduleFromRoute(body: Record<string, unknown>): ServiceResult<SchedulePreviewResponse> {
+  const result = previewSchedulePayload(body, {
+    cwd: WORKSPACE_DIR,
+    now: Date.now(),
+  })
+  if (!result.ok) return serviceFail(400, result.error)
+
+  const agents = loadAgents()
+  const agentId = typeof result.normalized.agentId === 'string' ? result.normalized.agentId : ''
+  const agent = agentId ? agents[agentId] : null
+  const warnings = [...result.warnings]
+  if (agentId && !agent) {
+    warnings.push(`Agent not found: ${agentId}`)
+  } else if (agent && isAgentDisabled(agent)) {
+    warnings.push(buildAgentDisabledMessage(agent, 'take scheduled work'))
+  }
+
+  return serviceOk({
+    ...result,
+    warnings,
+  })
+}
+
+export function createScheduleFromRoute(body: Record<string, unknown>): ServiceResult<ScheduleLike> {
+  const now = Date.now()
+  const schedules = loadSchedules()
+  const agents = loadAgents()
+  const candidateAgentId = typeof body.agentId === 'string' ? body.agentId.trim() : ''
+  const agent = agents[candidateAgentId]
+  if (!agent) {
+    return serviceFail(400, `Agent not found: ${String(body.agentId)}`)
+  }
+  if (isAgentDisabled(agent)) {
+    return serviceFail(409, buildAgentDisabledMessage(agent, 'take scheduled work'))
+  }
+  const prepared = prepareScheduleCreate({
+    input: body,
+    schedules,
+    now,
+    cwd: WORKSPACE_DIR,
+    historyActor: { actor: 'user' },
+  })
+  if (!prepared.ok) {
+    return serviceFail(400, prepared.error)
+  }
+  if (prepared.kind === 'duplicate') {
+    if (prepared.entries.length === 1) upsertSchedule(prepared.scheduleId, prepared.schedule)
+    else if (prepared.entries.length > 1) upsertSchedules(prepared.entries)
+    if (prepared.entries.length > 0) notify('schedules')
+    return serviceOk(prepared.schedule)
+  }
+  upsertSchedule(prepared.scheduleId, prepared.schedule)
+  logActivity({
+    entityType: 'schedule',
+    entityId: prepared.scheduleId,
+    action: 'created',
+    actor: 'user',
+    summary: `Schedule created: "${prepared.schedule.name}"`,
+  })
+  notify('schedules')
+  return serviceOk(prepared.schedule)
+}
+
+export function updateScheduleFromRoute(id: string, body: Record<string, unknown>): ServiceResult<ScheduleLike & { [key: string]: unknown }> {
+  const schedules = loadSchedules()
+  const current = schedules[id]
+  if (!current) return serviceFail(404, 'Schedule not found')
+
+  if (body.restore === true) {
+    const restored = restoreArchivedScheduleCluster(id, {
+      actor: { actor: 'user' },
+    })
+    if (!restored.ok || !restored.schedule) {
+      return serviceFail(409, 'Schedule is not archived.')
+    }
+    return serviceOk({
+      ...restored.schedule,
+      restoredIds: restored.restoredIds,
+    })
+  }
+
+  if (body.status === 'archived') {
+    const archived = archiveScheduleCluster(id, {
+      actor: { actor: 'user' },
+    })
+    if (!archived.ok || !archived.schedule) {
+      return serviceFail(500, 'Failed to archive schedule.')
+    }
+    return serviceOk({
+      ...archived.schedule,
+      archivedIds: archived.archivedIds,
+      cancelledTaskIds: archived.cancelledTaskIds,
+      abortedRunSessionIds: archived.abortedRunSessionIds,
+    })
+  }
+
+  const sessions = loadSessions()
+  const agents = loadAgents()
+  const sessionCwd = typeof current.createdInSessionId === 'string'
+    ? sessions[current.createdInSessionId]?.cwd
+    : null
+  const prepared = prepareScheduleUpdate({
+    id,
+    current,
+    patch: body,
+    schedules,
+    now: Date.now(),
+    cwd: sessionCwd || WORKSPACE_DIR,
+    agentExists: (agentId) => Boolean(agents[agentId]),
+    propagateEquivalentStatuses: true,
+    propagationSource: current as unknown as Record<string, unknown>,
+    historyActor: { actor: 'user' },
+  })
+  if (!prepared.ok) {
+    return serviceFail(400, errorMessage(prepared.error))
+  }
+  upsertSchedules(prepared.entries)
+  logActivity({
+    entityType: 'schedule',
+    entityId: id,
+    action: 'updated',
+    actor: 'user',
+    summary: `Schedule updated: "${prepared.schedule.name}"`,
+    detail: prepared.affectedScheduleIds.length > 1 ? { affectedScheduleIds: prepared.affectedScheduleIds } : undefined,
+  })
+  notify('schedules')
+  return serviceOk(
+    prepared.affectedScheduleIds.length > 1
+      ? { ...prepared.schedule, affectedScheduleIds: prepared.affectedScheduleIds }
+      : prepared.schedule,
+  )
+}
+
+export function deleteScheduleFromRoute(id: string, purge: boolean): ServiceResult<Record<string, unknown>> {
+  const current = loadSchedule(id)
+  if (!current) return serviceFail(404, 'Schedule not found')
+  if (purge) {
+    const purged = purgeArchivedScheduleCluster(id, {
+      actor: { actor: 'user' },
+    })
+    if (!purged.ok) {
+      return serviceFail(409, 'Only archived schedules can be purged.')
+    }
+    return serviceOk({ ok: true, purgedIds: purged.purgedIds })
+  }
+  const archived = archiveScheduleCluster(id, {
+    actor: { actor: 'user' },
+  })
+  if (!archived.ok || !archived.schedule) {
+    return serviceFail(500, 'Failed to archive schedule.')
+  }
+  return serviceOk({
+    ok: true,
+    archivedIds: archived.archivedIds,
+    cancelledTaskIds: archived.cancelledTaskIds,
+    removedQueuedTaskIds: archived.removedQueuedTaskIds,
+    abortedRunSessionIds: archived.abortedRunSessionIds,
+    schedule: archived.schedule,
+  })
+}
+
+export function runScheduleNow(id: string): ServiceResult<Record<string, unknown>> {
+  const schedule = loadSchedule(id) as Schedule | null
+  if (!schedule) return serviceFail(404, 'Schedule not found')
+  if (schedule.status === 'archived') {
+    return serviceFail(409, 'Archived schedules must be restored before they can run.')
+  }
+
+  const agents = loadAgents()
+  const agent = agents[schedule.agentId]
+  if (!agent) return serviceFail(400, 'Agent not found')
+  if (isAgentDisabled(agent)) {
+    return serviceFail(409, buildAgentDisabledMessage(agent, 'run schedules'))
+  }
+
+  const tasks = loadTasks()
+  const scheduleSignature = getScheduleSignatureKey(schedule)
+  if (scheduleSignature) {
+    const inFlight = Object.values(tasks as Record<string, InFlightTask>).some((task) =>
+      task
+      && (task.status === 'queued' || task.status === 'running')
+      && task.sourceScheduleKey === scheduleSignature
+    )
+    if (inFlight) {
+      return serviceOk({ ok: true, queued: false, reason: 'in_flight' })
+    }
+  }
+
+  const now = Date.now()
+  schedule.runNumber = (schedule.runNumber || 0) + 1
+  const { taskId } = prepareScheduledTaskRun({
+    schedule,
+    tasks,
+    now,
+    scheduleSignature,
+  })
+  saveTask(taskId, tasks[taskId])
+  enqueueTask(taskId)
+  pushMainLoopEventToMainSessions({
+    type: 'schedule_fired',
+    text: `Schedule fired manually: "${schedule.name}" (${schedule.id}) run #${schedule.runNumber} — task ${taskId}`,
+  })
+  schedule.lastRunAt = now
+  const scheduleWithHistory = appendScheduleHistoryEntry(schedule, {
+    now,
+    actor: 'user',
+    action: 'run_started',
+    summary: `Manual schedule run queued: "${schedule.name}"`,
+    metadata: { taskId, runNumber: schedule.runNumber || 0 },
+  })
+  upsertSchedule(schedule.id, scheduleWithHistory)
+  logActivity({
+    entityType: 'schedule',
+    entityId: schedule.id,
+    action: 'started',
+    actor: 'user',
+    summary: `Schedule run started: "${schedule.name}"`,
+    detail: { taskId, runNumber: schedule.runNumber },
+  })
+
+  return serviceOk({ ok: true, queued: true, taskId, runNumber: schedule.runNumber })
+}

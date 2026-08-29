@@ -1,0 +1,55 @@
+import assert from 'node:assert/strict'
+import { describe, it } from 'node:test'
+import { getExtensionManager } from './extensions'
+import { getEnabledToolPlanningView, getToolsForCapability, TOOL_CAPABILITY } from './tool-planning'
+
+let seq = 0
+
+function uniqueExtensionId(prefix: string): string {
+  seq += 1
+  return `${prefix}_${Date.now()}_${seq}`
+}
+
+describe('tool-planning', () => {
+  it('collects core planning metadata for aliased built-in tools', () => {
+    const view = getEnabledToolPlanningView(['web_search', 'web_fetch', 'web_extract', 'web_crawl', 'browser', 'manage_connectors'])
+
+    assert.deepEqual(view.displayToolIds, ['browser', 'manage_connectors', 'web'])
+    assert.deepEqual(getToolsForCapability(['web_search'], TOOL_CAPABILITY.researchSearch), ['web_search'])
+    assert.deepEqual(getToolsForCapability(['web_crawl'], TOOL_CAPABILITY.researchCrawl), ['web_crawl'])
+    assert.deepEqual(getToolsForCapability(['manage_connectors'], TOOL_CAPABILITY.deliveryVoiceNote), ['connector_message_tool'])
+  })
+
+  it('collects Google Workspace planning metadata through canonical and alias ids', () => {
+    const canonicalView = getEnabledToolPlanningView(['google_workspace'])
+    const aliasView = getEnabledToolPlanningView(['gws'])
+
+    assert.deepEqual(getToolsForCapability(['google_workspace'], 'workspace.google'), ['google_workspace'])
+    assert.deepEqual(getToolsForCapability(['gws'], 'workspace.google'), ['google_workspace'])
+    assert.deepEqual(canonicalView.displayToolIds, ['google_workspace'])
+    assert.deepEqual(aliasView.displayToolIds, ['google_workspace'])
+  })
+
+  it('collects planning metadata from custom extension tools', () => {
+    const extensionId = uniqueExtensionId('planner_extension')
+    getExtensionManager().registerBuiltin(extensionId, {
+      name: 'Planner Extension',
+      tools: [
+        {
+          name: 'custom_media_sender',
+          description: 'Send rendered media somewhere special.',
+          planning: {
+            capabilities: ['delivery.media', 'delivery.voice_note'],
+            disciplineGuidance: ['Use `custom_media_sender` for bespoke outbound media delivery.'],
+          },
+          parameters: { type: 'object', properties: {} },
+          execute: async () => 'ok',
+        },
+      ],
+    })
+
+    const view = getEnabledToolPlanningView([extensionId])
+    assert.deepEqual(getToolsForCapability([extensionId], TOOL_CAPABILITY.deliveryMedia), ['custom_media_sender'])
+    assert.equal(view.disciplineGuidance.includes('Use `custom_media_sender` for bespoke outbound media delivery.'), true)
+  })
+})

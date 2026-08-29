@@ -1,0 +1,167 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    # Multi-arch image builds compile native deps (better-sqlite3) and run the
+    # Next.js production build for linux/arm64 under QEMU emulation, which is far
+    # slower than the amd64-only build. Give the job headroom so the emulated
+    # arm64 stage is not cancelled mid-build.
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          registry-url: https://registry.npmjs.org
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Test
+        run: npm test
+
+      - name: Type-check
+        run: npm run type-check
+
+      - name: Build
+        run: npm run build:ci
+
+      - name: Sync package version with tag
+        id: package_version
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          CURRENT_VERSION="$(node -p "require('./package.json').version")"
+          if [ "$CURRENT_VERSION" != "$TAG_VERSION" ]; then
+            echo "Updating package version from ${CURRENT_VERSION} to ${TAG_VERSION}"
+            npm pkg set version="$TAG_VERSION"
+          fi
+
+          PUBLISHED_VERSION="$(node -p "require('./package.json').version")"
+          if [ "$PUBLISHED_VERSION" != "$TAG_VERSION" ]; then
+            echo "Failed to set package version to ${TAG_VERSION}; got ${PUBLISHED_VERSION}" >&2
+            exit 1
+          fi
+
+          echo "version=$TAG_VERSION" >> "$GITHUB_OUTPUT"
+
+      # npm publish runs BEFORE the disk-cleanup step which removes
+      # /opt/hostedtoolcache (and the Node 22 setup-node installation).
+      # The prepack script rebuilds the project via better-sqlite3's native
+      # addon, so Node 22 must still be on PATH.
+      - name: Check npm version availability
+        id: npm_version
+        run: |
+          VERSION="${{ steps.package_version.outputs.version }}"
+          if npm view "@swarmclawai/swarmclaw@${VERSION}" version >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Version ${VERSION} already exists on npm; publish step will be skipped."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish to npm
+        id: npm_publish
+        if: steps.npm_version.outputs.exists != 'true'
+        continue-on-error: true
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Summarize npm publish status
+        if: always()
+        run: |
+          if [ "${{ steps.npm_version.outputs.exists }}" = "true" ]; then
+            echo "npm publish skipped because @swarmclawai/swarmclaw@${{ steps.package_version.outputs.version }} already exists." >> "$GITHUB_STEP_SUMMARY"
+          elif [ "${{ steps.npm_publish.outcome }}" = "success" ]; then
+            echo "npm publish succeeded for @swarmclawai/swarmclaw@${{ steps.package_version.outputs.version }}." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "npm publish failed for @swarmclawai/swarmclaw@${{ steps.package_version.outputs.version }}. GitHub release creation will continue; rerun after restoring npm credentials or publish the version manually." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Set image name
+        id: image
+        run: |
+          echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /opt/hostedtoolcache /usr/local/lib/android /usr/share/dotnet /usr/local/share/powershell
+          docker system prune -af --volumes || true
+          df -h /
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image.outputs.name }}
+          tags: |
+            type=ref,event=tag
+            type=raw,value=latest
+            type=sha,prefix=sha-
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Prepare release body
+        id: release_body
+        if: success() && steps.package_version.outputs.version != '' && steps.image.outputs.name != ''
+        run: |
+          BODY_PATH="$(mktemp)"
+          if [ "${{ steps.npm_version.outputs.exists }}" = "true" ] || [ "${{ steps.npm_publish.outcome }}" = "success" ]; then
+            echo "## Install" >> "$BODY_PATH"
+            echo "- \`npm install -g @swarmclawai/swarmclaw@${{ steps.package_version.outputs.version }}\`" >> "$BODY_PATH"
+          else
+            echo "## Install" >> "$BODY_PATH"
+            echo "- npm package publish is pending for \`${{ github.ref_name }}\`; rerun this workflow after restoring npm credentials or publish the version manually." >> "$BODY_PATH"
+          fi
+          echo "## Docker" >> "$BODY_PATH"
+          echo "- \`docker pull ${{ steps.image.outputs.name }}:${{ github.ref_name }}\`" >> "$BODY_PATH"
+          echo "- \`docker pull ${{ steps.image.outputs.name }}:latest\`" >> "$BODY_PATH"
+          echo "## macOS desktop" >> "$BODY_PATH"
+          echo "- macOS builds publish both .dmg and .zip when Developer ID signing + notarization are configured. Until then, the desktop workflow publishes zip-only macOS artifacts to avoid the damaged unsigned DMG path. If Finder still reports a quarantined app, run \`xattr -dr com.apple.quarantine /Applications/SwarmClaw.app\` after installing, then open it again." >> "$BODY_PATH"
+          echo "path=$BODY_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        if: success() && steps.release_body.outputs.path != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
+          body_path: ${{ steps.release_body.outputs.path }}

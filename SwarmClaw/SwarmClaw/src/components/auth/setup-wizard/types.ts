@@ -1,0 +1,168 @@
+import type { GatewayProfile, ProviderCheckResult, ProviderId } from '@/types'
+import type { SetupProvider } from '@/lib/setup-defaults'
+
+export type SetupStep = 'profile' | 'path' | 'providers' | 'connect' | 'agents' | 'next' | 'done'
+export type CheckState = 'idle' | 'checking' | 'ok' | 'error'
+
+export type ProviderCheckResponse = ProviderCheckResult
+
+export interface SetupDoctorCheck {
+  id: string
+  label: string
+  status: 'pass' | 'warn' | 'fail'
+  detail: string
+  required?: boolean
+}
+
+export interface SetupDoctorResponse {
+  ok: boolean
+  summary: string
+  checks: SetupDoctorCheck[]
+  actions?: string[]
+}
+
+export interface SetupWizardProps {
+  onComplete: (destination?: string) => void
+}
+
+export interface ConfiguredProvider {
+  id: string
+  setupProvider: SetupProvider
+  provider: ProviderId
+  name: string
+  credentialId: string | null
+  endpoint: string | null
+  defaultModel: string
+  gatewayProfileId: string | null
+  notes?: string | null
+  tags?: string[]
+  deployment?: GatewayProfile['deployment'] | null
+  verified?: boolean
+  /** Pre-built dashboard URL (with token if available). Only set for OpenClaw. */
+  dashboardUrl?: string | null
+}
+
+export interface StarterDraftAgent {
+  id: string
+  templateId: string
+  name: string
+  description: string
+  systemPrompt: string
+  soul: string
+  providerConfigId: string | null
+  setupProvider: SetupProvider | null
+  provider: ProviderId | null
+  model: string
+  credentialId: string | null
+  apiEndpoint: string | null
+  gatewayProfileId: string | null
+  tools: string[]
+  capabilities: string[]
+  delegationEnabled: boolean
+  delegationTargetMode: 'all' | 'selected'
+  delegationTargetAgentIds: string[]
+  autoDraftSkillSuggestions: boolean
+  orchestratorEnabled: boolean
+  orchestratorMission: string
+  avatarSeed: string
+  avatarUrl: string | null
+  enabled: boolean
+}
+
+export interface CreatedAgentSummary {
+  id: string
+  name: string
+  provider: ProviderId
+  providerName: string
+}
+
+export const STEP_ORDER: SetupStep[] = ['profile', 'path', 'providers', 'agents']
+
+export const CONNECTOR_ICONS = [
+  { name: 'Discord', icon: 'D' },
+  { name: 'Slack', icon: 'S' },
+  { name: 'Telegram', icon: 'T' },
+  { name: 'WhatsApp', icon: 'W' },
+]
+
+export const OPENCLAW_USE_CASE_LABELS: Record<NonNullable<NonNullable<GatewayProfile['deployment']>['useCase']>, string> = {
+  'local-dev': 'Local Dev',
+  'single-vps': 'Single VPS',
+  'private-tailnet': 'Private Tailnet',
+  'browser-heavy': 'Browser Heavy',
+  'team-control': 'Team Control',
+}
+
+export const OPENCLAW_EXPOSURE_LABELS: Record<NonNullable<NonNullable<GatewayProfile['deployment']>['exposure']>, string> = {
+  'private-lan': 'Private LAN',
+  tailscale: 'Tailscale',
+  caddy: 'Caddy',
+  nginx: 'Nginx',
+  'ssh-tunnel': 'SSH Tunnel',
+}
+
+/** Shared props passed from facade to each step */
+export interface StepProvidersProps {
+  configuredProviders: ConfiguredProvider[]
+  configuredProviderIds: Set<SetupProvider>
+  error: string
+  canContinue: boolean
+  onBack: () => void
+  onSelectProvider: (provider: SetupProvider) => void
+  onRemoveProvider: (id: string) => void
+  onContinue: () => void
+  onSkip: () => void
+}
+
+export interface StepPathProps {
+  onboardingPath: import('@/lib/setup-defaults').OnboardingPath
+  starterKitId: string | null
+  intentText: string
+  onPathChange: (path: import('@/lib/setup-defaults').OnboardingPath) => void
+  onStarterKitChange: (starterKitId: string) => void
+  onIntentTextChange: (value: string) => void
+  onContinue: () => void
+  onBack: () => void
+  onSkip: () => void
+}
+
+export interface StepConnectProps {
+  provider: SetupProvider
+  selectedProvider: import('@/lib/setup-defaults').SetupProviderOption
+  initialLabel: string
+  editingProvider: ConfiguredProvider | null
+  configuredProviders: ConfiguredProvider[]
+  starterKitId: string | null
+  intentText: string
+  onSaveProvider: (provider: ConfiguredProvider) => void
+  onBack: () => void
+  onSkip: () => void
+}
+
+export interface StepAgentsProps {
+  draftAgents: StarterDraftAgent[]
+  configuredProviders: ConfiguredProvider[]
+  saving: boolean
+  error: string
+  onUpdateDraft: (id: string, patch: Partial<StarterDraftAgent>) => void
+  onUpdateDraftProvider: (id: string, providerConfigId: string) => void
+  onSaveAndContinue: () => void
+  onRemoveAgent: (id: string) => void
+  onBack: () => void
+  onSkip: () => void
+}
+
+export interface StepNextProps {
+  createdAgents: CreatedAgentSummary[]
+  onContinueToDashboard: () => void
+  onOpenFirstAgent: () => void
+  onOpenProtocols: () => void
+  onOpenBuilder: () => void
+  onOpenConnectors: () => void
+  onOpenUsage: () => void
+}
+
+export interface StepDoneProps {
+  createdAgents: CreatedAgentSummary[]
+  onComplete: () => void
+}

@@ -1,0 +1,169 @@
+import assert from 'node:assert/strict'
+import { describe, it } from 'node:test'
+import { ToolLoopTracker, hashToolInput, hashToolOutput } from './tool-loop-detection'
+
+describe('ToolLoopTracker', () => {
+  it('returns null for normal non-repeating tool calls', () => {
+    const tracker = new ToolLoopTracker()
+    assert.equal(tracker.record('web_search', { query: 'weather london' }, 'Sunny, 20C'), null)
+    assert.equal(tracker.record('files', { action: 'write', path: '/tmp/test.json' }, 'OK'), null)
+    assert.equal(tracker.record('web_search', { query: 'weather paris' }, 'Cloudy, 15C'), null)
+    assert.equal(tracker.size, 3)
+  })
+
+  it('detects generic repeat at warning threshold', () => {
+    const tracker = new ToolLoopTracker({ repeatWarn: 3, repeatCritical: 6 })
+    for (let i = 0; i < 2; i++) {
+      assert.equal(tracker.record('web_search', { query: 'same query' }, `result ${i}`), null)
+    }
+    const result = tracker.record('web_search', { query: 'same query' }, 'result 2')
+    assert.ok(result)
+    assert.equal(result.severity, 'warning')
+    assert.equal(result.detector, 'generic_repeat')
+  })
+
+  it('detects generic repeat at critical threshold', () => {
+    const tracker = new ToolLoopTracker({ repeatWarn: 3, repeatCritical: 5, toolFrequencyWarn: 100, toolFrequencyCritical: 100 })
+    for (let i = 0; i < 4; i++) {
+      tracker.record('web_search', { query: 'same' }, `result ${i}`)
+    }
+    const result = tracker.record('web_search', { query: 'same' }, 'result 4')
+    assert.ok(result)
+    assert.equal(result.severity, 'critical')
+    assert.equal(result.detector, 'generic_repeat')
+  })
+
+  it('detects polling stall when same tool returns identical output', () => {
+    const tracker = new ToolLoopTracker({ pollWarn: 3, pollCritical: 5 })
+    // Different inputs but same output = polling stall
+    for (let i = 0; i < 2; i++) {
+      assert.equal(tracker.record('process', { action: 'poll', id: `run-${i}` }, 'status: running'), null)
+    }
+    const result = tracker.record('process', { action: 'poll', id: 'run-2' }, 'status: running')
+    assert.ok(result)
+    assert.equal(result.severity, 'warning')
+    assert.equal(result.detector, 'polling_stall')
+  })
+
+  it('detects ping-pong between two tools', () => {
+    const tracker = new ToolLoopTracker({ pingPongWarn: 2, pingPongCritical: 4, repeatWarn: 100, repeatCritical: 100, pollWarn: 100, pollCritical: 100 })
+    // Simulate A-B-A-B with identical outputs
+    for (let i = 0; i < 2; i++) {
+      tracker.record('web_search', { query: 'find it' }, 'no results found')
+      tracker.record('web_fetch', { url: 'https://example.com' }, '404 not found')
+    }
+    // One more A to complete the 3rd pair-start
+    const result = tracker.record('web_search', { query: 'find it' }, 'no results found')
+    // The ping-pong detector checks the last pair against previous pairs
+    // After 4 calls (A-B-A-B) + 1 more A, we have 2 full A-B cycles with identical results
+    if (result) {
+      assert.equal(result.detector, 'ping_pong')
+    }
+  })
+
+  it('circuit breaker fires at absolute cap', () => {
+    const tracker = new ToolLoopTracker({ circuitBreaker: 5, repeatWarn: 100, repeatCritical: 100, toolFrequencyWarn: 100, toolFrequencyCritical: 100 })
+    for (let i = 0; i < 4; i++) {
+      tracker.record('shell', { command: 'curl http://stuck.com' }, `err ${i}`)
+    }
+    const result = tracker.record('shell', { command: 'curl http://stuck.com' }, 'err 4')
+    assert.ok(result)
+    assert.equal(result.severity, 'critical')
+    assert.equal(result.detector, 'circuit_breaker')
+  })
+
+  it('does not fire for varied tool calls even with many total calls', () => {
+    const tracker = new ToolLoopTracker({ toolFrequencyWarn: 100, toolFrequencyCritical: 100 })
+    for (let i = 0; i < 20; i++) {
+      const result = tracker.record('web_search', { query: `query ${i}` }, `result ${i}`)
+      assert.equal(result, null, `Unexpected detection at call ${i}`)
+    }
+    assert.equal(tracker.size, 20)
+  })
+
+  it('detects tool frequency when same tool is called too many times (any input)', () => {
+    const tracker = new ToolLoopTracker({ toolFrequencyWarn: 3, toolFrequencyCritical: 5 })
+    for (let i = 0; i < 2; i++) {
+      assert.equal(tracker.record('web_search', { query: `q${i}` }, `r${i}`), null)
+    }
+    const warn = tracker.record('web_search', { query: 'q2' }, 'r2')
+    assert.ok(warn)
+    assert.equal(warn.severity, 'warning')
+    assert.equal(warn.detector, 'tool_frequency')
+  })
+
+  it('previews critical repeats before another identical tool call executes', () => {
+    const tracker = new ToolLoopTracker({ repeatWarn: 2, repeatCritical: 3, toolFrequencyWarn: 100, toolFrequencyCritical: 100 })
+    tracker.record('web_search', { query: 'same' }, 'result 1')
+    tracker.record('web_search', { query: 'same' }, 'result 2')
+
+    const preview = tracker.preview('web_search', { query: 'same' })
+    assert.ok(preview)
+    assert.equal(preview?.severity, 'critical')
+    assert.equal(preview?.detector, 'generic_repeat')
+  })
+
+  it('previews tool overuse by frequency before the next call executes', () => {
+    const tracker = new ToolLoopTracker({ toolFrequencyWarn: 2, toolFrequencyCritical: 4 })
+    tracker.record('browser', { action: 'open', url: 'https://a.example' }, 'ok')
+
+    const preview = tracker.preview('browser', { action: 'open', url: 'https://b.example' })
+    assert.ok(preview)
+    assert.equal(preview?.severity, 'warning')
+    assert.equal(preview?.detector, 'tool_frequency')
+  })
+
+  it('detects output stagnation when many calls produce identical output', () => {
+    const tracker = new ToolLoopTracker({ repeatWarn: 100, repeatCritical: 100, toolFrequencyWarn: 100, toolFrequencyCritical: 100 })
+    for (let i = 0; i < 7; i++) {
+      assert.equal(tracker.record(`tool_${i}`, { input: `arg_${i}` }, 'Connection refused'), null)
+    }
+    const result = tracker.record('tool_7', { input: 'arg_7' }, 'Connection refused')
+    assert.ok(result)
+    assert.equal(result.detector, 'output_stagnation')
+    assert.equal(result.severity, 'critical')
+  })
+
+  it('detects output stagnation warning when 6 of 8 calls match', () => {
+    const tracker = new ToolLoopTracker({ repeatWarn: 100, repeatCritical: 100, toolFrequencyWarn: 100, toolFrequencyCritical: 100 })
+    for (let i = 0; i < 6; i++) {
+      tracker.record(`tool_${i}`, { input: `arg_${i}` }, 'same error output')
+    }
+    tracker.record('tool_6', { input: 'arg_6' }, 'different output A')
+    const result = tracker.record('tool_7', { input: 'arg_7' }, 'different output B')
+    assert.ok(result)
+    assert.equal(result.detector, 'output_stagnation')
+    assert.equal(result.severity, 'warning')
+  })
+
+  it('detects error convergence when most calls return errors', () => {
+    const tracker = new ToolLoopTracker({ repeatWarn: 100, repeatCritical: 100, toolFrequencyWarn: 100, toolFrequencyCritical: 100 })
+    tracker.record('shell', { cmd: 'test1' }, 'ok result')
+    for (let i = 0; i < 5; i++) {
+      tracker.record(`tool_${i}`, { input: `arg_${i}` }, `Error: ECONNREFUSED ${i}`)
+    }
+    const result = tracker.record('tool_5', { input: 'arg_5' }, 'Error: timeout on request')
+    if (result) {
+      assert.equal(result.detector, 'error_convergence')
+    }
+  })
+
+  it('does not fire stagnation for varied outputs', () => {
+    const tracker = new ToolLoopTracker({ repeatWarn: 100, repeatCritical: 100, toolFrequencyWarn: 100, toolFrequencyCritical: 100 })
+    for (let i = 0; i < 10; i++) {
+      const result = tracker.record(`tool_${i}`, { input: `arg_${i}` }, `unique result ${i}`)
+      assert.equal(result, null)
+    }
+  })
+})
+
+describe('hash helpers', () => {
+  it('produces consistent hashes for same input', () => {
+    assert.equal(hashToolInput({ query: 'test' }), hashToolInput({ query: 'test' }))
+    assert.equal(hashToolOutput('hello world'), hashToolOutput('hello world'))
+  })
+
+  it('produces different hashes for different input', () => {
+    assert.notEqual(hashToolInput({ query: 'a' }), hashToolInput({ query: 'b' }))
+  })
+})

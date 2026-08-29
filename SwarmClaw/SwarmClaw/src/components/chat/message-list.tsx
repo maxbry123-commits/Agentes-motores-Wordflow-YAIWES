@@ -1,0 +1,952 @@
+'use client'
+
+import { DEFAULT_HEARTBEAT_SHOW_ALERTS, DEFAULT_HEARTBEAT_SHOW_OK } from '@/lib/runtime/heartbeat-defaults'
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { useShallow } from 'zustand/react/shallow'
+import type { Message } from '@/types'
+import { useChatStore } from '@/stores/use-chat-store'
+import { useAppStore } from '@/stores/use-app-store'
+import { selectActiveSessionId } from '@/stores/slices/session-slice'
+import { api } from '@/lib/app/api-client'
+import { buildStreamingAwareMessageList } from '@/lib/chat/chat-streaming-state'
+import { dedupeMessagesForDisplay } from '@/lib/chat/chat-display'
+import { mergeQueuedTranscriptMessages } from '@/lib/chat/queued-message-queue'
+import { shouldShowDateSeparator } from '@/lib/chat/message-list-utils'
+import { errorMessage } from '@/lib/shared-utils'
+import { AgentAvatar } from '@/components/agents/agent-avatar'
+import { MessageBubble } from './message-bubble'
+import { ThinkingIndicator } from './thinking-indicator'
+import { SuggestionsBar } from './suggestions-bar'
+import { ExecApprovalCard } from './exec-approval-card'
+import { HeartbeatMoment, ActivityMoment, isNotableTool } from './activity-moment'
+import { useApprovalStore } from '@/stores/use-approval-store'
+import { useWs } from '@/hooks/use-ws'
+import { GatewayDisconnectOverlay, useGatewayStatus } from '@/components/settings/gateway-disconnect-overlay'
+
+const INTRO_GREETINGS = [
+  'What can I help you with?',
+  'Ready when you are.',
+  "Let's get started.",
+  'How can I assist you today?',
+  'What are we working on?',
+]
+
+function stableHash(str: string): number {
+  let hash = 0
+  for (let i = 0; i < str.length; i++) {
+    hash = ((hash << 5) - hash) + str.charCodeAt(i)
+    hash |= 0
+  }
+  return Math.abs(hash)
+}
+
+function dateSeparator(ts: number): string {
+  const d = new Date(ts)
+  const today = new Date()
+  const yesterday = new Date()
+  yesterday.setDate(today.getDate() - 1)
+  if (d.toDateString() === today.toDateString()) return 'Today'
+  if (d.toDateString() === yesterday.toDateString()) return 'Yesterday'
+  return d.toLocaleDateString([], { month: 'short', day: 'numeric' })
+}
+
+function getLatestAssistantToolMoment(messages: Message[]): { key: string; name: string; input: string } | null {
+  const last = messages[messages.length - 1]
+  if (!last || last.role !== 'assistant' || !last.toolEvents?.length) return null
+  const events = last.toolEvents
+  for (let i = events.length - 1; i >= 0; i--) {
+    if (isNotableTool(events[i].name)) {
+      return {
+        key: `${last.time}-${events[i].name}-${i}`,
+        name: events[i].name,
+        input: events[i].input || '',
+      }
+    }
+  }
+  return null
+}
+
+type ChatState = ReturnType<typeof useChatStore.getState>
+
+const selectHasLiveArtifacts = (s: ChatState) =>
+  s.displayText.length > 0 || s.toolEvents.length > 0 || s.thinkingText.length > 0
+
+interface LiveStreamBubbleProps {
+  message: Message
+  assistantName?: string
+  agentAvatarSeed?: string
+  agentAvatarUrl?: string | null
+  agentName?: string
+  cwd?: string
+  isLast?: boolean
+  onRetry?: () => void
+  messageIndex?: number
+  onToggleBookmark?: (index: number) => void
+  onEditResend?: (index: number, newText: string) => void
+  momentOverlay?: React.ReactNode
+}
+
+const LiveStreamBubble = memo(function LiveStreamBubble(props: LiveStreamBubbleProps) {
+  const liveStream = useChatStore(
+    useShallow((s) => ({
+      active: true as const,
+      phase: s.streamPhase,
+      toolName: s.streamToolName,
+      text: s.displayText,
+      thinking: s.thinkingText,
+      toolEvents: s.toolEvents,
+    })),
+  )
+
+  return <MessageBubble {...props} liveStream={liveStream} />
+})
+
+
+function useLastMessageMoment(messages: Message[], sessionId: string | null, agentId: string | null | undefined, streaming: boolean) {
+  type MomentType = { kind: 'heartbeat' } | { kind: 'tool'; key: string; name: string; input: string }
+  const [currentMoment, setCurrentMoment] = useState<MomentType | null>(null)
+
+  const heartbeatTopic = agentId ? `heartbeat:agent:${agentId}` : ''
+  useWs(heartbeatTopic, () => {
+    setCurrentMoment({ kind: 'heartbeat' })
+  })
+
+  const [trackedSessionId, setTrackedSessionId] = useState<string | null>(null)
+  const [trackedToolKey, setTrackedToolKey] = useState<string | null>(null)
+
+  // Render-time: respond to sessionId/messages changes (avoids set-state-in-effect)
+  if (sessionId !== trackedSessionId) {
+    setTrackedSessionId(sessionId)
+    const initialKey = sessionId
+      ? getLatestAssistantToolMoment(messages)?.key || null
+      : null
+    setTrackedToolKey(initialKey)
+    if (currentMoment !== null) setCurrentMoment(null)
+  } else if (sessionId) {
+    const moment = getLatestAssistantToolMoment(messages)
+    if (moment && moment.key !== trackedToolKey) {
+      setTrackedToolKey(moment.key)
+      setCurrentMoment({ kind: 'tool', key: moment.key, name: moment.name, input: moment.input })
+    }
+  }
+
+  const momentOverlay = useMemo(() => {
+    if (streaming || !currentMoment) return null
+    if (currentMoment.kind === 'heartbeat') {
+      return <HeartbeatMoment onDismiss={() => setCurrentMoment(null)} />
+    }
+    return (
+      <ActivityMoment
+        key={currentMoment.key}
+        toolName={currentMoment.name}
+        toolInput={currentMoment.input}
+        onDismiss={() => setCurrentMoment(null)}
+      />
+    )
+  }, [streaming, currentMoment])
+
+  return { currentMoment, momentOverlay }
+}
+
+interface LiveThinkingLaneProps {
+  show: boolean
+  assistantName?: string
+  agentAvatarSeed?: string
+  agentAvatarUrl?: string | null
+  agentName?: string
+}
+
+const LiveThinkingLane = memo(function LiveThinkingLane({
+  show,
+  assistantName,
+  agentAvatarSeed,
+  agentAvatarUrl,
+  agentName,
+}: LiveThinkingLaneProps) {
+  if (!show) return null
+
+  return (
+    <ThinkingIndicator
+      assistantName={assistantName}
+      agentAvatarSeed={agentAvatarSeed}
+      agentAvatarUrl={agentAvatarUrl}
+      agentName={agentName}
+    />
+  )
+})
+
+interface Props {
+  messages: Message[]
+  streaming: boolean
+  connectorFilter?: string | null
+  loading?: boolean
+}
+
+export function MessageList({ messages, streaming, connectorFilter = null, loading = false }: Props) {
+  const scrollRef = useRef<HTMLDivElement>(null)
+  const [showScrollToBottom, setShowScrollToBottom] = useState(false)
+  const settledCountRef = useRef(0)
+  const snapUntilRef = useRef(0)
+  const prevSessionIdRef = useRef<string | null>(null)
+  const assistantRenderId = useChatStore((s) => s.assistantRenderId)
+  const thinkingStartTime = useChatStore((s) => s.thinkingStartTime)
+  const hasLiveArtifacts = useChatStore(selectHasLiveArtifacts)
+  const messageStartIndex = useChatStore((s) => s.messageStartIndex)
+  const setMessages = useChatStore((s) => s.setMessages)
+  const queuedMessages = useChatStore((s) => s.queuedMessages)
+  const retryLastMessage = useChatStore((s) => s.retryLastMessage)
+  const editAndResend = useChatStore((s) => s.editAndResend)
+  const sendMessage = useChatStore((s) => s.sendMessage)
+  const hasMoreMessages = useChatStore((s) => s.hasMoreMessages)
+  const loadingMore = useChatStore((s) => s.loadingMore)
+  const totalMessages = useChatStore((s) => s.totalMessages)
+  const loadMoreMessages = useChatStore((s) => s.loadMoreMessages)
+  const session = useAppStore((s) => {
+    const id = selectActiveSessionId(s)
+    return id ? s.sessions[id] : null
+  })
+  const sessionId = session?.id ?? null
+  const agents = useAppStore((s) => s.agents)
+  const agent = session?.agentId ? agents[session.agentId] : null
+  const appSettings = useAppStore((s) => s.appSettings)
+  const assistantName = agent?.name
+    || (session?.provider === 'claude-cli' ? undefined : session?.model || session?.provider)
+    || undefined
+
+  const showOk = appSettings.heartbeatShowOk ?? DEFAULT_HEARTBEAT_SHOW_OK
+  const showAlerts = appSettings.heartbeatShowAlerts ?? DEFAULT_HEARTBEAT_SHOW_ALERTS
+
+  // Gateway disconnect overlay for openclaw agents
+  const isOpenClaw = agent?.provider === 'openclaw'
+  const gatewayStatus = useGatewayStatus()
+  const showGatewayOverlay = isOpenClaw && gatewayStatus === 'disconnected'
+
+  // Moment overlay for last assistant message (heartbeat or tool events)
+  const { momentOverlay: lastMomentOverlay } = useLastMessageMoment(messages, sessionId, agent?.id, streaming)
+
+  // Unread count tracking
+  const unreadRef = useRef(0)
+  const [unreadCount, setUnreadCount] = useState(0)
+  const prevMsgCountRef = useRef(messages.length)
+
+  // Bookmark filter
+  const [bookmarkFilter, setBookmarkFilter] = useState(false)
+
+  // Connector filtering is handled via connectorFilter prop from chat-area
+
+  // Use refs for callbacks so transcriptNodes memo doesn't bust on every messages change
+  const messagesCallbackRef = useRef(messages)
+  messagesCallbackRef.current = messages
+  const messageStartIndexRef = useRef(messageStartIndex)
+  messageStartIndexRef.current = messageStartIndex
+  const sessionIdRef = useRef(sessionId)
+  sessionIdRef.current = sessionId
+
+  const toggleBookmark = useCallback(async (absoluteIndex: number) => {
+    const sid = sessionIdRef.current
+    const msgs = messagesCallbackRef.current
+    const localIndex = absoluteIndex - messageStartIndexRef.current
+    if (!sid) return
+    const msg = msgs[localIndex]
+    if (!msg) return
+    const next = !msg.bookmarked
+    try {
+      await api('PUT', `/chats/${sid}/messages`, { messageIndex: absoluteIndex, bookmarked: next })
+      const updated = [...msgs]
+      updated[localIndex] = { ...updated[localIndex], bookmarked: next }
+      setMessages(updated)
+    } catch (err: unknown) {
+      console.error('Failed to toggle bookmark:', errorMessage(err))
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  const handleEditResend = useCallback(async (index: number, newText: string) => {
+    if (!sessionIdRef.current || !editAndResend) return
+    await editAndResend(index, newText)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // In-thread search
+  const [searchOpen, setSearchOpen] = useState(false)
+  const [searchQuery, setSearchQuery] = useState('')
+  const [searchIdx, setSearchIdx] = useState(0)
+  const searchInputRef = useRef<HTMLInputElement>(null)
+  const openSearch = useCallback(() => {
+    setSearchOpen(true)
+    setTimeout(() => searchInputRef.current?.focus(), 50)
+  }, [])
+
+  const isHeartbeatMessage = (msg: Message) =>
+    msg.role === 'assistant' && (msg.kind === 'heartbeat' || /^\s*HEARTBEAT_OK\b/i.test(msg.text || '') || /^\s*NO_MESSAGE\b/i.test(msg.text || ''))
+  const isHeartbeatOk = (msg: Message) =>
+    msg.suppressed === true || (msg.kind === 'heartbeat' && (/^\s*HEARTBEAT_OK\b/i.test(msg.text || '') || /^\s*NO_MESSAGE\b/i.test(msg.text || '')))
+
+  const baseDisplayedMessages = useMemo(() => {
+    const displayedMessages: Message[] = []
+    for (const msg of messages) {
+      const isHeartbeat = isHeartbeatMessage(msg)
+
+      if (isHeartbeat) {
+        if (!showAlerts) continue
+        if (!showOk && isHeartbeatOk(msg)) continue
+      }
+
+      const last = displayedMessages[displayedMessages.length - 1]
+      const lastIsHeartbeat = !!last && isHeartbeatMessage(last)
+      if (isHeartbeat && lastIsHeartbeat) {
+        displayedMessages[displayedMessages.length - 1] = msg
+      } else {
+        displayedMessages.push(msg)
+      }
+    }
+
+    return dedupeMessagesForDisplay(displayedMessages)
+  }, [messages, showAlerts, showOk])
+
+  const displayedMessages = useMemo(
+    () => mergeQueuedTranscriptMessages(baseDisplayedMessages, queuedMessages, sessionId),
+    [baseDisplayedMessages, queuedMessages, sessionId],
+  )
+
+  const latestPersistedStreamingMessage = useMemo(() => {
+    for (let i = displayedMessages.length - 1; i >= 0; i -= 1) {
+      const candidate = displayedMessages[i]
+      if (candidate.role === 'assistant' && candidate.streaming === true) {
+        return candidate
+      }
+    }
+    return null
+  }, [displayedMessages])
+
+  const currentRunHasCompletedAssistant = useMemo(
+    () => (
+      streaming
+      && thinkingStartTime > 0
+      && displayedMessages.some((message) => (
+        message.role === 'assistant'
+        && message.streaming !== true
+        && message.kind !== 'system'
+        && message.kind !== 'heartbeat'
+        && typeof message.time === 'number'
+        && message.time >= thinkingStartTime
+      ))
+    ),
+    [displayedMessages, streaming, thinkingStartTime],
+  )
+
+  const showLiveStreamRow = streaming
+    && !!assistantRenderId
+    && !currentRunHasCompletedAssistant
+    && (hasLiveArtifacts || !!latestPersistedStreamingMessage)
+
+  const streamingAwareMessages = useMemo(() => (
+    buildStreamingAwareMessageList(displayedMessages, {
+      localStreaming: streaming,
+      hasLiveArtifacts,
+      assistantRenderId,
+      showLiveRow: showLiveStreamRow,
+      syntheticAssistant: latestPersistedStreamingMessage,
+    })
+  ), [assistantRenderId, displayedMessages, hasLiveArtifacts, latestPersistedStreamingMessage, showLiveStreamRow, streaming])
+
+  const filteredMessages = useMemo(() => {
+    let nextMessages = bookmarkFilter
+      ? streamingAwareMessages.filter((msg) => msg.bookmarked)
+      : streamingAwareMessages
+    if (connectorFilter) {
+      nextMessages = nextMessages.filter((msg) => msg.source?.connectorId === connectorFilter)
+    }
+    return nextMessages
+  }, [bookmarkFilter, connectorFilter, streamingAwareMessages])
+
+  const hasVisiblePersistedStreamingMessage = useMemo(
+    () => filteredMessages.some((msg) => msg.role === 'assistant' && msg.streaming === true && msg.clientRenderId !== assistantRenderId),
+    [assistantRenderId, filteredMessages],
+  )
+
+  // Search matches
+  const searchMatches = useMemo(() => {
+    const normalizedQuery = searchQuery.trim().toLowerCase()
+    if (!normalizedQuery) return []
+    return filteredMessages
+      .map((msg, i) => ({ msg, i }))
+      .filter(({ msg }) => msg.text.toLowerCase().includes(normalizedQuery))
+  }, [filteredMessages, searchQuery])
+  const searchMatchSet = useMemo(() => new Set(searchMatches.map((match) => match.i)), [searchMatches])
+  const currentSearchMatchIndex = searchQuery ? (searchMatches[searchIdx]?.i ?? null) : null
+  const originalIndexMap = useMemo(() => {
+    const indexMap = new Map<Message, number>()
+    messages.forEach((msg, index) => {
+      indexMap.set(msg, messageStartIndex + index)
+    })
+    return indexMap
+  }, [messageStartIndex, messages])
+
+  const handleDeleteMessage = useCallback(async (absoluteIndex: number) => {
+    const sid = sessionIdRef.current
+    const msgs = messagesCallbackRef.current
+    const localIndex = absoluteIndex - messageStartIndexRef.current
+    if (!sid || absoluteIndex < 0 || localIndex < 0) return
+    try {
+      await api('DELETE', `/chats/${sid}/messages`, { messageIndex: absoluteIndex })
+      setMessages(
+        msgs.filter((_: Message, idx: number) => idx !== localIndex),
+        { totalMessages: Math.max(0, totalMessages - 1) },
+      )
+    } catch {
+      // best-effort
+    }
+  }, [setMessages, totalMessages])
+
+  // Snapshot the settled count at memo time so it's captured in the closure.
+  // Messages up to this count appear instantly; only new ones get entrance animations.
+  const settledSnapshot = settledCountRef.current
+
+  const transcriptNodes = useMemo(() => {
+    let lastAssistantIndex = -1
+    if (!streaming) {
+      for (let i = filteredMessages.length - 1; i >= 0; i--) {
+        if (filteredMessages[i].role === 'assistant') {
+          lastAssistantIndex = i
+          break
+        }
+      }
+    }
+
+    return filteredMessages.map((msg, i) => {
+      if (msg.kind === 'context-clear') {
+        const originalIndex = originalIndexMap.get(msg) ?? -1
+        return (
+          <div key={`ctx-clear-${msg.time}-${i}`} className="group/ctx flex items-center gap-4 py-3">
+            <div className="flex-1 h-px bg-amber-400/20" />
+            <span className="flex items-center gap-1.5 text-[10px] font-600 text-amber-400/60 uppercase tracking-[0.1em]">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" className="shrink-0">
+                <line x1="2" y1="12" x2="22" y2="12" />
+                <polyline points="8 8 4 12 8 16" />
+                <polyline points="16 8 20 12 16 16" />
+              </svg>
+              New context
+              {msg.time ? ` · ${new Date(msg.time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}` : ''}
+            </span>
+            {sessionId && originalIndex >= 0 && (
+              <button
+                type="button"
+                onClick={() => void handleDeleteMessage(originalIndex)}
+                className="opacity-0 group-hover/ctx:opacity-100 text-[10px] font-600 text-amber-400/60 hover:text-amber-400 bg-transparent border-none cursor-pointer transition-all px-1.5 py-0.5 rounded-[4px] hover:bg-amber-400/10"
+                title="Undo — restore full context"
+              >
+                Undo
+              </button>
+            )}
+            <div className="flex-1 h-px bg-amber-400/20" />
+          </div>
+        )
+      }
+
+      const originalIndex = originalIndexMap.get(msg) ?? -1
+      const isLiveStreamRow = streaming && !!assistantRenderId && msg.clientRenderId === assistantRenderId
+      const isLastAssistant = i === lastAssistantIndex
+      const isSearchMatch = !!searchQuery && searchMatchSet.has(i)
+      const isCurrentMatch = currentSearchMatchIndex === i
+      const prevMsg = i > 0 ? filteredMessages[i - 1] : null
+      const showDateSep = shouldShowDateSeparator(msg.time, prevMsg?.time)
+
+      // Only animate genuinely new messages (arrived after the batch load).
+      // Settled messages (loaded on session switch) appear instantly.
+      const isSettled = i < settledSnapshot
+      const animStyle = isSettled
+        ? undefined
+        : {
+            animation: `${msg.role === 'user' ? 'msg-in-right' : 'msg-in-left'} 0.4s var(--ease-spring) both`,
+            animationDelay: `${Math.min((i - settledSnapshot) * 0.05, 0.4)}s`,
+          }
+
+      const momentOverlay = isLastAssistant ? lastMomentOverlay : null
+
+      const BubbleComponent = isLiveStreamRow ? LiveStreamBubble : MessageBubble
+
+      return (
+        <div
+          key={msg.clientRenderId ? `${sessionId}-${msg.clientRenderId}-${i}` : `${sessionId}-${msg.role}-${originalIndex >= 0 ? originalIndex : i}`}
+          data-message-index={i}
+          style={animStyle}
+        >
+          {showDateSep && (
+            <div className="flex items-center gap-4 py-2 mb-2">
+              <div className="flex-1 h-px bg-white/[0.06]" />
+              <span className="text-[10px] font-600 text-text-3/50 uppercase tracking-[0.1em]">
+                {dateSeparator(msg.time)}
+              </span>
+              <div className="flex-1 h-px bg-white/[0.06]" />
+            </div>
+          )}
+          <div className={isCurrentMatch ? 'ring-1 ring-amber-400/50 rounded-[16px] bg-amber-400/[0.04]' : isSearchMatch ? 'bg-white/[0.02] rounded-[16px]' : ''}>
+            <BubbleComponent
+              message={msg}
+              assistantName={assistantName}
+              agentAvatarSeed={agent?.avatarSeed}
+              agentAvatarUrl={agent?.avatarUrl}
+              agentName={agent?.name}
+              cwd={session?.cwd}
+              isLast={isLastAssistant}
+              onRetry={isLastAssistant ? retryLastMessage : undefined}
+              messageIndex={originalIndex >= 0 ? originalIndex : undefined}
+              onToggleBookmark={toggleBookmark}
+              onEditResend={handleEditResend}
+              momentOverlay={momentOverlay}
+            />
+          </div>
+        </div>
+      )
+    })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    agent?.avatarSeed,
+    agent?.avatarUrl,
+    agent?.name,
+    assistantRenderId,
+    assistantName,
+    currentSearchMatchIndex,
+    filteredMessages,
+    lastMomentOverlay,
+    originalIndexMap,
+    retryLastMessage,
+    searchMatchSet,
+    searchQuery,
+    session?.cwd,
+    sessionId,
+    settledSnapshot,
+    streaming,
+  ])
+
+  // Track whether user is at/near bottom so we know whether to auto-scroll on new content
+  const wasAtBottomRef = useRef(true)
+
+  const isNearBottom = useCallback((el: HTMLDivElement) => {
+    return el.scrollHeight - el.scrollTop - el.clientHeight < 200
+  }, [])
+
+  const updateScrollState = useCallback(() => {
+    const el = scrollRef.current
+    if (!el) return
+    const nearBottom = isNearBottom(el)
+    wasAtBottomRef.current = nearBottom
+    setShowScrollToBottom(!nearBottom)
+    // Cancel snap window if user manually scrolls away
+    if (!nearBottom && Date.now() < snapUntilRef.current) {
+      snapUntilRef.current = 0
+    }
+    if (nearBottom && unreadRef.current > 0) {
+      unreadRef.current = 0
+      setUnreadCount(0)
+    }
+  }, [isNearBottom])
+
+  // Track unread messages arriving while scrolled up
+  useEffect(() => {
+    const newCount = messages.length - prevMsgCountRef.current
+    prevMsgCountRef.current = messages.length
+    if (newCount > 0 && scrollRef.current && !isNearBottom(scrollRef.current)) {
+      unreadRef.current += newCount
+      setUnreadCount(unreadRef.current)
+    }
+  }, [messages.length, isNearBottom])
+
+  // Detect session switch — set snap window and reset scroll state.
+  // Must fire before the scroll positioning layoutEffect below.
+  useLayoutEffect(() => {
+    if (sessionId !== prevSessionIdRef.current) {
+      prevSessionIdRef.current = sessionId
+      wasAtBottomRef.current = true
+      snapUntilRef.current = Date.now() + 2000
+      // Mark all messages as settled — new messages loaded for this session
+      // will also be settled (see below).
+      settledCountRef.current = 0
+    } else if (Date.now() < snapUntilRef.current) {
+      // Still in the snap window (messages just loaded for this session).
+      // Treat the new batch as settled so they appear without stagger.
+      settledCountRef.current = messages.length
+    }
+  }, [messages.length, sessionId])
+
+  // Position scroll before paint — no setState here to avoid cascading renders.
+  // The onScroll handler and the state-update effect below handle UI state.
+  useLayoutEffect(() => {
+    const el = scrollRef.current
+    if (!el || messages.length === 0) return
+
+    const snapping = Date.now() < snapUntilRef.current
+
+    if (snapping || wasAtBottomRef.current) {
+      el.scrollTop = el.scrollHeight
+      wasAtBottomRef.current = true
+    }
+  }, [hasLiveArtifacts, messages.length])
+
+  // Update scroll-related UI state after render (separate from layoutEffect to avoid cascading)
+  useEffect(() => {
+    const el = scrollRef.current
+    if (!el || messages.length === 0) return
+    updateScrollState()
+  }, [hasLiveArtifacts, messages.length, updateScrollState])
+
+  // Re-snap when content resizes during snap window (lazy images increasing scrollHeight)
+  useEffect(() => {
+    const el = scrollRef.current
+    if (!el) return
+    const content = el.firstElementChild as HTMLElement | null
+    if (!content) return
+
+    const observer = new ResizeObserver(() => {
+      if (Date.now() < snapUntilRef.current || wasAtBottomRef.current) {
+        el.scrollTop = el.scrollHeight
+      }
+    })
+    observer.observe(content)
+    return () => observer.disconnect()
+  }, [sessionId])
+
+  const handleScrollToBottom = useCallback(() => {
+    const el = scrollRef.current
+    if (!el) return
+    el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' })
+    setShowScrollToBottom(false)
+    unreadRef.current = 0
+    setUnreadCount(0)
+  }, [])
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    const handler = () => handleScrollToBottom()
+    window.addEventListener('swarmclaw:scroll-bottom', handler)
+    return () => window.removeEventListener('swarmclaw:scroll-bottom', handler)
+  }, [handleScrollToBottom])
+
+  // Scroll to a specific message by index (used by search)
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    const handler = (e: Event) => {
+      const idx = (e as CustomEvent).detail?.index
+      if (typeof idx !== 'number') return
+      const el = scrollRef.current?.querySelector(`[data-message-index="${idx}"]`) as HTMLElement | null
+      if (el) {
+        el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+        el.classList.add('bg-accent-bright/10')
+        setTimeout(() => el.classList.remove('bg-accent-bright/10'), 2000)
+      }
+    }
+    window.addEventListener('swarmclaw:scroll-to-message', handler)
+    return () => window.removeEventListener('swarmclaw:scroll-to-message', handler)
+  }, [])
+
+  useEffect(() => {
+    if (!searchQuery || !searchMatches.length) return
+    const currentMatch = searchMatches[searchIdx]
+    if (!currentMatch) return
+    const el = scrollRef.current?.querySelector(`[data-message-index="${currentMatch.i}"]`) as HTMLElement | null
+    if (!el) return
+    el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+  }, [searchIdx, searchMatches, searchQuery])
+
+  // Ctrl+F search toggle
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key === 'f') {
+        e.preventDefault()
+        setSearchOpen((v) => {
+          if (!v) setTimeout(() => searchInputRef.current?.focus(), 50)
+          else { setSearchQuery(''); setSearchIdx(0) }
+          return !v
+        })
+      }
+      if (e.key === 'Escape' && searchOpen) {
+        setSearchOpen(false)
+        setSearchQuery('')
+        setSearchIdx(0)
+      }
+    }
+    window.addEventListener('keydown', handler)
+    return () => window.removeEventListener('keydown', handler)
+  }, [searchOpen])
+
+  return (
+    <div className="relative flex-1 min-h-0 min-w-0 flex flex-col overflow-hidden isolate" data-testid="message-list">
+      <div className="shrink-0 px-4 md:px-12 lg:px-16 pt-3">
+        <div className="flex flex-wrap items-center gap-2 rounded-[14px] border border-white/[0.06] bg-surface/55 px-3 py-2 backdrop-blur-sm">
+          <button
+            type="button"
+            onClick={() => {
+              if (searchOpen) {
+                setSearchOpen(false)
+                setSearchQuery('')
+                setSearchIdx(0)
+              } else {
+                openSearch()
+              }
+            }}
+            className={`inline-flex items-center gap-1.5 rounded-[9px] border px-2.5 py-1.5 text-[11px] font-600 transition-colors cursor-pointer ${
+              searchOpen
+                ? 'border-accent-bright/25 bg-accent-soft/60 text-accent-bright'
+                : 'border-white/[0.06] bg-white/[0.03] text-text-3 hover:text-text-2 hover:bg-white/[0.06]'
+            }`}
+          >
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+              <circle cx="11" cy="11" r="8" />
+              <line x1="21" y1="21" x2="16.65" y2="16.65" />
+            </svg>
+            Find
+            <span className="hidden sm:inline text-text-3/50">Cmd/Ctrl+F</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => setBookmarkFilter((v) => !v)}
+            className={`inline-flex items-center gap-1.5 rounded-[9px] border px-2.5 py-1.5 text-[11px] font-600 transition-colors cursor-pointer ${
+              bookmarkFilter
+                ? 'border-amber-400/25 bg-amber-500/10 text-amber-300'
+                : 'border-white/[0.06] bg-white/[0.03] text-text-3 hover:text-text-2 hover:bg-white/[0.06]'
+            }`}
+          >
+            <svg width="12" height="12" viewBox="0 0 24 24" fill={bookmarkFilter ? 'currentColor' : 'none'} stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+              <path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z" />
+            </svg>
+            {bookmarkFilter ? 'Bookmarked' : 'Bookmarks'}
+          </button>
+          {(searchQuery || bookmarkFilter) && (
+            <button
+              type="button"
+              onClick={() => {
+                setSearchOpen(false)
+                setSearchQuery('')
+                setSearchIdx(0)
+                setBookmarkFilter(false)
+              }}
+              className="inline-flex items-center gap-1.5 rounded-[9px] border border-white/[0.06] bg-transparent px-2.5 py-1.5 text-[11px] font-600 text-text-3 hover:text-text-2 hover:bg-white/[0.04] cursor-pointer transition-colors"
+            >
+              Reset filters
+            </button>
+          )}
+          <div className="ml-auto flex items-center gap-2 text-[11px] text-text-3/60">
+            {searchQuery ? (
+              <span className="tabular-nums">
+                {searchMatches.length > 0 ? `${searchIdx + 1}/${searchMatches.length}` : '0 results'}
+              </span>
+            ) : (
+              <span>{filteredMessages.length} message{filteredMessages.length === 1 ? '' : 's'}</span>
+            )}
+            {loading && (
+              <span className="inline-flex items-center gap-1.5 rounded-full bg-white/[0.04] px-2 py-1 text-text-3/70">
+                <span className="w-2 h-2 rounded-full bg-accent-bright animate-pulse" />
+                Loading thread
+              </span>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* In-thread search bar */}
+      {searchOpen && (
+        <div className="shrink-0 z-20 flex items-center gap-2 px-4 md:px-12 lg:px-16 py-2 bg-surface/95 backdrop-blur-sm border-b border-white/[0.06]">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" className="text-text-3 shrink-0">
+            <circle cx="11" cy="11" r="8" />
+            <line x1="21" y1="21" x2="16.65" y2="16.65" />
+          </svg>
+          <input
+            ref={searchInputRef}
+            type="text"
+            value={searchQuery}
+            onChange={(e) => { setSearchQuery(e.target.value); setSearchIdx(0) }}
+            placeholder="Search in conversation..."
+            aria-label="Search messages"
+            className="flex-1 bg-transparent text-text text-[13px] outline-none placeholder:text-text-3/50"
+            style={{ fontFamily: 'inherit' }}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') {
+                e.preventDefault()
+                if (e.shiftKey) setSearchIdx((v) => Math.max(0, v - 1))
+                else setSearchIdx((v) => Math.min(searchMatches.length - 1, v + 1))
+              }
+            }}
+          />
+          {searchQuery && (
+            <span className="text-[11px] text-text-3 tabular-nums shrink-0">
+              {searchMatches.length > 0 ? `${searchIdx + 1}/${searchMatches.length}` : '0 results'}
+            </span>
+          )}
+          <button
+            onClick={() => setSearchIdx((v) => Math.max(0, v - 1))}
+            disabled={!searchMatches.length}
+            aria-label="Previous match"
+            className="p-1 rounded-[6px] text-text-3 hover:text-text-2 hover:bg-white/[0.04] disabled:opacity-30 cursor-pointer border-none bg-transparent transition-colors"
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="m18 15-6-6-6 6" /></svg>
+          </button>
+          <button
+            onClick={() => setSearchIdx((v) => Math.min(searchMatches.length - 1, v + 1))}
+            disabled={!searchMatches.length}
+            aria-label="Next match"
+            className="p-1 rounded-[6px] text-text-3 hover:text-text-2 hover:bg-white/[0.04] disabled:opacity-30 cursor-pointer border-none bg-transparent transition-colors"
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="m6 9 6 6 6-6" /></svg>
+          </button>
+          <button
+            onClick={() => setBookmarkFilter((v) => !v)}
+            aria-label={bookmarkFilter ? 'Show all messages' : 'Show bookmarked only'}
+            className={`p-1 rounded-[6px] hover:bg-white/[0.04] cursor-pointer border-none bg-transparent transition-colors ${bookmarkFilter ? 'text-amber-500' : 'text-text-3 hover:text-text-2'}`}
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill={bookmarkFilter ? 'currentColor' : 'none'} stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+              <path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z" />
+            </svg>
+          </button>
+          <button
+            onClick={() => { setSearchOpen(false); setSearchQuery(''); setSearchIdx(0) }}
+            aria-label="Close search"
+            className="p-1 rounded-[6px] text-text-3 hover:text-text-2 hover:bg-white/[0.04] cursor-pointer border-none bg-transparent transition-colors"
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg>
+          </button>
+        </div>
+      )}
+
+      <div
+        ref={scrollRef}
+        onScroll={updateScrollState}
+        role="log"
+        aria-label="Conversation transcript"
+        data-testid="chat-thread"
+        className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden px-4 md:px-12 lg:px-16 pt-4 pb-[120px] md:pb-10 fade-up"
+      >
+        <div className="flex flex-col gap-6 relative">
+          {/* Chat spine — vertical line for assistant messages */}
+          <div className="absolute left-[15px] top-0 bottom-0 w-px bg-white/[0.06] pointer-events-none" />
+          {hasMoreMessages && (
+            <div className="flex justify-center py-3">
+              <button
+                onClick={async () => {
+                  const el = scrollRef.current
+                  const prevHeight = el?.scrollHeight ?? 0
+                  await loadMoreMessages()
+                  // Preserve scroll position after prepending
+                  if (el) {
+                    requestAnimationFrame(() => {
+                      el.scrollTop += el.scrollHeight - prevHeight
+                    })
+                  }
+                }}
+                disabled={loadingMore}
+                className="inline-flex items-center gap-2 px-4 py-1.5 rounded-full border border-white/[0.08] bg-surface/80 text-text-3 text-[12px] font-600 hover:bg-surface-2 hover:text-text-2 transition-colors cursor-pointer disabled:opacity-50"
+              >
+                {loadingMore ? (
+                  <>
+                    <span className="w-3 h-3 rounded-full border-2 border-text-3/30 border-t-text-2 animate-spin" />
+                    Loading...
+                  </>
+                ) : (
+                  <>
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round">
+                      <path d="M12 19V5" />
+                      <path d="m5 12 7-7 7 7" />
+                    </svg>
+                    Load earlier messages
+                    <span className="text-text-3/50">({totalMessages - messages.length} more)</span>
+                  </>
+                )}
+              </button>
+            </div>
+          )}
+          {filteredMessages.length === 0 && !streaming && (
+            searchQuery.trim() || bookmarkFilter || connectorFilter ? (
+              <div className="flex flex-col items-center justify-center gap-3 py-20 text-center">
+                <div className="w-12 h-12 rounded-full bg-white/[0.04] border border-white/[0.06] flex items-center justify-center">
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" className="text-text-3/70">
+                    <circle cx="11" cy="11" r="8" />
+                    <line x1="21" y1="21" x2="16.65" y2="16.65" />
+                  </svg>
+                </div>
+                <span className="font-display text-[16px] font-600 text-text-2">
+                  {bookmarkFilter ? 'No bookmarked messages here' : 'No messages match these filters'}
+                </span>
+                <span className="text-[13px] text-text-3/60 max-w-[360px]">
+                  {searchQuery.trim()
+                    ? `Nothing in this thread matches "${searchQuery.trim()}".`
+                    : connectorFilter
+                      ? 'Try another source filter or reset the thread filters.'
+                      : 'Try another keyword or turn off bookmarks-only mode.'}
+                </span>
+                {(searchQuery.trim() || bookmarkFilter) && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSearchOpen(false)
+                      setSearchQuery('')
+                      setSearchIdx(0)
+                      setBookmarkFilter(false)
+                    }}
+                    className="rounded-[10px] border border-white/[0.06] bg-white/[0.03] px-3 py-2 text-[12px] font-600 text-text-2 hover:bg-white/[0.06] cursor-pointer transition-colors"
+                  >
+                    Clear thread filters
+                  </button>
+                )}
+              </div>
+            ) : (
+              <div className="flex flex-col items-center justify-center gap-3 py-20 text-center" style={{ animation: 'fadeUp 0.5s cubic-bezier(0.16, 1, 0.3, 1) both' }}>
+                <AgentAvatar seed={agent?.avatarSeed || null} avatarUrl={agent?.avatarUrl} name={agent?.name || 'Agent'} size={48} />
+                <span className="font-display text-[16px] font-600 text-text-2">{agent?.name || 'Assistant'}</span>
+                <span className="text-[14px] text-text-3/60">
+                  {INTRO_GREETINGS[stableHash(agent?.id || session?.id || '') % INTRO_GREETINGS.length]}
+                </span>
+              </div>
+            )
+          )}
+          {transcriptNodes}
+          <ApprovalCards agentId={agent?.id} />
+          <LiveThinkingLane
+            show={streaming && !showLiveStreamRow && !hasLiveArtifacts && !hasVisiblePersistedStreamingMessage}
+            assistantName={assistantName}
+            agentAvatarSeed={agent?.avatarSeed}
+            agentAvatarUrl={agent?.avatarUrl}
+            agentName={agent?.name}
+          />
+          {appSettings.suggestionsEnabled === true && !streaming && filteredMessages.length > 0 && filteredMessages[filteredMessages.length - 1]?.role === 'assistant' && (
+            <SuggestionsBar lastMessage={filteredMessages[filteredMessages.length - 1]} onSend={sendMessage} />
+          )}
+        </div>
+      </div>
+      {showGatewayOverlay && <GatewayDisconnectOverlay agentId={agent?.id || null} />}
+      {showScrollToBottom && (
+        <button
+          onClick={handleScrollToBottom}
+          className="absolute right-6 md:right-12 lg:right-16 bottom-5 inline-flex items-center gap-2 px-3 py-1.5 rounded-full border border-white/[0.08] bg-[#171a2b]/95 text-text-2 text-[12px] font-600 hover:bg-[#1e2238] transition-colors shadow-lg cursor-pointer"
+          title="Scroll to latest messages"
+        >
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round">
+            <path d="M12 5v14" />
+            <path d="m19 12-7 7-7-7" />
+          </svg>
+          Latest
+          {unreadCount > 0 && (
+            <span className="inline-flex items-center justify-center min-w-[18px] h-[18px] px-1 rounded-full bg-accent-bright text-white text-[10px] font-700">
+              {unreadCount}
+            </span>
+          )}
+        </button>
+      )}
+    </div>
+  )
+}
+
+function ApprovalCards({ agentId }: { agentId?: string | null }) {
+  const approvals = useApprovalStore((s) => s.approvals)
+
+  const cards = Object.values(approvals).filter((a) => !agentId || a.agentId === agentId)
+
+  if (!cards.length) return null
+
+  return (
+    <div className="flex flex-col gap-2">
+      {cards.map((a) => (
+        <ExecApprovalCard key={a.id} approval={a} />
+      ))}
+    </div>
+  )
+}
