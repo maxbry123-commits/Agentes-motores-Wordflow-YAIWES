@@ -68,3 +68,5 @@
 {"number": 68, "parts": 1, "slug": "Kimi-K3", "source": "https://github.com/MoonshotAI/Kimi-K3.git", "source_commit": "3cb39dfd32e51c3328e2e4b4af21341247d06c43", "status": "COMPLETE"}
 {"number": 69, "parts": 1, "slug": "GLM-5", "source": "https://github.com/zai-org/glm-5.git", "source_commit": "414ad9eb891b05b5d7d51d573939bfe9ce538223", "status": "COMPLETE"}
 {"number": 70, "parts": 1, "slug": "Qwen3.5", "source": "https://github.com/QwenLM/Qwen3.5.git", "source_commit": "2ea10dc725823bf7c3e21ce8557cbe15245132ae", "status": "COMPLETE"}
+{"number": 71, "parts": 32, "slug": "Hyundai-Physical-AI-Stack", "source": "https://github.com/boston-dynamics/spot-sdk.git", "source_commit": "8577b41dffe0eb7b2913c6599794c5c135c8574e", "status": "COMPLETE"}
+{"number": 72, "parts": 1, "slug": "Artificial-Agent-Lab", "source": "https://github.com/BY571/artificial-agent-lab.git", "source_commit": "a54e8aa990175d60025a85540aa9b89e9d8dbfc1", "status": "COMPLETE"}
