@@ -46,3 +46,5 @@
 {"number": 46, "parts": 1, "slug": "Kimi-CLI", "source": "https://github.com/MoonshotAI/kimi-cli.git", "source_commit": "cbc15c076d17f70fec9f89c90c0502e68657f505", "status": "COMPLETE"}
 {"number": 47, "parts": 1, "slug": "Mini-Agent", "source": "https://github.com/MiniMax-AI/Mini-Agent.git", "source_commit": "d76a4f6389688cabda39c224a6cdfa274215d47c", "status": "COMPLETE"}
 {"number": 48, "parts": 7, "slug": "Xiaomi-Miloco", "source": "https://github.com/XiaoMi/xiaomi-miloco.git", "source_commit": "e900529fe0203a4b6a0a5487987a633887cf7b7f", "status": "COMPLETE"}
+{"number": 49, "parts": 6, "slug": "Meta-OpenEnv", "source": "https://github.com/meta-pytorch/OpenEnv.git", "source_commit": "38b2a31354d1d4d627894412b9d469e92f4a2c61", "status": "COMPLETE"}
+{"number": 50, "parts": 1, "slug": "Kimi-K2.5", "source": "https://github.com/MoonshotAI/Kimi-K2.5.git", "source_commit": "c119f68d1a9a13f88f6a59b8e5e0840983b22689", "status": "COMPLETE"}
