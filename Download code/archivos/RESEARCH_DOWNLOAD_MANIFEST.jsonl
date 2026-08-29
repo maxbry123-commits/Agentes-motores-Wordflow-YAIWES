@@ -70,3 +70,9 @@
 {"number": 70, "parts": 1, "slug": "Qwen3.5", "source": "https://github.com/QwenLM/Qwen3.5.git", "source_commit": "2ea10dc725823bf7c3e21ce8557cbe15245132ae", "status": "COMPLETE"}
 {"number": 71, "parts": 32, "slug": "Hyundai-Physical-AI-Stack", "source": "https://github.com/boston-dynamics/spot-sdk.git", "source_commit": "8577b41dffe0eb7b2913c6599794c5c135c8574e", "status": "COMPLETE"}
 {"number": 72, "parts": 1, "slug": "Artificial-Agent-Lab", "source": "https://github.com/BY571/artificial-agent-lab.git", "source_commit": "a54e8aa990175d60025a85540aa9b89e9d8dbfc1", "status": "COMPLETE"}
+{"number": 73, "parts": 4, "slug": "Swarm-Agent", "source": "https://github.com/desplega-ai/agent-swarm.git", "source_commit": "348ac62bdfd2b8d06238675e1c1f33958f4b36d9", "status": "COMPLETE"}
+{"number": 74, "parts": 3, "slug": "Bernstein", "source": "https://github.com/sipyourdrink-ltd/bernstein.git", "source_commit": "55e00f614249f83946d4176d40b7b494d0d2446f", "status": "COMPLETE"}
+{"number": 75, "parts": 1, "slug": "Arena-of-Autonomous-Threads", "source": "https://github.com/rafaelmateo123/Arena-of-Autonomous-Threads.git", "source_commit": "52ef54f26785e9d61ea300c083051fa7af61741a", "status": "COMPLETE"}
+{"number": 76, "parts": 1, "slug": "OSS-Agent-Lab", "source": "https://github.com/jeremylongshore/oss-agent-lab.git", "source_commit": "c2e69d198746447f266bfe4fceae8b5b8c5938be", "status": "COMPLETE"}
+{"number": 77, "parts": 1, "slug": "Aiyu-Multi-Agent", "source": "https://github.com/teeprakorn1/aiyu-multi-agent.git", "source_commit": "c652b985bd6595b2f85a4d7f6832ed67bf7450a5", "status": "COMPLETE"}
+{"number": 78, "parts": 1, "slug": "OpenAlice", "source": "https://github.com/TraderAlice/OpenAlice.git", "source_commit": "9467a2593f631f7efeb6c2f601cc450605381d57", "status": "COMPLETE"}
