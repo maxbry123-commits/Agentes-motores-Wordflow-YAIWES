@@ -63,3 +63,8 @@
 {"number": 63, "parts": 2, "slug": "Kaji", "source": "https://github.com/apokamo/kaji.git", "source_commit": "9f85c86f9ae776956f7f4f65e7488d90034fbb98", "status": "COMPLETE"}
 {"number": 64, "parts": 1, "slug": "Prime-Agent", "source": "https://github.com/PrimeIntellect-ai/prime-agent.git", "source_commit": "5b6c0e94e11a97fcfdd7a9fc9dc4f7acbda9c853", "status": "COMPLETE"}
 {"number": 65, "parts": 2, "slug": "Grok-Build", "source": "https://github.com/xai-org/grok-build.git", "source_commit": "bc7f02eddd3d84085849dc19ed216f11c23b0571", "status": "COMPLETE"}
+{"number": 66, "parts": 18, "slug": "Qwen-UI-Agent", "source": "https://github.com/Tongyi-MAI/MAI-UI.git", "source_commit": "3deabf1d1fcf31964511929938b7c9485589b29c", "status": "COMPLETE"}
+{"number": 67, "parts": 1, "slug": "Codex-Security", "source": "https://github.com/openai/codex-security.git", "source_commit": "abe3a4fdb771347e9c98e23c443dec73c32b1f82", "status": "COMPLETE"}
+{"number": 68, "parts": 1, "slug": "Kimi-K3", "source": "https://github.com/MoonshotAI/Kimi-K3.git", "source_commit": "3cb39dfd32e51c3328e2e4b4af21341247d06c43", "status": "COMPLETE"}
+{"number": 69, "parts": 1, "slug": "GLM-5", "source": "https://github.com/zai-org/glm-5.git", "source_commit": "414ad9eb891b05b5d7d51d573939bfe9ce538223", "status": "COMPLETE"}
+{"number": 70, "parts": 1, "slug": "Qwen3.5", "source": "https://github.com/QwenLM/Qwen3.5.git", "source_commit": "2ea10dc725823bf7c3e21ce8557cbe15245132ae", "status": "COMPLETE"}
