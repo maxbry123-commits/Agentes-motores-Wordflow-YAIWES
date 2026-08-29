@@ -1,0 +1,25 @@
+skill: contrato-dag-sheriff
+version: "2.4"
+modelo:
+  - agentskills.io SKILL.md frontmatter
+  - skill-creator init+validate
+  - fail-closed policy eval errors
+  - loop max_i + retry per node
+  - stop-gate no PASS sin evidence
+origen_chat:
+  - input_block literal
+  - contrato v1 fail-closed
+  - DAG sheriff sentinel juez guardian
+  - 1 Ixx 1 nodo 3 refutes
+  - think16 goals12 council12 gout12
+  - F1-F10 operators16
+  - P1 GH/HF P2 skills OS P3 comunidad
+  - LOOP por nodo
+  - contrato 1 universal
+  - contrato 2 runtime escrito
+archivos:
+  SKILL.md: orquestacion
+  references/loop-engine.yml: bucle gaps
+  assets/CONTRATO-1.yml: activador limpio
+  references/TRAZABILIDAD.yml: este file
+url_repo: https://github.com/maxbry123-commits/Agentes-motores-Wordflow-YAIWES/blob/main/tarea%20en%20curso%20grock%20gpt%20skills/skills%20grock%20tarea%201/SKILL.md
