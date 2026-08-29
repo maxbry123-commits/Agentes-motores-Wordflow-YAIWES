@@ -60,3 +60,6 @@
 {"number": 60, "parts": 2, "slug": "ToolOrchestra", "source": "https://github.com/NVlabs/ToolOrchestra.git", "source_commit": "c1c0a4002be128b18accb267aac5ffdc26a28103", "status": "COMPLETE"}
 {"number": 61, "parts": 2, "slug": "Sovereign-OS", "source": "https://github.com/Justin0504/Sovereign-OS.git", "source_commit": "d273d4e89b432b8151a2b95e3ceffa745d4264a8", "status": "COMPLETE"}
 {"number": 62, "parts": 2, "slug": "Reyn", "source": "https://github.com/tya5/reyn.git", "source_commit": "543c9f8201e1d834fc04d240f2bb94828c3eb38a", "status": "COMPLETE"}
+{"number": 63, "parts": 2, "slug": "Kaji", "source": "https://github.com/apokamo/kaji.git", "source_commit": "9f85c86f9ae776956f7f4f65e7488d90034fbb98", "status": "COMPLETE"}
+{"number": 64, "parts": 1, "slug": "Prime-Agent", "source": "https://github.com/PrimeIntellect-ai/prime-agent.git", "source_commit": "5b6c0e94e11a97fcfdd7a9fc9dc4f7acbda9c853", "status": "COMPLETE"}
+{"number": 65, "parts": 2, "slug": "Grok-Build", "source": "https://github.com/xai-org/grok-build.git", "source_commit": "bc7f02eddd3d84085849dc19ed216f11c23b0571", "status": "COMPLETE"}
