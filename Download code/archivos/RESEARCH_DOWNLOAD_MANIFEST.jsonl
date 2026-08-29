@@ -76,3 +76,9 @@
 {"number": 76, "parts": 1, "slug": "OSS-Agent-Lab", "source": "https://github.com/jeremylongshore/oss-agent-lab.git", "source_commit": "c2e69d198746447f266bfe4fceae8b5b8c5938be", "status": "COMPLETE"}
 {"number": 77, "parts": 1, "slug": "Aiyu-Multi-Agent", "source": "https://github.com/teeprakorn1/aiyu-multi-agent.git", "source_commit": "c652b985bd6595b2f85a4d7f6832ed67bf7450a5", "status": "COMPLETE"}
 {"number": 78, "parts": 1, "slug": "OpenAlice", "source": "https://github.com/TraderAlice/OpenAlice.git", "source_commit": "9467a2593f631f7efeb6c2f601cc450605381d57", "status": "COMPLETE"}
+{"number": 79, "parts": 2, "slug": "Dr-Claw", "source": "https://github.com/OpenLAIR/dr-claw.git", "source_commit": "773f9034b1e87638b483f4f1186e910aeeecbd1a", "status": "COMPLETE"}
+{"number": 80, "parts": 1, "slug": "AgentSPEX", "source": "https://github.com/ScaleML/AgentSPEX.git", "source_commit": "db99b7b6802fe15ef2997c82ec1d49e5228128f6", "status": "COMPLETE"}
+{"number": 81, "parts": 5, "slug": "Agents-Universe", "source": "https://github.com/agentuniverse-ai/agentUniverse.git", "source_commit": "254ecd280f54c2d2de654bbe5373e9f947d2dedf", "status": "COMPLETE"}
+{"number": 82, "parts": 1, "slug": "Spice-Agent-Coding", "source": "https://github.com/spiceai/skills.git", "source_commit": "eba5641ceafca40a70ff791618fc4ec59fbe946c", "status": "COMPLETE"}
+{"number": 83, "parts": 1, "slug": "Jidoka", "source": "https://github.com/agentjido/jidoka.git", "source_commit": "e339996a52fc6f90cb4f67481cd4eb874f6b68d0", "status": "COMPLETE"}
+{"number": 84, "parts": 1, "slug": "Plugin-Marketplace", "source": "https://github.com/anthropics/claude-plugins-official.git", "source_commit": "ed404106fcd80ba98ecb7c851e531dcb626d13b7", "status": "COMPLETE"}
