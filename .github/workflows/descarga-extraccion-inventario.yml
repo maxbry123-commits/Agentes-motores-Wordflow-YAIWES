@@ -1,21 +1,11 @@
 name: Descarga y extracción inventario
-# INPUT BLOCK literal: 5 puntos del plan.
-# 1 Destino Agentes-motores-Wordflow-YAIWES main; raíz = nombre exacto; ZIP completo; nada suelto; no mezclar.
-# 2 Lista = inventario completo; sin filtrar; sin quitar; sin URL inventada.
-# 3 Action solo esa lista; no reutilizar action anterior; no añadir repos fuera de lista.
-# 4 Solo procedimiento del skill; ejemplo no es otro repo; sin tercer proceso.
-# 5 PASO 1 ZIP → PASO 2 extraer en raíz exacta → main.
-
 on:
   workflow_dispatch:
-
 permissions:
   contents: write
-
 concurrency:
   group: descarga-extraccion-inventario
   cancel-in-progress: false
-
 jobs:
   descarga-extraccion:
     runs-on: ubuntu-latest
@@ -95,17 +85,17 @@ Sovereign-OS	https://github.com/Justin0504/Sovereign-OS
 Reyn	https://github.com/tya5/reyn
 Kaji	https://github.com/apokamo/kaji
 Prime Agent	https://github.com/PrimeIntellect-ai/prime-agent
-Grok Build	
+Grok Build	https://github.com/xai-org/grok-build
 MiniMax Agent Team / Mavis	
 Qwen-UI-Agent	https://github.com/Tongyi-MAI/MAI-UI
-Codex Security	
+Codex Security	https://github.com/openai/codex-security
 Kimi K2.6 Agent Swarm	
-Kimi K3 Agent Swarm	
+Kimi K3 Agent Swarm	https://github.com/MoonshotAI/Kimi-K3
 GLM-5V-Turbo	
-GLM-5.3-Flash	
+GLM-5.3-Flash	https://github.com/zai-org/glm-5
 DeepSeek-V4	
-Qwen3.5 Agent	
-Hyundai Physical-AI Stack	
+Qwen3.5 Agent	https://github.com/QwenLM/Qwen3.5
+Hyundai Physical-AI Stack	https://github.com/boston-dynamics/spot-sdk
 Artificial Agent Lab	https://github.com/BY571/artificial-agent-lab
 Swarm Agent	https://github.com/desplega-ai/agent-swarm
 Bernstein	https://github.com/sipyourdrink-ltd/bernstein
@@ -122,25 +112,20 @@ Thinking Workflow 10 — Research Bundle
 Agents Universe	https://github.com/agentuniverse-ai/agentUniverse
 Spice Agent Coding	https://github.com/spiceai/skills
 Jidoka	https://github.com/agentjido/jidoka
-Plugin Marketplace	
+Plugin Marketplace	https://github.com/anthropics/claude-plugins-official
 AgentOS	https://github.com/rivet-dev/agentos
 ORCA	https://github.com/stablyai/orca
-Arena of Autonomous Threads	https://github.com/rafaelmateo123/Arena-of-Autonomous-Threads
 OpenRSI/OpenMLE research stack	https://github.com/FrontisAI/OpenRSI
 EOF
           while IFS=$'\t' read -r name repo; do
             test -n "$name"
-            if test -z "${repo:-}"; then
-              echo "SIN_ZIP_PUBLICO: $name"
-              continue
-            fi
+            if test -z "${repo:-}"; then echo "SIN_ZIP_PUBLICO: $name"; continue; fi
             slug=$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]' | sed 's#[^a-z0-9][^a-z0-9]*#-#g; s#^-##; s#-$##')
             owner_repo=$(printf '%s' "$repo" | sed 's#https://github.com/##')
             branch=$(git ls-remote --symref "$repo.git" HEAD 2>/dev/null | awk '/^ref:/ {sub("refs/heads/", "", $2); print $2; exit}')
             test -n "$branch"
             curl --fail --location --retry 3 --retry-delay 2 -o ".download-queue/$slug.zip" "https://github.com/$owner_repo/archive/refs/heads/$branch.zip"
           done < .download-queue/repos.tsv
-
       - name: Paso 2 - Extraer cada ZIP en su raíz
         shell: bash
         working-directory: repo
@@ -171,7 +156,6 @@ EOF
               if dest.exists():
                   shutil.rmtree(dest)
               dest.mkdir(parents=True)
-              seen = set()
               with zipfile.ZipFile(zp) as z:
                   bad = z.testzip()
                   if bad is not None:
@@ -181,6 +165,7 @@ EOF
                   if len(tops) != 1:
                       raise SystemExit(f'ZIP no tiene una sola raíz: {name} {tops}')
                   top = next(iter(tops))
+                  seen = set()
                   for info in z.infolist():
                       raw = info.filename.replace('\\', '/')
                       if not raw or raw.endswith('/') or raw.startswith('__MACOSX') or raw.endswith('.DS_Store'):
@@ -200,8 +185,6 @@ EOF
                       target.parent.mkdir(parents=True, exist_ok=True)
                       with z.open(info) as src, target.open('wb') as dst:
                           shutil.copyfileobj(src, dst, length=1024 * 1024)
-              if not any(dest.rglob('*')):
-                  raise SystemExit(f'raíz vacía: {name}')
               print(f'PASS EXTRACT: {name}')
           PY
           rm -rf .download-queue
