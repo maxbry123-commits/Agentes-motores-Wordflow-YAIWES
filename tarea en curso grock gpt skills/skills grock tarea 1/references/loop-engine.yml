@@ -1,0 +1,28 @@
+# LOOP por nodo. Fail-closed. No escala.
+
+max_i: 10
+no_escalate: true
+fail_closed_on_eval_error: true
+
+on_gap:
+  1_inventory: listar gaps del out.gaps
+  2_research: P1 github+hf; P2 skills/RAG OS; P3 SO/HN/discussions
+  3_methods10: escribir 10 vias nuevas o repetidas con evidencia
+  4_replay: BLOCK_i+1 usando methods10
+  5_sheriff: PASS|FAIL|LOOP
+  6_if_LOOP_and_i_lt_10: goto 1_inventory
+  7_if_i_eq_10: emit gaps; verdict=FAIL; no PASS
+  8_if_PASS: next nodo
+  9_if_FAIL: block next
+
+stop_loop:
+  - verdict==PASS
+  - i==10
+  - token_absent AND opcode_would_be_DISPATCH_RUN
+  - methods10_identical_3_veces
+
+retry:
+  max: 10
+  error_policy: deny
+
+same_as_prev_methods: LOOP_break_to_FAIL
