@@ -1,0 +1,1007 @@
+# Changelog
+
+All notable changes to `loop-engineer` are documented here.
+
+---
+
+## Errata
+
+- **2026-06-30 — receipts claim corrected (M1 credibility slice).** The 0.3.4
+  *Documentation* note below overstated `examples/coverage-repair`: it implied the
+  frozen example ships a receipts trail. In reality a live run appends receipts to
+  `.loop/receipts/*.jsonl`, but this example ships the contract artifacts only —
+  `find examples/coverage-repair -iname '*receipt*'` returns nothing. The example's
+  `WORKFLOW.md` and `README.md` are reworded to describe the mechanism; the 0.3.4
+  history is left intact.
+
+## 0.12.0 — 2026-07-30
+
+**A verdict you can hand to a signer (slice 4a of tamper-evident provenance).**
+The kernel gains `loop verdict <workspace>`: a pure projection of a finished
+run — doctor verdict, chain head, terminal outcome, and the chain-bound
+evidence digests that pass the strict verified-evidence bar — into one
+canonical `loop-engineer/verdict@1` predicate body (`schemas/verdict.schema.json`,
+normative in `reference/repo-os-contract.md` §23). Digests, enums, and issue
+codes only; `run_id` is the single operator-controlled string; the field set is
+an allowlist held by test. The kernel never signs, never builds an in-toto
+Statement, and never reads an environment variable — `scripts/test_verdict_purity.py`
+makes each boundary mechanical.
+
+The composite action gains an opt-in `attest` input (default false): it writes
+the predicate to the runner temp dir and hands it to `actions/attest` as
+`predicate-path`, alongside a *separate* `subject-path` — a file whose entire
+content is the chain head, exactly 64 lowercase hex bytes with no trailing
+newline, produced by the single definition `loop verdict --emit-subject`. The
+predicate bytes are deliberately **not** the subject (§23): `doctor.validation_mode`
+and `tool.version` live inside the predicate, so the same run projects different
+bytes in different environments. The step exposes `attestation-url`/`attestation-id`
+outputs; a legible permission
+precheck replaces the raw OIDC 403, and an empty chain head skips with a
+warning rather than shipping a malformed subject. `.github/workflows/attest.yml`
+mints a real attestation on every push to main over a workspace seeded through
+the runner's own dispatch + auto-terminal path, and fails loud if no
+attestation URL is produced or the observed head differs from the seeded one.
+
+What this does not buy: the signature attests context — repo, workflow,
+trigger, time — never correctness, so a signed verdict over a weakened gate is
+just a signed weakened gate. An agent with ordinary merge rights can loosen
+`loop/**`/`schemas/**`/`action.yml`/the workflow and then mint a perfectly
+genuine attestation for the result. ADR 0002 decision 6 named code-owner review
+on those paths as the control; that decision is **withdrawn, not pending**
+(ADR 0002, amendment 2026-07-30). This repository has one maintainer, GitHub
+forbids approving your own pull request, and the ruleset grants no bypass — so
+requiring code-owner review would leave maintainer-authored pull requests
+unmergeable while gating only the bot-authored ones, and agent work here lands
+under the maintainer's account. `.github/CODEOWNERS` records which paths are
+gate-defining; it is not a review requirement. What remains is legibility rather
+than prevention, and an unattested chain rewrite is detected at best one run late.
+
+**A verdict you can check (slice 4b of tamper-evident provenance).** Verification
+ships alongside emission, so this release describes one coherent state rather
+than half a mechanism.
+
+`loop verdict --compare <file|-> <workspace>` compares an attested predicate
+against the local projection over four facets — `run_id`, `chain.head`, the whole
+`terminal` object, and the verified-evidence digest set — exiting 0 on agreement,
+1 on disagreement and 2 on refusal. It accepts a **bare** predicate only: an
+in-toto Statement or a `gh --format json` envelope is refused by name with the
+documented jq path to unwrap. `signature_checked` is the literal `false` on every
+path and there is no flag to flip it — authenticity is `gh attestation verify`'s
+job, it runs first, and neither check implies the other. `doctor` and `tool` are
+deliberately not compared: both are environment-coupled, so comparing them would
+make an honest environment difference read as tampering.
+
+`loop doctor --expect-chain-ancestor <sha256>` (or `--anchor <path>`, resolving
+the digest from a tracked `loop-engineer/anchor@1` file) asks the answerable
+cross-run question — *was this digest ever my head?* — because
+`--expect-chain-head` is exact current-head equality and fails by construction
+once a store grows. Ancestry is established by **replay**, recomputing every hash,
+never by trusting the stored `event_hash` column: a tamperer who can rewrite the
+store can also insert a row bearing the anchored digest. `loop/attestation.py`
+adds a pure signer-trust policy over already-verified certificate claims that
+**refuses** when a claim it needs is absent, and `scripts/action_anchor_resolve.py`
+is the single `gh attestation verify` call site, fail-closed on anything it
+cannot confidently classify — including a real signer denial, whose exact stderr
+shape is pinned by a fixture captured from live `gh` rather than paraphrased.
+All of it is normative in `reference/repo-os-contract.md` §24.
+
+**Behavioral change:** the attested subject is now a head-bearing file, so the
+three attestations minted before slice 4b landed — the pushes through `c493804` —
+carry a different subject form: their subject digest *is* the chain head, with no
+retrievable bytes that hash to it. They remain valid records of what they were.
+
+What this does not buy, beyond the limits above: anchor trust is **exactly
+ordinary write access** to the anchor file — an actor who can edit it re-points it
+at a head they had attested. An attestation can corroborate a carried head but can
+never discover one, because GitHub exposes no endpoint that lists attestations
+without a subject digest. Attestations are deletable and no retention window is
+documented, so a missing one is a typed failure rather than a skip. And the
+independent-audit property holds for **public** repositories: a private repository
+signs against GitHub's own instance, which has no public transparency log.
+
+**Behavioral change: unknown flags are refused instead of ignored.** `loop
+<command> <target> --typo` used to exit 0 with the flag silently dropped — so one
+typo in `--expect-chain-ancestor` was a green tamper gate for a check that never
+ran, and `scaffold <target> --bogus x` wrote a contract past a flag it had
+ignored. The exit 2 an unknown *leading* flag produced was not a guard either: the
+flag name became the positional target and failed the target-exists check, so the
+protection disappeared the moment the flag moved after the path. Every command now
+refuses a residual dash-leading token with exit 2 and names the flag. The three
+per-flag `only valid for …` guards still fire ahead of it, so those messages are
+unchanged. A script passing a flag this CLI never supported will now fail where it
+previously passed quietly — which is the point.
+
+## 0.11.0 — 2026-07-26
+
+**Verifier identity, and evidence that is load-bearing.** Two slices of the
+tamper-evident-provenance program ship together, because neither was cut on its own.
+
+*Verifier identity and independence (PR #94).* evidence@1 records now carry
+`verified_by.code_digest` and `verified_by.policy_digest` — the runner hashes the
+verifier it actually executed and the goalpost it was held to. `loop doctor`
+reports `self_verified_evidence` when a record declares that its producer also
+verified it, making the independence rule of `reference/safety-and-approvals.md` §5
+a machine check rather than prose. Verify bundles record the visible/held-out
+criterion partition.
+
+*Evidence wiring (PR #102).* A verified dispatch binds its evidence digests into
+the hash chain at append time, using the existing `artifact_hashes` envelope field
+— no new event type and still one append per dispatch. The bundle is also written
+to a content-addressed object store whose location is derived from the digest, so
+a third-party reader finds the original bytes from `record["sha256"]` alone and a
+swapped bundle no longer destroys the evidence. `loop doctor` hash-verifies every
+discovered record, re-hashes what the chain bound, and compares a record's
+`policy_digest` against the live `TASKS.json` goalpost. Five new issue codes:
+`evidence_chain_mismatch`, `missing_bound_evidence`, `policy_digest_mismatch`,
+`unverified_evidence_terminal`, `bound_evidence_escape`.
+
+**Behavioural flag — `Succeeded` can now mean more.** The opt-in
+`completion_policy.mode: all_required_verified_evidence` requires every cited
+evidence entry to be a workspace-relative record that hash-verifies, **attests a
+pass**, is chain-bound wherever a store exists, and agrees with the live goalpost.
+The default `all_required` is unchanged and every record written before this
+release still validates. The canonical green-marker rule now lives in
+`loop.evidence.verify_bundle_is_green` and is shared object-for-object with
+`scripts/metrics.py`, so a bundle cannot read RED to the FCR gate and GREEN to the
+completion gate.
+
+**Known limitations, stated rather than discovered.** Binding makes tampering
+detectable against an anchor, not impossible: without `--expect-chain-head` a
+worker who can rewrite `.loop/` can rewrite the chain too, and a contract with no
+event store cannot chain-bind at all. Deleting `.loop/events.db` after a run leaves
+plain `loop doctor` quiet — the `missing_event_store` tripwire only fires on
+leftover `-wal`/`-shm` residue — so the external anchor is the control that holds.
+Four upgrade notes in `reference/repo-os-contract.md` §17 name the behaviour that
+can turn a previously-clean contract red: `policy_digest_mismatch` is not opt-in
+and has no first-class re-baseline affordance; the `completion_policy` enum
+widening is forward-incompatible as a hard error against an older kernel; `os.link`
+now runs once per dispatch; and a bound artifact above the 64 MiB read cap fails
+doctor with no configuration knob.
+
+## 0.10.0 — 2026-07-25
+
+**The hash-linked event chain.** Every `loop-engineer/event@1` row now carries
+`prev_event_hash` and `event_hash` — a sha256 over a canonical JSON preimage of
+the event's hashed fields, `prev_event_hash` among them. Canonical form is
+`json.dumps(sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+allow_nan=False)` encoded UTF-8, pinned normatively with conformance vectors in
+`reference/repo-os-contract.md` §16. The digest is computed **inside the store on
+append**, never supplied by a caller, and the deterministic reducer re-verifies
+each link as it folds: a spliced, reordered, or edited row raises
+`ChainBreakError` and stops the fold instead of projecting a plausible state.
+`loop.chain` is stdlib-only and imports no other module of this package, so
+`verify_chain()` re-verifies an exported event stream without the store code
+(#82).
+
+**Store generations and `loop migrate`.** A fresh store stamps `PRAGMA
+user_version = 2` and widens the `events` DDL with `event_hash TEXT NOT NULL`.
+`loop migrate` is the only store-upgrade path — explicit, idempotent, and
+non-rewriting: it adds the two columns and stamps `user_version = 2`, but never
+backfills hashes onto existing rows, because the append-only `BEFORE UPDATE`
+trigger forbids it. Pre-migration rows therefore stay an **unchained prefix**
+that doctor reports rather than elides, and the first post-migration append is a
+chain genesis.
+
+**Anchored doctor gate.** `loop doctor` gains an `event_store.chain` block
+(`head`, `unchained_prefix`) and a `--expect-chain-head SHA256` flag — also
+accepted by `validate` and `verify` — that fails the gate unless the store's head
+equals an externally remembered anchor. Four new issue codes: `event_chain_broken`
+(a link does not verify), `chain_anchor_mismatch` (the head differs from the
+supplied anchor, or an anchor was supplied with no readable store),
+`missing_event_store` (`events.db` is absent while SQLite sidecars remain — the
+store was deleted), and `chain_columns_missing` (the store still declares
+generation 2 with its chain columns gone — the lazy downgrade). The composite
+action publishes the observed head as a `chain-head` output on every run and
+optionally enforces one through an `expect-chain-head` input.
+
+**Integrity boundary.** The chain is **tamper-evident relative to an anchored
+head** — a detection property, not a prevention one, and scoped to the anchor.
+It detects splicing, reordering, an edit that does not recompute every downstream
+digest, and byte corruption of any hashed field; given an anchor it detects *any*
+divergence from the head that anchor names, including tail truncation, which is
+otherwise invisible because deleting trailing events leaves a shorter but
+internally valid chain. It does **not** detect a full in-workspace recompute, a
+chain-column downgrade that also resets `user_version`, deletion of the store when
+no sidecars remain and no anchor is supplied, well-formed lies (nothing in the
+chain judges whether a payload is true), or anything in a never-migrated prefix.
+And the window stays open at the head: "An anchor certifies the log only up to the
+anchored head. Everything appended after the last externally-read anchor —
+including a rewrite of the suffix — is unverified until the next anchor is read
+and remembered outside the workspace. The chain narrows the tampering window; it
+does not close it." `scripts/test_adversarial_chain.py` pins both sides — the
+attacks that are caught and four `PINNED LIMITATION` cases that are not. The full
+boundary, with the anchor's trust assumptions, is normative in
+`reference/repo-os-contract.md` §16.
+
+**Stricter reads.** `status`, `replay`, and `doctor` now **reject** a store
+containing any schema-invalid event, raising `invalid_event` instead of silently
+folding past it as they did in 0.9.0. Validation runs before the fold, so a tamper
+that also violates `event@1` surfaces as `invalid_event` rather than
+`event_chain_broken`.
+
+**Sidecars resolved.** Read verbs no longer leave `-wal`/`-shm` files beside a
+clean `.loop/events.db` — the 0.9.0 known limitation recorded below. #80 landed
+the first half, opening read-only connections with `immutable=1` when no WAL
+sidecar exists; this release completes it with a two-stage retry so that a lost
+`immutable=1` race against a live writer retries plainly as `mode=ro` before
+anything may be called corruption, the same read path in the runner, and a
+zero-carve-out tripwire proving every read verb leaves a clean store
+byte-identical on both store generations.
+
+**Compatibility, both directions.** Pre-0.10.0 *readers* can read a v2 store:
+their explicit ten-column `SELECT` is unaffected by the two added columns.
+Pre-0.10.0 *writers* must not append to a chained store. A fresh v0.10.0 store
+refuses such an append at the database, because `event_hash` is `NOT NULL`; a
+*migrated* store keeps its columns nullable, so the append succeeds and produces a
+permanent, unrepairable `event_chain_broken` — the row cannot be re-linked
+afterwards, since `UPDATE` is trigger-blocked. Pin your `loop-engineer` and action
+version per store.
+
+Test baseline: 1021 passed / 16 skipped with the `yaml`+`schemas` extras;
+951 / 86 in structural-fallback mode (PyYAML only). Both measured in a fresh
+worktree; a live checkout reads +2 passed / −2 skipped through two
+checked-when-present tests.
+
+## 0.9.0 — 2026-07-17
+
+**The event-sourced kernel.** The contract gains a durable runtime substrate:
+`loop-engineer/event@1` events in an append-only SQLite store
+(`.loop/events.db` — WAL, `synchronous=FULL`, no-update/no-delete triggers,
+`expected_sequence` compare-and-swap) folded by a deterministic reducer that
+enforces FSM legality, the all-required completion gate, and terminal
+immutability through the same `loop.fsm`/`loop.completion` modules the
+writers use (#62). Around it: a canonical intermediate-state FSM with
+unknown-state validation and writer timestamps (#59); `loop-engineer/plan@1`
+— a Loop Plan IR with a `plan-lint` verb and a typed capability vocabulary
+(#61); `loop-engineer/evidence@1` — hashed evidence objects with provenance,
+re-verifiable byte-for-byte (#63); administrative `terminal_superseded`
+events — the only event a terminated run admits, so a wrong terminal is
+corrected on the record instead of edited in place (#64); a run-control event
+vocabulary for approval, pause, and resume (#73); and explicit validation
+modes `--mode basic|strict|release` across the CLI (#60).
+
+**Runtime verbs.** `loop run` — event-sourced single-step dispatch with
+crash-safe resume (#71); read-only `loop status` and `loop replay` (#70);
+`loop simulate` — strictly read-only dry-run dispatch prediction (#75);
+`approve` / `pause` / `resume` / `cancel` (#74); a subprocess-isolated
+verifier runner — shlex argv, no shell, wall-clock cap, bounded output tail,
+typed failure classes — plus typed fail-loud stubs for the not-yet-shipped
+run modes (#72); `loop architect` as a typed fail-loud deferral (#76). And
+`loop doctor` now composes an event-store consistency gate over
+`status`/`replay` whenever `.loop/events.db` exists — one hard gate across
+the file layer and the event log (#77).
+
+**Completion-semantics hardening (Phase 0).** `Succeeded` now requires
+**all** required criteria satisfied plus evidence — the prior any-true
+reading was a correctness bug, fixed in one shared `loop/completion.py`
+wired into the writer API, the integrations projection, and the contract
+validator's G1 check. `terminal_state.json` is create-once (atomic;
+`force` always raises); iteration ids are canonical ints (legacy decimal
+strings stay read-compatible); `terminal@1` gains an additive
+`completion_policy` (#48).
+
+**Adversarial hardening.** A property-based kernel suite over FSM legality,
+G1 completion, supersession, and replay determinism (#65), and a
+process/security suite — real crash injection at code-controlled barriers,
+verifier tampering, workspace-escape TOCTOU (#66). The `verify_evidence()`
+symlink-swap TOCTOU that suite discovered (#67) is closed by fd-pinned
+open-then-verify (#69), retiring the strict xfail marker.
+
+**Scoreboard, funnel, housekeeping.** The ST5 harness scoreboard — 9 public
+harnesses read through a foreign-layout registry with 8 vendored fixtures
+(#41); contributor-funnel fixes — trigger-phrase disambiguation (#42),
+documentation-completeness labels on the self-eval (#43),
+`approval_requested`/`replanned` recognized as honest-red metrics tokens
+(#44), metrics-clean RUNLOG seeding (#45); Dependabot version updates and
+least-privilege workflow permissions (#46, #47).
+
+**Known limitation.** Read verbs over the event store leave SQLite
+`-wal`/`-shm` sidecars next to `.loop/events.db` (read-only connections
+recreate them and cannot checkpoint on close). Store content is never
+mutated, but tree-byte-identity checks over a store-backed workspace will
+notice them. *(Resolved in 0.10.0 — see "Sidecars resolved" above.)*
+
+Test baseline: 933 passed / 16 skipped with the `yaml`+`schemas` extras;
+864 / 85 in structural-fallback mode (PyYAML only).
+
+## 0.8.0 — 2026-07-09
+
+**ST3 — integration adapters.** `loop/integrations.py`: an engine-neutral,
+pure-stdlib projection (`EngineOutcome` + `to_terminal_state`) from any
+engine's "the run ended" signal onto the 7 typed terminal states, with the
+fixed precedence safety → human → blocked → budget → spec-gap → gate verdict.
+`Succeeded` is reachable only through a green `holdout_gate.decide` verdict,
+a clean anticheat sweep, a met criterion, and evidence; `false_completion` is
+copied from the gate, never synthesized; missing gate/anticheat input fails
+closed to `FailedUnverifiable`. The LangGraph recipe is upgraded in place to
+this bar (its run now scores clean under `loop metrics` — closing the
+recorded FCR-1.0 follow-up) and a Temporal recipe lands
+(`examples/temporal-certify/`, certify-activity pattern, cancellation →
+`AbortedByHuman`, retry exhaustion → `FailedBlocked`, timeout →
+`FailedBudget`). Both recipes pin the false-completion invariant
+(visible-green/holdout-red → `FailedUnverifiable` with
+`false_completion: true`, never `Succeeded`) and pass the doctor round-trip.
+
+**ST4 — contributor funnel.** `loop inspect` now recognizes a foreign
+Superpowers-style run dir read-only (`loop/foreign.py` — a layout mapper onto
+the existing `LoopPaths` seam; the M2/M3-hardened scorer is untouched and a
+foreign harness with no gate and no terminal record scores honestly low).
+The reading is checked in as `docs/gap-reports/superpowers.md` — the §14
+conformance checklist evaluated against a vendored, sanitized fixture
+(`examples/superpowers-run/`). A second runnable example lands:
+`examples/flaky-test-triage/` — doctor-clean, gate-backed, and the showcase
+for repair records (`loop metrics` derives a non-null repair-productivity of
+1.0 from its anchored red→green repair). Seven gate-backed starter issues are
+drafted under `docs/contributing/issues/` and filed at release;
+CONTRIBUTING gains the start-here funnel.
+
+## 0.7.0 — 2026-07-08
+
+**ST2 — the portable standard.** The on-disk contract is now a documented,
+versioned, tool-agnostic standard, not an implicit format one validator happens
+to enforce. `reference/repo-os-contract.md` is promoted to the normative spec:
+a stability note (§0 — `$id` majors of the form `loop-engineer/<artifact>@<major>`,
+strictly additive within a major, breaking changes ship as a new major side by
+side), an artifact/schema table across all 7 published schemas with required
+keys read verbatim from `schemas/*.schema.json` (§11), the lifecycle vocabulary
+and terminal-file-iff rule (§12), the repair-record vs rollout-record two-shape
+clarification (§13), and a conformance checklist (§14, items A1–E1) any harness
+can satisfy to claim it "emits a Loop-Engineer-conformant contract v1."
+
+### Added
+- **`doctor` lifecycle line** — `validate_contract` (and so `loop doctor`)
+  reports `lifecycle: planned | running | terminated:<State> | unknown`,
+  derived from `state.json` and the terminal file. Additive reporting only —
+  never an issue source — so an operator sees *why* no terminal file is
+  expected on an in-flight loop instead of being pushed to fabricate one.
+  DG-3 regression tests pin both directions in both validation modes: a
+  null-terminal loop without `terminal_state.json` is conformant; a non-null
+  `terminal_state` without the file still fails.
+- **Round-trip template regression** (`scripts/test_template_roundtrip.py`) —
+  every `templates/*` artifact, filled with schema-valid values, passes
+  `validate_contract` with zero issues in both validation modes, for both an
+  in-flight and a terminated scaffold. The DG-class template↔validator↔schema
+  drift cannot silently return.
+- **Runnable conformance checklist** (`scripts/test_conformance.py`) — executes
+  checklist items A1–E1 in CI against the flagship example
+  (`examples/coverage-repair`) and a fresh template scaffold, including
+  additive-key tolerance (D2) and lifecycle honesty (E1). A doc-parity test
+  pins every checklist ID to the normative doc so the checklist and its
+  documentation cannot drift apart.
+- **README "A versioned, conformance-checkable standard"** — a pointer
+  subsection linking the promoted normative doc.
+
+### Fixed (external-review patch set, PRs #27–#30)
+- **doctor evidence and surface fixes (#27)** — an empty-evidence `Succeeded`
+  now fails validation in both modes (G1 cross-check); ledger validation is
+  scoped to the canonical rollout/receipt files instead of force-validating
+  foreign `.loop/*.jsonl`, and fails closed on corrupt UTF-8; the fallback YAML
+  parser no longer strips `#` inside quoted strings; missing verify scripts and
+  dangling task file targets are surfaced as issues.
+- **atomic terminate (#28)** — `loop.emit.terminate` writes the terminal record
+  exactly once, atomically; a second call raises `EmitError` instead of
+  silently overwriting the loop's end record.
+- **strict-by-install gates (#29)** — the GitHub Action and the pre-commit hook
+  install the `[schemas]` extra so consumer repos gate in real JSON-Schema
+  mode, not the structural fallback; the Action's PR comment is sticky and its
+  score parsing robust.
+- **inspector scores execution evidence (#30)** — `loop inspect` credits
+  verification gates on execution evidence rather than keyword presence, so a
+  keyword-stuffed contract can no longer buy a "strong" scorecard while the
+  gate-backed flagship example keeps its score.
+
+**B1 — the writer API.** `loop.emit` lets a foreign runtime (LangGraph, a plain
+script, any orchestrator) record an evidence-backed loop contract without
+adopting the loop-engineer runtime. It is a writer, never a runtime: it renders
+the contract artifacts and refuses a dishonest `Succeeded` at write time — the
+same evidence cross-check `loop doctor` enforces, applied before the file exists.
+
+### Added
+- **`loop/emit.py` writer API** — `open_contract`, `append_iteration`,
+  `append_receipt`, and `terminate`, plus the `EmitError` raised when a write
+  would produce a dishonest or schema-invalid artifact. `terminate` refuses an
+  evidence-free `Succeeded` (also no-met-criterion or false-completion-flagged),
+  so the honesty gate runs at write time rather than only at validate time;
+  every artifact it writes passes `doctor` by construction.
+- **LangGraph recipe** (`examples/langgraph-emit/`) — a runnable three-node
+  graph whose terminal node ships proof-of-done through `loop.emit`; the emitted
+  contract passes `loop doctor` independently of the graph that wrote it. Paired
+  with the 10-line integration guide `docs/integrations/langgraph.md`.
+- **Recipe acceptance test** (`scripts/test_langgraph_recipe.py`) — runs the
+  example end-to-end and asserts the emitted contract passes `doctor` and ends
+  `Succeeded` with evidence. Env-guarded on `langgraph` (skips when absent), so
+  the package stays zero-dependency; a dedicated `recipe (langgraph)` CI job
+  installs LangGraph and runs it.
+
+**A1 — the Stop-hook firewall.** The false-completion wedge, enforced at the
+session boundary instead of only on demand. When a `.loop/` contract claims
+`Succeeded` while `loop doctor` still reports `ok:false`, the Stop hook blocks the
+turn from ending and hands the agent the named doctor issues, so a run cannot exit
+on a false "done". It is fail-open by construction — a broken or unresolvable
+firewall never locks a session — and a strict no-op for every repo without a
+`.loop/` contract.
+
+### Added
+- **`hooks/stop_firewall.py`** — a stdlib-only Stop hook that blocks a
+  `Succeeded`-claiming contract whose `loop doctor` report is `ok:false`, carrying
+  the issues into the block reason. Fails open on any error (malformed stdin,
+  unresolvable `loop` CLI, doctor failure), stays silent when no `.loop/` exists,
+  respects `stop_hook_active` to avoid livelock, and blocks at most once per
+  session per issue-set (a tempdir sentinel keyed on the issue digest). Covered by
+  `scripts/test_stop_firewall.py` (subprocess acceptance tests for the honest,
+  lying, in-flight, absent, once-per-session, and fail-open paths).
+- **Plugin-manifest registration** — the hook is wired into
+  `.claude-plugin/plugin.json` under the top-level `hooks.Stop` key
+  (`python3 ${CLAUDE_PLUGIN_ROOT}/hooks/stop_firewall.py`), so a marketplace
+  install gets the firewall with zero configuration.
+
+**C1 — the CI gate.** The proof-of-done gate at the two boundaries where a
+foreign repo already runs its checks: a GitHub Action for pull-request CI and a
+pre-commit hook for the local commit. Both wrap the same `loop doctor` honesty
+gate the runtime enforces, so a consumer adopts the wedge without adopting the
+loop-engineer runtime — and the repo dogfoods both on its own contract in CI.
+
+### Added
+- **Composite GitHub Action** (`action.yml`, id `loop-engineer gate`) — runs
+  `loop doctor` as a hard gate and `loop inspect` as a scorecard (warn-only until
+  `fail-under-score` is set), installing loop-engineer from PyPI (`version:`) or
+  from the action's own checkout by default. Writes the scorecard to the job
+  summary and, given a `github-token`, an optional PR comment. The `action-dogfood`
+  CI job runs it against the tracked flagship example contract
+  (`examples/coverage-repair`) at `fail-under-score: 90` — the repo root's live
+  `.loop/` is gitignored and absent in a fresh CI checkout.
+- **`.pre-commit-hooks.yaml`** — a `language: python` hook id `loop-doctor`
+  (`entry: loop doctor .`, `always_run`, `pass_filenames: false`) that a consumer
+  wires in with three lines of `.pre-commit-config.yaml`; PR1's self-contained
+  wheel is what makes the `language: python` install work from any consumer repo.
+- **Pre-commit acceptance test** (`scripts/test_precommit_hook.py`) — asserts the
+  hook definition is sound and its entry matches a declared console script, plus a
+  consumer-fixture path that scaffolds a fresh contract and runs the hook through
+  `pre-commit try-repo` end-to-end. Env-guarded on the `pre-commit` tool (skips
+  when absent); the `action-dogfood` CI job installs it and runs the fixture for
+  real on the PR checkout.
+
+**PR5 — Adopt in your stack.** The four on-ramps shipped above (uvx funnel,
+`loop.emit` writer, Stop-hook firewall, CI Action + pre-commit hook) get a single
+"Adopt in your stack" README section that funnels a reader from zero-install
+`uvx loop-engineer inspect .` through to full adoption, with a refreshed Install
+section. Every claim the section makes is gate-backed by a new test, so the docs
+can never advertise an on-ramp that does not exist.
+
+### Added
+- **README "Adopt in your stack" section + Install refresh** — a runtime-neutral
+  adoption path leading with `uvx loop-engineer inspect .` (zero install), then the
+  `loop.emit` writer for foreign runtimes, the Stop-hook firewall, and the CI
+  Action / pre-commit gate pinned at `SollanSystems/loop-engineer@v0.7.0` (a
+  forward-looking pin re-verified at the next release).
+- **show-hn launch draft leads with the uvx funnel** — the M5-LAUNCH Show HN draft
+  now opens its command sequence with `uvx loop-engineer inspect .`. The draft
+  lives under the gitignored `roadmap/` tree (a launch working file, absent in a
+  fresh checkout), so its gate is env-guarded.
+- **Docs-claims gate test** (`scripts/test_docs_adoption.py`) — asserts every
+  "Adopt in your stack" README claim is backed by a shipped, wired artifact: the
+  uvx funnel by the `loop-engineer` console script, the `loop.emit` claim by the
+  real writer functions + the LangGraph guide, the Stop-hook claim by the
+  registered hook file, and the CI Action claim by `action.yml` + the
+  `loop-doctor` pre-commit hook. The show-hn assertion skips when the gitignored
+  draft is absent (fresh CI checkouts), matching the repo's env-guarded-skip
+  pattern.
+
+## 0.6.1 — 2026-07-04
+
+**PyPI substrate.** `loop-engineer` becomes a self-contained wheel that runs from
+any directory — the CLI no longer depends on being executed from a source
+checkout — and ships to PyPI on a version tag through trusted publishing, with no
+token or secret stored in the repo.
+
+### Added
+- **Self-contained wheel** — the schemas, contract templates, and CLI-needed tool
+  scripts the loop reads at runtime are bundled into the wheel under
+  `loop/_bundle/` (via `[tool.hatch.build.targets.wheel.force-include]`) and
+  resolved through an `importlib.resources`-first resolver (`loop/_resources.py`)
+  that falls back to the repo-relative layout for editable installs / source
+  checkouts. `loop` invocations no longer break when run outside the repo tree.
+- **`loop-engineer` console script** — a second `[project.scripts]` entry point
+  alongside `loop` (both map to `loop.__main__:main`), so `uvx loop-engineer`
+  funnels straight to the CLI under the PyPI project name.
+- **Wheel self-containment acceptance test**
+  (`scripts/test_wheel_selfcontained.py`) — builds the wheel and asserts its zip
+  manifest carries the bundled `schemas/`, `templates/`, and `tools/` resources,
+  so a regression that drops a runtime resource from the wheel fails the suite
+  (env-guarded: skips when `pip`/`build` are unavailable locally, hard-fails the
+  build under CI).
+- **Tag-triggered PyPI publish workflow** (`.github/workflows/publish.yml`) — on a
+  `v*` tag push it guards that the tag matches the `pyproject` version, builds the
+  sdist + wheel, smoke-tests the wheel from a throwaway venv (`loop-engineer
+  --version`, then `loop scaffold`/`doctor`/`inspect`), and publishes via PyPI
+  **trusted publishing** (`id-token: write`, the `pypi` environment,
+  `pypa/gh-action-pypi-publish`) — no API token or secret anywhere in the repo.
+
+## 0.6.0 — 2026-07-03
+
+"Metrics real": false-completion-rate (FCR) and repair-productivity (RP) graduate
+from claims to derivations (the ST1 spec), and the derivation itself survived two
+rounds of adversarial red-teaming before merge — every exploit found is now a
+pinned regression test. (PR #16.)
+
+### Added
+- **`loop metrics <loop-dir>`** — derives FCR and RP from a loop's real on-disk
+  evidence (RUNLOG, verify bundles, held-out verdict, repair records, receipts),
+  never from agent narration. FCR is computed two ways — the deterministic
+  claim×verify cross-join and the aggregated held-out `false_completion` flag —
+  and disagreement is surfaced, not resolved. An unmatched success claim counts
+  as a false completion (fail-closed). Output is a `loop-engineer/metrics@1`
+  scorecard whose `provenance` block names every input file, so a skeptic can
+  re-derive each number by hand.
+- **`loop metrics --baseline`** — writes `docs/metrics-baseline.json` and
+  **refuses** (non-zero exit, writes nothing) unless the run is genuinely
+  gate-backed: a structurally valid held-out verdict artifact must exist (a gate
+  line in a verify script never qualifies); no rejected or unanchored repair
+  record; the two FCR methods must agree; a vacuous zero-claim run cannot
+  baseline.
+- **Published baseline** over the gate-backed `examples/coverage-repair`:
+  **FCR 0.0, RP 1.0** — the README numbers cite the committed file (a test binds
+  the README literals to the JSON), reproducible with
+  `python3 -m loop metrics examples/coverage-repair`.
+- **Canonical record schemas** — `schemas/repair-record.schema.json`
+  (`loop-engineer/repair@1`, RP's only input) and
+  `schemas/rollout-record.schema.json` (`loop-engineer/rollout@1`, the separate
+  candidate-adjudication artifact). Ends the two-shapes-both-called-"the repair
+  record" ambiguity; `validate_contract` checks record files when present and
+  `doctor` reports which record schemas it validated.
+- **`loop` console script** (`[project.scripts]`) — the CLI runs from any
+  directory under the supported editable install.
+
+### Changed
+- **`productive` is recomputed, never trusted.** `recheck_productive` recomputes
+  it from each record's own evidence and rejects disagreements;
+  `rollout_ledger.summarize()` (whose productivity key is now honestly named
+  `rollout_productivity`) and the metrics command aggregate only validated
+  records. Repair records additionally **anchor** to the deterministic verify
+  bundles: `verification_before/after` scores must match a same-task red→green
+  bundle pair (order-enforced when known), or the record is rejected/unanchored.
+- **Claim semantics are outcome-class aware.** A completion-class claim
+  (`task_passed`/`succeeded`/`terminal`) is clean only if every verify bundle in
+  its iteration is green — no exceptions; a progress-class claim (`advanced`)
+  may carry a red intermediate only if the same task reaches green in a strictly
+  later iteration. Unrecognized outcome tokens are surfaced in provenance
+  instead of silently escaping the denominator.
+
+### Honesty hardening (adversarial pre-merge review)
+Two red-team rounds (four, then two, adversarial reviewers) attacked the metrics
+implementation before merge and confirmed 17 issues — including a `--baseline`
+that would have published a clean headline FCR over a run its own held-out gate
+had flagged, and an `evidence_backed` satisfiable by a prose mention of the
+gate. All are fixed and pinned as regression tests; the honest residual is
+documented in the README: a committed verdict artifact is *evidence, not proof* —
+tamper detection belongs to the anti-cheat layer.
+
+## 0.5.0 — 2026-07-03
+
+The two pre-launch milestones of the v1.0 roadmap landed together: **"enforce the
+wedge"** (false-completion defense is now enforced by validators, not asserted by
+docs) and **"first screen"** (the README/demo surface rebuilt for a stranger's
+first 30 seconds). PRs #7–#13. The version jumps 0.3.4 → 0.5.0 to match the
+roadmap's milestone numbering (`docs/superpowers/plans/2026-06-30-loop-engineer-v1.0-roadmap.md`);
+there is no 0.4.x tag.
+
+### Added
+- **Gate-backed flagship example.** `examples/coverage-repair` now runs
+  end-to-end through the real held-out gate; its `false_completion: false` is
+  backed by a committed gate verdict (`.loop/artifacts/holdout-verdict.json`),
+  not a hand-set flag (#9).
+- **Weak→strong demo, filmed live.** `docs/demo.gif` + `docs/demo.cast`: the
+  inspector scores a self-asserted DIY loop (committed as `examples/naive-loop`)
+  0/weak, then the gate-backed example 90/strong — 100% live tool output.
+  Social card at `docs/social-card.png` (#13).
+- **`loop scaffold`** command + JSON Schemas for the contract artifacts
+  (`schemas/*.schema.json`), with templates reconciled to what the validator
+  actually checks (#8).
+- **Promised templates shipped:** `templates/verify-safety.sh`,
+  `templates/extract-trace-metrics.sh`, `templates/judge-rubric.sh`; central
+  model-routing doctrine at `reference/model-routing.md` (#11).
+- **v1.0 master roadmap + four strategic specs** committed under
+  `docs/superpowers/` — credibility enforcement, ST1 metrics baseline, ST2
+  portable contract spec, ST3 integration adapters (this release).
+
+### Changed
+- **Validator cross-checks.** A `Succeeded` terminal no longer validates with
+  `false_completion: true` or an empty/false `criteria_met`; the inspector
+  grades false-completion defense on *invocation evidence* (the gate/scan
+  actually ran), never on a self-asserted flag (#8).
+- **Held-out gate + scanner hardening.** An empty visible set can no longer
+  certify (`test_empty_visible_set_returns_not_ready`); the anti-cheat scanner
+  detects edits that neuter its own gate-decision functions
+  (`test_self_neuter_of_gate_matcher_is_detected`) and reports gate tampering
+  with a distinct exit code (#8).
+- **README first screen** rebuilt for launch conversion: tagline, concrete
+  failure modes, zero-install first command, stack diagram, comparison table,
+  demo embed (#7, #12).
+- **Skill trigger surface:** diagnostic spokes (loop-inspector,
+  loop-runtime-monitor) named at the router and marketplace, trigger-phrase
+  batch, path anchoring and neutral framing across all 9 skills (#11).
+
+### Fixed
+- **CLI:** `--help`/`--version`/usage text, distinct operational-error messages,
+  explicit exit codes, ledger tolerance for foreign receipt lines (#10).
+- **The repo's own live contract passes its own gate:** `python3 -m loop doctor
+  .loop` → `ok: true` — the release-blocking exit criterion of the
+  wedge-enforcement milestone (#8).
+
+## 0.3.4 — 2026-06-29
+
+Dogfood-driven hardening: ran `loop-inspector` + `loop-runtime-monitor` against 9 real
+on-disk loops (foreign and in-house). The tools had been built and tested only against
+this suite's own well-formed loops, so first contact with foreign/edge-case inputs exposed
+six defects — all fixed here under TDD, each pinned by a regression test.
+
+### Fixed
+- **(P1) `inspect_loop` no longer crashes on a malformed `manifest.yaml`.** `read_manifest`
+  (`loop/contract.py`) ran `yaml.safe_load` without a guard — the one read path missing the
+  `json.JSONDecodeError` guard every JSON read already had — so a malformed manifest in an
+  untrusted/foreign loop dir killed the inspector with a traceback instead of returning a
+  report. It now fails safe to `{}`, fixing the crash for `inspect_loop`, `validate_contract`,
+  and `doctor_report` at once.
+- **`inspect_loop` now scores `SPEC.md` / `WORKFLOW.md` / `TASKS.json` dual-location** (`.loop/`
+  ∪ workspace root), like `manifest`/`state` already resolved. Previously SPEC/WORKFLOW were
+  hard-coded to the workspace root, so a loop whose contract lives under `.loop/` (including
+  loop-engineer's own repo) was falsely scored as having "no success criteria" / "no
+  independent verification." Scores on substance, not on where the file sits.
+- **`inspect_loop` recognizes a single-file `loop-contract.md`** as a contract-owned source
+  for success criteria, approval gates, plan-then-execute, and terminal-state coverage — a
+  committed minimal-contract loop that names all 7 terminal states is no longer scored 0/7.
+- **`runtime_monitor` is terminal-state-aware.** It now reads `terminal_state` / `state ==
+  "terminal"` and reports `recommendation: "done"` (surfacing the terminal state) instead of
+  advising `continue` on a loop that has already finished.
+- **`runtime_monitor` no longer reports an unparseable RUNLOG as healthy.** A non-empty
+  RUNLOG that yields zero parseable iteration records now returns `status: "degraded"` /
+  `recommendation: "replan"` (with evidence) instead of the benign `ok`/`continue`/`[]` that
+  was byte-identical to a healthy loop — making the silent inertness of stall/repair-churn
+  detection on prose RUNLOGs visible.
+
+### Changed
+- Removed the unreferenced broad-substring corpus scoring path from `scripts/inspect_loop.py`
+  (`_gather_corpus`, `_walk_bounded`, `_evaluate_checks`, `_terminal_states_covered`) — dead
+  code since the keyword-stuffing fix replaced it with the typed-contract path. Corrected
+  `loop-inspector/SKILL.md` and `reference/patterns.md` §4 to describe the actual named,
+  typed, dual-located contract file set the inspector reads, rather than a "reads any foreign
+  harness shape semantically" claim the implementation never honored.
+
+### Added
+- **`pyproject.toml`** — the portable core is now installable with `pip install -e .`
+  (optional `pip install -e ".[yaml]"` for faster manifest parsing), so
+  `python3 -m loop doctor|inspect <workspace>` runs from any directory rather than only the
+  repo root. The core stays pure-stdlib; PyYAML remains an optional extra. A new
+  `test_docs_version` check pins the `pyproject.toml` version to `.claude-plugin/plugin.json`.
+
+### Documentation
+- README: the *Portable validator / inspector* section documents the editable install for
+  running outside the repo root; the 30-second `inspect` demo now shows the full
+  `target` / `present` / `gaps` report; the `doctor` block notes the omitted `paths` object;
+  `validate` / `verify` are documented as `doctor` aliases; `terminal_state.json` is noted as
+  resolving in either `.loop/` or the workspace root.
+- `examples/coverage-repair` records receipts at the canonical `.loop/receipts/*.jsonl` (was the
+  stale pre-decoupling `.gsd/audit/receipts/` path, inconsistent with the example's own `.loop/`
+  layout).
+- `loop-runtime-monitor/SKILL.md` frames its position generically ("vs a loop-driving operator")
+  instead of naming a private plugin agent.
+
+## 0.3.3 — 2026-06-29
+
+### Changed
+- Citation accuracy: corrected three over-reaching attributions to real sources
+  (no citations removed, no IDs changed). The "A/B trigger policy / cost-benefit
+  knob" and "cuts wasted edits" are reframed as this suite's own design choices
+  rather than PreFlect (arXiv 2602.07187) findings — PreFlect reflects on every
+  plan unconditionally and reports no edit-efficiency metric. The "repo-native
+  run-ledger over a vendor eval UI" is attributed to this suite as its answer to
+  the open challenge posed by Code as Agent Harness (arXiv 2605.18747), not as
+  that paper's claim.
+
+### Fixed
+- Standalone scripts now resolve the `loop` package when run by path. The
+  documented invocations `python3 scripts/runtime_monitor.py <loop>` and
+  `python3 scripts/inspect_loop.py <loop>` put `scripts/` on `sys.path` (not the
+  repo root), so the sibling `loop` package was unimportable and the scripts
+  silently used their degraded fallbacks — `runtime_monitor` reported
+  `missing RUNLOG.md` on the canonical `.loop/RUNLOG.md` layout, and
+  `inspect_loop` could not read `plan_then_execute` from `.loop/manifest.yaml`.
+  Both scripts now self-bootstrap the repo root onto `sys.path` before importing
+  `loop.*`, matching `python -m loop` behaviour. The bug was invisible to CI
+  because `python -m pytest` already places the repo root on `sys.path`; added
+  by-path subprocess regression tests that reproduce the real standalone call.
+
+## 0.3.2 — 2026-06-28
+
+Loop Contract Core plus a public open-source readiness pass: every skill now runs
+on the bundled portable core with no private tooling, and the repo ships CI and
+standard community files.
+
+### Added
+- **Loop Contract Core.** The portable `loop/` package with
+  `python3 -m loop doctor|validate|verify|inspect`, shared workspace/`.loop`
+  path resolution, and JSON schemas for `manifest@1`, `state@1`, `tasks@1`, and
+  `terminal@1`.
+- **Generic receipt schema** (`schemas/receipt.schema.json`, `receipt@1`) — an
+  engine-neutral dispatch/cost record at `.loop/receipts/*.jsonl` so the flywheel,
+  evals, and runtime-monitor compute routing + cost metrics without any private
+  telemetry.
+- **`byo-default` structural check** (the 13th self-eval check) — fails if any
+  skill depends on an unbundled tool without also naming the bundled default path.
+- **Continuous integration** (`.github/workflows/ci.yml`) — runs the frontmatter,
+  self-eval, pytest, compile, JSON-validity, and quickstart-smoke gates on Python
+  3.10 / 3.11 / 3.12.
+- **Community files** — CONTRIBUTING, CODE_OF_CONDUCT, SECURITY, and issue/PR
+  templates.
+- **Discoverability metadata** in `plugin.json` (homepage, repository, keywords).
+
+### Changed
+- **Bring-your-own-verifier decoupling.** Skills and reference docs now default to
+  the bundled gate (`scripts/verify-fast` → `verify-full`, `python3 -m loop verify`)
+  and `.loop/receipts/*.jsonl`. `/verify-slice`, `/verify-milestone`, `.gsd/`
+  receipts, `model_routing.py` / `workflow_routing.py`, Harmony, and Hermes are now
+  documented as optional integrations / example realizations, never requirements.
+- **Install** is now `claude plugin marketplace add SollanSystems/loop-engineer`;
+  the marketplace is renamed from `loop-engineer-local` to `loop-engineer`.
+- `.claude-plugin/plugin.json` version `0.3.1` → `0.3.2`.
+
+### Fixed
+- `scripts/inspect_loop.py` now scores contract-owned artifacts instead of broad
+  README/prose keyword matches; `plan_then_execute: false` no longer receives
+  credit by substring.
+- `scripts/runtime_monitor.py` now resolves canonical root `RUNLOG.md`, returns
+  structured reports for partial loop state, and avoids cross-task repair-churn
+  false positives.
+- `scripts/benchmark_harness.py` rejects duplicate task ids before computing A/B
+  metrics.
+- `scripts/anticheat_scan.py` flags semantic self-weakening of safety ranking or
+  downgrade mapping as `FailedSafety`.
+
+---
+
+## 0.3.1 — 2026-06-22
+
+Adversarial-fix milestone. The v0.3.0 release closed two false-POSITIVE classes
+in the anti-cheat scanner; a GPT-5.5/xhigh `codex challenge` over the v0.3.0 diff
+then found the blind side — evasion paths the scanner failed to flag, plus
+boundary-validation gaps in three harness scripts. This patch closes them.
+
+### Fixed
+
+**Anti-cheat scanner false-negatives (P1.1–P1.5)** — `scripts/anticheat_scan.py`
+- **Scoped self-exclusion (P1.1).** A scanner self-edit that empties or shrinks
+  `DEFAULT_GATE_PATHS` / `_ADDED_LINE_SIGNATURES` is now graded critical
+  (`FailedSafety`); additive and comment-only self-edits stay clean. Removed
+  entries are compared semantically, so a reorder or reformat does not flag.
+- **Delete + rename evidence (P1.2).** `parse_changed_files` now also captures
+  gate files that are deleted (`+++ /dev/null`) or renamed
+  (`rename from`/`rename to`); both of Codex's exact exploit diffs now return
+  `clean:false`.
+- **verify-\* gate coverage (P1.3).** Gate-path matching now covers
+  `verify-fast` / `verify-full` / `verify-safety`; tampering one to bypass it is
+  flagged.
+- **Broader tautology detection (P1.4).** Identical-operand assertions (a literal
+  or an identifier compared against itself) and always-true unittest calls now
+  downgrade to `FailedUnverifiable`; honest asserts with distinct operands stay clean.
+- **Path-shaped hidden-answer names (P1.5).** Trajectory reads of held-out /
+  hold_out / answer-key / golden / expected-output paths are flagged, while a
+  plain `assert result == expected` stays clean.
+
+**Boundary validation (P1.6, P2.1–P2.4)**
+- `scripts/benchmark_harness.py` — `compare()` raises on a mismatched A/B
+  task-set instead of reporting a silent delta; non-bool `claimed_done` /
+  `verification_passed` and out-of-range repair / criteria counts are rejected.
+- `scripts/runtime_monitor.py` — robust score parsing for `1e-3`, negatives, and
+  malformed input (no crash); tests pin the exact intervention per scenario.
+- `scripts/inspect_loop.py` — bounded shallow walk with a per-file read cap
+  replaces the unbounded full-tree traversal.
+
+### Changed (P2.5)
+- `README.md` — present-tense install note corrected to "all 9 skills".
+- `.claude-plugin/plugin.json` — version `0.3.0` → `0.3.1`.
+
+### Credits
+- The false-negative and boundary findings came from the GPT-5.5/xhigh
+  `codex` adversarial review over the v0.3.0 release diff.
+
+---
+
+## 0.3.0 — 2026-06-21
+
+The v0.2-roadmap (`G5`–`G8`) plus the two anti-cheat scanner fixes carried over
+from the 0.2.0 run, built to the same deterministic release bar. Two net-new
+spokes take the suite from 7 to 9 skills; the new capability ships as runnable,
+composable tooling, not a new runtime. No publish — that remains a human-only act.
+
+### Added
+
+**Two new spokes (7 → 9 skills)**
+- `skills/loop-runtime-monitor/` (**G6**) — the *observer*. Watches an in-flight
+  run from outside via `.loop/state.json` + `RUNLOG.md`, detects **stall**
+  (same `active_task` across N iterations with no measured progress),
+  **repair-churn** (repair attempts without score improvement), and
+  **budget-overrun**, and surfaces one intervention recommendation
+  (replan / revert / approval / terminate). Backed by runnable
+  `scripts/runtime_monitor.py`. Read-only over the run — it recommends, never
+  mutates.
+- `skills/loop-inspector/` (**G7**) — the *quality layer above the ecosystem*.
+  Reads an existing loop directory (a `.loop/` contract, a superpowers or ruflo
+  harness — read-only, plan-then-execute) and emits a **scored gap report**
+  against the prime-directive checklist (defines success? verification? terminal
+  states? approval gates? false-completion defense?) plus the 7-state taxonomy.
+  Backed by runnable `scripts/inspect_loop.py`.
+
+**Rollout ledger (G8)**
+- `scripts/rollout_ledger.py` — an append-only JSONL **rollout ledger**: one
+  record per loop candidate with EXACTLY the 7 fields `id`, `parent`, `verdict`,
+  `score`, `score_delta`, `coherent_with_prior_winner`, `productive`, plus a
+  read/summarize path. The lineage survives compaction; `productive` is the
+  per-candidate signal behind repair-productivity. `scripts/test_rollout_ledger.py`
+  is the TDD suite (round-trips ≥2 records, asserts all 7 fields).
+
+**Comparative benchmark (G5)**
+- `scripts/benchmark_harness.py` — a **comparative benchmark** that computes
+  false-completion-rate, repair-productivity, and criteria-met for TWO result
+  inputs (reference-harness vs loop-engineer) and the delta between them. Ships
+  the measurement tool only — live numbers are the operator's to run, not a baked
+  claim. `scripts/test_benchmark_harness.py` asserts the deltas across two
+  distinct inputs.
+- `reference/eval-suite.md` — adds a documented **Comparative A/B Protocol**
+  section pairing the harness with the existing metric definitions.
+
+### Fixed
+
+**Anti-cheat scanner (two false-positive classes pinned as regression tests)**
+- `scripts/anticheat_scan.py` — gate-path matching is now **basename /
+  word-boundary**, not substring: a test file editing test-mutation is graded
+  `test-file-mutation` (medium), never upgraded to critical `gate-tampering` by a
+  substring collision with a gate script's path.
+- `scripts/anticheat_scan.py` — **self-exclusion**: a diff that introduces or
+  modifies the scanner's own file set (`anticheat_scan.py` + its test) is no
+  longer graded as gate-tampering against its own correction.
+- `scripts/test_anticheat_scan.py` — both fixes pinned as regression tests; the
+  pre-existing `gate-tampering-is-critical` failsafe stays green.
+
+**Stricter structural facts**
+- `evals/cases/structural.json` — `skill_names` updated 7 → 9 to match real
+  on-disk state (the two new spokes); `self_eval.py` now asserts all 9 skills.
+- `skills/loop-engineer/SKILL.md` — router decision-map gains
+  `[[loop-runtime-monitor]]` and `[[loop-inspector]]` rows.
+
+### Changed
+- `.claude-plugin/plugin.json` — version `0.2.0` → `0.3.0`.
+- `README.md` / `GLOSSARY.md` — document the two new spokes, the rollout ledger,
+  and the comparative benchmark; the *How it compares* positioning is unchanged.
+
+### Notes
+- The repo remains private. Flipping it to public MIT is a separate, human-only
+  act outside the scope of the run that produced this version.
+
+---
+
+## 0.2.0 — 2026-06-21
+
+Release-readiness pass: a real LICENSE file, owned terminology, a documented
+differentiation story, and — most substantively — the false-completion defense
+turned from prose into **runnable tooling** the loop can call.
+
+### Added
+
+**Licensing & docs**
+- `LICENSE` — MIT, Sollan Systems 2026, at repo root. (Through 0.1.0, MIT was
+  declared only in `plugin.json` / `README.md`; the license file itself was
+  missing — a real public-release blocker.)
+- `GLOSSARY.md` — owns the suite's vocabulary: loop engineering, the operating
+  contract, deterministic gate vs advisory rubric, held-out verifier split,
+  anti-cheat trajectory scan, false completion, the two first-class metrics, the
+  repair record, the failure-mode taxonomy, and the 7 terminal states.
+- `README.md` — a **"How it compares"** section positioning the suite against the
+  adjacent clusters (native execution primitives, SDLC workflow harnesses,
+  swarm/orchestration engines) and separating what is genuinely differentiated
+  from what is table-stakes.
+
+**Runnable false-completion defense (design-only in 0.1.0 → tooling in 0.2.0)**
+- `scripts/holdout_gate.py` — the held-out verifier split as composable tooling:
+  a loop may declare `Succeeded` only if a withheld **holdout** check set passes,
+  not just the **visible** set it optimized against. Emits a measurable
+  `false_completion` event so false-completion-rate is *measured*, not
+  self-reported. Pure `decide()` core + a `run_manifest()` executor.
+- `scripts/anticheat_scan.py` — the anti-cheat trajectory scan as composable
+  tooling: after a `Succeeded` claim, sweeps the diff + trajectory for shortcut
+  signatures (gate tampering, skip/xfail injection, assert-true, hidden-answer
+  reads, test-file mutation). HIGH/CRITICAL findings auto-downgrade the verdict
+  (`FailedUnverifiable` / `FailedSafety`); MEDIUM is a review flag so honest TDD
+  is not punished.
+- `scripts/test_holdout_gate.py`, `scripts/test_anticheat_scan.py` — TDD suites
+  for both tools.
+- `reference/eval-suite.md` + `skills/loop-evals/SKILL.md` — wire the two scripts
+  in as the runnable realization of the Layer-4 false-completion-rate and
+  Layer-5 anti-cheat surfaces (previously described only as design guidance).
+
+**Stricter self-eval (10 → 12 deterministic checks)**
+- `scripts/self_eval.py` — added `license-present` (a real MIT LICENSE with
+  correct title / holder / year / body marker, so a stub cannot pass) and
+  `readme-differentiation` (a "How it compares" heading plus both first-class
+  metrics named). The gate was *strengthened*; no existing check was weakened.
+- `evals/cases/structural.json` — `license` and `readme_differentiation` expected
+  facts backing the two new checks.
+- `scripts/test_self_eval.py` — coverage for both new checks
+  (missing-then-present, wrong-holder, heading-required, markers-required) and
+  the updated 12-check count.
+
+### Changed
+- `.gitignore` — ignore `.loop/` (per-run operating-contract telemetry from the
+  self-improvement run; not plugin content).
+
+### Notes
+- The repo remains private. Flipping it to public MIT is a separate, human-only
+  act outside the scope of the release run that produced this version.
+
+---
+
+## 0.1.0 — 2026-06-20
+
+Initial release of the loop-engineer local plugin.
+
+### Added
+
+**Plugin packaging**
+- `.claude-plugin/plugin.json` — plugin manifest (name `loop-engineer`, version `0.1.0`, MIT)
+- `.claude-plugin/marketplace.json` — local marketplace registration (`loop-engineer-local`)
+
+**Skills — 1 router + 6 spokes**
+- `skills/loop-engineer/` — router; maps broad intent to the right spoke; decision quickstart
+- `skills/loop-architect/` — scenario classification → architecture decision record (chosen architecture + realization + loop patterns + risk profile); encodes the full scenario→architecture→realization matrix
+- `skills/loop-contract/` — scaffolds the repo-OS operating contract (SPEC / WORKFLOW / TASKS.json / RUNLOG / .loop/state.json) with pre-execution reflection
+- `skills/loop-run/` — operator; runs the state machine iteration by iteration; 7 explicit terminal states; approval pause/resume; delegates to `/verify-slice`; model-routing-compliant dispatch examples
+- `skills/loop-repair/` — patch-and-repair loop; structured repair record (failure\_mode / hypothesis / repair\_action / verification\_before / verification\_after / remaining\_delta); max-N attempt cap (default 2) with replan/revert/terminate escalation
+- `skills/loop-evals/` — 7-layer eval suite designer; makes false-completion-rate and repair-productivity first-class metrics; deterministic-gate-first then rubric-judge; repo-native regression harness; delegates to `/verify-slice` + `/verify-milestone`
+- `skills/loop-flywheel/` — improvement flywheel; mines traces and RUNLOG to generate new eval cases; memory compaction (short-term continue-run summary vs long-term lessons); improvement schedule and scorecard freeze policy
+
+**Reference depth (7 files)**
+- `reference/architecture-matrix.md` — 5-candidate architecture comparison table (complexity / reliability / verifiability / parallelism / cost / ease-of-adoption) + scenario→realization decision table; maximize-single-agent-first rule
+- `reference/loop-patterns.md` — 6 loop patterns with when-to-use and 3-line skeletons: pre-execution reflection (PreFlect), milestone loop, patch-and-repair, improvement flywheel, manager-orchestrator delegation, plan-then-execute
+- `reference/repo-os-contract.md` — full repo-OS tree layout; per-artifact schemas for SPEC / WORKFLOW / TASKS.json / RUNLOG / .loop/state.json / terminal\_state.json; separation-of-concerns rationale; YAML skill-manifest example
+- `reference/prompt-templates.md` — 4 templates adapted for Claude Code: BOOTSTRAP, GOAL-LAUNCH, REPAIR-LOOP, SHORT-OUTCOME-FIRST; portability note for Codex
+- `reference/eval-suite.md` — 7-layer suite table (layer / mechanism / key metric); false-completion-rate and repair-productivity definitions; deterministic-first-then-rubric rule; judge calibration; flywheel schedule
+- `reference/safety-and-approvals.md` — escalation ladder; approval lifecycle (pause + resume from run state, never a fresh attempt); 7 terminal states with firing conditions; plan-then-execute policy; verifier-gaming → hard-terminate; anti-cheat (hidden canaries + adversarial probes); permission tiers
+- `reference/platform-map.md` — portable-core mapping: Claude (Workflow tool / Agent routing / /verify-slice / GSD / Harmony spine), Codex/ChatGPT-Pro (AGENTS.md / Goal mode / structured outputs), Hermes (persistent memory / isolated subagents), Google Conductor
+
+**Contract templates (10 files)**
+- `templates/AGENTS.md.tmpl` — table-of-contents of stable rules
+- `templates/SPEC.md.tmpl` — success criteria, constraints, non-goals, evidence rules
+- `templates/WORKFLOW.md.tmpl` — loop policy, approval gates, budgets, 7 terminal states, repair cap (N=2)
+- `templates/TASKS.json.tmpl` — machine-readable task ledger scaffold
+- `templates/RUNLOG.md.tmpl` — human-readable iteration history scaffold
+- `templates/state.json.tmpl` — all state fields from the interface contract; terminal\_state: null
+- `templates/terminal_state.json.tmpl` — terminal state record scaffold
+- `templates/EVALS-rubric.md.tmpl` — eval rubric scaffold (7-layer)
+- `templates/verify-fast.sh` — runnable stub with comment markers for fast deterministic checks
+- `templates/verify-full.sh` — runnable stub with comment markers for full verification suite
+
+**Scripts / quality gates**
+- `scripts/validate_frontmatter.py` — deterministic frontmatter gate: `yaml.safe_load` parse, dict check, `name:` == directory name, `description:` non-empty; exits `1` on any error
+- `scripts/test_validate_frontmatter.py` — pytest suite for the frontmatter validator (TDD; 4 cases)
+- `scripts/self_eval.py` — 10 structural checks (skills present, frontmatter valid, reference cross-links, `[[link]]` resolution, terminal-state tokens, repair-record fields, eval-layer + metric coverage, templates present, no secret patterns, model-routing compliance); reports `structural_pass_rate`
+- `scripts/test_self_eval.py` — pytest suite for the self-eval runner (TDD; 2 cases)
+
+**Evals harness**
+- `evals/rubric.md` — 10 weighted dimensions (research-fidelity, scenario-routing-correctness, contract-completeness, reuse-not-duplication, safety/terminal-state rigor, eval-suite depth, flywheel/memory clarity, frontmatter/trigger quality, brevity/altitude, worked-example quality); target mean ≥9.5/10
+- `evals/cases/structural.json` — expected structural facts for `self_eval.py` check inputs
+
+**Worked example**
+- `examples/coverage-repair/` — end-to-end scenario: bring `pricing.py` to 80% coverage + input validation via a repair loop; includes ADR (architecture=single-supervisor, realization=markdown-supervisor), SPEC, WORKFLOW, TASKS.json, RUNLOG (2 iterations: verify-fail → repair → verify-pass), repair-record.json, terminal\_state.json (Succeeded), and README tying each artifact to its spoke
+
+**Docs**
+- `README.md` — what it is; 7-skill table; install commands; decision quickstart; terminal state reference; reuse table; gate commands
+- `CHANGELOG.md` — this file
+
+### Design decisions
+
+- The loop is the design object, not the prompt. Skills architect loops, not domain solutions.
+- 7 explicit terminal states; no silent "completed."
+- Reuse over reimplementation: `/verify-slice`, `/verify-milestone`, Harmony `engine/cli.py` spine, `launch-local-agent` grader split, model-routing HARD CONTRACT, `.gsd/audit/receipts/*.jsonl`.
+- Portable core: repo-OS contract is engine-neutral; v1 ships contract-level mapping across Claude / Codex / Hermes / Google — live cross-engine runners are deferred.
+- Deterministic structural gate (100% pass required) is separate from the advisory LLM rubric judge (target ≥9.5/10).
+- `description:` frontmatter MUST be double-quoted to avoid the colon-space YAML-discovery break (enforced by `validate_frontmatter.py`).
+- No new verification engine — delegates to existing infrastructure.

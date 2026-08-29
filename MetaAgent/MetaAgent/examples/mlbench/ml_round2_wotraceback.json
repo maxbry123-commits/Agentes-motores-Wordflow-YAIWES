@@ -1,0 +1,70 @@
+{
+    "agents": [
+        {
+            "agent_id": "0",
+            "name": "DataPreparationAndModelSelectionAgent",
+            "system_prompt": "You are DataPreparationAndModelSelectionAgent. Your goal is to clean and prepare the given dataset for machine learning and select the most appropriate model. Your responsibilities include handling missing values, encoding categorical variables, normalizing numerical features,  and selecting the models(Several ML models that may achieve the best performance). Ensure the dataset is in a format suitable for model training.  You can use the following tools: \n- code_interpreter: Use it with <execute>```python <Your Code> ```<\\execute>. and you will get the stdout or error message\n WARNING: This environment is not a Jupyter notebook. Please use print(df.head()) instead of df.head(), other Jupyter outputs also need print out \n- If dataset is prepared and model is selected successfully, output `<STATE_TRANS>: 2`.\n- If no conditions are met, output `<STATE_TRANS>: None`.\n DO NOT WRITE THIS IN THE CODE SNIPPET!",
+            "tools": [
+                "code_interpreter"
+            ]
+        },
+        {
+            "agent_id": "1",
+            "name": "ModelTrainingAndEvaluationAgent",
+            "system_prompt": "You are ModelTrainingAndEvaluationAgent. Your goal is to train the selected machine learning models (You can choose to select multiple models and make comparisons) using the prepared dataset and evaluate it on the test dataset. Ensure to split the dataset into training and validation sets, optimize the model's hyperparameters if necessary, and compute the required metrics such as F-1 score, RMSE, and any other relevant metrics. Output the evaluation results. You can use the following tools:\n- code_interpreter: Use it with <execute>```python <Your Code> ```<\\execute>. and you will get the stdout or error message\n WARNING: This environment is not a Jupyter notebook. Please use print(df.head()) instead of df.head(), other Jupyter outputs also need print out\n- If model is trained and evaluated successfully, output `<STATE_TRANS>: 3`.\n- If no conditions are met, output `<STATE_TRANS>: None`.\n DO NOT WRITE THIS IN THE CODE SNIPPET!",
+            "tools": [
+                "code_interpreter"
+            ]
+        },
+        {
+            "agent_id": "2",
+            "name": "ReportingAgent",
+            "system_prompt": "You are ReportingAgent. Your goal is to compile the evaluation metrics and generate a comprehensive report for the user. Ensure the report is clear, concise, and includes all relevant metrics and insights.\n- If no conditions are met, output `<STATE_TRANS>: None`.\n DO NOT WRITE THIS IN THE CODE SNIPPET!",
+            "tools": []
+        }
+    ],
+    "states": {
+        "states": [
+            {
+                "state_id": "1",
+                "agent_id": "0",
+                "instruction": "Clean and prepare the given dataset for machine learning and select the most appropriate model.",
+                "is_initial": true,
+                "is_final": false,
+                "listener": [
+                   "1"
+                ]
+            },
+            {
+                "state_id": "2",
+                "agent_id": "1",
+                "instruction": "Train the selected machine learning model using the prepared dataset and evaluate it on the test dataset.",
+                "is_initial": false,
+                "is_final": false,
+                "listener": [
+                    "0","2"
+                ] 
+            },
+            {
+                "state_id": "3",
+                "agent_id": "2",
+                "instruction": "Compile the evaluation metrics and generate a comprehensive report for the user. Use <|submit|>: Your answer to submit the answer to the user.",
+                "is_initial": false,
+                "is_final": true,
+                "listener": []
+            }
+        ],
+        "transitions": [
+            {
+                "from_state": "1",
+                "to_state": "2",
+                "condition": "If dataset is prepared and model is selected successfully"
+            },
+            {
+                "from_state": "2",
+                "to_state": "3",
+                "condition": "If model is trained and evaluated successfully"
+            }
+        ]
+    }
+}

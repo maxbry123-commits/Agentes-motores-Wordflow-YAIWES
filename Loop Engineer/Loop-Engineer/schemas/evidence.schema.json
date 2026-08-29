@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "loop-engineer/evidence@1",
+  "title": "Loop Engineer Evidence @1",
+  "description": "A hashed evidence record with artifact provenance. loop doctor discovers records from the declared location .loop/evidence/*.json, validates them, hash-verifies the artifact each one references, and compares the latest record per task against the live TASKS.json goalpost; a verified dispatch also binds the record's bytes into the event hash chain. Hash verification proves the pointer, never the provenance, and code_digest is never re-hashed against the verifier file. See reference/repo-os-contract.md #17.",
+  "type": "object",
+  "required": ["schema", "id", "kind", "uri", "sha256", "media_type", "produced_by", "created_at"],
+  "properties": {
+    "schema": {"const": "loop-engineer/evidence@1"},
+    "id": {"type": "string", "minLength": 1},
+    "kind": {"type": "string", "minLength": 1, "description": "Open vocabulary; examples include verify-bundle, log, diff, screenshot, and report."},
+    "uri": {"type": "string", "minLength": 1, "pattern": "^(?!/)(?![A-Za-z][A-Za-z0-9+.\\-]*://).+$", "description": "Workspace-relative POSIX path, never an absolute path or URI."},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$", "maxLength": 64},
+    "media_type": {"type": "string", "minLength": 1},
+    "produced_by": {
+      "type": "object",
+      "required": ["run_id", "task_id", "attempt", "executor"],
+      "properties": {
+        "run_id": {"type": "string", "minLength": 1},
+        "task_id": {"type": ["string", "null"]},
+        "attempt": {"type": ["integer", "null"], "minimum": 1},
+        "executor": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": true
+    },
+    "verified_by": {
+      "type": ["object", "null"],
+      "default": null,
+      "properties": {
+        "by": {"type": "string", "minLength": 1},
+        "at": {"type": "string", "minLength": 1, "description": "ISO-8601 timestamp."},
+        "command": {"type": ["string", "null"], "default": null,
+                    "description": "The declared verify command that was executed; null when no declared command ran."},
+        "code_digest": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$", "maxLength": 64, "default": null,
+                        "description": "sha256 of argv[0]'s file when it is a workspace file; null otherwise."},
+        "code_digest_basis": {"type": ["string", "null"],
+                              "enum": ["workspace_file", "path_lookup", "outside_workspace",
+                                       "not_a_file", "unresolvable", "unreadable",
+                                       "unparseable_command", "empty_command",
+                                       "injected_verifier", null],
+                              "default": null,
+                              "description": "Why code_digest is what it is. Always explains a null."},
+        "policy_digest": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$", "maxLength": 64, "default": null,
+                          "description": "sha256 of the canonical JSON of the declared goalpost (repo-os-contract §17)."}
+      },
+      "required": ["by", "at"],
+      "additionalProperties": true
+    },
+    "created_at": {"type": "string", "minLength": 1, "description": "ISO-8601 UTC timestamp."},
+    "policy_result": {
+      "type": ["object", "null"],
+      "default": null,
+      "properties": {"ok": {"type": "boolean"}},
+      "required": ["ok"],
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}

@@ -1,0 +1,67 @@
+{
+    "agents": [
+        {
+            "agent_id": "0",
+            "name": "QuestionInfoProcessor",
+            "system_prompt": "You are QuestionInfoProcessor. Your goal is to parse and understand the list of questions and gather relevant information. Your responsibility is to break down the questions into key topics and sub-questions and then search for accurate and comprehensive information for each question. You should ensure that the questions are clear and well-defined, and the information is relevant and reliable. In this task, you need to cover all possible answer keywords as much as possible, such as former names, full names, abbreviations, etc.",
+            "tools": [
+                "search_engine"
+            ]
+        },
+        {
+            "agent_id": "1",
+            "name": "StoryGenerator",
+            "system_prompt": "You are StoryGenerator. Your goal is to generate a coherent story that includes answers to all the questions. Your responsibility is to integrate the information provided by QuestionInfoProcessor into a well-structured and engaging story. You should ensure that the story is coherent and answers all the questions. The key to this task is keyword coverage. You need to make sure all possible answers to the question are covered.",
+            "tools": []
+        }
+    ],
+    "states": {
+        "states": [
+            {
+                "state_id": "1",
+                "agent_id": "0",
+                "instruction": "Parse the list of questions into key topics and sub-questions, then search for relevant information to answer the parsed questions.",
+                "is_initial": true,
+                "is_final": false,
+                "listener": [
+                    "1"
+                ]
+            },
+            {
+                "state_id": "2",
+                "agent_id": "1",
+                "instruction": "Generate a coherent story that includes answers to all the questions using the gathered information.",
+                "is_initial": false,
+                "is_final": false,
+                "listener": [
+                    "0"
+                ]
+            },
+            {
+                "state_id": "3",
+                "agent_id": "1",
+                "instruction": "Submit the completed story by following the format: <|submit|> <fill story>",
+                "is_initial": false,
+                "is_final": true,
+                "listener": []
+            }
+        ],
+        "transitions": [
+            {
+                "from_state": "1",
+                "to_state": "2",
+                "condition": "If questions are parsed and information is gathered successfully"
+            },
+            {
+                "from_state": "2",
+                "to_state": "1",
+                "condition": "If the question is not parsed or information is not gathered successfully"
+            },
+            {
+                "from_state": "2",
+                "to_state": "3",
+                "condition": "If the story is generated successfully"
+            }
+        ]
+    }
+}

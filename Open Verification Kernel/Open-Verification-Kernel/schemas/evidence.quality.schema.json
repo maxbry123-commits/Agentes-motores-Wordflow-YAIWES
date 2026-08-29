@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openverification.dev/schemas/evidence.quality.schema.json",
+  "title": "Evidence Quality Report",
+  "type": "object",
+  "required": ["schema_version", "bundle_id", "passed", "issues"],
+  "properties": {
+    "schema_version": { "type": "string", "const": "ovk.evidence_quality.v1" },
+    "bundle_id": { "type": "string", "minLength": 1 },
+    "passed": { "type": "boolean" },
+    "issues": {
+      "type": "array",
+      "items": { "$ref": "evidence.invariant_issue.schema.json" }
+    }
+  },
+  "additionalProperties": false
+}

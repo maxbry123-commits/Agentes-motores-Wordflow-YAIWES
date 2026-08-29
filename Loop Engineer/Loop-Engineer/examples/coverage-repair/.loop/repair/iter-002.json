@@ -1,0 +1,12 @@
+{
+  "schema": "loop-engineer/repair@1",
+  "iteration_id": "iter-002",
+  "attempt": 1,
+  "failure_mode": "deterministic-fail",
+  "hypothesis": "The zero-quantity and negative-price branches of pricing.apply_discount are never reached because the production function lacks them, leaving pricing.py at 0.74 line coverage just under the 0.80 gate.",
+  "repair_action": "Added the two missing branches directly to production pricing.apply_discount: qty==0 returns base_price, price<0 raises PricingError; the existing tests already cover both branches once they exist. No edit to the tests, fixtures, verifier, or SPEC.md.",
+  "verification_before": { "verify_full": "FAIL", "metric": "line_coverage", "failing": ["pricing.py:41-47", "pricing.py:58"], "score": 0.74 },
+  "verification_after": { "verify_full": "PASS", "metric": "line_coverage", "failing": [], "score": 0.83 },
+  "remaining_delta": "none — coverage 0.83 >= 0.80 and both validation branches green",
+  "productive": true
+}
