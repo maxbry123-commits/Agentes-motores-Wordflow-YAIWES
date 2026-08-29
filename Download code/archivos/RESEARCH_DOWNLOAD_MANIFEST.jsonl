@@ -1,0 +1,11 @@
+{"number": 1, "parts": 1, "slug": "Guardians", "source": "https://github.com/metareflection/guardians.git", "source_commit": "59e52d9f1cbefdb344245304e260e647489a647b", "status": "COMPLETE"}
+{"number": 2, "parts": 1, "slug": "Loop-Engineer", "source": "https://github.com/SollanSystems/loop-engineer.git", "source_commit": "8f915f8f84e6b616116c4353eb266e6899f73441", "status": "COMPLETE"}
+{"number": 3, "parts": 3, "slug": "Agent-Zero", "source": "https://github.com/agent0ai/agent-zero.git", "source_commit": "6a6cecff8527b164668c7a6ab2f76b6b1ed7cfa1", "status": "COMPLETE"}
+{"number": 4, "parts": 1, "slug": "Awesome-Agent-Workflows", "source": "https://github.com/Richicinschi/awesome-agent-workflows.git", "source_commit": "7b410743b8f3699498d19461a182689954e78d2f", "status": "COMPLETE"}
+{"number": 5, "parts": 1, "slug": "Agent-Capability-Standard", "source": "https://github.com/synaptiai/agent-capability-standard.git", "source_commit": "95f7ac2befcef9f33374f1a4922e5cd89ac90df0", "status": "COMPLETE"}
+{"number": 6, "parts": 2, "slug": "Microsoft-Agent-Framework", "source": "https://github.com/microsoft/agent-framework.git", "source_commit": "edfe115ea06bca57ae5a123d0fac5b3fdda13603", "status": "COMPLETE"}
+{"number": 7, "parts": 1, "slug": "LangGraph", "source": "https://github.com/langchain-ai/langgraph.git", "source_commit": "11ee185999b86bfea2d8c0e69cef9a5e37acf686", "status": "COMPLETE"}
+{"number": 8, "parts": 1, "slug": "Open-Verification-Kernel", "source": "https://github.com/fraware/open-verification-kernel.git", "source_commit": "ab41a59946bad0d45b8e3244a7952c8d1df830c1", "status": "COMPLETE"}
+{"number": 9, "parts": 1, "slug": "Agentic-Workflow-Framework", "source": "https://github.com/JRA-CodingLab/agentic-workflow-framework.git", "source_commit": "24ffe0a7249224081212292586f6d7892e684d07", "status": "COMPLETE"}
+{"number": 10, "parts": 1, "slug": "MetaAgent", "source": "https://github.com/SaFo-Lab/MetaAgent.git", "source_commit": "597469fc7d296d95da41196c0f5a663c6a77982e", "status": "COMPLETE"}
+{"number": 11, "parts": 2, "slug": "Rasa", "source": "https://github.com/RasaHQ/rasa.git", "source_commit": "60a3cff9c08183760355b07bd60f5223d8916d6b", "status": "COMPLETE"}
