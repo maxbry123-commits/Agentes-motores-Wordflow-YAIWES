@@ -1,0 +1,14 @@
+skill_url: https://github.com/maxbry123-commits/Agentes-motores-Wordflow-YAIWES/blob/main/tarea%20en%20curso%20grock%20gpt%20skills/skills%20grock%20tarea%201/SKILL.md
+USE: contrato-dag-sheriff
+READ: skill_url
+LEER_LITERAL: instrucciones_del_mensaje
+MAP: 1_enunciado=1_Ixx=1_nodo
+RUNTIME: escribir_PRELUDE_RESEARCH_BLOCK_CODA_en_cada_nodo
+RESEARCH: P1_github_hf -> P2_skills_os -> P3_comunidad
+LOOP: references/loop-engine.yml max_i=10
+SHERIFF: FAIL=no_siguiente
+GUARDIAN: no_RUN sin INICIA|RUN|IMPUTA EL CONTRATO
+EMIT: contrato_2_en_chat
+GITHUB: solo_si_apruebo
+PATH: tarea en curso grock gpt skills/skills grock tarea 1/
+estado: ESPERA_INICIA
