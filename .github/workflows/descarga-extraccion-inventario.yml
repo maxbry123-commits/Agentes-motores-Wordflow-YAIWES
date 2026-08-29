@@ -17,9 +17,11 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          git clone --depth 1 "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" repo
+          sudo apt-get update -y
+          sudo apt-get install -y zip unzip
+          git clone --depth 1 --no-tags "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" repo
           cd repo
-          mkdir -p .download-queue
+          mkdir -p .download-queue/src
           cat > .download-queue/repos.tsv <<'EOF'
           Guardians	https://github.com/metareflection/guardians
           Loop Engineer	https://github.com/SollanSystems/loop-engineer
@@ -148,9 +150,15 @@ jobs:
             test -n "$repo"
             slug=$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]' | sed 's#[^a-z0-9][^a-z0-9]*#-#g; s#^-##; s#-$##')
             owner_repo=$(printf '%s' "$repo" | sed 's#https://github.com/##')
-            branch=$(git ls-remote --symref "$repo.git" HEAD 2>/dev/null | awk '/^ref:/ {sub("refs/heads/", "", $2); print $2; exit}')
-            test -n "$branch"
-            curl --fail --location --retry 3 --retry-delay 2 -o ".download-queue/$slug.zip" "https://github.com/$owner_repo/archive/refs/heads/$branch.zip"
+            src=".download-queue/src/$slug"
+            rm -rf "$src"
+            git clone --depth 1 --no-tags "https://x-access-token:${GITHUB_TOKEN}@github.com/${owner_repo}.git" "$src"
+            rm -rf "$src/.git"
+            rm -f ".download-queue/$slug.zip"
+            ( cd "$src" && zip -q -r -9 -y "../../$slug.zip" . )
+            unzip -tq ".download-queue/$slug.zip"
+            rm -rf "$src"
+            echo "PASS ZIP: $name"
           done < .download-queue/repos.tsv
       - name: Paso 2 - Extraer cada ZIP en su raiz
         shell: bash
@@ -215,5 +223,15 @@ jobs:
           git add -A
           if git diff --cached --quiet; then exit 0; fi
           git commit -m "extract: raices individuales inventario en main"
-          git pull --rebase origin main
-          git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:main
+          n=1
+          while test "$n" -le 3; do
+            git fetch origin main
+            git rebase origin/main
+            if git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:main; then
+              echo "PUSH PASS attempt $n"
+              break
+            fi
+            if test "$n" -eq 3; then exit 1; fi
+            sleep $((n * 2))
+            n=$((n + 1))
+          done
