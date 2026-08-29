@@ -1,4 +1,4 @@
-name: Descarga y extracción 90+ repos
+name: Descarga y extracción 90+
 
 on:
   workflow_dispatch:
@@ -8,7 +8,100 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Paso 1 - Descargar ZIP
-        run: echo "Paso 1 - descarga de los repos de la lista 90+"
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .download-queue
+          cat > .download-queue/repos.tsv <<'EOF'
+Guardians	https://github.com/metareflection/guardians
+Loop Engineer	https://github.com/SollanSystems/loop-engineer
+Agent-Zero	https://github.com/agent0ai/agent-zero
+Awesome Agent Workflows	https://github.com/Richicinschi/awesome-agent-workflows
+Agent Capability Standard	https://github.com/synaptiai/agent-capability-standard
+Microsoft Agent Framework	https://github.com/microsoft/agent-framework
+LangGraph	https://github.com/langchain-ai/langgraph
+Open Verification Kernel	https://github.com/fraware/open-verification-kernel
+Agentic Workflow Framework	https://github.com/JRA-CodingLab/agentic-workflow-framework
+MetaAgent	https://github.com/SaFo-Lab/MetaAgent
+Rasa	https://github.com/RasaHQ/rasa
+Semantic Kernel	https://github.com/microsoft/semantic-kernel
+DSPy	https://github.com/stanfordnlp/dspy
+Agno	https://github.com/agno-agi/agno
+Haystack	https://github.com/deepset-ai/haystack
+SwarmClaw	https://github.com/swarmclawai/swarmclaw
+SwarmDock	https://github.com/swarmclawai/swarmdock
+Agent Framework Samples	https://github.com/microsoft/Agent-Framework-Samples
+IntentKit	https://github.com/crestalnetwork/intentkit
+PraisonAI	https://github.com/MervinPraison/PraisonAI
+Trigger.dev	https://github.com/triggerdotdev/trigger.dev
+Solace Agent Mesh	https://github.com/SolaceLabs/solace-agent-mesh
+OpenRSI / Frontis-MA1 / OpenMLE	https://github.com/FrontisAI/OpenRSI
+Claw AI Lab	https://github.com/Claw-AI-Lab/Claw-AI-Lab
+Hivemind	https://github.com/hivementality-ai/hivemind
+Research Agent Lab	https://github.com/binary-ciao/research_agent_lab
+AI4S Agent Lab	https://github.com/Goldenmonstew/ai4s-agent-lab
+Evolver / EvolveR	https://github.com/KnowledgeXLab/EvolveR
+Ghost in the Droid	https://github.com/ghost-in-the-droid/android-agent
+Zuora Coding Agent	https://github.com/zuora/zuora-coding-agent
+Oh-My-Agents	https://github.com/visualiaconsulting/oh-my-agents
+Agent Skill Lab	https://github.com/ricardoml96/agent-skill-lab
+AI Agent Lab	https://github.com/quantiota/AI-Agent-Lab
+MiroThinker	https://github.com/MiroMindAI/MiroThinker
+Agents-A1	https://github.com/InternScience/Agents-A1
+Yunjue Agent	https://github.com/YunjueTech/Yunjue-Agent
+OpenClaw-RL	https://github.com/Gen-Verse/OpenClaw-RL
+SETA	https://github.com/camel-ai/seta
+ATLAS	https://github.com/itigges22/ATLAS
+OpenDev	https://github.com/opendev-to/opendev
+Shofer	https://github.com/shofer-dev/shofer
+Safe Lab Agents	https://github.com/MaxNaeg/safe_lab_agents
+CORAL	https://github.com/Human-Agent-Society/CORAL
+NVIDIA OpenShell	https://github.com/NVIDIA/OpenShell
+NVIDIA NeMo Agent Toolkit	https://github.com/NVIDIA/NeMo-Agent-Toolkit
+Kimi Code	https://github.com/MoonshotAI/kimi-cli
+Mini-Agent	https://github.com/MiniMax-AI/Mini-Agent
+Xiaomi Miloco	https://github.com/XiaoMi/xiaomi-miloco
+Meta OpenEnv	https://github.com/meta-pytorch/OpenEnv
+Kimi K2.5 / Agent Swarm	https://github.com/MoonshotAI/Kimi-K2.5
+MiniMax Provider Verifier	https://github.com/MiniMax-AI/MiniMax-Provider-Verifier
+Z.ai GLM Skills	https://github.com/zai-org/GLM-skills
+Xiaomi MiMo-V2-Flash	https://github.com/xiaomimimo/MiMo-V2-Flash
+Qwen-Agent / DeepPlanning	https://github.com/QwenLM/Qwen-Agent
+Agent Contracts	https://github.com/relari-ai/agent-contracts
+Bound	https://github.com/Danny-de-bree/bound
+Agent Handoff	https://github.com/artyomboyko/Agent_Handoff
+Agent Checkpoint	https://github.com/akz4ol/agent-checkpoint
+LangChain Task Steering	https://github.com/edvinhallvaxhiu/langchain-task-steering
+ToolOrchestra	https://github.com/NVlabs/ToolOrchestra
+Sovereign-OS	https://github.com/Justin0504/Sovereign-OS
+Reyn	https://github.com/tya5/reyn
+Kaji	https://github.com/apokamo/kaji
+AgentSPEX	https://github.com/ScaleML/AgentSPEX
+AgentOS	https://github.com/framerslab/agentos
+ORCA	https://github.com/saiichi/orca
+EOF
+          while IFS=$'\t' read -r name repo; do
+            slug=$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]' | sed 's#[^a-z0-9][^a-z0-9]*#-#g; s#^-##; s#-$##')
+            branch=$(git ls-remote --symref "$repo.git" HEAD 2>/dev/null | awk '/^ref:/ {sub("refs/heads/", "", $2); print $2; exit}')
+            test -n "$branch"
+            curl --fail --location --retry 3 --retry-delay 2 -o ".download-queue/$slug.zip" "https://github.com/$(printf '%s' "$repo" | sed 's#https://github.com/##')/archive/refs/heads/$branch.zip"
+          done < .download-queue/repos.tsv
 
       - name: Paso 2 - Extraer cada ZIP en su raíz
-        run: echo "Paso 2 - extracción de cada repo en su raíz correspondiente"
+        shell: bash
+        run: |
+          set -euo pipefail
+          while IFS=$'\t' read -r name repo; do
+            slug=$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]' | sed 's#[^a-z0-9][^a-z0-9]*#-#g; s#^-##; s#-$##')
+            zip=".download-queue/$slug.zip"
+            root="$name"
+            rm -rf "$root"
+            mkdir -p "$root"
+            tmp=$(mktemp -d)
+            unzip -q "$zip" -d "$tmp"
+            entries=("$tmp"/*)
+            test "${#entries[@]}" -eq 1
+            extracted="${entries[0]}"
+            cp -a "$extracted"/. "$root"/
+            rm -rf "$tmp"
+          done < .download-queue/repos.tsv
