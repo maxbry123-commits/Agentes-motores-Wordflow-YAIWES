@@ -115,3 +115,5 @@
 {"number": 115, "parts": 1, "slug": "NVIDIA-AI-Q", "source": "https://github.com/NVIDIA-AI-Blueprints/aiq.git", "source_commit": "bf4e67d1564ef8d2ec8f65b5f9001e512befc095", "status": "COMPLETE"}
 {"number": 116, "parts": 1, "slug": "Atomic-Agent", "source": "https://github.com/AtomicBot-ai/atomic-agent.git", "source_commit": "4caff55e6afb9d9a61b36e9fa98bf9afd7531582", "status": "COMPLETE"}
 {"number": 117, "parts": 20, "slug": "Atomic-Chat", "source": "https://github.com/AtomicBot-ai/Atomic-Chat.git", "source_commit": "073c88534542a654d47ddf9afa9bc470c89b2304", "status": "COMPLETE"}
+{"number": 118, "parts": 2, "slug": "Atomic-Hermes", "source": "https://github.com/AtomicBot-ai/atomic-hermes.git", "source_commit": "d73323210d1f6e01325f4e112371a14fede93c78", "status": "COMPLETE"}
+{"number": 119, "parts": 4, "slug": "Atomic-llama-cpp-TurboQuant", "source": "https://github.com/AtomicBot-ai/atomic-llama-cpp-turboquant.git", "source_commit": "cd560939087c95b93a1f30a95603d6b079436952", "status": "COMPLETE"}
