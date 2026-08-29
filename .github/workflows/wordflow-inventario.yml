@@ -218,6 +218,9 @@ jobs:
               print(f'PASS EXTRACT: {name} files={count}')
           PY
           rm -rf .download-queue
+          git lfs uninstall || true
+          git config lfs.allowincompletepush true
+          find . -name .gitattributes -type f -print0 | xargs -0 -r sed -i '/filter=lfs/d' || true
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
