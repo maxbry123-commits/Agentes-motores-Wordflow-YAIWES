@@ -20,3 +20,5 @@
 {"number": 31, "parts": 1, "slug": "ux-research-pipeline", "source": "https://github.com/shipaleks/ux-research-pipeline.git", "source_commit": "1827e1c076cbe822b34cf41f883508757db06884", "status": "COMPLETE"}
 {"number": 32, "parts": 1, "slug": "framework-of-thoughts", "source": "https://github.com/fjfricke/framework-of-thoughts.git", "source_commit": "93cb04b655ac0111a310dfefd3497f05c35975e4", "status": "COMPLETE"}
 {"number": 33, "parts": 1, "slug": "Self-consistency", "source": "https://github.com/akpe12/Self-consistency.git", "source_commit": "0bdac1c4117ee6ae028725363870e4ff33e67f72", "status": "COMPLETE"}
+{"number": 34, "parts": 3, "slug": "veritrace", "source": "https://github.com/noah-art3mis/veritrace.git", "source_commit": "d556c8fa31a0e07c6682f42c01d10b038a2206a8", "status": "COMPLETE"}
+{"number": 35, "parts": 1, "slug": "AI-Agent-Skills", "source": "https://github.com/sreerevanth/AI-Agent-Skills.git", "source_commit": "5a4e7935857e25f42d17e7a2b2bddc39e0a89cad", "status": "COMPLETE"}
