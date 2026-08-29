@@ -7,3 +7,9 @@
 {"number": 7, "parts": 1, "slug": "HadiFrt20-deepresearch", "source": "https://github.com/HadiFrt20/deepresearch.git", "source_commit": "d28f6bcf3b0eedcad45cf60945eedf633a7d295c", "status": "COMPLETE"}
 {"number": 8, "parts": 2, "slug": "LanguageAgentTreeSearch", "source": "https://github.com/lapisrocks/LanguageAgentTreeSearch.git", "source_commit": "853d81614607dd27433faf17c7b0a7d660f95d22", "status": "COMPLETE"}
 {"number": 9, "parts": 6, "slug": "self-refine", "source": "https://github.com/madaan/self-refine.git", "source_commit": "9a206d41e5d2d0c241bb441f41eeadb945afaa55", "status": "COMPLETE"}
+{"number": 10, "parts": 5, "slug": "MindMap", "source": "https://github.com/wyl-willing/MindMap.git", "source_commit": "0411a54719e9b90176d02e937ab73d2df5e25963", "status": "COMPLETE"}
+{"number": 11, "parts": 1, "slug": "graph-of-thoughts", "source": "https://github.com/spcl/graph-of-thoughts.git", "source_commit": "3d9d9dbd8937d47a4441f681b8b40e3c5b054f16", "status": "COMPLETE"}
+{"number": 12, "parts": 2, "slug": "reflexion", "source": "https://github.com/noahshinn/reflexion.git", "source_commit": "218cf0ef1df84b05ce379dd4a8e47f17766733a0", "status": "COMPLETE"}
+{"number": 13, "parts": 1, "slug": "openmythos-vega", "source": "https://github.com/vegafoundation/openmythos.git", "source_commit": "299a0cdb0ae0c0df23fa34e4dc829230a979d87a", "status": "COMPLETE"}
+{"number": 14, "parts": 3, "slug": "deer-flow", "source": "https://github.com/bytedance/deer-flow.git", "source_commit": "bf740ffa9077f55661fce80186b656651f497c89", "status": "COMPLETE"}
+{"number": 15, "parts": 1, "slug": "OpenManus", "source": "https://github.com/FoundationAgents/OpenManus.git", "source_commit": "3309bf4e416fb1c74b008f3e86494439a31bad53", "status": "COMPLETE"}
