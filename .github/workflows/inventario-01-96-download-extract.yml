@@ -1,0 +1,56 @@
+name: INVENTARIO 01-96 — DOWNLOAD ZIP → EXTRACT
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  download-extract:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+
+      - name: Prepare workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .staging
+          echo "Workflow preparado para auditoría. La ejecución real comienza únicamente cuando el propietario pulse Run workflow."
+
+      # INVENTARIO 01–96: incorporar aquí, sin alterar orden ni nombres,
+      # las 96 entradas exactas del inventario de fuente de verdad.
+      # Cada entrada debe definir su URL de ZIP y su raíz exacta.
+      # No se ejecuta ningún repositorio que no pertenezca al inventario.
+
+      - name: PASO 1 — DOWNLOAD ZIP (01-96)
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "PASO 1 — DOWNLOAD ZIP"
+          echo "AUDITORÍA: este bloque queda montado; requiere el inventario 01–96 exacto para ejecutar descargas."
+          echo "No se inventan URLs ni repositorios."
+          exit 1
+
+      - name: PASO 2 — EXTRACT (raíz individual)
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "PASO 2 — EXTRACT"
+          echo "Cada ZIP se extraerá únicamente en su raíz correspondiente."
+          echo "No se permiten archivos/repositorios sueltos fuera de su raíz."
+          exit 1
+
+      - name: Commit to main
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .
+          git diff --cached --quiet || git commit -m "Import inventory 01-96"
+          git push origin main
