@@ -105,3 +105,6 @@
 {"number": 105, "parts": 1, "slug": "Claude-Agent-SDK-Python", "source": "https://github.com/anthropics/claude-agent-sdk-python.git", "source_commit": "af5ff1b9f2f279575f89b78f17572c6e35fbc2b6", "status": "COMPLETE"}
 {"number": 106, "parts": 3, "slug": "Gemini-CLI", "source": "https://github.com/google-gemini/gemini-cli.git", "source_commit": "0bd1d439751478771c45d3d0895a6a9760554bf4", "status": "COMPLETE"}
 {"number": 107, "parts": 1, "slug": "Google-Agent-Skills", "source": "https://github.com/google/skills.git", "source_commit": "a7123f80525a4438bc9601d7d6511dfde674b620", "status": "COMPLETE"}
+{"number": 108, "parts": 5, "slug": "MiMo-Code", "source": "https://github.com/XiaomiMiMo/MiMo-Code.git", "source_commit": "092e42fefbeecf0ddde522c346663a286df6a609", "status": "COMPLETE"}
+{"number": 109, "parts": 1, "slug": "MiMo-Skills", "source": "https://github.com/XiaomiMiMo/MiMo-Skills.git", "source_commit": "fa2a81225730f7a4885bb22dc7a7f646fc0b3823", "status": "COMPLETE"}
+{"number": 110, "parts": 5, "slug": "Llama-Agentic-System", "source": "https://github.com/meta-llama/llama-agentic-system.git", "source_commit": "10eff824035527e156be18998ba391201a69efaf", "status": "COMPLETE"}
