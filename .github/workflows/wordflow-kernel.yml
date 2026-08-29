@@ -1,0 +1,32 @@
+name: Wordflow kernel razonamiento
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: wordflow-kernel
+  cancel-in-progress: false
+env:
+  GIT_LFS_SKIP_SMUDGE: '1'
+  GIT_LFS_SKIP_PUSH: '1'
+jobs:
+  descarga-extraccion:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Paso 1 ZIP kernel
+        shell: bash
+        run: |
+          set -euo pipefail
+          git lfs uninstall --local || true
+          sudo apt-get update -y
+          sudo apt-get install -y zip unzip
+          python3 scripts/research_download_kernel.py 'Core kernel razonamiento repo para Yaiwes' '_work/kernel-download'
+      - name: Paso 2 EXTRACT kernel slugs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/extract_kernel.py 'Core kernel razonamiento repo para Yaiwes'
