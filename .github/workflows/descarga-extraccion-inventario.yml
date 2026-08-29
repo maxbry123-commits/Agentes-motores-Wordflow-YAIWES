@@ -1,4 +1,4 @@
-name: Descarga y extracción inventario
+name: Descarga y extraccion inventario
 on:
   workflow_dispatch:
 permissions:
@@ -21,127 +21,129 @@ jobs:
           cd repo
           mkdir -p .download-queue
           cat > .download-queue/repos.tsv <<'EOF'
-Guardians	https://github.com/metareflection/guardians
-Loop Engineer	https://github.com/SollanSystems/loop-engineer
-Agent-Zero	https://github.com/agent0ai/agent-zero
-Awesome Agent Workflows	https://github.com/Richicinschi/awesome-agent-workflows
-Agent Capability Standard	https://github.com/synaptiai/agent-capability-standard
-Microsoft Agent Framework	https://github.com/microsoft/agent-framework
-LangGraph	https://github.com/langchain-ai/langgraph
-Open Verification Kernel	https://github.com/fraware/open-verification-kernel
-Agentic Workflow Framework	https://github.com/JRA-CodingLab/agentic-workflow-framework
-MetaAgent	https://github.com/SaFo-Lab/MetaAgent
-Rasa	https://github.com/RasaHQ/rasa
-Semantic Kernel	https://github.com/microsoft/semantic-kernel
-DSPy	https://github.com/stanfordnlp/dspy
-Agno	https://github.com/agno-agi/agno
-Haystack	https://github.com/deepset-ai/haystack
-SwarmClaw	https://github.com/swarmclawai/swarmclaw
-SwarmDock	https://github.com/swarmclawai/swarmdock
-Agent Framework Samples	https://github.com/microsoft/Agent-Framework-Samples
-IntentKit	https://github.com/crestalnetwork/intentkit
-PraisonAI	https://github.com/MervinPraison/PraisonAI
-Trigger.dev	https://github.com/triggerdotdev/trigger.dev
-Solace Agent Mesh	https://github.com/SolaceLabs/solace-agent-mesh
-OpenRSI / Frontis-MA1 / OpenMLE	https://github.com/FrontisAI/openrsi
-Claw AI Lab	https://github.com/Claw-AI-Lab/Claw-AI-Lab
-Hivemind	https://github.com/hivementality-ai/hivemind
-Research Agent Lab	https://github.com/binary-ciao/research_agent_lab
-AI4S Agent Lab	https://github.com/Goldenmonstew/ai4s-agent-lab
-Evolver / EvolveR	https://github.com/KnowledgeXLab/EvolveR
-Ghost in the Droid	https://github.com/ghost-in-the-droid/android-agent
-Zuora Coding Agent	https://github.com/zuora/zuora-coding-agent
-Oh-My-Agents	https://github.com/visualiaconsulting/oh-my-agents
-Agent Skill Lab	https://github.com/ricardoml96/agent-skill-lab
-AI Agent Lab	https://github.com/quantiota/AI-Agent-Lab
-MiroThinker	https://github.com/MiroMindAI/MiroThinker
-Agents-A1	https://github.com/InternScience/Agents-A1
-Yunjue Agent	https://github.com/YunjueTech/Yunjue-Agent
-OpenClaw-RL	https://github.com/Gen-Verse/OpenClaw-RL
-SETA	https://github.com/camel-ai/seta
-ATLAS	https://github.com/itigges22/ATLAS
-OpenDev	https://github.com/opendev-to/opendev
-Shofer	https://github.com/shofer-dev/shofer
-Safe Lab Agents	https://github.com/MaxNaeg/safe_lab_agents
-CORAL	https://github.com/Human-Agent-Society/CORAL
-NVIDIA OpenShell	https://github.com/NVIDIA/OpenShell
-NVIDIA NeMo Agent Toolkit	https://github.com/NVIDIA/NeMo-Agent-Toolkit
-Kimi Code	https://github.com/MoonshotAI/kimi-cli
-Mini-Agent	https://github.com/MiniMax-AI/Mini-Agent
-Xiaomi Miloco	https://github.com/XiaoMi/xiaomi-miloco
-Meta OpenEnv	https://github.com/meta-pytorch/OpenEnv
-Kimi K2.5 / Agent Swarm	https://github.com/MoonshotAI/Kimi-K2.5
-MiniMax Provider Verifier	https://github.com/MiniMax-AI/MiniMax-Provider-Verifier
-Z.ai GLM Skills	https://github.com/zai-org/GLM-skills
-Xiaomi MiMo-V2-Flash	https://github.com/xiaomimimo/MiMo-V2-Flash
-Qwen-Agent / DeepPlanning	https://github.com/QwenLM/Qwen-Agent
-Agent Contracts	https://github.com/relari-ai/agent-contracts
-Bound	https://github.com/Danny-de-bree/bound
-Agent Handoff	https://github.com/artyomboyko/Agent_Handoff
-Agent Checkpoint	https://github.com/akz4ol/agent-checkpoint
-LangChain Task Steering	https://github.com/edvinhallvaxhiu/langchain-task-steering
-ToolOrchestra	https://github.com/NVlabs/ToolOrchestra
-Sovereign-OS	https://github.com/Justin0504/Sovereign-OS
-Reyn	https://github.com/tya5/reyn
-Kaji	https://github.com/apokamo/kaji
-Prime Agent	https://github.com/PrimeIntellect-ai/prime-agent
-Grok Build	https://github.com/xai-org/grok-build
-Qwen-UI-Agent	https://github.com/Tongyi-MAI/MAI-UI
-Codex Security	https://github.com/openai/codex-security
-Kimi K3 Agent Swarm	https://github.com/MoonshotAI/Kimi-K3
-GLM-5.3-Flash	https://github.com/zai-org/glm-5
-Qwen3.5 Agent	https://github.com/QwenLM/Qwen3.5
-Hyundai Physical-AI Stack	https://github.com/boston-dynamics/spot-sdk
-Artificial Agent Lab	https://github.com/BY571/artificial-agent-lab
-Swarm Agent	https://github.com/desplega-ai/agent-swarm
-Bernstein	https://github.com/sipyourdrink-ltd/bernstein
-Arena of Autonomous Threads	https://github.com/rafaelmateo123/Arena-of-Autonomous-Threads
-OSS Agent Lab	https://github.com/jeremylongshore/oss-agent-lab
-Aiyu Multi-Agent	https://github.com/teeprakorn1/aiyu-multi-agent
-OpenAlice	https://github.com/TraderAlice/OpenAlice
-Dr. Claw	https://github.com/OpenLAIR/dr-claw
-AgentSPEX	https://github.com/ScaleML/AgentSPEX
-Agents Universe	https://github.com/agentuniverse-ai/agentUniverse
-Spice Agent Coding	https://github.com/spiceai/skills
-Jidoka	https://github.com/agentjido/jidoka
-Plugin Marketplace	https://github.com/anthropics/claude-plugins-official
-AgentOS	https://github.com/rivet-dev/agentos
-ORCA	https://github.com/stablyai/orca
-Agent Resume	https://github.com/MukundaKatta/agent-resume
-GLM-5V-Turbo	https://github.com/zai-org/GLM-V
-MiniMax Code	https://github.com/MiniMax-AI/minimax-code
-OpenRoom	https://github.com/MiniMax-AI/OpenRoom
-MiniMax Skills	https://github.com/MiniMax-AI/skills
-Kimi Code CLI	https://github.com/MoonshotAI/kimi-code
-Kimi Agent SDK	https://github.com/MoonshotAI/kimi-agent-sdk
-Kimi K2	https://github.com/MoonshotAI/Kimi-K2
-DeepSeek Harness (dsh)	https://github.com/deepseek-ai/deepseek-harness
-Awesome DeepSeek Agent	https://github.com/deepseek-ai/awesome-deepseek-agent
-GitHub Copilot CLI	https://github.com/github/copilot-cli
-GitHub Copilot SDK	https://github.com/github/copilot-sdk
-GitHub Copilot App	https://github.com/github/app
-Qwen Code	https://github.com/QwenLM/qwen-code
-Codex	https://github.com/openai/codex
-OpenAI Skills	https://github.com/openai/skills
-Claude Code	https://github.com/anthropics/claude-code
-Claude Agent SDK — TypeScript	https://github.com/anthropics/claude-agent-sdk-typescript
-Claude Agent SDK — Python	https://github.com/anthropics/claude-agent-sdk-python
-Gemini CLI	https://github.com/google-gemini/gemini-cli
-Google Agent Skills	https://github.com/google/skills
-MiMo Code	https://github.com/XiaomiMiMo/MiMo-Code
-MiMo Skills	https://github.com/XiaomiMiMo/MiMo-Skills
-Llama Agentic System	https://github.com/meta-llama/llama-agentic-system
-Llama Stack	https://github.com/meta-llama/llama-stack
-Llama Cookbook	https://github.com/meta-llama/llama-cookbook
-NVIDIA Agent Skills	https://github.com/NVIDIA/skills
-NVIDIA-labs Object Oriented Agents (NOOA)	https://github.com/NVIDIA-NeMo/labs-OO-Agents
-NVIDIA AI-Q	https://github.com/NVIDIA-AI-Blueprints/aiq
-Atomic Agent	https://github.com/AtomicBot-ai/atomic-agent
-Atomic Chat	https://github.com/AtomicBot-ai/Atomic-Chat
-Atomic Hermes	https://github.com/AtomicBot-ai/atomic-hermes
-Atomic llama.cpp TurboQuant	https://github.com/AtomicBot-ai/atomic-llama-cpp-turboquant
-EOF
+          Guardians	https://github.com/metareflection/guardians
+          Loop Engineer	https://github.com/SollanSystems/loop-engineer
+          Agent-Zero	https://github.com/agent0ai/agent-zero
+          Awesome Agent Workflows	https://github.com/Richicinschi/awesome-agent-workflows
+          Agent Capability Standard	https://github.com/synaptiai/agent-capability-standard
+          Microsoft Agent Framework	https://github.com/microsoft/agent-framework
+          LangGraph	https://github.com/langchain-ai/langgraph
+          Open Verification Kernel	https://github.com/fraware/open-verification-kernel
+          Agentic Workflow Framework	https://github.com/JRA-CodingLab/agentic-workflow-framework
+          MetaAgent	https://github.com/SaFo-Lab/MetaAgent
+          Rasa	https://github.com/RasaHQ/rasa
+          Semantic Kernel	https://github.com/microsoft/semantic-kernel
+          DSPy	https://github.com/stanfordnlp/dspy
+          Agno	https://github.com/agno-agi/agno
+          Haystack	https://github.com/deepset-ai/haystack
+          SwarmClaw	https://github.com/swarmclawai/swarmclaw
+          SwarmDock	https://github.com/swarmclawai/swarmdock
+          Agent Framework Samples	https://github.com/microsoft/Agent-Framework-Samples
+          IntentKit	https://github.com/crestalnetwork/intentkit
+          PraisonAI	https://github.com/MervinPraison/PraisonAI
+          Trigger.dev	https://github.com/triggerdotdev/trigger.dev
+          Solace Agent Mesh	https://github.com/SolaceLabs/solace-agent-mesh
+          OpenRSI / Frontis-MA1 / OpenMLE	https://github.com/FrontisAI/openrsi
+          Claw AI Lab	https://github.com/Claw-AI-Lab/Claw-AI-Lab
+          Hivemind	https://github.com/hivementality-ai/hivemind
+          Research Agent Lab	https://github.com/binary-ciao/research_agent_lab
+          AI4S Agent Lab	https://github.com/Goldenmonstew/ai4s-agent-lab
+          Evolver / EvolveR	https://github.com/KnowledgeXLab/EvolveR
+          Ghost in the Droid	https://github.com/ghost-in-the-droid/android-agent
+          Zuora Coding Agent	https://github.com/zuora/zuora-coding-agent
+          Oh-My-Agents	https://github.com/visualiaconsulting/oh-my-agents
+          Agent Skill Lab	https://github.com/ricardoml96/agent-skill-lab
+          AI Agent Lab	https://github.com/quantiota/AI-Agent-Lab
+          MiroThinker	https://github.com/MiroMindAI/MiroThinker
+          Agents-A1	https://github.com/InternScience/Agents-A1
+          Yunjue Agent	https://github.com/YunjueTech/Yunjue-Agent
+          OpenClaw-RL	https://github.com/Gen-Verse/OpenClaw-RL
+          SETA	https://github.com/camel-ai/seta
+          ATLAS	https://github.com/itigges22/ATLAS
+          OpenDev	https://github.com/opendev-to/opendev
+          Shofer	https://github.com/shofer-dev/shofer
+          Safe Lab Agents	https://github.com/MaxNaeg/safe_lab_agents
+          CORAL	https://github.com/Human-Agent-Society/CORAL
+          NVIDIA OpenShell	https://github.com/NVIDIA/OpenShell
+          NVIDIA NeMo Agent Toolkit	https://github.com/NVIDIA/NeMo-Agent-Toolkit
+          Kimi Code	https://github.com/MoonshotAI/kimi-cli
+          Mini-Agent	https://github.com/MiniMax-AI/Mini-Agent
+          Xiaomi Miloco	https://github.com/XiaoMi/xiaomi-miloco
+          Meta OpenEnv	https://github.com/meta-pytorch/OpenEnv
+          Kimi K2.5 / Agent Swarm	https://github.com/MoonshotAI/Kimi-K2.5
+          MiniMax Provider Verifier	https://github.com/MiniMax-AI/MiniMax-Provider-Verifier
+          Z.ai GLM Skills	https://github.com/zai-org/GLM-skills
+          Xiaomi MiMo-V2-Flash	https://github.com/xiaomimimo/MiMo-V2-Flash
+          Qwen-Agent / DeepPlanning	https://github.com/QwenLM/Qwen-Agent
+          Agent Contracts	https://github.com/relari-ai/agent-contracts
+          Bound	https://github.com/Danny-de-bree/bound
+          Agent Handoff	https://github.com/artyomboyko/Agent_Handoff
+          Agent Checkpoint	https://github.com/akz4ol/agent-checkpoint
+          LangChain Task Steering	https://github.com/edvinhallvaxhiu/langchain-task-steering
+          ToolOrchestra	https://github.com/NVlabs/ToolOrchestra
+          Sovereign-OS	https://github.com/Justin0504/Sovereign-OS
+          Reyn	https://github.com/tya5/reyn
+          Kaji	https://github.com/apokamo/kaji
+          Prime Agent	https://github.com/PrimeIntellect-ai/prime-agent
+          Grok Build	https://github.com/xai-org/grok-build
+          Qwen-UI-Agent	https://github.com/Tongyi-MAI/MAI-UI
+          Codex Security	https://github.com/openai/codex-security
+          Kimi K3 Agent Swarm	https://github.com/MoonshotAI/Kimi-K3
+          GLM-5.3-Flash	https://github.com/zai-org/glm-5
+          Qwen3.5 Agent	https://github.com/QwenLM/Qwen3.5
+          Hyundai Physical-AI Stack	https://github.com/boston-dynamics/spot-sdk
+          Artificial Agent Lab	https://github.com/BY571/artificial-agent-lab
+          Swarm Agent	https://github.com/desplega-ai/agent-swarm
+          Bernstein	https://github.com/sipyourdrink-ltd/bernstein
+          Arena of Autonomous Threads	https://github.com/rafaelmateo123/Arena-of-Autonomous-Threads
+          OSS Agent Lab	https://github.com/jeremylongshore/oss-agent-lab
+          Aiyu Multi-Agent	https://github.com/teeprakorn1/aiyu-multi-agent
+          OpenAlice	https://github.com/TraderAlice/OpenAlice
+          Dr. Claw	https://github.com/OpenLAIR/dr-claw
+          AgentSPEX	https://github.com/ScaleML/AgentSPEX
+          Agents Universe	https://github.com/agentuniverse-ai/agentUniverse
+          Spice Agent Coding	https://github.com/spiceai/skills
+          Jidoka	https://github.com/agentjido/jidoka
+          Plugin Marketplace	https://github.com/anthropics/claude-plugins-official
+          AgentOS	https://github.com/rivet-dev/agentos
+          ORCA	https://github.com/stablyai/orca
+          Agent Resume	https://github.com/MukundaKatta/agent-resume
+          GLM-5V-Turbo	https://github.com/zai-org/GLM-V
+          MiniMax Code	https://github.com/MiniMax-AI/minimax-code
+          OpenRoom	https://github.com/MiniMax-AI/OpenRoom
+          MiniMax Skills	https://github.com/MiniMax-AI/skills
+          Kimi Code CLI	https://github.com/MoonshotAI/kimi-code
+          Kimi Agent SDK	https://github.com/MoonshotAI/kimi-agent-sdk
+          Kimi K2	https://github.com/MoonshotAI/Kimi-K2
+          DeepSeek Harness (dsh)	https://github.com/deepseek-ai/deepseek-harness
+          Awesome DeepSeek Agent	https://github.com/deepseek-ai/awesome-deepseek-agent
+          GitHub Copilot CLI	https://github.com/github/copilot-cli
+          GitHub Copilot SDK	https://github.com/github/copilot-sdk
+          GitHub Copilot App	https://github.com/github/app
+          Qwen Code	https://github.com/QwenLM/qwen-code
+          Codex	https://github.com/openai/codex
+          OpenAI Skills	https://github.com/openai/skills
+          Claude Code	https://github.com/anthropics/claude-code
+          Claude Agent SDK — TypeScript	https://github.com/anthropics/claude-agent-sdk-typescript
+          Claude Agent SDK — Python	https://github.com/anthropics/claude-agent-sdk-python
+          Gemini CLI	https://github.com/google-gemini/gemini-cli
+          Google Agent Skills	https://github.com/google/skills
+          MiMo Code	https://github.com/XiaomiMiMo/MiMo-Code
+          MiMo Skills	https://github.com/XiaomiMiMo/MiMo-Skills
+          Llama Agentic System	https://github.com/meta-llama/llama-agentic-system
+          Llama Stack	https://github.com/meta-llama/llama-stack
+          Llama Cookbook	https://github.com/meta-llama/llama-cookbook
+          NVIDIA Agent Skills	https://github.com/NVIDIA/skills
+          NVIDIA-labs Object Oriented Agents (NOOA)	https://github.com/NVIDIA-NeMo/labs-OO-Agents
+          NVIDIA AI-Q	https://github.com/NVIDIA-AI-Blueprints/aiq
+          Atomic Agent	https://github.com/AtomicBot-ai/atomic-agent
+          Atomic Chat	https://github.com/AtomicBot-ai/Atomic-Chat
+          Atomic Hermes	https://github.com/AtomicBot-ai/atomic-hermes
+          Atomic llama.cpp TurboQuant	https://github.com/AtomicBot-ai/atomic-llama-cpp-turboquant
+          EOF
           while IFS=$'\t' read -r name repo; do
+            name=$(printf '%s' "$name" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            repo=$(printf '%s' "$repo" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
             test -n "$name"
             test -n "$repo"
             slug=$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]' | sed 's#[^a-z0-9][^a-z0-9]*#-#g; s#^-##; s#-$##')
@@ -150,7 +152,7 @@ EOF
             test -n "$branch"
             curl --fail --location --retry 3 --retry-delay 2 -o ".download-queue/$slug.zip" "https://github.com/$owner_repo/archive/refs/heads/$branch.zip"
           done < .download-queue/repos.tsv
-      - name: Paso 2 - Extraer cada ZIP en su raíz
+      - name: Paso 2 - Extraer cada ZIP en su raiz
         shell: bash
         working-directory: repo
         env:
@@ -167,12 +169,14 @@ EOF
               if not line.strip():
                   continue
               name, repo = line.split('\t', 1)
+              name = name.strip()
+              repo = repo.strip()
               slug = ''.join((c.lower() if c.isalnum() else '-') for c in name).strip('-')
               while '--' in slug:
                   slug = slug.replace('--', '-')
               zp = root / '.download-queue' / f'{slug}.zip'
               if not zp.is_file() or zp.stat().st_size == 0:
-                  raise SystemExit(f'ZIP ausente o vacío: {name}')
+                  raise SystemExit(f'ZIP ausente o vacio: {name}')
               dest = root / name
               shutil.rmtree(dest, ignore_errors=True)
               dest.mkdir(parents=True, exist_ok=True)
