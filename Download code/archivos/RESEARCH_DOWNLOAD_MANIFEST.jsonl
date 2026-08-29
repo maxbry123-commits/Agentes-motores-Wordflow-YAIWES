@@ -21,3 +21,8 @@
 {"number": 21, "parts": 3, "slug": "Trigger-dev", "source": "https://github.com/triggerdotdev/trigger.dev.git", "source_commit": "f8aacacb8fa05d5044aa3853dce829eb71f61c48", "status": "COMPLETE"}
 {"number": 22, "parts": 1, "slug": "Solace-Agent-Mesh", "source": "https://github.com/SolaceLabs/solace-agent-mesh.git", "source_commit": "f71e744842a66331a7dbb33e5fba8319dc892d12", "status": "COMPLETE"}
 {"number": 23, "parts": 4, "slug": "OpenRSI", "source": "https://github.com/FrontisAI/openrsi.git", "source_commit": "1f477c48b6b464e196b651abc229dfe75247315a", "status": "COMPLETE"}
+{"number": 24, "parts": 2, "slug": "Claw-AI-Lab", "source": "https://github.com/Claw-AI-Lab/Claw-AI-Lab.git", "source_commit": "e349697ada7438254ea45caa3b65dc3e898ac3c2", "status": "COMPLETE"}
+{"number": 25, "parts": 1, "slug": "Hivemind", "source": "https://github.com/hivementality-ai/hivemind.git", "source_commit": "1cb27d29b329e2485acb2c35bf7bd8b9d12923a6", "status": "COMPLETE"}
+{"number": 26, "parts": 1, "slug": "Research-Agent-Lab", "source": "https://github.com/binary-ciao/research_agent_lab.git", "source_commit": "6d712ddf9013e5ec1d8275f705aaa316a70ad06e", "status": "COMPLETE"}
+{"number": 27, "parts": 1, "slug": "AI4S-Agent-Lab", "source": "https://github.com/Goldenmonstew/ai4s-agent-lab.git", "source_commit": "fe1427c9b479060a4c035b5777ee70ef85ec806f", "status": "COMPLETE"}
+{"number": 28, "parts": 1, "slug": "EvolveR", "source": "https://github.com/KnowledgeXLab/EvolveR.git", "source_commit": "63834b727ee6e7af3410657de36eb845814249ba", "status": "COMPLETE"}
