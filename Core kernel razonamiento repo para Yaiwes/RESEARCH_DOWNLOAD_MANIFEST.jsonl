@@ -22,3 +22,13 @@
 {"number": 33, "parts": 1, "slug": "Self-consistency", "source": "https://github.com/akpe12/Self-consistency.git", "source_commit": "0bdac1c4117ee6ae028725363870e4ff33e67f72", "status": "COMPLETE"}
 {"number": 34, "parts": 3, "slug": "veritrace", "source": "https://github.com/noah-art3mis/veritrace.git", "source_commit": "d556c8fa31a0e07c6682f42c01d10b038a2206a8", "status": "COMPLETE"}
 {"number": 35, "parts": 1, "slug": "AI-Agent-Skills", "source": "https://github.com/sreerevanth/AI-Agent-Skills.git", "source_commit": "5a4e7935857e25f42d17e7a2b2bddc39e0a89cad", "status": "COMPLETE"}
+{"number": 16, "parts": 11, "slug": "camel", "source": "https://github.com/camel-ai/camel.git", "source_commit": "e88b5eebe9f8bb5597196384c818fb4e3c63b25c", "status": "COMPLETE"}
+{"number": 18, "parts": 1, "slug": "tree-of-thoughts", "source": "https://github.com/kyegomez/tree-of-thoughts.git", "source_commit": "b6197795423c9d0ac3b84d0019f8cd82b201f600", "status": "COMPLETE"}
+{"number": 19, "parts": 1, "slug": "agentdescent", "source": "https://github.com/Birfy/agentdescent.git", "source_commit": "8ea8ca81eb248018d45e2b9112049b6d858c1812", "status": "COMPLETE"}
+{"number": 20, "parts": 1, "slug": "Fable5res", "source": "https://github.com/ahmdd4vd/Fable5res.git", "source_commit": "340596f46d6c3c4bc6037cdec9387989a59aea77", "status": "COMPLETE"}
+{"number": 21, "parts": 1, "slug": "fable5-methodology", "source": "https://github.com/UnpaidAttention/fable5-methodology.git", "source_commit": "ee559b5ce50533416f4eb0213776830a710fa622", "status": "COMPLETE"}
+{"number": 22, "parts": 1, "slug": "OpenMythos-kyegomez", "source": "https://github.com/kyegomez/OpenMythos.git", "source_commit": "155430a88d2a98322fc4c79b2a067792c3c9579a", "status": "COMPLETE"}
+{"number": 23, "parts": 1, "slug": "OpenMythos-Bananefre", "source": "https://github.com/Bananefre/OpenMythos.git", "source_commit": "5e63b57395b3366c8035ce2f61b1a46fc91d72d7", "status": "COMPLETE"}
+{"number": 24, "parts": 1, "slug": "OpenMythos-MLX", "source": "https://github.com/DeadByDawn101/OpenMythos-MLX.git", "source_commit": "dbc37a5107d1958a84bae17f02f99ac7862b4693", "status": "COMPLETE"}
+{"number": 25, "parts": 1, "slug": "OpenMythos-Skill", "source": "https://github.com/SarthakDz/OpenMythos-Skill.git", "source_commit": "345e276421d605c53827ea308b67f91a9e71ac28", "status": "COMPLETE"}
+{"number": 26, "parts": 2, "slug": "dagu-org", "source": "https://github.com/dagu-org/dagu.git", "source_commit": "b59f742fa6ba859729880a71f62a4231008ce22b", "status": "COMPLETE"}
