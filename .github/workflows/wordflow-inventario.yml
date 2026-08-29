@@ -166,9 +166,28 @@ jobs:
             rm -rf "$src"
             GIT_LFS_SKIP_SMUDGE=1 git clone --depth 1 --no-tags "https://x-access-token:${GITHUB_TOKEN}@github.com/${owner_repo}.git" "$src"
             rm -rf "$src/.git"
-            rm -f ".download-queue/$slug.zip"
-            ( cd "$src" && zip -q -r -9 -y "../../$slug.zip" . )
-            unzip -tq ".download-queue/$slug.zip"
+            rm -f .download-queue/${slug}*.zip
+            ( cd "$src" && zip -q -r -9 -y "../../${slug}_full.zip" . )
+            full=".download-queue/${slug}_full.zip"
+            sz=$(stat -c '%s' "$full")
+            if test "$sz" -le 12000000; then
+              mv "$full" ".download-queue/${slug}_0001.zip"
+            else
+              zipsplit -n 12000000 -b .download-queue "$full"
+              rm -f "$full"
+              i=1
+              for pth in .download-queue/${slug}_full*.zip; do
+                test -f "$pth" || continue
+                part=$(printf '.download-queue/%s_%04d.zip' "$slug" "$i")
+                mv "$pth" "$part"
+                psz=$(stat -c '%s' "$part")
+                if test "$psz" -gt 17000000; then echo "ZIP part exceeds 17MB: $part"; exit 1; fi
+                i=$((i+1))
+              done
+            fi
+            for z in .download-queue/${slug}_*.zip; do
+              unzip -tq "$z"
+            done
             rm -rf "$src"
             echo "PASS ZIP: $name"
           done < .download-queue/repos.tsv
@@ -228,40 +247,42 @@ jobs:
               slug = ''.join((c.lower() if c.isalnum() else '-') for c in name).strip('-')
               while '--' in slug:
                   slug = slug.replace('--', '-')
-              zp = root / '.download-queue' / f'{slug}.zip'
-              if not zp.is_file() or zp.stat().st_size == 0:
+              parts = sorted((root / '.download-queue').glob(f'{slug}_*.zip'))
+              if not parts:
                   raise SystemExit(f'ZIP ausente o vacio: {name}')
               dest = root / name
               shutil.rmtree(dest, ignore_errors=True)
               dest.mkdir(parents=True, exist_ok=True)
-              try:
-                  with ZipFile(zp) as z:
-                      if z.testzip() is not None:
-                          raise SystemExit(f'CRC failure in {name}')
-                      seen = set()
-                      count = 0
-                      for info in z.infolist():
-                          raw = info.filename.replace('\\', '/')
-                          if not raw or raw.endswith('/'):
-                              continue
-                          p = Path(raw)
-                          if p.is_absolute() or '..' in p.parts:
-                              raise SystemExit(f'{name}: unsafe ZIP path: {raw}')
-                          if raw in seen:
-                              raise SystemExit(f'{name}: duplicate member: {raw}')
-                          seen.add(raw)
-                          target = (dest / raw).resolve()
-                          if dest.resolve() not in target.parents:
-                              raise SystemExit(f'{name}: extraction escape: {raw}')
-                          target.parent.mkdir(parents=True, exist_ok=True)
-                          with z.open(info) as src, target.open('wb') as dst:
-                              shutil.copyfileobj(src, dst, length=1024 * 1024)
-                          count += 1
-                      if count == 0:
-                          raise SystemExit(f'{name}: zero files extracted')
-              except BadZipFile as exc:
-                  raise SystemExit(f'{name}: invalid ZIP: {exc}')
-              size = zp.stat().st_size
+              count = 0
+              size = 0
+              seen = set()
+              for zp in parts:
+                  size += zp.stat().st_size
+                  try:
+                      with ZipFile(zp) as z:
+                          if z.testzip() is not None:
+                              raise SystemExit(f'CRC failure in {name}')
+                          for info in z.infolist():
+                              raw = info.filename.replace('\\', '/')
+                              if not raw or raw.endswith('/'):
+                                  continue
+                              pth = Path(raw)
+                              if pth.is_absolute() or '..' in pth.parts:
+                                  raise SystemExit(f'{name}: unsafe ZIP path: {raw}')
+                              if raw in seen:
+                                  continue
+                              seen.add(raw)
+                              target = (dest / raw).resolve()
+                              if dest.resolve() not in target.parents:
+                                  raise SystemExit(f'{name}: extraction escape: {raw}')
+                              target.parent.mkdir(parents=True, exist_ok=True)
+                              with z.open(info) as src, target.open('wb') as dst:
+                                  shutil.copyfileobj(src, dst, length=1024 * 1024)
+                              count += 1
+                  except BadZipFile as exc:
+                      raise SystemExit(f'{name}: invalid ZIP: {exc}')
+              if count == 0:
+                  raise SystemExit(f'{name}: zero files extracted')
               print(f'PASS EXTRACT: {name} files={count} zip={size}')
               if batch and batch + size > BATCH_LIMIT:
                   commit(batch, f'{batch_no:03d}')
