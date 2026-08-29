@@ -1,0 +1,131 @@
+site_name: AgentDescent
+site_description: A parallel, self-evolving framework for accelerating RSI
+repo_url: https://github.com/Birfy/agentdescent
+repo_name: Birfy/agentdescent
+docs_dir: docs
+site_dir: site
+
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  features:
+    - navigation.sections
+    - navigation.top
+    - navigation.tracking
+    - navigation.indexes
+    - content.code.copy
+    - toc.follow
+
+nav:
+  - Home: index.md
+  - Getting started:
+    - Install and first run: install.md
+    - Quickstart — dataset to skill: quickstart-skill.md
+    - Quickstart — evolve a directory: quickstart-directory.md
+    - Quickstart — evolve an agent's code: quickstart-agent-code.md
+  - Core concepts:
+    - Concepts: concepts.md
+    - Architecture: architecture.md
+    - The data model: data-model.md
+    - Governance (L0 / L1 / L2): governance.md
+  - The evolve method: evolution.md
+  - Modules — design and usage:
+    - Module map: modules.md
+    - Strategies — what evolves: strategies.md
+    - Evolving a directory: directory-evolution.md
+    - Agents & LLMs: agents.md
+    - Document backends: backends.md
+    - The aggregator (the optimizer): aggregator.md
+    - The ledger: ledger.md
+    - The verifier: verifier.md
+    - The data layer: dataloader.md
+    - Rewards: rewards.md
+    - Reference orchestrator & domain: orchestrator.md
+  - Running at scale:
+    - Parallelism (DP / TP): parallelism.md
+    - Where rollouts run: execution.md
+    - Sandboxes: sandboxes.md
+    - Async — no round barrier: async.md
+    - Duration-aware scheduling: duration-scheduling.md
+  - The decision plane (policies):
+    - Choosing policies: policies.md
+    - Task sampling: sampling.md
+    - Candidate selection: selection.md
+    - Proposal policies: proposal-policies.md
+    - Conflict policies: conflict-policies.md
+    - Fusion policies: fusion-policies.md
+    - Acceptance policies: acceptance-policies.md
+    - Promotion policies: promotion-policies.md
+    - Staleness policies: staleness.md
+    - The aggregator_factory exit: aggregator-factory.md
+  - API reference: api.md
+  - Run everything, and extend it: usage.md
+  - Examples and results:
+    - Complete example — skill evolution: skill-evolution.md
+    - Efficiency experiments: efficiency.md
+    - Measured results: results.md
+    - Runtime matrix: matrix-overview.md
+    - Runtime matrix — report: matrix-report.md
+  - Self-evolution algorithms:
+    - Overview: self-evolution-examples.md
+    - Porting checklist: porting-checklist.md
+    - MethodPolicy porting checklist: porting-methodpolicy.md
+    - Port fidelity: port-fidelity.md
+    - ACE — context evolution: algo-ace.md
+    - GEPA — prompt evolution: algo-gepa.md
+    - EvoSkill — skill discovery: algo-evoskill.md
+    - SkillOpt — skill-document training: algo-skillopt.md
+    - ADAS — meta agent search: algo-adas.md
+    - DGM — Darwin Gödel Machine: algo-dgm.md
+    - OpenEvolve — program evolution: algo-openevolve.md
+    - ERA — empirical-software search: algo-era.md
+    - PromptBreeder — genetic prompts: algo-promptbreeder.md
+    - AFlow — workflow search: algo-aflow.md
+    - Reflexion — episodic memory: algo-reflexion.md
+    - Self-Refine — feedback refinement: algo-self-refine.md
+    - Voyager — skill library: algo-voyager.md
+    - SkillWeaver — web APIs: algo-skillweaver.md
+    - Absolute Zero — zero-data self-play: algo-absolute-zero.md
+    - R-Zero — challenger/solver: algo-r-zero.md
+    - Agent0 — tool curriculum: algo-agent0.md
+    - SICA — self-edit: algo-sica.md
+    - Gödel Agent — self-modification: algo-godel-agent.md
+  - Design records:
+    - Evolving a directory: design-directory-evolution.md
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.details
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/Birfy/agentdescent

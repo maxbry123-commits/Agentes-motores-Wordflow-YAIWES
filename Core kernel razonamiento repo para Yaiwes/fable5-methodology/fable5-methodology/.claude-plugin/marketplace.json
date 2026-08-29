@@ -1,0 +1,22 @@
+{
+  "name": "fable5-methodology",
+  "owner": {
+    "name": "UnpaidAttention",
+    "url": "https://github.com/UnpaidAttention"
+  },
+  "metadata": {
+    "description": "Marketplace for the fable5-methodology plugin — a self-enforcing engineering methodology for AI coding agents.",
+    "version": "1.0.0"
+  },
+  "plugins": [
+    {
+      "name": "fable5-methodology",
+      "description": "Self-enforcing engineering methodology extracted from Claude Fable 5: prime directives + integrity rules injected each session, 26 on-demand skills, 4 contracted subagents, and 6 lifecycle hooks that gate destructive commands and unverified 'done' claims.",
+      "version": "1.0.0",
+      "author": {
+        "name": "UnpaidAttention"
+      },
+      "source": "./"
+    }
+  ]
+}

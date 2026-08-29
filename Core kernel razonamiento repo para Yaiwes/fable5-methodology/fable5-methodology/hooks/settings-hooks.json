@@ -1,0 +1,66 @@
+{
+  "_comment": "Ready-to-merge into ~/.claude/settings.json or .claude/settings.json. INSTALL: copy fable5-methodology/hooks/*.{sh,py} into .claude/hooks/ (or point the paths at the collection), make them executable (chmod +x), then merge this 'hooks' object into settings.json. Paths use ${CLAUDE_PROJECT_DIR} (the documented project-root env var). These COMPLEMENT any existing hooks — Claude Code runs all registered hooks for an event; merge arrays, do not overwrite. Schema verified against code.claude.com/docs/en/hooks on 2026-07-06.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ${CLAUDE_PROJECT_DIR}/.claude/hooks/pre-tool-guard.py"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ${CLAUDE_PROJECT_DIR}/.claude/hooks/post-edit-verify.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ${CLAUDE_PROJECT_DIR}/.claude/hooks/evidence-log.sh"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ${CLAUDE_PROJECT_DIR}/.claude/hooks/delivery-gate.sh"
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ${CLAUDE_PROJECT_DIR}/.claude/hooks/pre-compact-handoff.sh"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ${CLAUDE_PROJECT_DIR}/.claude/hooks/session-loader.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
