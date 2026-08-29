@@ -27,6 +27,7 @@ jobs:
         run: |
           set -euo pipefail
           git rm -r --ignore-unmatch 'Download code/archivos'
+          git rm -r --ignore-unmatch 'Download code'
           git rm --ignore-unmatch 'scripts/research_download_chain.py'
           git rm --ignore-unmatch '.github/workflows/research-download-chain-final.yml'
 
