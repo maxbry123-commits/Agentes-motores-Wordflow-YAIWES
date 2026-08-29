@@ -95,3 +95,6 @@
 {"number": 95, "parts": 2, "slug": "DeepSeek-Harness", "source": "https://github.com/deepseek-ai/deepseek-harness.git", "source_commit": "cd5ef8148158c3a752a658978873241fdf8e2bbc", "status": "COMPLETE"}
 {"number": 96, "parts": 1, "slug": "Awesome-DeepSeek-Agent", "source": "https://github.com/deepseek-ai/awesome-deepseek-agent.git", "source_commit": "9ae39209bbfd901b653003472c4b35de9e16ffdf", "status": "COMPLETE"}
 {"number": 97, "parts": 1, "slug": "GitHub-Copilot-CLI", "source": "https://github.com/github/copilot-cli.git", "source_commit": "024bf28728f3cc82365e0143f44d071ebafbce4d", "status": "COMPLETE"}
+{"number": 98, "parts": 1, "slug": "GitHub-Copilot-SDK", "source": "https://github.com/github/copilot-sdk.git", "source_commit": "50ce37e19258524c6de82651652971e96d7ae5f3", "status": "COMPLETE"}
+{"number": 99, "parts": 3, "slug": "GitHub-Copilot-App", "source": "https://github.com/github/app.git", "source_commit": "d9ccd4d77934e49d6d30bede693525e21d0be489", "status": "COMPLETE"}
+{"number": 100, "parts": 5, "slug": "Qwen-Code", "source": "https://github.com/QwenLM/qwen-code.git", "source_commit": "1fb4a4eb00368b0c5ef53408c10f8d5d1c979320", "status": "COMPLETE"}
