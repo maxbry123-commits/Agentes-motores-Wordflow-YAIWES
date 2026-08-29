@@ -38,3 +38,5 @@
 {"number": 38, "parts": 1, "slug": "SETA", "source": "https://github.com/camel-ai/seta.git", "source_commit": "e4715b01174e6c9503fc46120d81dd692ced75e6", "status": "COMPLETE"}
 {"number": 39, "parts": 2, "slug": "ATLAS", "source": "https://github.com/itigges22/ATLAS.git", "source_commit": "ef616c5d2797f3e54dbe2aa33f8159049e144965", "status": "COMPLETE"}
 {"number": 40, "parts": 2, "slug": "OpenDev", "source": "https://github.com/opendev-to/opendev.git", "source_commit": "d32c660e4eed1a8e988d1fd58da88e41ba641d08", "status": "COMPLETE"}
+{"number": 41, "parts": 13, "slug": "Shofer", "source": "https://github.com/shofer-dev/shofer.git", "source_commit": "892a8ea32b8be33324a9e6242fef8ee6910ca13a", "status": "COMPLETE"}
+{"number": 42, "parts": 4, "slug": "Safe-Lab-Agents", "source": "https://github.com/MaxNaeg/safe_lab_agents.git", "source_commit": "e4a71147c219caf8867a135ab1fbd4c26e35d43b", "status": "COMPLETE"}
