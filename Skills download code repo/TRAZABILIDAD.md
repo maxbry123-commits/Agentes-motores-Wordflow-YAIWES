@@ -1,15 +1,8 @@
-# Estado real
+# Trazabilidad
 
-No hay 96 ZIP de GitHub. Hay 89 con URL única montable. Arena no se duplica.
+Inventario vigente: `Skills download code repo/INVENTARIO.md`
+Workflow: `.github/workflows/descarga-extraccion-inventario.yml`
+Extract skill origen: `Wordflow Code/skills/code Yaml sobre como se extrae los archivos del skills.yaml` en agentes
+Copia local extract: `Skills download code repo/code Yaml sobre como se extrae los archivos del skills.yaml`
 
-## Añadidos en esta pasada
-- Agent Resume → https://github.com/MukundaKatta/agent-resume
-- GLM-5V-Turbo → https://github.com/zai-org/GLM-V (repo VLM oficial que anuncia GLM-5V-Turbo)
-
-## Siguen sin repo GitHub oficial de código
-1. MiniMax Agent Team / Mavis — MiniMax dijo que lo abrirán después; hoy es producto
-2. Kimi K2.6 Agent Swarm — pesos en Hugging Face; Moonshot no publicó MoonshotAI/Kimi-K2.6
-3. DeepSeek-V4 — pesos en Hugging Face; no existe deepseek-ai/DeepSeek-V4
-4. CODE LAYER 11 — Thinking Workflow — no hay repo público con ese nombre
-5. Atomic — nombre genérico; no hay oficial único
-6. Thinking Workflow 10 — Research Bundle — no hay repo público con ese nombre
+37/37 con URL oficial del input. 0 vacíos. 0 duplicados. 0 URLs inventadas.
