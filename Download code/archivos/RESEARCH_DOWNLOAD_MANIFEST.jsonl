@@ -45,3 +45,4 @@
 {"number": 45, "parts": 3, "slug": "NVIDIA-NeMo-Agent-Toolkit", "source": "https://github.com/NVIDIA/NeMo-Agent-Toolkit.git", "source_commit": "1aa105b09a499bac9eec251f0fe3ce998b4ce7df", "status": "COMPLETE"}
 {"number": 46, "parts": 1, "slug": "Kimi-CLI", "source": "https://github.com/MoonshotAI/kimi-cli.git", "source_commit": "cbc15c076d17f70fec9f89c90c0502e68657f505", "status": "COMPLETE"}
 {"number": 47, "parts": 1, "slug": "Mini-Agent", "source": "https://github.com/MiniMax-AI/Mini-Agent.git", "source_commit": "d76a4f6389688cabda39c224a6cdfa274215d47c", "status": "COMPLETE"}
+{"number": 48, "parts": 7, "slug": "Xiaomi-Miloco", "source": "https://github.com/XiaoMi/xiaomi-miloco.git", "source_commit": "e900529fe0203a4b6a0a5487987a633887cf7b7f", "status": "COMPLETE"}
