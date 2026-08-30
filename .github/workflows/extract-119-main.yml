@@ -8,6 +8,7 @@ concurrency:
   cancel-in-progress: false
 env:
   GIT_LFS_SKIP_SMUDGE: '1'
+  GIT_LFS_SKIP_PUSH: '1'
 jobs:
   extract:
     runs-on: ubuntu-latest
@@ -17,7 +18,16 @@ jobs:
         with:
           ref: main
           fetch-depth: 1
-      - name: Paso 2 EXTRACT raices main
+          lfs: false
+      - name: off LFS hooks
+        run: |
+          git lfs uninstall || true
+          git config lfs.allowincompletepush true
+          git config filter.lfs.required false
+          git config filter.lfs.smudge ''
+          git config filter.lfs.clean ''
+          git config filter.lfs.process ''
+      - name: Paso 2 EXTRACT uno por uno
         shell: bash
         run: |
           set -euo pipefail
