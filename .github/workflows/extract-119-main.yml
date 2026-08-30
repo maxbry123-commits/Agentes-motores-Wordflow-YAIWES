@@ -16,12 +16,6 @@ jobs:
           ref: main
           fetch-depth: 1
           lfs: false
-      - name: Paso 1 - validar entorno sin LFS
-        shell: bash
-        run: |
-          set -euo pipefail
-          ! command -v git-lfs
-          ! git config --get-regexp '^filter\.lfs\.' >/dev/null 2>&1
       - name: Paso 2 EXTRACT uno por uno
         shell: bash
         run: |
