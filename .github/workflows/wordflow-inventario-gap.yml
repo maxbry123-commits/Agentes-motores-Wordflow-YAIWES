@@ -16,20 +16,14 @@ jobs:
         with:
           fetch-depth: 1
           lfs: false
-      - name: Paso 1 - validar entorno sin LFS
-        shell: bash
-        run: |
-          set -euo pipefail
-          ! command -v git-lfs
-          ! git config --get-regexp '^filter\.lfs\.' >/dev/null 2>&1
-      - name: Paso 2 - Descargar ZIP
+      - name: Paso 1 - Descargar ZIP
         shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update -y
           sudo apt-get install -y zip unzip
           python3 scripts/research_download_chain.py 'Download code/archivos' '_work/research-download'
-      - name: Paso 3 - Extraer cada ZIP en su raiz
+      - name: Paso 2 - Extraer cada ZIP en su raiz
         shell: bash
         run: |
           set -euo pipefail
