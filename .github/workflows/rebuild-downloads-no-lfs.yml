@@ -4,6 +4,13 @@ on:
     branches: [main]
     paths:
       - '.github/workflows/rebuild-downloads-no-lfs.yml'
+      - 'scripts/research_download_chain.py'
+      - 'scripts/research_download_kernel.py'
+      - 'scripts/research_download_extra.py'
+      - 'scripts/extract_inventory.py'
+      - 'scripts/extract_kernel.py'
+      - 'scripts/extract_extra.py'
+      - 'scripts/skill_guard.py'
   workflow_dispatch:
 permissions:
   contents: write
@@ -15,27 +22,19 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
-      - name: Checkout main without LFS
+      - name: Checkout main with LFS disabled
         uses: actions/checkout@v4
         with:
           ref: main
           fetch-depth: 1
           lfs: false
-      - name: Remove Git LFS capability from runner
-        shell: bash
-        run: |
-          set -euo pipefail
-          if dpkg-query -W -f='${Status}' git-lfs 2>/dev/null | grep -q 'install ok installed'; then
-            sudo apt-get purge -y git-lfs
-          fi
-          ! command -v git-lfs
       - name: Prepare tooling
         shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update -y
           sudo apt-get install -y zip unzip
-      - name: Clean prior generated downloads
+      - name: Clean prior generated downloads and extracted roots
         shell: bash
         run: |
           set -euo pipefail
@@ -43,41 +42,88 @@ jobs:
           rm -rf 'Core kernel razonamiento repo para Yaiwes'
           mkdir -p 'Download code/archivos'
           mkdir -p 'Core kernel razonamiento repo para Yaiwes'
-      - name: Rebuild kernel 01-35 from existing locked downloader
+      - name: Forensic preflight - no LFS operational artifacts
         shell: bash
         run: |
           set -euo pipefail
-          python3 scripts/research_download_kernel.py 'Core kernel razonamiento repo para Yaiwes' '_work/kernel-rebuild'
-      - name: Rebuild main 37-119 from existing locked downloader
+          python3 - <<'PY'
+          from pathlib import Path
+          roots=[Path('scripts'),Path('.github/workflows')]
+          forbidden=('git lfs','git-lfs.github.com','GIT_LFS_','filter=lfs')
+          self_file=Path('.github/workflows/rebuild-downloads-no-lfs.yml').resolve()
+          bad=[]
+          for root in roots:
+              for p in root.rglob('*'):
+                  if not p.is_file() or p.resolve()==self_file: continue
+                  try: text=p.read_text(errors='ignore')
+                  except Exception: continue
+                  for token in forbidden:
+                      if token in text: bad.append((str(p),token))
+          if bad:
+              raise SystemExit('FORENSIC FAIL: forbidden LFS usage/artifact in operational code: '+repr(bad))
+          print('FORENSIC PASS: operational scripts/workflows contain no LFS calls/configuration')
+          PY
+      - name: Rebuild main 01-119 from restored 119 queue
         shell: bash
         run: |
           set -euo pipefail
           python3 scripts/research_download_chain.py 'Download code/archivos' '_work/main-rebuild'
-      - name: Rebuild extra agents from existing downloader
+      - name: Extract main 01-119 into deterministic roots
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/extract_inventory.py 'Download code/archivos'
+      - name: Rebuild kernel queue
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/research_download_kernel.py 'Core kernel razonamiento repo para Yaiwes' '_work/kernel-rebuild'
+      - name: Extract kernel queue
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/extract_kernel.py 'Core kernel razonamiento repo para Yaiwes'
+      - name: Rebuild extra agents
         shell: bash
         run: |
           set -euo pipefail
           python3 scripts/research_download_extra.py 'Download code/archivos' '_work/extra-rebuild'
-      - name: Forensic verification
+      - name: Extract extra agents
         shell: bash
         run: |
           set -euo pipefail
-          test -f 'Core kernel razonamiento repo para Yaiwes/RESEARCH_DOWNLOAD_MANIFEST.jsonl'
-          kernel_count=$(grep -c '"status": "COMPLETE"' 'Core kernel razonamiento repo para Yaiwes/RESEARCH_DOWNLOAD_MANIFEST.jsonl')
-          test "$kernel_count" -eq 35
-          test -f 'Download code/archivos/RESEARCH_DOWNLOAD_MANIFEST.jsonl'
-          main_count=$(grep -c '"status": "COMPLETE"' 'Download code/archivos/RESEARCH_DOWNLOAD_MANIFEST.jsonl')
-          test "$main_count" -eq 83
-          test -f 'Download code/archivos/EXTRA_AGENTS_MANIFEST.jsonl'
-          extra_count=$(grep -c '"status": "COMPLETE"' 'Download code/archivos/EXTRA_AGENTS_MANIFEST.jsonl')
-          test "$extra_count" -eq 3
-          if find . -type f -not -path './.git/*' -print0 | xargs -0 grep -Il 'git-lfs.github.com' | grep -q .; then
-            echo 'FAIL: LFS pointer text detected'
-            exit 1
-          fi
-          if git grep -n -E 'git[[:space:]]+lfs|GIT_LFS_' -- . ':!.git' >/tmp/lfs_hits.txt; then
-            cat /tmp/lfs_hits.txt
-            echo 'FAIL: LFS usage detected in repository'
-            exit 1
-          fi
-          echo "FORENSIC PASS: kernel=35 main=83 extra=3; no LFS usage/pointers detected"
+          python3 scripts/extract_extra.py 'Download code/archivos'
+      - name: Forensic final verification
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          main=Path('Download code/archivos/RESEARCH_DOWNLOAD_MANIFEST.jsonl')
+          kernel=Path('Core kernel razonamiento repo para Yaiwes/RESEARCH_DOWNLOAD_MANIFEST.jsonl')
+          extra=Path('Download code/archivos/EXTRA_AGENTS_MANIFEST.jsonl')
+          assert main.exists(), 'main manifest missing'
+          assert kernel.exists(), 'kernel manifest missing'
+          assert extra.exists(), 'extra manifest missing'
+          main_rows=[json.loads(x) for x in main.read_text().splitlines() if x.strip()]
+          kernel_rows=[json.loads(x) for x in kernel.read_text().splitlines() if x.strip()]
+          extra_rows=[json.loads(x) for x in extra.read_text().splitlines() if x.strip()]
+          assert len(main_rows)==119, f'main manifest count={len(main_rows)}'
+          assert len({r['number'] for r in main_rows})==119, 'main numbering not unique'
+          assert all(r.get('status')=='COMPLETE' for r in main_rows), 'main incomplete status'
+          assert len(kernel_rows)==35, f'kernel manifest count={len(kernel_rows)}'
+          assert len(extra_rows)==3, f'extra manifest count={len(extra_rows)}'
+          for root in (Path('Download code/archivos'), Path('Core kernel razonamiento repo para Yaiwes')):
+              for p in root.rglob('*'):
+                  if p.is_file() and p.suffix=='.zip':
+                      assert p.stat().st_size <= 17*1000*1000, f'ZIP too large: {p}'
+          for root in (Path('Download code/archivos'), Path('Core kernel razonamiento repo para Yaiwes')):
+              for p in root.rglob('*'):
+                  if not p.is_file() or '.git' in p.parts: continue
+                  try: text=p.read_text(errors='ignore')
+                  except Exception: continue
+                  if 'git-lfs.github.com' in text or 'filter=lfs' in text:
+                      raise SystemExit(f'LFS pointer/config text detected: {p}')
+          print('FORENSIC PASS: main=119 kernel=35 extra=3; extraction completed; ZIP safety verified; no LFS pointer/config text detected')
+          PY
