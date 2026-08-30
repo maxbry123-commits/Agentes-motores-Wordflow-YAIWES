@@ -1,0 +1,141 @@
+
+
+services:
+  vscode:
+    build:
+      context: vscode
+      dockerfile: Dockerfile
+    environment:
+      - CLAUDE_CONFIG_DIR=/home/coder/.claude  #web API persistence
+    # ports:                # not published — reachable only via nginx + Authelia (code-server is auth:none)
+    #   - "8080:8080"
+    volumes:
+      # volume used to access the `notebooks` folder
+      - ../notebooks:/home/coder/project
+      - ./vscode/config.yaml:/home/coder/.config/code-server/config.yaml   # auth: none (Authelia gates it)
+      - ./aiagentui/uploads:/home/coder/project/uploads
+      - claude-config:/home/coder/.config/claude-code
+      - ../CLAUDE.md:/home/coder/.claude/CLAUDE.md:ro
+      - claude-data:/home/coder/.claude
+      - jh-config:/home/coder/jh   # JupyterHub connection config from the aiagentui box; jh-exec reads it via ~/.env symlink (read-only: vscode only consumes)
+      - mail-config:/home/coder/mail   # email creds from the aiagentui Save-email modal; idle-listener reads /home/coder/mail/.env (no docker/ mount)
+
+    env_file:
+      - .env
+
+  grafana:
+    image: grafana/grafana:12.4.1
+    environment:
+      - GF_INSTALL_PLUGINS=questdb-questdb-datasource
+      # Authelia auth-proxy: trust the Remote-User header set by nginx → no separate Grafana login
+      - GF_AUTH_PROXY_ENABLED=true
+      - GF_AUTH_PROXY_HEADER_NAME=Remote-User
+      - GF_AUTH_PROXY_HEADER_PROPERTY=username
+      - GF_AUTH_PROXY_AUTO_SIGN_UP=true
+      - GF_AUTH_PROXY_HEADERS=Email:Remote-Email Name:Remote-Name
+    # ports:                # not published — reachable only via nginx
+    #   - "3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning/datasources/:/etc/grafana/provisioning/datasources/
+      - ./grafana/provisioning/dashboards/:/etc/grafana/provisioning/dashboards/
+      - ./grafana/dashboards:/etc/dashboards
+    extra_hosts:
+      - "host.docker.internal:host-gateway"  
+    depends_on:
+      - questdb
+    env_file:
+      - .env
+
+  questdb:
+    image: questdb/questdb:9.4.0
+    ports:
+      # - "9000:9000"    # not published — reachable only via nginx
+      - "9009:9009"
+      - "8812:8812"
+      - "9003:9003"
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+
+    volumes:
+      - questdb-data:/root/.questdb
+    env_file:
+      - .env
+
+
+  authelia:  # SSO login portal / forward-auth
+    image: authelia/authelia:4.39
+    environment:
+      # Render configuration.yml through Authelia's template filter so {{ env "DOMAIN" }} resolves
+      - X_AUTHELIA_CONFIG=/config/configuration.yml
+      - X_AUTHELIA_CONFIG_FILTERS=template
+    volumes:
+      - ./authelia:/config
+    expose:
+      - "9091"            # internal only — reached by nginx as authelia:9091, NOT published to the host
+    env_file:
+      - .env              # provides DOMAIN to the template filter
+
+  aiagentui:  # Flask application service
+    build:   # Specify the location of your Dockerfile and application code
+      context: aiagentui
+      target: builder
+
+    # ports:                # not published — reachable only via nginx + Authelia
+    #   - "5000:5000"
+    volumes:
+      - ./aiagentui:/aiagentui  # Optional: Mount the application directory for live reloading in development  
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./aiagentui/uploads:/aiagentui/uploads
+      - /backup/rsnapshot:/backup/rsnapshot:ro
+      - /run/recovery:/run/recovery
+      - aiagentui-data:/aiagentui/instance   # persisted app store (Claude API key, future app config) — survives rebuild + restore
+      - jh-config:/aiagentui/jh   # JupyterHub config: /save-jh writes /aiagentui/jh/.env — shared with vscode
+      - mail-config:/aiagentui/mail   # Save-email modal writes /aiagentui/mail/.env — shared with vscode (read-only there)
+    env_file:
+      - .env
+
+  nginx:
+    image: nginx:stable
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf
+      - ./nginx/conf.d/default.conf.template:/etc/nginx/conf.d/default.conf.template
+      - ./nginx/conf.d/default.conf:/etc/nginx/conf.d/default.conf
+      - ./nginx/snippets:/etc/nginx/snippets
+      - /etc/letsencrypt:/etc/letsencrypt
+      - ./nginx/.well-known/:/usr/share/nginx/html/.well-known/
+      - ./nginx/certs/dhparam.pem:/etc/ssl/certs/dhparam.pem
+    ports:
+      - "80:80"
+      - "443:443"
+    env_file:
+      - ./nginx/nginx.env
+    command: /bin/bash -c "envsubst '$$DOMAIN' < /etc/nginx/conf.d/default.conf.template > /etc/nginx/conf.d/default.conf && exec nginx -g 'daemon off;'"
+    depends_on:
+      - vscode
+      - grafana
+      - questdb
+      - aiagentui
+      - authelia
+  # Refer to ./init.yaml to for initial SSL setup
+  # add the following line in in crontab (5 am, every monday)
+  #   0 5 * * 1 docker compose run certbot renew
+  certbot:
+    image: certbot/certbot
+    ports: []
+    volumes:
+      - /etc/letsencrypt:/etc/letsencrypt
+      - /var/lib/letsencrypt:/var/lib/letsencrypt
+      - ./nginx/.well-known/:/usr/share/nginx/html/.well-known/
+
+
+volumes:
+  grafana-data:
+  questdb-data:
+  claude-config:
+  claude-data:
+  aiagentui-data:
+  jh-config:
+  mail-config:

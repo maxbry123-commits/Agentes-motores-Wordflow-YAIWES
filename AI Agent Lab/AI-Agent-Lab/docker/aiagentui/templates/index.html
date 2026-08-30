@@ -1,0 +1,723 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="csrf-token" content="{{ csrf_token() }}">
+    <title>AI Agent Lab Dashboard</title>
+    <link href="/static/css/vanilla.css" rel="stylesheet">
+    <link href="/static/css/style.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+  </head>
+  <body class="is-paper">
+
+    <!-- Flash messages -->
+    {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+    <div class="flash-messages">
+      {% for category, message in messages %}
+      <div class="alert alert-{{ category }}">{{ message }}</div>
+      {% endfor %}
+    </div>
+    {% endif %}
+    {% endwith %}
+
+    <!-- Left Icon Sidebar -->
+    <aside class="icon-sidebar">
+      <nav class="sidebar-nav">
+        <div class="sidebar-item-wrap">
+          <button type="button" class="sidebar-item" onclick="toggleSidebarPopover(event, 'code-server')" aria-haspopup="menu" aria-expanded="false" title="Code Server">
+            <div class="sidebar-icon-wrap">
+              <span class="sidebar-icon-img app-icon" role="img" aria-label="Code Server"
+                style="--icon: url('/static/img/coder.svg')"></span>
+            </div>
+            <span class="sidebar-label">Code Server</span>
+          </button>
+          <div class="sidebar-popover" id="pop-code-server" role="menu" hidden>
+            <a class="sidebar-popover-item" href="https://vscode.{{ domain }}" target="_blank" rel="noopener noreferrer" role="menuitem">
+              <span>Open Code Server</span>
+              <span class="sidebar-popover-icon app-icon" aria-hidden="true"
+                style="--icon: url('/static/img/link-square-01-stroke-rounded-black.svg')"></span>
+            </a>
+            <a class="sidebar-popover-item" href="https://coder.com/docs/code-server" target="_blank" rel="noopener noreferrer" role="menuitem">
+              <span>Learn More</span>
+              <span class="sidebar-popover-icon app-icon" aria-hidden="true"
+                style="--icon: url('/static/img/link-square-01-stroke-rounded-black.svg')"></span>
+            </a>
+          </div>
+        </div>
+        <div class="sidebar-item-wrap">
+          <button type="button" class="sidebar-item" onclick="toggleSidebarPopover(event, 'questdb')" aria-haspopup="menu" aria-expanded="false" title="QuestDB">
+            <div class="sidebar-icon-wrap">
+              <span class="sidebar-icon-img app-icon" role="img" aria-label="QuestDB"
+                style="--icon: url('/static/img/questdb.svg')"></span>
+            </div>
+            <span class="sidebar-label">QuestDB</span>
+          </button>
+          <div class="sidebar-popover" id="pop-questdb" role="menu" hidden>
+            <a class="sidebar-popover-item" href="https://questdb.{{ domain }}" target="_blank" rel="noopener noreferrer" role="menuitem">
+              <span>Open QuestDB</span>
+              <span class="sidebar-popover-icon app-icon" aria-hidden="true"
+                style="--icon: url('/static/img/link-square-01-stroke-rounded-black.svg')"></span>
+            </a>
+            <a class="sidebar-popover-item" href="https://questdb.io/docs/" target="_blank" rel="noopener noreferrer" role="menuitem">
+              <span>Learn More</span>
+              <span class="sidebar-popover-icon app-icon" aria-hidden="true"
+                style="--icon: url('/static/img/link-square-01-stroke-rounded-black.svg')"></span>
+            </a>
+          </div>
+        </div>
+        <div class="sidebar-item-wrap">
+          <button type="button" class="sidebar-item" onclick="toggleSidebarPopover(event, 'grafana')" aria-haspopup="menu" aria-expanded="false" title="Grafana">
+            <div class="sidebar-icon-wrap">
+              <span class="sidebar-icon-img app-icon" role="img" aria-label="Grafana"
+                style="--icon: url('/static/img/grafana.svg')"></span>
+            </div>
+            <span class="sidebar-label">Grafana</span>
+          </button>
+          <div class="sidebar-popover" id="pop-grafana" role="menu" hidden>
+            <a class="sidebar-popover-item" href="https://grafana.{{ domain }}/dashboards" target="_blank" rel="noopener noreferrer" role="menuitem">
+              <span>Open Grafana</span>
+              <span class="sidebar-popover-icon app-icon" aria-hidden="true"
+                style="--icon: url('/static/img/link-square-01-stroke-rounded-black.svg')"></span>
+            </a>
+            <a class="sidebar-popover-item" href="https://grafana.com/docs/" target="_blank" rel="noopener noreferrer" role="menuitem">
+              <span>Learn More</span>
+              <span class="sidebar-popover-icon app-icon" aria-hidden="true"
+                style="--icon: url('/static/img/link-square-01-stroke-rounded-black.svg')"></span>
+            </a>
+          </div>
+        </div>
+        <div class="sidebar-item-wrap">
+          <button type="button" class="sidebar-item" onclick="toggleSidebarPopover(event, 'prometheus')" aria-haspopup="menu" aria-expanded="false" title="Prometheus">
+            <div class="sidebar-icon-wrap">
+              <span class="sidebar-icon-img app-icon" role="img" aria-label="Prometheus"
+                style="--icon: url('/static/img/prometheus.svg')"></span>
+            </div>
+            <span class="sidebar-label">Prometheus</span>
+          </button>
+          <div class="sidebar-popover" id="pop-prometheus" role="menu" hidden>
+            <a class="sidebar-popover-item" href="https://grafana.{{ domain }}/d/rYdddlPWk/node-exporter-full" target="_blank" rel="noopener noreferrer" role="menuitem">
+              <span>System Metrics</span>
+              <span class="sidebar-popover-icon app-icon" aria-hidden="true"
+                style="--icon: url('/static/img/link-square-01-stroke-rounded-black.svg')"></span>
+            </a>
+            <a class="sidebar-popover-item" href="https://prometheus.io/docs/" target="_blank" rel="noopener noreferrer" role="menuitem">
+              <span>Learn More</span>
+              <span class="sidebar-popover-icon app-icon" aria-hidden="true"
+                style="--icon: url('/static/img/link-square-01-stroke-rounded-black.svg')"></span>
+            </a>
+          </div>
+        </div>
+        <div class="sidebar-item-wrap">
+          <button type="button" class="sidebar-item" onclick="toggleSidebarPopover(event, 'claude')" aria-haspopup="menu" aria-expanded="false" title="Claude AI">
+            <div class="sidebar-icon-wrap">
+              <span class="sidebar-icon-img app-icon" role="img" aria-label="Claude AI"
+                style="--icon: url('/static/img/claude-stroke-rounded-black.svg')"></span>
+            </div>
+            <span class="sidebar-label">Claude AI</span>
+          </button>
+          <div class="sidebar-popover" id="pop-claude" role="menu" hidden>
+            <a class="sidebar-popover-item" href="javascript:void(0)" role="menuitem" onclick="closeSidebarPopovers(); openModal('claude')">
+              <span>Claude API Key</span>
+              <span class="sidebar-popover-icon app-icon" aria-hidden="true"
+                style="--icon: url('/static/img/link-square-01-stroke-rounded-black.svg')"></span>
+            </a>
+            <a class="sidebar-popover-item" href="javascript:void(0)" role="menuitem" onclick="closeSidebarPopovers(); showMailPanel(false)">
+              <span>Claude AI</span>
+              <span class="sidebar-popover-icon app-icon" aria-hidden="true"
+                style="--icon: url('/static/img/link-square-01-stroke-rounded-black.svg')"></span>
+            </a>
+            <a class="sidebar-popover-item" href="https://platform.claude.com/docs/en/home" target="_blank" rel="noopener noreferrer" role="menuitem">
+              <span>Learn More</span>
+              <span class="sidebar-popover-icon app-icon" aria-hidden="true"
+                style="--icon: url('/static/img/link-square-01-stroke-rounded-black.svg')"></span>
+            </a>
+          </div>
+        </div>
+        <div class="sidebar-item-wrap">
+          <button type="button" class="sidebar-item" onclick="toggleSidebarPopover(event, 'jupyterhub')" aria-haspopup="menu" aria-expanded="false" title="JupyterHub">
+            <div class="sidebar-icon-wrap">
+              <span class="sidebar-icon-img app-icon" role="img" aria-label="JupyterHub"
+                style="--icon: url('/static/img/jupyterhub.svg')"></span>
+            </div>
+            <span class="sidebar-label">JupyterHub</span>
+          </button>
+          <div class="sidebar-popover" id="pop-jupyterhub" role="menu" hidden>
+            <a class="sidebar-popover-item" href="{{ jh_host or 'https://hub.' ~ domain }}" target="_blank" rel="noopener noreferrer" role="menuitem">
+              <span>Open JupyterHub</span>
+              <span class="sidebar-popover-icon app-icon" aria-hidden="true"
+                style="--icon: url('/static/img/link-square-01-stroke-rounded-black.svg')"></span>
+            </a>
+            <a class="sidebar-popover-item" href="javascript:void(0)" role="menuitem" onclick="closeSidebarPopovers(); openModal('jupyterhub')">
+              <span>JupyterHub API Key</span>
+              <span class="sidebar-popover-icon app-icon" aria-hidden="true"
+                style="--icon: url('/static/img/link-square-01-stroke-rounded-black.svg')"></span>
+            </a>
+          </div>
+        </div>
+        <button class="sidebar-item" onclick="openModal('upload')" title="Upload a File">
+          <div class="sidebar-icon-wrap">
+            <span class="sidebar-icon-img app-icon" role="img" aria-label="Upload"
+              style="--icon: url('/static/img/upload.svg')"></span>
+          </div>
+          <span class="sidebar-label">Upload a File</span>
+        </button>
+        <button class="sidebar-item" onclick="openModal('restore')" title="Restore a Backup">
+          <div class="sidebar-icon-wrap">
+            <span class="sidebar-icon-img app-icon" role="img" aria-label="Restore"
+              style="--icon: url('/static/img/data-recovery.svg')"></span>
+          </div>
+          <span class="sidebar-label">Restore a Backup</span>
+        </button>
+        <div class="sidebar-item-wrap">
+          <button type="button" class="sidebar-item" onclick="toggleSidebarPopover(event, 'docker')" aria-haspopup="menu" aria-expanded="false" title="Docker">
+            <div class="sidebar-icon-wrap">
+              <span class="sidebar-icon-img app-icon" role="img" aria-label="Docker"
+                style="--icon: url('/static/img/docker.svg')"></span>
+            </div>
+            <span class="sidebar-label">Docker</span>
+          </button>
+          <div class="sidebar-popover" id="pop-docker" role="menu" hidden>
+            <a class="sidebar-popover-item" href="javascript:void(0)" role="menuitem" onclick="restartService('docker-vscode-1', 'VSCode')">
+              <span>Restart VSCode</span>
+              <span class="sidebar-popover-icon app-icon" aria-hidden="true"
+                style="--icon: url('/static/img/link-square-01-stroke-rounded-black.svg')"></span>
+            </a>
+            <a class="sidebar-popover-item" href="javascript:void(0)" role="menuitem" onclick="restartService('docker-questdb-1', 'QuestDB')">
+              <span>Restart QuestDB</span>
+              <span class="sidebar-popover-icon app-icon" aria-hidden="true"
+                style="--icon: url('/static/img/link-square-01-stroke-rounded-black.svg')"></span>
+            </a>
+            <a class="sidebar-popover-item" href="javascript:void(0)" role="menuitem" onclick="restartService('docker-grafana-1', 'Grafana')">
+              <span>Restart Grafana</span>
+              <span class="sidebar-popover-icon app-icon" aria-hidden="true"
+                style="--icon: url('/static/img/link-square-01-stroke-rounded-black.svg')"></span>
+            </a>
+            <a class="sidebar-popover-item" href="javascript:void(0)" role="menuitem" onclick="restartNginx()">
+              <span>Restart Nginx</span>
+              <span class="sidebar-popover-icon app-icon" aria-hidden="true"
+                style="--icon: url('/static/img/link-square-01-stroke-rounded-black.svg')"></span>
+            </a>
+            <div id="nginx-message" style="display:none; color: green; padding: 4px 12px; font-size: 13px;">Nginx is restarting. Please wait...</div>
+          </div>
+        </div>
+        <div class="sidebar-item-wrap">
+          <button type="button" class="sidebar-item" onclick="toggleSidebarPopover(event, 'mail')" aria-haspopup="menu" aria-expanded="false" title="Mail">
+            <div class="sidebar-icon-wrap">
+              <span class="sidebar-icon-img app-icon" role="img" aria-label="Mail"
+                style="--icon: url('/static/img/mail-at-sign-01-stroke-rounded-black.svg')"></span>
+            </div>
+            <span class="sidebar-label">Mail</span>
+          </button>
+          <div class="sidebar-popover" id="pop-mail" role="menu" hidden>
+            <a class="sidebar-popover-item" href="#" onclick="return openMail('inbox', event)" role="menuitem">
+              <span>Open Inbox</span>
+              <span class="sidebar-popover-icon app-icon" aria-hidden="true"
+                style="--icon: url('/static/img/link-square-01-stroke-rounded-black.svg')"></span>
+            </a>
+            <a class="sidebar-popover-item" href="#" onclick="return openMail('key', event)" role="menuitem">
+              <span>Set Password</span>
+              <span class="sidebar-popover-icon app-icon" aria-hidden="true"
+                style="--icon: url('/static/img/link-square-01-stroke-rounded-black.svg')"></span>
+            </a>
+          </div>
+        </div>
+        <div class="sidebar-item-wrap">
+          <button type="button" class="sidebar-item" onclick="toggleSidebarPopover(event, 'github')" aria-haspopup="menu" aria-expanded="false" title="GitHub">
+            <div class="sidebar-icon-wrap">
+              <span class="sidebar-icon-img app-icon" role="img" aria-label="GitHub"
+                style="--icon: url('/static/img/github.svg')"></span>
+            </div>
+            <span class="sidebar-label">GitHub</span>
+          </button>
+          <div class="sidebar-popover" id="pop-github" role="menu" hidden>
+            <a class="sidebar-popover-item" href="https://github.com/quantiota/AI-Agent-Lab/tree/main/docs" target="_blank" rel="noopener noreferrer" role="menuitem">
+              <span>Help Docs</span>
+              <span class="sidebar-popover-icon app-icon" aria-hidden="true"
+                style="--icon: url('/static/img/link-square-01-stroke-rounded-black.svg')"></span>
+            </a>
+            <a class="sidebar-popover-item" href="https://github.com/quantiota/AI-Agent-Lab/issues" target="_blank" rel="noopener noreferrer" role="menuitem">
+              <span>Create an Issue</span>
+              <span class="sidebar-popover-icon app-icon" aria-hidden="true"
+                style="--icon: url('/static/img/link-square-01-stroke-rounded-black.svg')"></span>
+            </a>
+            <a class="sidebar-popover-item" href="https://github.com/quantiota/AI-Agent-Lab/discussions" target="_blank" rel="noopener noreferrer" role="menuitem">
+              <span>Discussions</span>
+              <span class="sidebar-popover-icon app-icon" aria-hidden="true"
+                style="--icon: url('/static/img/link-square-01-stroke-rounded-black.svg')"></span>
+            </a>
+          </div>
+        </div>
+      </nav>
+    </aside>
+
+    <!-- Main Content -->
+    <div class="main-wrapper">
+
+      <!-- Top Header -->
+      <header class="top-header is-dark">
+        <div class="p-navigation__tagged-logo">
+          <a class="p-navigation__link" href="https://github.com/quantiota/AI-Agent-Lab" target="_blank" rel="noopener noreferrer">
+            <div class="p-navigation__logo-tag">
+              <img class="p-navigation__logo-icon" src="{{ url_for('static', filename='img/quantiota-white-icon.svg') }}" alt="AI Agent Lab">
+            </div>
+            <span class="p-navigation__logo-title">AI Agent Lab</span>
+          </a>
+        </div>
+        <div class="header-actions">
+          <button id="theme-toggle" class="theme-toggle-btn p-navigation__link">
+            <span style="display:inline-flex;align-items:center;">
+              <img src="/static/img/sun-02-stroke-standard-white.svg" alt="Light mode icon" class="theme-toggle-icon light-icon" width="24" height="24" style="display:block;">
+              <img src="/static/img/moon-02-stroke-standard-white.svg" alt="Dark mode icon" class="theme-toggle-icon dark-icon" width="24" height="24" style="display:none;">
+            </span>
+          </button>
+          <a href="https://auth.{{ domain }}/logout" class="header-logout p-navigation__link" title="Log out" aria-label="Log out">
+            <span class="app-icon" style="--icon: url('/static/img/logout-square-01-stroke-rounded-black.svg')"></span>
+          </a>
+        </div>
+      </header>
+
+      <!-- Grafana Cards -->
+      <div class="cards-row">
+        <div class="metric-card">
+          <iframe src="https://grafana.{{ domain }}/d-solo/rYdddlPWk/node-exporter-full?orgId=1&refresh=1m&theme=light&panelId=77" class="grafana-iframe" frameborder="0"></iframe>
+        </div>
+        <div class="metric-card">
+          <iframe src="https://grafana.{{ domain }}/d-solo/rYdddlPWk/node-exporter-full?orgId=1&refresh=1m&theme=light&panelId=78" class="grafana-iframe" frameborder="0"></iframe>
+        </div>
+        <div class="metric-card">
+          <iframe src="https://grafana.{{ domain }}/d-solo/rYdddlPWk/node-exporter-full?orgId=1&refresh=1m&theme=light&panelId=74" class="grafana-iframe" frameborder="0"></iframe>
+        </div>
+      </div>
+
+      <!-- Chat Panel -->
+      <div class="chat-panel">
+
+        <!-- Chat Sidebar -->
+        <div class="chat-sidebar">
+          <div class="chat-sidebar-header">
+            <button class="icon-btn" title="Toggle sidebar">
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="3" y="3" width="18" height="18" rx="2"/>
+                <line x1="9" y1="3" x2="9" y2="21"/>
+              </svg>
+            </button>
+            <button class="icon-btn" title="Search">
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="11" cy="11" r="8"/>
+                <line x1="21" y1="21" x2="16.65" y2="16.65"/>
+              </svg>
+            </button>
+            <button class="icon-btn" title="New chat" onclick="newChat()">
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
+                <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
+              </svg>
+            </button>
+          </div>
+
+          <div class="chat-agents-list">
+            <a class="chat-agent-item" href="javascript:void(0)" role="button" onclick="newChat()">
+              <div class="agent-icon-wrap">
+                <span class="agent-icon app-icon" aria-hidden="true"
+                  style="--icon: url('/static/img/pencil-edit-02-stroke-rounded-black.svg')"></span>
+              </div>
+              <span>New chat</span>
+            </a>
+            <a class="chat-agent-item" href="javascript:void(0)" role="button" title="Search chats" onclick="openSearch()">
+              <div class="agent-icon-wrap">
+                <span class="agent-icon app-icon" aria-hidden="true"
+                  style="--icon: url('/static/img/search-01-stroke-rounded-black.svg')"></span>
+              </div>
+              <span>Search chats</span>
+            </a>
+            <a class="chat-agent-item" href="https://vscode.{{ domain }}" target="_blank" rel="noopener noreferrer">
+              <div class="agent-icon-wrap">
+                <span class="agent-icon app-icon" aria-hidden="true"
+                  style="--icon: url('/static/img/code-simple-stroke-rounded-black.svg')"></span>
+              </div>
+              <span>Code</span>
+            </a>
+          </div>
+
+          <div id="chat-history" class="chat-history-section">
+            <!-- Chat history items populated by scripts.js -->
+          </div>
+
+          <div class="chat-sidebar-footer">
+            <div class="footer-copyright">© 2026 <a href="https://www.quantiota.ai" target="_blank" rel="noopener">Quantiota</a></div>
+          </div>
+        </div>
+
+        <!-- Chat Main -->
+        <div class="chat-main">
+          <div class="chat-model-header">
+            <div class="model-dropdown" id="model-dropdown">
+              <button type="button" class="model-selector" id="model-selector-btn" onclick="toggleModelMenu(event)" aria-haspopup="listbox" aria-expanded="false">
+                <span id="model-label">Claude Haiku 4.5</span>
+                <svg class="model-chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <polyline points="6 9 12 15 18 9"/>
+                </svg>
+              </button>
+              <ul class="model-menu" id="model-menu" role="listbox" hidden>
+                <li class="model-option" role="option" data-model="claude-haiku-4-5-20251001" aria-selected="true" onclick="selectModel(this)">Claude Haiku 4.5</li>
+                <li class="model-option" role="option" data-model="claude-sonnet-4-6" aria-selected="false" onclick="selectModel(this)">Claude Sonnet 4.6</li>
+                <li class="model-option" role="option" data-model="claude-opus-4-8" aria-selected="false" onclick="selectModel(this)">Claude Opus 4.8</li>                
+              </ul>
+              <input type="hidden" id="model-select" value="claude-haiku-4-5-20251001">
+            </div>
+          </div>
+
+          <div id="chatbot-body" class="chat-body">
+            <div class="chat-greeting">
+              <h2>What can I help with?</h2>
+            </div>
+          </div>
+
+          <div class="chat-input-area">
+            <div id="chat-attachment" class="chat-attachment" style="display:none;"></div>
+            <div class="chat-input-box">
+              <button class="attach-btn" title="Attach file" onclick="document.getElementById('chat-file-input').click()">
+                <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
+                </svg>
+              </button>
+              <input type="file" id="chat-file-input" class="chat-file-input"
+                accept=".txt,.csv,.sql,.md,.json,.log,.py,.js,.yml,.yaml,.html,.css,.xml,.tsv,.png,.jpg,.jpeg,.gif,.webp,.pdf"
+                onchange="handleAttach(event)" />
+              <input type="text" id="chatbot-input" placeholder="Ask anything..." class="chat-input" onkeypress="handleChatEnter(event)" />
+              <button class="send-btn" onclick="sendMessage()" title="Send">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                  <line x1="12" y1="19" x2="12" y2="5"/>
+                  <polyline points="5 12 12 5 19 12"/>
+                </svg>
+              </button>
+            </div>
+            <div class="chat-chips">
+              <button class="chip" onclick="usePrompt('Write a QuestDB SQL query that ')">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14a9 3 0 0 0 18 0V5"/><path d="M3 12a9 3 0 0 0 18 0"/></svg>
+                Write SQL
+              </button>
+              <button class="chip" onclick="usePrompt('Summarize the following:\n')">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
+                Summarize
+              </button>
+              <button class="chip" onclick="usePrompt('Explain this error and how to fix it:\n')">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+                Explain error
+              </button>
+              <button class="chip" onclick="usePrompt('Give me advice about ')">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+                Get advice
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Mail Panel (reuses the chat 2-column frame) -->
+      <div class="chat-panel" id="mail-panel" style="display:none">
+        <div class="chat-sidebar">
+          <div class="chat-sidebar-header">
+            <button class="icon-btn" title="Back to chat" onclick="showMailPanel(false)">
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
+            </button>
+            <span class="mail-title">MailBox</span>
+            <button class="icon-btn" title="Refresh" onclick="loadCurrentFolder()">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+            </button>
+          </div>
+          <div class="mail-search"><input type="text" class="modal-input" id="mail-search-input" placeholder="Search messages" onkeydown="if(event.key==='Enter'){event.preventDefault();mailSearch();}" oninput="if(!this.value.trim())loadCurrentFolder();" /></div>
+          <div class="mail-folders">
+            <a href="javascript:void(0)" class="mail-folder" id="mail-folder-inbox" onclick="mailTab('inbox')">
+              <span class="app-icon mail-folder-ico" aria-hidden="true" style="--icon:url('/static/img/inbox-stroke-rounded-black.svg')"></span>
+              <span>Inbox</span>
+            </a>
+            <a href="javascript:void(0)" class="mail-folder" id="mail-folder-sent" onclick="mailTab('sent')">
+              <span class="app-icon mail-folder-ico" aria-hidden="true" style="--icon:url('/static/img/sent-02-stroke-rounded-black.svg')"></span>
+              <span>Sent</span>
+            </a>
+            <a href="javascript:void(0)" class="mail-folder" id="mail-folder-junk" onclick="mailTab('junk')">
+              <span class="app-icon mail-folder-ico" aria-hidden="true" style="--icon:url('/static/img/junk-stroke-rounded-black.svg')"></span>
+              <span>Junk</span>
+            </a>
+          </div>
+          <div id="mail-list" class="chat-history-section"></div>
+          <div class="chat-sidebar-footer">
+            <div class="footer-copyright" id="mail-box-label"></div>
+          </div>
+        </div>
+        <div class="chat-main">
+          <div id="mail-view" class="mail-view">
+            <div class="mail-view-empty">Select a message to read.</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <style>
+      #mail-panel .mail-title { flex: 1; padding: 0 8px; font-size: 14px; font-weight: 600; color: var(--vf-color-text-default); }
+      #mail-panel .mail-folders { display: flex; flex-direction: column; gap: 2px; padding: 6px; border-bottom: 1px solid var(--vf-color-border-low, rgba(0,0,0,.1)); }
+      #mail-panel .mail-folder { display: flex; align-items: center; gap: 9px; padding: 7px 10px; border-radius: 8px; font-size: 13px; text-decoration: none; color: var(--vf-color-text-muted); }
+      #mail-panel .mail-folder-ico { width: 16px; height: 16px; color: inherit; opacity: .90; }
+      #mail-panel .mail-folder:hover { background: var(--vf-color-background-hover); }
+      #mail-panel .mail-folder.is-active { background: var(--vf-color-background-hover); color: var(--vf-color-text-default); font-weight: 600; }
+      #mail-panel .mail-more { display: block; text-align: center; padding: 9px; font-size: 12.5px; color: var(--vf-color-text-muted); text-decoration: none; }
+      #mail-panel .mail-more:hover { color: var(--vf-color-text-default); background: var(--vf-color-background-hover); }
+      #mail-panel .mail-search { padding: 8px 8px 4px; }
+      #mail-panel .mail-search .modal-input { width: 100%; box-sizing: border-box; }
+      #mail-list .mail-item { flex-direction: column; align-items: flex-start; gap: 2px; }
+      #mail-list .mail-item .mi-from { font-size: 13px; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      #mail-list .mail-item .mi-subject { font-size: 12px; color: var(--vf-color-text-muted); max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      #mail-list .mail-item.is-unread .mi-from { font-weight: 600; }
+      #mail-list .mail-item.is-unread .mi-from::before { content: "\2022"; color: var(--vf-color-text-muted); margin-right: 5px; }
+      .mail-view { padding: 24px; overflow: auto; height: 100%; box-sizing: border-box; }
+      .mail-view-empty { color: var(--vf-color-text-muted); }
+      .mail-msg-subject { font-size: 20px; font-weight: 600; margin-bottom: 6px; }
+      .mail-msg-meta { color: var(--vf-color-text-muted); font-size: 13px; }
+      .mail-msg-body { white-space: pre-wrap; word-wrap: break-word; font-family: inherit; margin-top: 16px; font-size: 14px; }
+    </style>
+    <script>
+      function mesc(s){return (s==null?'':String(s)).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
+      function showMailPanel(on){
+        var chat=document.querySelector('.chat-panel:not(#mail-panel)');
+        var mail=document.getElementById('mail-panel');
+        if(chat)chat.style.display=on?'none':'';
+        if(mail)mail.style.display=on?'':'none';
+      }
+      var mailFolders={}, mailCurrent='', mailLimit=5, mailCache=[];
+      function openMail(mode,event){
+        if(event){event.preventDefault();}
+        var pop=document.getElementById('pop-mail'); if(pop)pop.hidden=true;
+        if(mode==='key'){ openModal('email'); return false; }
+        showMailPanel(true); mailReset(); return false;
+      }
+      var MAIL_TABS=['inbox','sent','junk'];
+      function mailReset(){
+        mailCurrent=''; mailLimit=5;
+        var si=document.getElementById('mail-search-input'); if(si)si.value='';
+        MAIL_TABS.forEach(function(k){ var el=document.getElementById('mail-folder-'+k); if(el)el.classList.remove('is-active'); });
+        document.getElementById('mail-list').innerHTML='';
+        document.getElementById('mail-view').innerHTML='<div class="mail-view-empty">Select a message to read.</div>';
+      }
+      function mailTab(which){
+        mailCurrent=which; mailLimit=5;
+        var si=document.getElementById('mail-search-input'); if(si)si.value='';
+        MAIL_TABS.forEach(function(k){ var el=document.getElementById('mail-folder-'+k); if(el)el.classList.toggle('is-active', which===k); });
+        document.getElementById('mail-view').innerHTML='<div class="mail-view-empty">Select a message to read.</div>';
+        loadCurrentFolder();
+      }
+      function loadCurrentFolder(){
+        if(!mailCurrent){ return; }
+        if(mailCurrent==='inbox'){ loadInbox(); return; }
+        var key=mailCurrent;   // 'sent' or 'junk' → resolve the real folder name
+        if(mailFolders[key]){ loadInbox(mailFolders[key]); return; }
+        fetch('/api/mail/folders').then(function(r){return r.json();}).then(function(d){
+          mailFolders=(d&&d.special)||{};
+          if(mailFolders[key]){ loadInbox(mailFolders[key]); }
+          else { document.getElementById('mail-list').innerHTML='<div style="padding:12px;color:var(--vf-color-text-muted)">No '+key+' folder found.</div>'; }
+        }).catch(function(){ document.getElementById('mail-list').innerHTML='<div style="padding:12px;color:#dc2626">Could not list folders.</div>'; });
+      }
+      function loadInbox(folder){
+        var list=document.getElementById('mail-list');
+        list.innerHTML='<div style="padding:12px;color:var(--vf-color-text-muted)">Loading…</div>';
+        var url='/api/mail/inbox?limit='+mailLimit+(folder?('&folder='+encodeURIComponent(folder)):'');
+        fetch(url).then(function(r){return r.json();}).then(function(d){
+          if(d.error){list.innerHTML='<div style="padding:12px;color:#dc2626">'+mesc(d.error)+'</div>';return;}
+          var lbl=document.getElementById('mail-box-label'); if(lbl)lbl.textContent=d.mailbox_addr||'';
+          var envs=d.envelopes||[];
+          envs.forEach(function(e){ e._folder=folder||''; });
+          mailCache=envs;
+          if(!envs.length){list.innerHTML='<div style="padding:12px;color:var(--vf-color-text-muted)">No messages.</div>';return;}
+          var html=renderMailRows(envs);
+          if(envs.length>=mailLimit){ html+='<a class="mail-more" href="javascript:void(0)" onclick="mailMore()">Load more</a>'; }
+          list.innerHTML=html;
+        }).catch(function(err){list.innerHTML='<div style="padding:12px;color:#dc2626">'+mesc(err)+'</div>';});
+      }
+      function mailMore(){ mailLimit+=5; loadCurrentFolder(); }
+      function renderMailRows(envs){
+        return envs.map(function(e){
+          return '<a class="chat-agent-item mail-item'+(e.seen?'':' is-unread')+'" href="javascript:void(0)" onclick="loadMessage(\''+e.uid+'\',\''+(e._folder||'')+'\')">'
+            +'<span class="mi-from">'+mesc(e.from)+'</span>'
+            +'<span class="mi-subject">'+mesc(e.subject||'(no subject)')+'</span></a>';
+        }).join('');
+      }
+      function mailSearch(){
+        var q=(document.getElementById('mail-search-input').value||'').trim();
+        var list=document.getElementById('mail-list');
+        if(!q){ if(mailCurrent){ loadCurrentFolder(); } else { list.innerHTML=''; } return; }
+        list.innerHTML='<div style="padding:12px;color:var(--vf-color-text-muted)">Searching…</div>';
+        function one(folder){
+          var u='/api/mail/search?q='+encodeURIComponent(q)+(folder?('&folder='+encodeURIComponent(folder)):'');
+          return fetch(u).then(function(r){return r.json();}).then(function(d){
+            var es=(d&&d.envelopes)||[]; es.forEach(function(e){ e._folder=folder||''; }); return es;
+          }).catch(function(){ return []; });
+        }
+        function run(sent){
+          var jobs=[ one('') ];                 // Inbox
+          if(sent){ jobs.push(one(sent)); }     // Sent
+          Promise.all(jobs).then(function(parts){
+            var envs=[].concat.apply([],parts);
+            envs.sort(function(a,b){ return new Date(b.date)-new Date(a.date); });
+            if(!envs.length){ list.innerHTML='<div style="padding:12px;color:var(--vf-color-text-muted)">No matches.</div>'; return; }
+            list.innerHTML=renderMailRows(envs);
+          });
+        }
+        if(mailFolders.sent){ run(mailFolders.sent); }
+        else { fetch('/api/mail/folders').then(function(r){return r.json();}).then(function(d){ mailFolders=(d&&d.special)||{}; run(mailFolders.sent||''); }).catch(function(){ run(''); }); }
+      }
+      function loadMessage(uid,folder){
+        var v=document.getElementById('mail-view');
+        v.innerHTML='<div class="mail-view-empty">Loading…</div>';
+        var fq=folder?('?folder='+encodeURIComponent(folder)):'';
+        fetch('/api/mail/message/'+encodeURIComponent(uid)+fq).then(function(r){return r.json();}).then(function(m){
+          if(m.error){v.innerHTML='<div style="color:#dc2626">'+mesc(m.error)+'</div>';return;}
+          v.innerHTML='<div class="mail-msg-subject">'+mesc(m.subject||'(no subject)')+'</div>'
+            +'<div class="mail-msg-meta"><strong>'+mesc(m.from)+'</strong> &middot; '+mesc(m.date)+'</div>'
+            +'<div class="mail-msg-meta">to '+mesc(m.to)+'</div>'
+            +'<div class="mail-msg-body">'+mesc(m.body)+'</div>';
+        }).catch(function(err){v.innerHTML='<div style="color:#dc2626">'+mesc(err)+'</div>';});
+      }
+    </script>
+
+    <!-- Modal: Claude AI -->
+    <div id="claude-modal" class="modal-overlay" onclick="closeModal('claude')">
+      <div class="modal-box" onclick="event.stopPropagation()">
+        <div class="modal-header">
+          <h3>Claude API Key</h3>
+          <button class="modal-close" onclick="closeModal('claude')">&#x2715;</button>
+        </div>
+        <div class="modal-body">
+          <p>Enter your Claude (Anthropic) API key to access AI features.</p>
+          <form id="claude-api-form" class="api-key-form">
+            <input type="password" id="api-key-input" class="api-key-input" placeholder="Enter your Anthropic API key" />
+            <button type="submit" class="api-key-submit">Submit</button>
+          </form>
+        </div>
+      </div>
+    </div>
+
+    <!-- Modal: JupyterHub API Key -->
+    <div id="jupyterhub-modal" class="modal-overlay" onclick="closeModal('jupyterhub')">
+      <div class="modal-box" onclick="event.stopPropagation()">
+        <div class="modal-header">
+          <h3>JupyterHub API Key</h3>
+          <button class="modal-close" onclick="closeModal('jupyterhub')">&#x2715;</button>
+        </div>
+        <div class="modal-body">
+          <p>Connect this lab to a remote JupyterHub for GPU execution. Enter the Hub URL, your username, and an API token.</p>
+          <form id="jupyterhub-api-form" class="api-key-form">
+            <input type="text" id="jh-url-input" class="api-key-input" placeholder="Hub URL — e.g. https://hub.example.com" />
+            <input type="text" id="jh-user-input" class="api-key-input" placeholder="Username — e.g. agent-01" />
+            <input type="password" id="jh-token-input" class="api-key-input" placeholder="API token" />
+            <button type="submit" class="api-key-submit">Submit</button>
+          </form>
+        </div>
+      </div>
+    </div>
+
+    <!-- Modal: Email Password -->
+    <div id="email-modal" class="modal-overlay" onclick="closeModal('email')">
+      <div class="modal-box" onclick="event.stopPropagation()">
+        <div class="modal-header">
+          <h3>Mail Password</h3>
+          <button class="modal-close" onclick="closeModal('email')">&#x2715;</button>
+        </div>
+        <div class="modal-body">
+          <p>Set the password for this agent's mailbox{% if email_user %} <strong>{{ email_user }}</strong>{% endif %}.</p>
+          <form id="email-api-form" class="api-key-form">
+            <input type="password" id="email-pass-input" class="api-key-input" placeholder="Mailbox password" />
+            <button type="submit" class="api-key-submit">Submit</button>
+          </form>
+        </div>
+      </div>
+    </div>
+
+    <!-- Modal: Upload files -->
+    <div id="upload-modal" class="modal-overlay" onclick="closeModal('upload')">
+      <div class="modal-box" onclick="event.stopPropagation()">
+        <div class="modal-header">
+          <h3>Upload files</h3>
+          <button class="modal-close" onclick="closeModal('upload')">&#x2715;</button>
+        </div>
+        <div class="modal-body">
+          <form id="upload-form" action="/upload" method="POST" enctype="multipart/form-data">
+            <div class="upload-dropzone" id="upload-dropzone">
+              <div class="upload-dz-icon">
+                <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                  <line x1="12" y1="3" x2="12" y2="15"/>
+                  <polyline points="8 7 12 3 16 7"/>
+                  <path d="M5 14v3a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-3"/>
+                </svg>
+              </div>
+              <button type="button" class="upload-select-btn" onclick="document.getElementById('file').click()">Select file</button>
+              <div class="upload-dz-title">or drop files to upload</div>
+              <div class="upload-dz-hint">CSV, TXT, SQL or PDF. Max size of 800K</div>
+            </div>
+            <input type="file" id="file" name="file" class="upload-file-input" accept=".csv,.txt,.sql,.pdf" hidden />
+          </form>
+          <div id="error-message" class="upload-error" style="display:none;"></div>
+          <div id="file-list" class="upload-file-list"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Modal: Restore a Backup -->
+    <div id="restore-modal" class="modal-overlay" onclick="closeModal('restore')">
+      <div class="modal-box" onclick="event.stopPropagation()">
+        <div class="modal-header">
+          <h3>Select a Backup to Restore</h3>
+          <button class="modal-close" onclick="closeModal('restore')">&#x2715;</button>
+        </div>
+        <div class="modal-body">
+          <div class="restore-dropdown" id="restore-dropdown">
+            <button type="button" class="restore-selector" id="restore-selector-btn" onclick="toggleRestoreMenu(event)" aria-haspopup="listbox" aria-expanded="false">
+              <span id="restore-label" class="restore-placeholder">Select a Backup</span>
+              <svg class="restore-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <polyline points="6 9 12 15 18 9"/>
+              </svg>
+            </button>
+            <ul class="restore-menu" id="restore-menu" role="listbox" hidden></ul>
+            <input type="hidden" id="restore-select" value="">
+          </div>
+          <div id="status-message"></div>
+        </div>
+        <div class="modal-footer">
+          <button id="restore-btn" class="restore-submit">Restore</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Modal: Search chats -->
+    <div id="search-modal" class="modal-overlay" onclick="closeModal('search')">
+      <div class="modal-box" onclick="event.stopPropagation()">
+        <div class="modal-header">
+          <h3>Search chats</h3>
+          <button class="modal-close" onclick="closeModal('search')">&#x2715;</button>
+        </div>
+        <div class="modal-body">
+          <input type="text" id="search-input" class="modal-input" placeholder="Search your conversations..." oninput="searchChats()" />
+          <div id="search-results" class="search-results"></div>
+        </div>
+      </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/marked-katex-extension/lib/index.umd.js"></script>
+    <script src="/static/js/scripts.js"></script>
+    <script src="/static/js/theme.js"></script>
+    <script>
+      function openModal(name) {
+        document.getElementById(name + '-modal').classList.add('active');
+      }
+      function closeModal(name) {
+        document.getElementById(name + '-modal').classList.remove('active');
+      }
+      function handleChatEnter(e) {
+        if (e.key === 'Enter') sendMessage();
+      }
+    </script>
+  </body>
+</html>

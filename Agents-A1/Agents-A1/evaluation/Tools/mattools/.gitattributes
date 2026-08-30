@@ -1,0 +1,21 @@
+# declare HTML, rST and test files as vendored/docs to exclude them when calculating repo languages on GitHub
+src/tool_source_code/pymatgen/tests/files/**/* linguist-vendored
+src/tool_source_code/pymatgen/docs/**/* linguist-generated
+src/tool_source_code/pymatgen/dev_scripts/**/* linguist-vendored
+assets/**/* linguist-vendored
+src/built_python_parser/**/* linguist-vendored
+src/code_segments/**/* linguist-vendored
+src/defects_doc/**/* linguist-vendored
+src/lightrag/**/* linguist-vendored
+src/**/*.json linguist-vendored
+src/**/*.txt linguist-vendored
+src/vector_store/**/* linguist-vendored
+poetry.lock linguist-vendored
+pymatgen_codebase.txt linguist-vendored
+requirements.txt linguist-vendored
+LICENSE linguist-vendored
+pyproject.toml linguist-vendored
+
+*.roff linguist-vendored
+*.md linguist-documentation
+*.py linguist-language=Python
