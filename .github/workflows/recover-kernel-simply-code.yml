@@ -1,0 +1,83 @@
+name: Recover kernel simply-code
+on:
+  workflow_dispatch:
+    inputs:
+      source_url:
+        description: 'Canonical Git repository URL for kernel component simply-code'
+        required: true
+        default: 'https://github.com/openai/simply-code.git'
+        type: string
+permissions:
+  contents: write
+concurrency:
+  group: recover-kernel-simply-code
+  cancel-in-progress: false
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          lfs: false
+
+      - name: Trace source repository
+        env:
+          SOURCE_URL: ${{ inputs.source_url }}
+        run: |
+          set -euo pipefail
+          echo "SOURCE_URL=$SOURCE_URL"
+          git ls-remote "$SOURCE_URL" HEAD
+
+      - name: Download and package simply-code
+        env:
+          SOURCE_URL: ${{ inputs.source_url }}
+        run: |
+          set -euo pipefail
+          DEST='Core kernel razonamiento repo para Yaiwes'
+          WORK='_work/simply-code-recovery'
+          rm -rf "$WORK" "$DEST/simply-code" "$DEST"/simply-code_*.zip
+          mkdir -p "$WORK/src" "$WORK/pack"
+          git clone --depth 1 --no-tags "$SOURCE_URL" "$WORK/src/simply-code"
+          SHA=$(git -C "$WORK/src/simply-code" rev-parse HEAD)
+          rm -rf "$WORK/src/simply-code/.git"
+          mkdir -p "$WORK/stage/simply-code"
+          cp -a "$WORK/src/simply-code/." "$WORK/stage/simply-code/"
+          cd "$WORK/stage"
+          zip -q -r -9 "$GITHUB_WORKSPACE/$WORK/pack/simply-code_0001.zip" .
+          cd "$GITHUB_WORKSPACE"
+          unzip -tq "$WORK/pack/simply-code_0001.zip"
+          test "$(stat -c%s "$WORK/pack/simply-code_0001.zip")" -le 17000000
+          mkdir -p "$DEST"
+          cp "$WORK/pack/simply-code_0001.zip" "$DEST/"
+          rm -rf "$DEST/simply-code"
+          mkdir -p "$DEST/simply-code"
+          unzip -q "$WORK/pack/simply-code_0001.zip" -d "$DEST/simply-code"
+          test -n "$(find "$DEST/simply-code" -type f -print -quit)"
+          printf '%s\n' "{\"number\":17,\"slug\":\"simply-code\",\"source\":\"$SOURCE_URL\",\"source_commit\":\"$SHA\",\"parts\":1,\"status\":\"COMPLETE\"}" > "$DEST/simply-code_RECOVERY_MANIFEST.jsonl"
+
+      - name: Forensic verification
+        run: |
+          set -euo pipefail
+          DEST='Core kernel razonamiento repo para Yaiwes'
+          test -f "$DEST/simply-code_0001.zip"
+          unzip -tq "$DEST/simply-code_0001.zip"
+          test -d "$DEST/simply-code"
+          test -n "$(find "$DEST/simply-code" -type f -print -quit)"
+          test -f "$DEST/simply-code_RECOVERY_MANIFEST.jsonl"
+          grep -q '"slug":"simply-code"' "$DEST/simply-code_RECOVERY_MANIFEST.jsonl"
+          ! grep -RIlE 'git-lfs.github.com/spec/|filter=lfs' "$DEST/simply-code" >/dev/null
+
+      - name: Commit recovery evidence
+        run: |
+          set -euo pipefail
+          git add -- 'Core kernel razonamiento repo para Yaiwes'
+          if git diff --cached --quiet; then
+            echo 'No recovery changes to commit'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'recover(download): kernel simply-code component'
+          git push origin HEAD:main
