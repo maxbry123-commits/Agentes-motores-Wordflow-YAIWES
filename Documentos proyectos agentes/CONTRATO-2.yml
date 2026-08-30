@@ -1,0 +1,33 @@
+contrato: v2
+modo: fail-closed
+repo: Agentes-motores-Wordflow-YAIWES
+rama: main
+skill: https://github.com/maxbry123-commits/Agentes-motores-Wordflow-YAIWES/blob/main/tarea%20en%20curso%20grock%20gpt%20skills/skills%20grock%20tarea%201/SKILL.md
+workflow: .github/workflows/yaiwes-sheriff-15m.yml
+run: https://github.com/maxbry123-commits/Agentes-motores-Wordflow-YAIWES/actions/workflows/yaiwes-sheriff-15m.yml
+loop: cron */15 * * * *
+input_block:
+  I01: Destino Agentes-motores-Wordflow-YAIWES
+  I02: Raiz Core kernel razonamiento repo para Yaiwes
+  I08: En main Agentes Yaiwes y Wordflow code
+  I09: Aqui solo los 35 nuevos
+  I10: Exacto donde viven los otros mas de 100 agente
+  I11: En main cada uno en su raiz
+  I13: En download code no vive nada
+  I14: docs no code van a Documentos proyectos agentes
+  I15: archivo de code van a download code
+  I18: documentos de despliegue 1 2 3 4 que no son code
+  I20: no eliminar hasta lista
+  I21: elimina docs que no sea metodo de trabajo o desplegar o documentos proyecto
+  I22: elimina solo markdown o texto no cableado
+  I23: no eliminas json yaml python
+  I25: loop cada 15 minutos revisar descargas zip extraccion ubicacion
+nodos:
+  N1_KERNEL: 35 en Core kernel razonamiento repo para Yaiwes cada uno su raiz
+  N2_89: 89 primera descarga main/<nombre>/ no Download code
+  N3_CODE: code a Download code
+  N4_DOCS: despliegue 1-4 a Documentos proyectos agentes
+  N5_DELETE: solo md/txt no cableado; keep metodo+desplegar+documentos proyecto
+  N6_LOOP15: workflow yaiwes-sheriff-15m status cada 15m; apply_moves y apply_delete_md solo dispatch
+prohibido: [LFS, tercer_paso, borrar_py_json_yml, borrar_en_cron]
+estado: montado_sin_INICIA_delete
