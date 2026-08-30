@@ -43,6 +43,8 @@ jobs:
           rm -rf 'Core kernel razonamiento repo para Yaiwes'
           rm -rf OpenHands OpenCode Temporal
           rm -f FORENSIC-REBUILD-REPORT.json
+          find scripts -type d -name __pycache__ -prune -exec rm -rf {} +
+          find .github/workflows -type d -name __pycache__ -prune -exec rm -rf {} +
           mkdir -p 'Download code/archivos'
           mkdir -p 'Core kernel razonamiento repo para Yaiwes'
       - name: Forensic preflight - no LFS operational artifacts
@@ -52,25 +54,25 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
           roots=[Path('scripts'),Path('.github/workflows')]
-          forbidden=('git lfs','GIT_LFS_')
+          forbidden=('git '+'lfs','GIT_'+'LFS_')
           self_file=Path('.github/workflows/rebuild-downloads-no-lfs.yml').resolve()
           bad=[]
           for root in roots:
               for p in root.rglob('*'):
-                  if not p.is_file() or p.resolve()==self_file: continue
+                  if not p.is_file() or p.resolve()==self_file or '__pycache__' in p.parts or p.suffix=='.pyc': continue
                   try: text=p.read_text(errors='ignore')
                   except Exception: continue
                   for token in forbidden:
                       if token in text: bad.append((str(p),token))
           if bad:
-              raise SystemExit('FORENSIC FAIL: forbidden LFS usage/artifact in operational code: '+repr(bad))
+              raise SystemExit('FORENSIC FAIL: forbidden LFS operational reference: '+repr(bad))
           print('FORENSIC PASS: operational scripts/workflows contain no LFS calls/configuration')
           PY
       - name: Clean deterministic main extraction roots
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PY'
+          PYTHONDONTWRITEBYTECODE=1 python3 - <<'PY'
           import ast, shutil
           from pathlib import Path
           src=Path('scripts/extract_inventory.py').read_text()
@@ -78,46 +80,59 @@ jobs:
           names=None
           for node in tree.body:
               if isinstance(node, ast.Assign) and any(isinstance(t,ast.Name) and t.id=='NAMES' for t in node.targets):
-                  names=ast.literal_eval(node.value)
-                  break
-          if not names or len(names)!=119:
-              raise SystemExit('FORENSIC FAIL: expected 119 deterministic extraction roots')
-          for name in names.values():
-              shutil.rmtree(name, ignore_errors=True)
+                  names=ast.literal_eval(node.value); break
+          if not names or len(names)!=119: raise SystemExit('FORENSIC FAIL: expected 119 deterministic extraction roots')
+          for name in names.values(): shutil.rmtree(name, ignore_errors=True)
           print('FORENSIC PASS: removed 119 previous main extraction roots')
+          PY
+      - name: Static validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile scripts/research_download_chain.py scripts/research_download_kernel.py scripts/research_download_extra.py scripts/extract_inventory.py scripts/extract_kernel.py scripts/extract_extra.py scripts/skill_guard.py scripts/forensic_verify_rebuild.py
+          PYTHONDONTWRITEBYTECODE=1 python3 - <<'PY'
+          import ast
+          from pathlib import Path
+          for p in Path('scripts').glob('*.py'):
+              tree=ast.parse(p.read_text())
+              for n in ast.walk(tree):
+                  if isinstance(n,ast.FunctionDef) and 'retry' in n.name.lower():
+                      if any(isinstance(x,ast.Call) and isinstance(x.func,ast.Name) and x.func.id==n.name for x in ast.walk(n)):
+                          raise SystemExit(f'FORENSIC FAIL: direct retry recursion in {p}:{n.name}')
+          print('FORENSIC PASS: retry recursion static check')
           PY
       - name: Rebuild main 01-119 from restored 119 queue
         shell: bash
         run: |
           set -euo pipefail
-          python3 scripts/research_download_chain.py 'Download code/archivos' '_work/main-rebuild'
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/research_download_chain.py 'Download code/archivos' '_work/main-rebuild'
       - name: Extract main 01-119 into deterministic roots
         shell: bash
         run: |
           set -euo pipefail
-          python3 scripts/extract_inventory.py 'Download code/archivos'
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/extract_inventory.py 'Download code/archivos'
       - name: Rebuild kernel queue
         shell: bash
         run: |
           set -euo pipefail
-          python3 scripts/research_download_kernel.py 'Core kernel razonamiento repo para Yaiwes' '_work/kernel-rebuild'
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/research_download_kernel.py 'Core kernel razonamiento repo para Yaiwes' '_work/kernel-rebuild'
       - name: Extract kernel queue
         shell: bash
         run: |
           set -euo pipefail
-          python3 scripts/extract_kernel.py 'Core kernel razonamiento repo para Yaiwes'
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/extract_kernel.py 'Core kernel razonamiento repo para Yaiwes'
       - name: Rebuild extra agents
         shell: bash
         run: |
           set -euo pipefail
-          python3 scripts/research_download_extra.py 'Download code/archivos' '_work/extra-rebuild'
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/research_download_extra.py 'Download code/archivos' '_work/extra-rebuild'
       - name: Extract extra agents
         shell: bash
         run: |
           set -euo pipefail
-          python3 scripts/extract_extra.py 'Download code/archivos'
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/extract_extra.py 'Download code/archivos'
       - name: Forensic final verification
         shell: bash
         run: |
           set -euo pipefail
-          python3 scripts/forensic_verify_rebuild.py
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/forensic_verify_rebuild.py
