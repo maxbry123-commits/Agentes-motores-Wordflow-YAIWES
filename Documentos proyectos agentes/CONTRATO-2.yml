@@ -1,0 +1,25 @@
+contrato: v2
+modo: fail-closed
+repo: Agentes-motores-Wordflow-YAIWES
+rama: main
+raiz: notas de trabajo grock y gpt
+skill: https://github.com/maxbry123-commits/agentes/blob/main/skills/research-download-chain/SKILL.md
+workflow: .github/workflows/extract-119-main.yml
+run: https://github.com/maxbry123-commits/Agentes-motores-Wordflow-YAIWES/actions/workflows/extract-119-main.yml
+guard: scripts/skill_guard.py
+input_block:
+  I26: anota en el skills solo editar una nota sin reescribir LFS y 100MB + checklist pre-Run
+  I27: github accion extract con solucion LFS y CHUNK 8MiB para 119
+  I28: si otros GHA tienen el mismo problema editarlos con las dos soluciones
+nodos:
+  N1_NOTA_SKILL: PASS
+  N2_EXTRACT119: extract-119-main.yml + extract_inventory.py + skill_guard.py
+  N3_KERNEL: extract-kernel.yml + extract_kernel.py
+  N4_RUN: dispatch extract-119-main
+checklist_pre_run:
+  - CHUNK=8MiB no recomponer
+  - GIT_LFS_SKIP_SMUDGE + GIT_LFS_SKIP_PUSH
+  - push --no-verify
+  - packer LOCK no reescrito
+prohibido: [LFS_enable, recomponer_100MB, reescribir_packer]
+estado: INICIA
