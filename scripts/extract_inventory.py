@@ -15,8 +15,7 @@ for line in MANIFEST.read_text().splitlines():
     if line.strip(): rows.append(json.loads(line))
 for row in rows:
     slug=row['slug']; number=str(row['number']).zfill(2); name=NAMES.get(number, slug); dest=Path(name)
-    if dest.is_dir() and any(dest.rglob('*')):
-        print(f'SKIP EXTRACT done: {name}'); continue
+    shutil.rmtree(dest, ignore_errors=True)
     dest.mkdir(parents=True, exist_ok=True)
     parts=sorted(SRC.glob(f'{slug}_*.zip'))
     if not parts: raise SystemExit(f'ZIP ausente: {name}')
