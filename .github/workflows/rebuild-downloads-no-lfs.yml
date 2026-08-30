@@ -3,7 +3,7 @@ on:
   push:
     branches: [main]
     paths:
-      - '.github/workflows/rebuild-downloads-no-lfs.yml'
+      - '.github/workflows/*.yml'
       - 'scripts/research_download_chain.py'
       - 'scripts/research_download_kernel.py'
       - 'scripts/research_download_extra.py'
