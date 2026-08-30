@@ -1,27 +1,26 @@
 import json, subprocess, time
 from pathlib import Path
+
 CHUNK=8*1024*1024
 
 def run(c):
-    subprocess.run(c,check=True)
+    subprocess.run(c, check=True)
 
-def sanitize_hooks():
-    for hook in (Path('.git/hooks/pre-push'), Path('.git/hooks/post-checkout'), Path('.git/hooks/post-commit')):
-        if hook.exists(): hook.unlink()
-
-def sanitize_attributes(dest: Path):
-    marker=''.join(('filter=', 'lfs'))
-    pointer=''.join(('git-', 'lfs'))
-    for p in dest.rglob('.gitattributes'):
+def reject_lfs_material(dest: Path):
+    bad=[]
+    for p in dest.rglob('*'):
+        if not p.is_file():
+            continue
         try:
-            lines=p.read_text(errors='ignore').splitlines()
+            text=p.read_text(errors='ignore')
         except Exception:
             continue
-        keep=[ln for ln in lines if marker not in ln and pointer not in ln]
-        if keep:
-            p.write_text('\n'.join(keep)+'\n')
-        else:
-            p.unlink()
+        if 'git-lfs.github.com/spec/' in text:
+            bad.append(str(p))
+        elif 'filter=lfs' in text:
+            bad.append(str(p))
+    if bad:
+        raise SystemExit('FORENSIC FAIL: LFS material detected: '+repr(bad[:20]))
 
 def chunk_tree(dest: Path):
     rec=[]
@@ -37,7 +36,8 @@ def chunk_tree(dest: Path):
             i=0
             while True:
                 data=f.read(CHUNK)
-                if not data: break
+                if not data:
+                    break
                 (d/f'{p.name}.part-{i:04d}').write_bytes(data)
                 i+=1
         rec.append({'path':str(p.relative_to(dest)),'bytes':size,'chunk_bytes':CHUNK})
@@ -46,17 +46,19 @@ def chunk_tree(dest: Path):
         split=dest/'SPLIT_FILES.json'
         prev=[]
         if split.exists():
-            try: prev=json.loads(split.read_text())
-            except Exception: prev=[]
+            try:
+                prev=json.loads(split.read_text())
+            except Exception:
+                prev=[]
         split.write_text(json.dumps(prev+rec,indent=2))
     return rec
 
 def guard_dest(dest: Path):
-    sanitize_attributes(dest)
+    reject_lfs_material(dest)
     return chunk_tree(dest)
 
 def push(label):
-    sanitize_attributes(Path('.'))
+    reject_lfs_material(Path('.'))
     big=[(p,p.stat().st_size) for p in Path('.').rglob('*') if p.is_file() and '.git' not in p.parts and p.stat().st_size>=99*1024*1024]
     for p,size in big:
         print('OVERSIZE',p,size)
@@ -69,5 +71,6 @@ def push(label):
             print(f'PUSH PASS {label} attempt {attempt}')
             return
         except subprocess.CalledProcessError:
-            if attempt==3: raise
+            if attempt==3:
+                raise
             time.sleep(attempt*2)
