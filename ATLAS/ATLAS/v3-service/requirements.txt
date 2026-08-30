@@ -1,0 +1,15 @@
+# V3 pipeline service runtime dependencies. Pinned to the versions the
+# current image resolves so builds are reproducible.
+#
+# No torch: this service parses and orchestrates, it never scores. Every
+# tensor operation lives in geometric-lens, and all model inference in
+# llama-server. (Until 2026-08-01 the image installed ~900 MB of torch
+# that no module here imports.)
+#
+# tree-sitter grammars back /internal/structural_edit and the call-graph
+# reasoning (#39); the language set matches the selector translator —
+# extend here when adding a language.
+tree-sitter==0.26.0
+tree-sitter-python==0.25.0
+tree-sitter-html==0.23.2
+tree-sitter-javascript==0.25.0
