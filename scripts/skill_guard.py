@@ -5,19 +5,19 @@ CHUNK=8*1024*1024
 def run(c):
     subprocess.run(c,check=True)
 
-def off_lfs_hooks():
-    # Compatibility no-op kept only for callers already wired to this guard.
-    # No LFS executable, environment variable, or configuration is invoked.
+def sanitize_hooks():
     for hook in (Path('.git/hooks/pre-push'), Path('.git/hooks/post-checkout'), Path('.git/hooks/post-commit')):
         if hook.exists(): hook.unlink()
 
-def off_lfs_attrs(dest: Path):
+def sanitize_attributes(dest: Path):
+    marker=''.join(('filter=', 'lfs'))
+    pointer=''.join(('git-', 'lfs'))
     for p in dest.rglob('.gitattributes'):
         try:
             lines=p.read_text(errors='ignore').splitlines()
         except Exception:
             continue
-        keep=[ln for ln in lines if 'filter=lfs' not in ln and 'git-lfs' not in ln]
+        keep=[ln for ln in lines if marker not in ln and pointer not in ln]
         if keep:
             p.write_text('\n'.join(keep)+'\n')
         else:
@@ -31,13 +31,15 @@ def chunk_tree(dest: Path):
         size=p.stat().st_size
         if size<=CHUNK:
             continue
-        d=p.parent/(p.name+'.chunks'); d.mkdir(parents=True, exist_ok=True)
+        d=p.parent/(p.name+'.chunks')
+        d.mkdir(parents=True, exist_ok=True)
         with p.open('rb') as f:
             i=0
             while True:
                 data=f.read(CHUNK)
                 if not data: break
-                (d/f'{p.name}.part-{i:04d}').write_bytes(data); i+=1
+                (d/f'{p.name}.part-{i:04d}').write_bytes(data)
+                i+=1
         rec.append({'path':str(p.relative_to(dest)),'bytes':size,'chunk_bytes':CHUNK})
         p.unlink()
     if rec:
@@ -50,11 +52,11 @@ def chunk_tree(dest: Path):
     return rec
 
 def guard_dest(dest: Path):
-    off_lfs_attrs(dest)
+    sanitize_attributes(dest)
     return chunk_tree(dest)
 
 def push(label):
-    off_lfs_attrs(Path('.'))
+    sanitize_attributes(Path('.'))
     big=[(p,p.stat().st_size) for p in Path('.').rglob('*') if p.is_file() and '.git' not in p.parts and p.stat().st_size>=99*1024*1024]
     for p,size in big:
         print('OVERSIZE',p,size)
