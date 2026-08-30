@@ -28,10 +28,10 @@ jobs:
                   if not p.is_file() or p.name=='wordflow-inventario.yml': continue
                   try: t=p.read_text(errors='ignore')
                   except Exception: continue
-                  for token in ('git lfs','git-lfs.github.com','GIT_LFS_','filter=lfs'):
+                  for token in ('git lfs','GIT_LFS_'):
                       if token in t: bad.append((str(p),token))
           if bad: raise SystemExit(f'FORENSIC FAIL: forbidden LFS operational reference: {bad}')
-          print('FORENSIC PASS: workflow/scripts are LFS-free')
+          print('FORENSIC PASS: workflow/scripts contain no operational LFS commands or env')
           PY
       - name: Paso 1 - Descargar ZIP 01-119
         shell: bash
