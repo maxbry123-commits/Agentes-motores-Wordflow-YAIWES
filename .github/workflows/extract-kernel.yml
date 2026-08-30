@@ -8,6 +8,7 @@ concurrency:
   cancel-in-progress: false
 env:
   GIT_LFS_SKIP_SMUDGE: '1'
+  GIT_LFS_SKIP_PUSH: '1'
 jobs:
   extract:
     runs-on: ubuntu-latest
@@ -16,6 +17,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 1
+          lfs: false
+      - name: off LFS hooks
+        run: |
+          git lfs uninstall || true
+          git config lfs.allowincompletepush true
+          git config filter.lfs.required false
       - name: EXTRACT kernel slugs
         run: |
           set -euo pipefail
