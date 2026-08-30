@@ -71,6 +71,13 @@ jobs:
           test -f 'Download code/archivos/EXTRA_AGENTS_MANIFEST.jsonl'
           extra_count=$(grep -c '"status": "COMPLETE"' 'Download code/archivos/EXTRA_AGENTS_MANIFEST.jsonl')
           test "$extra_count" -eq 3
-          ! find . -type f -not -path './.git/*' -print0 | xargs -0 grep -Il 'git-lfs.github.com' | grep .
-          ! git grep -n -E 'git[[:space:]]+lfs|GIT_LFS_' -- . ':!.git' || true
-          echo "FORENSIC PASS: kernel=35 main=83 extra=3; no LFS pointer text detected"
+          if find . -type f -not -path './.git/*' -print0 | xargs -0 grep -Il 'git-lfs.github.com' | grep -q .; then
+            echo 'FAIL: LFS pointer text detected'
+            exit 1
+          fi
+          if git grep -n -E 'git[[:space:]]+lfs|GIT_LFS_' -- . ':!.git' >/tmp/lfs_hits.txt; then
+            cat /tmp/lfs_hits.txt
+            echo 'FAIL: LFS usage detected in repository'
+            exit 1
+          fi
+          echo "FORENSIC PASS: kernel=35 main=83 extra=3; no LFS usage/pointers detected"
