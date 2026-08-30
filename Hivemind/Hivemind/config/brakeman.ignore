@@ -1,0 +1,94 @@
+{
+  "ignored_warnings": [
+    {
+      "fingerprint": "c1e3dcca5a58393a87e03da8e0b6d31b893a71ae3610e9c9a01457711c5881d2",
+      "note": "Rclone remote name is server-controlled, not user input"
+    },
+    {
+      "fingerprint": "2db3bb70f75ed8e9928ce44299aaabd4bfd34fdb9a6398a75b0184930f66d604",
+      "note": "Docker compose status uses allowlisted service names"
+    },
+    {
+      "fingerprint": "d817e0097cfdf5d53c84a2d93f9bc0ec67b2a136d6819dc38b4b42ee6b2aa0ee",
+      "note": "Docker inspect uses allowlisted service names"
+    },
+    {
+      "fingerprint": "5ca8013543a0ad370104607f016ca99e95d200dcb5ac5dd9057406b9a27f216f",
+      "note": "Docker compose restart uses allowlisted service names"
+    },
+    {
+      "fingerprint": "092f702183c28e851d3a02eb708b2b1fcf52e888adf06e5a1b41c8f400e2988f",
+      "note": "Mail gem from() method, not SQL \u2014 false positive"
+    },
+    {
+      "fingerprint": "3ffe28640defd3facc9b5d70e774579199b4ca9a1373c934fb2943bfa73217e3",
+      "note": "Net::HTTP to admin-configured API base URL \u2014 not user input"
+    },
+    {
+      "fingerprint": "b93ae9ee4700f171a5446ba998686f8ed4e63d69e29df0da50b8d63ecba18792",
+      "note": "CodingAgentJob: Open3.capture3 with fixed docker command array + script file path we control; container name derives from COMPOSE_PROJECT_NAME (operator .env), passed as an argv element with no shell"
+    },
+    {
+      "fingerprint": "79770329b85047f80227d131cc80d6358fd442a83cc02643a2768a580111efde",
+      "note": "Glob executor: pattern is shell_escaped, runs in isolated workspace container"
+    },
+    {
+      "fingerprint": "3764c74ea8c92b09a432253d9c7f39afffcad77d9ed5af73b0b78f35a6c4bd14",
+      "note": "Shell executor: paths use SecureRandom.hex, runs in isolated workspace container; container name from COMPOSE_PROJECT_NAME (operator .env), argv element, no shell"
+    },
+    {
+      "fingerprint": "8fb2702d96b345bb7677cc3b5a6561b8b7870a593beff6a050e3e4597af2e7cd",
+      "note": "Shell executor cleanup: paths use SecureRandom.hex, runs in isolated container; container name from COMPOSE_PROJECT_NAME (operator .env), argv element, no shell"
+    },
+    {
+      "fingerprint": "d8f0564e703c14f20ae96fcba06ecf66046ab824039ba6fcdf815a39617a4ea0",
+      "note": "WorkspaceIo: path is shell_escaped, runs in isolated workspace container; container name from COMPOSE_PROJECT_NAME (operator .env), argv element, no shell"
+    },
+    {
+      "fingerprint": "e806f7f403a69357ce553f9cf222a0375b9afbed2558228e5f31d53e61275d25",
+      "note": "False positive: server.command is Shellwords.shellsplit into array args, no shell interpretation; container name from COMPOSE_PROJECT_NAME (operator .env), argv element"
+    },
+    {
+      "fingerprint": "f0cfac6eb72acdb919a1c91d8966f9f95ccd32aca2c61f99259b3468099c34dc",
+      "note": "Project file delete: guarded by .. rejection, realpath resolution, and starts_with? workspace check"
+    },
+    {
+      "fingerprint": "00ea9587653198991ee41c3b2b850718e19c0a320c1b0689c92e0b6397be97d0",
+      "note": "agents_controller: resolve_agent_path blocks traversal via .., realpath, and starts_with? check"
+    },
+    {
+      "fingerprint": "0d656c30a1d1d46b35231569283dae94ee2106090ed162648ec9958f7bac09c5",
+      "note": "agents_controller: resolve_agent_path blocks traversal via .., realpath, and starts_with? check"
+    },
+    {
+      "fingerprint": "9df707c6434897dbb27e370980dbb8dcc5f026a8bfb2e4fd15404ce22655719e",
+      "note": "agents_controller: mkdir_p uses resolve_agent_path + sanitized name (gsub non-alphanum)"
+    },
+    {
+      "fingerprint": "611dc4ccdfd49f8fa858c0434d403475b63d371d12c7f46427910fc09d1729e3",
+      "note": "agents_controller: send_file via resolve_agent_path which blocks traversal"
+    },
+    {
+      "fingerprint": "23a19eb6edf87669ddefb40352c8a38405e99d9bab2a7e729cc2adfaced02830",
+      "note": "workspace_files_controller: resolve_path blocks traversal via .., realpath, and starts_with? check"
+    },
+    {
+      "fingerprint": "ce2e677dd062297a6f48a0a25f8ffb30db2076d87db06bc6a6fc00bba1ccbb02",
+      "note": "workspace_files_controller: resolve_path blocks traversal via .., realpath, and starts_with? check"
+    },
+    {
+      "fingerprint": "cdd3a91b7c1c4f3c625f5edf9b6c4824e24ee976b991be70db0549c41669d537",
+      "note": "workspace_files_controller: mkdir_p uses resolve_path + sanitized name (gsub non-alphanum)"
+    },
+    {
+      "fingerprint": "15012eef342ebf846843839f12e3709b69b68e9cb643897909a6a6d38a520295",
+      "note": "workspace_files_controller: send_file via resolve_path which blocks traversal"
+    },
+    {
+      "fingerprint": "c2a25b4040db81c8028aa376fd53908747f2f09f6b12822ccbf773fecf752f66",
+      "note": "workspace_files_controller: set_root mkdir_p uses allowlisted ROOTS config, not user input"
+    }
+  ],
+  "updated": "2026-04-01",
+  "brakeman_version": "8.0.4"
+}

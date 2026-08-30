@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai4s-agent-lab"
+version = "0.1.0"
+description = "Wanrun Cong's personal, auditable research-loop project for AI for Science"
+requires-python = ">=3.10"
+dependencies = []
+readme = "README.md"
+license = {file = "LICENSE"}
+authors = [{name = "Wanrun Cong"}]
+keywords = ["ai-for-science", "scientific-agent", "reproducibility", "evidence"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Operating System :: POSIX",
+  "Topic :: Scientific/Engineering",
+]
+
+[project.scripts]
+ai4s-agent-lab = "ai4s_agent_lab.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/Goldenmonstew/ai4s-agent-lab"
+Repository = "https://github.com/Goldenmonstew/ai4s-agent-lab"
+Issues = "https://github.com/Goldenmonstew/ai4s-agent-lab/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -1,0 +1,724 @@
+#!/usr/bin/env bash
+# ============================================================
+# Hivemind 🐝 — One-Line Installer
+# ============================================================
+# Usage:
+#   curl -fsSL https://raw.githubusercontent.com/hivementality-ai/hivemind/main/install.sh | bash
+#   — or —
+#   git clone ... && cd hivemind && ./install.sh
+# ============================================================
+
+set -euo pipefail
+
+HIVEMIND_DIR="${HIVEMIND_DIR:-$HOME/hivemind}"
+REPO_URL="${HIVEMIND_REPO:-https://github.com/hivementality-ai/hivemind.git}"
+BRANCH="${HIVEMIND_BRANCH:-main}"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+info()  { echo -e "${CYAN}▸${NC} $*"; }
+ok()    { echo -e "${GREEN}✓${NC} $*"; }
+warn()  { echo -e "${YELLOW}⚠${NC} $*"; }
+fail()  { echo -e "${RED}✗${NC} $*"; exit 1; }
+
+header() {
+  echo ""
+  echo -e "${BOLD}${YELLOW}🐝 Hivemind Installer${NC}"
+  echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+  echo ""
+}
+
+# ----------------------------------------------------------
+# Detect OS
+# ----------------------------------------------------------
+detect_os() {
+  case "$(uname -s)" in
+    Linux*)  OS="linux" ;;
+    Darwin*) OS="mac" ;;
+    *)       fail "Unsupported OS: $(uname -s). Hivemind supports macOS and Linux." ;;
+  esac
+  ARCH="$(uname -m)"
+  ok "Detected: $OS ($ARCH)"
+}
+
+# ----------------------------------------------------------
+# Install a single package on Linux (helper)
+# ----------------------------------------------------------
+install_linux_package() {
+  local pkg="$1"
+  command -v "$pkg" &>/dev/null && return
+  info "Installing $pkg..."
+  if command -v apt-get &>/dev/null; then
+    sudo apt-get update -qq && sudo apt-get install -y -qq "$pkg"
+  elif command -v dnf &>/dev/null; then
+    sudo dnf install -y -q "$pkg"
+  elif command -v yum &>/dev/null; then
+    sudo yum install -y -q "$pkg"
+  elif command -v pacman &>/dev/null; then
+    sudo pacman -S --noconfirm "$pkg"
+  elif command -v zypper &>/dev/null; then
+    sudo zypper install -y "$pkg"
+  else
+    fail "Cannot install $pkg — no supported package manager found. Install it manually."
+  fi
+  ok "$pkg installed"
+}
+
+# ----------------------------------------------------------
+# Install prerequisites (git, curl, brew, etc.)
+# ----------------------------------------------------------
+install_prerequisites() {
+  if [ "$OS" = "mac" ]; then
+    # Xcode Command Line Tools (provides git, curl, make, etc.)
+    if ! xcode-select -p &>/dev/null; then
+      info "Installing Xcode Command Line Tools (this may take a few minutes)..."
+      xcode-select --install 2>/dev/null || true
+      # Wait for installation to complete
+      until xcode-select -p &>/dev/null; do
+        sleep 5
+      done
+    fi
+    ok "Xcode Command Line Tools installed"
+
+    # Homebrew (requires sudo — redirect /dev/tty so the password prompt works
+    # even when the script is piped via curl | bash)
+    if ! command -v brew &>/dev/null; then
+      info "Installing Homebrew (you may be prompted for your password)..."
+      /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" < /dev/tty
+      # Add to PATH for this session (Apple Silicon vs Intel)
+      eval "$(/opt/homebrew/bin/brew shellenv 2>/dev/null || /usr/local/bin/brew shellenv 2>/dev/null)"
+    fi
+    ok "Homebrew available"
+
+  else  # Linux
+    install_linux_package git
+    install_linux_package curl
+    install_linux_package zstd
+  fi
+}
+
+# ----------------------------------------------------------
+# Install Docker if missing
+# ----------------------------------------------------------
+install_docker() {
+  if command -v docker &>/dev/null; then
+    ok "Docker already installed: $(docker --version)"
+    return
+  fi
+
+  info "Installing Docker..."
+
+  if [ "$OS" = "mac" ]; then
+    # macOS — try Homebrew first, then direct download
+    if command -v brew &>/dev/null; then
+      info "Installing Docker Desktop via Homebrew..."
+      brew install --cask docker
+    else
+      echo ""
+      warn "Homebrew not found — cannot auto-install Docker Desktop."
+      echo -e "  Install it from: ${BOLD}https://docs.docker.com/desktop/install/mac-install/${NC}"
+      echo ""
+      echo "  After installing, open Docker Desktop and wait for it to start,"
+      echo "  then re-run this script."
+      exit 1
+    fi
+
+    # Wait for Docker Desktop to be ready
+    if ! docker info &>/dev/null 2>&1; then
+      info "Starting Docker Desktop..."
+      open -a Docker
+      echo -n "Waiting for Docker to start..."
+      local attempts=0
+      while ! docker info &>/dev/null 2>&1; do
+        sleep 2
+        echo -n "."
+        attempts=$((attempts + 1))
+        if [ $attempts -gt 60 ]; then
+          echo ""
+          fail "Docker didn't start in time. Open Docker Desktop manually, then re-run."
+        fi
+      done
+      echo ""
+    fi
+  else
+    # Linux — official install script
+    info "Installing Docker via get.docker.com..."
+    curl -fsSL https://get.docker.com | sh
+
+    # Add current user to docker group
+    if ! groups | grep -q docker; then
+      sudo usermod -aG docker "$USER"
+      warn "Added $USER to docker group. You may need to log out and back in."
+    fi
+
+    # Start and enable Docker
+    sudo systemctl start docker 2>/dev/null || true
+    sudo systemctl enable docker 2>/dev/null || true
+  fi
+
+  ok "Docker installed"
+}
+
+# ----------------------------------------------------------
+# Ensure the current shell can reach the Docker socket
+#
+# `usermod -aG docker` only takes effect on a NEW login session.
+# On a fresh box where this script just installed Docker, the rest
+# of the run still can't reach /var/run/docker.sock and dies with
+# "permission denied". Re-exec under `sg docker` so the docker group
+# is active in the same session; fall back to sudo if `sg` is missing.
+# ----------------------------------------------------------
+ensure_docker_access() {
+  [ "$OS" = "linux" ] || return 0
+  docker info &>/dev/null 2>&1 && return 0   # socket already reachable
+
+  # Guard against an infinite re-exec loop
+  if [ -n "${HIVEMIND_REEXEC:-}" ]; then
+    warn "Docker socket still unreachable after re-exec — falling back to sudo for docker."
+    docker() { sudo docker "$@"; }
+    export -f docker
+    return 0
+  fi
+
+  if id -nG "$USER" 2>/dev/null | grep -qw docker && command -v sg &>/dev/null; then
+    warn "Docker group not active in this shell yet — re-executing under 'sg docker'..."
+    export HIVEMIND_REEXEC=1
+    exec sg docker -c "$(printf '%q ' bash "$0" "$@")"
+  fi
+
+  warn "Cannot activate docker group in this session — using sudo for docker commands."
+  warn "Log out and back in (or reboot) to use Docker without sudo permanently."
+  docker() { sudo docker "$@"; }
+  export -f docker
+}
+
+# ----------------------------------------------------------
+# Verify Docker Compose
+# ----------------------------------------------------------
+check_compose() {
+  if docker compose version &>/dev/null 2>&1; then
+    ok "Docker Compose available: $(docker compose version --short 2>/dev/null || echo 'v2')"
+    return
+  fi
+
+  # Attempt auto-install on Linux
+  if [ "$OS" = "linux" ]; then
+    info "Docker Compose plugin not found — attempting install..."
+    install_linux_package docker-compose-plugin
+    if docker compose version &>/dev/null 2>&1; then
+      ok "Docker Compose available: $(docker compose version --short 2>/dev/null || echo 'v2')"
+      return
+    fi
+  fi
+
+  fail "Docker Compose not found. Install Docker Desktop (macOS) or docker-compose-plugin (Linux)."
+}
+
+# ----------------------------------------------------------
+# Clone or locate repo
+# ----------------------------------------------------------
+setup_repo() {
+  # If we're already inside the repo (script run from repo dir)
+  if [ -f "./docker-compose.yml" ] && [ -f "./.env.example" ]; then
+    HIVEMIND_DIR="$(pwd)"
+    ok "Using existing repo: $HIVEMIND_DIR"
+    pull_latest_tag
+    return
+  fi
+
+  if [ -d "$HIVEMIND_DIR" ] && [ -f "$HIVEMIND_DIR/docker-compose.yml" ]; then
+    ok "Hivemind already cloned: $HIVEMIND_DIR"
+    pull_latest_tag
+    return
+  fi
+
+  info "Cloning Hivemind to $HIVEMIND_DIR..."
+  git clone "$REPO_URL" "$HIVEMIND_DIR"
+  ok "Cloned"
+  pull_latest_tag
+}
+
+# ----------------------------------------------------------
+# Pull latest release tag
+# ----------------------------------------------------------
+pull_latest_tag() {
+  cd "$HIVEMIND_DIR"
+
+  info "Fetching latest release..."
+  git fetch origin --tags --force --quiet 2>/dev/null || true
+
+  # Find the latest stable tag (CalVer: vYYYY.MM.PATCH, excludes -rc tags)
+  local latest_tag=""
+  while IFS= read -r tag; do
+    [ -z "$tag" ] && continue
+    if [[ "$tag" != *-rc* ]]; then
+      latest_tag="$tag"
+      break
+    fi
+  done < <(git tag --sort=-version:refname 2>/dev/null)
+
+  if [ -z "$latest_tag" ]; then
+    warn "No release tags found — using main branch"
+    git checkout main --quiet 2>/dev/null || true
+    git pull origin main --quiet
+    return
+  fi
+
+  local current
+  current="$(git describe --tags --exact-match 2>/dev/null || echo 'none')"
+
+  if [ "$current" = "$latest_tag" ]; then
+    ok "Already on latest release: $latest_tag"
+  else
+    info "Updating to latest release: $latest_tag"
+    git checkout "$latest_tag" --quiet
+    ok "Now on $latest_tag"
+  fi
+}
+
+# ----------------------------------------------------------
+# Generate secrets
+# ----------------------------------------------------------
+generate_secret() {
+  openssl rand -hex 32 2>/dev/null || LC_ALL=C tr -dc 'a-f0-9' < /dev/urandom | head -c 64
+}
+
+generate_short_secret() {
+  openssl rand -hex 16 2>/dev/null || LC_ALL=C tr -dc 'a-f0-9' < /dev/urandom | head -c 32
+}
+
+# ----------------------------------------------------------
+# Configure .env
+# ----------------------------------------------------------
+setup_env() {
+  cd "$HIVEMIND_DIR"
+
+  if [ -f ".env" ]; then
+    warn ".env already exists — skipping generation (delete it to regenerate)"
+    return
+  fi
+
+  info "Generating .env with fresh secrets..."
+
+  # Active Record Encryption keys
+  local ar_primary
+  local ar_deterministic
+  local ar_salt
+  ar_primary="$(generate_secret)"
+  ar_deterministic="$(generate_secret)"
+  ar_salt="$(generate_secret)"
+
+  # Rails master key
+  local master_key
+  master_key="$(generate_short_secret)"
+
+  # Docker socket GID
+  local docker_gid=0
+  if [ "$OS" = "linux" ]; then
+    docker_gid="$(stat -c '%g' /var/run/docker.sock 2>/dev/null || echo 0)"
+  elif [ "$OS" = "mac" ]; then
+    docker_gid="$(stat -f '%g' /var/run/docker.sock 2>/dev/null || echo 0)"
+  fi
+
+  # Internal API secret (Rails ↔ SDK proxy)
+  local internal_secret
+  internal_secret="$(generate_secret)"
+
+  cat > .env <<EOF
+# ============================================================
+# Hivemind 🐝 — Generated by install.sh on $(date -u +"%Y-%m-%d %H:%M UTC")
+# ============================================================
+# Manage API keys, channels, and integrations in Mission Control → Integrations.
+
+# Multi-instance isolation (defaults match the primary instance).
+# Run a second instance on this machine with: hivemind new <name>
+COMPOSE_PROJECT_NAME=hivemind
+APP_PORT=8080
+CONNECTOR_PORT=3002
+AGENTS_SHARED_DIR=$HOME/hivemind-agents-shared
+
+# Active Record Encryption (required for Vault)
+ACTIVE_RECORD_ENCRYPTION_PRIMARY_KEY=$ar_primary
+ACTIVE_RECORD_ENCRYPTION_DETERMINISTIC_KEY=$ar_deterministic
+ACTIVE_RECORD_ENCRYPTION_KEY_DERIVATION_SALT=$ar_salt
+
+# Rails
+RAILS_MASTER_KEY=$master_key
+SECRET_KEY_BASE=$master_key
+
+# Docker
+DOCKER_GID=$docker_gid
+
+# Internal API (shared secret between Rails and SDK proxy)
+INTERNAL_API_SECRET=$internal_secret
+EOF
+
+  # Also write master key file for Rails
+  mkdir -p config
+  echo -n "$master_key" > config/master.key
+  chmod 600 config/master.key
+
+  ok "Generated .env and config/master.key"
+}
+
+# ----------------------------------------------------------
+# Create shared workspace directory
+# ----------------------------------------------------------
+setup_shared_workspace() {
+  local shared_dir="$HOME/hivemind-agents-shared"
+  if [ ! -d "$shared_dir" ]; then
+    mkdir -p "$shared_dir"
+    ok "Created shared workspace: $shared_dir"
+  else
+    ok "Shared workspace exists: $shared_dir"
+  fi
+}
+
+# ----------------------------------------------------------
+# Optional: Semantic memory (Ollama + nomic-embed-text)
+# ----------------------------------------------------------
+setup_memory_embeddings() {
+  local has_ollama=false
+  local has_model=false
+
+  # Detect existing Ollama installation
+  if command -v ollama &>/dev/null; then
+    has_ollama=true
+    # Check if nomic-embed-text is already pulled
+    if ollama list 2>/dev/null | grep -q "nomic-embed-text"; then
+      has_model=true
+    fi
+  fi
+
+  echo ""
+  echo -e "${BOLD}${CYAN}🧠 Semantic Memory${NC}"
+  echo -e "  Hivemind agents can remember conversations and recall them"
+  echo -e "  using semantic search (meaning-based, not just keywords)."
+  echo ""
+
+  if [ "$has_ollama" = true ] && [ "$has_model" = true ]; then
+    ok "Ollama and nomic-embed-text already installed — semantic memory is ready!"
+    echo "MEMORY_EMBEDDINGS_ENABLED=true" >> "$HIVEMIND_DIR/.env"
+    echo "MEMORY_EMBEDDINGS_PROVIDER=ollama" >> "$HIVEMIND_DIR/.env"
+    return
+  elif [ "$has_ollama" = true ]; then
+    echo -e "  ${GREEN}✓${NC} Ollama is already installed."
+    echo -e "  Just need to pull the embedding model (~274MB)."
+  else
+    echo -e "  This requires Ollama with the nomic-embed-text model."
+    echo -e "  You can use a ${BOLD}local${NC} install (~274MB download, ~500MB RAM)"
+    echo -e "  or connect to an ${BOLD}existing remote${NC} Ollama instance."
+  fi
+
+  echo ""
+  echo -e "  ${YELLOW}Without this, agents still remember — but search is keyword-only.${NC}"
+  echo ""
+
+  # If no local Ollama, offer remote as a first option before installing locally
+  if [ "$has_ollama" = false ]; then
+    echo -e "  Do you have a ${BOLD}remote Ollama instance${NC} running on another machine?"
+    echo -e "  Press ${BOLD}Y${NC} to use a remote URL"
+    echo -e "  Press ${BOLD}n${NC} to install Ollama locally (or skip)"
+    echo ""
+
+    local use_remote
+    if [ -t 0 ] || [ -e /dev/tty ]; then
+      read -rp "$(echo -e "${CYAN}▸${NC}") Use remote Ollama? [y/N] " use_remote < /dev/tty 2>/dev/null || use_remote="N"
+    else
+      use_remote="N"
+      info "Non-interactive install — skipping remote Ollama prompt"
+    fi
+    use_remote="${use_remote:-N}"
+
+    if [[ "$use_remote" =~ ^[Yy] ]]; then
+      # Remote Ollama path
+      local remote_url
+      if [ -t 0 ] || [ -e /dev/tty ]; then
+        read -rp "$(echo -e "${CYAN}▸${NC}") Remote Ollama URL [e.g. http://192.168.1.100:11434]: " remote_url < /dev/tty 2>/dev/null || remote_url=""
+      else
+        remote_url=""
+      fi
+
+      # Strip trailing slash for consistency
+      remote_url="${remote_url%/}"
+
+      if [ -z "$remote_url" ]; then
+        warn "No URL entered — skipping semantic memory"
+        echo "MEMORY_EMBEDDINGS_ENABLED=false" >> "$HIVEMIND_DIR/.env"
+        return
+      fi
+
+      # Validate connectivity
+      info "Checking connection to ${remote_url}..."
+      local tags_response
+      tags_response=$(curl -sf --connect-timeout 5 --max-time 10 "${remote_url}/api/tags" 2>/dev/null)
+      if [ $? -ne 0 ] || [ -z "$tags_response" ]; then
+        warn "Could not reach ${remote_url}/api/tags — verify the URL and that Ollama is running"
+        warn "Skipping semantic memory — you can configure the URL later in Settings → Providers"
+        echo "MEMORY_EMBEDDINGS_ENABLED=false" >> "$HIVEMIND_DIR/.env"
+        return
+      fi
+
+      ok "Connected to remote Ollama at ${remote_url}"
+
+      # Check if nomic-embed-text is available on the remote instance
+      if echo "$tags_response" | grep -q "nomic-embed-text"; then
+        ok "nomic-embed-text model found on remote instance"
+      else
+        warn "nomic-embed-text not found on remote Ollama instance"
+        echo -e "  Run on your remote machine: ${BOLD}ollama pull nomic-embed-text${NC}"
+        echo -e "  Continuing setup — you can pull the model later."
+      fi
+
+      echo "MEMORY_EMBEDDINGS_ENABLED=true" >> "$HIVEMIND_DIR/.env"
+      echo "MEMORY_EMBEDDINGS_PROVIDER=ollama" >> "$HIVEMIND_DIR/.env"
+      echo "OLLAMA_BASE_URL=${remote_url}" >> "$HIVEMIND_DIR/.env"
+      ok "Semantic memory configured (remote Ollama at ${remote_url})"
+      return
+    fi
+  fi
+
+  echo -e "  Press ${BOLD}Y${NC} to install Ollama and enable semantic memory"
+  echo -e "  Press ${BOLD}n${NC} to skip (you can enable it later)"
+  echo ""
+
+  local enable_embeddings
+  if [ -t 0 ] || [ -e /dev/tty ]; then
+    read -rp "$(echo -e "${CYAN}▸${NC}") Enable semantic memory? [Y/n] " enable_embeddings < /dev/tty 2>/dev/null || enable_embeddings="Y"
+  else
+    enable_embeddings="Y"
+    info "Non-interactive install — enabling semantic memory by default"
+  fi
+  enable_embeddings="${enable_embeddings:-Y}"
+
+  if [[ ! "$enable_embeddings" =~ ^[Yy] ]]; then
+    warn "Skipping semantic memory — agents will use keyword-based recall"
+    echo "MEMORY_EMBEDDINGS_ENABLED=false" >> "$HIVEMIND_DIR/.env"
+    return
+  fi
+
+  # Install Ollama if not present
+  if [ "$has_ollama" = false ]; then
+    info "Installing Ollama..."
+    if [ "$OS" = "mac" ]; then
+      if command -v brew &>/dev/null; then
+        brew install ollama
+      else
+        curl -fsSL https://ollama.com/install.sh | sh
+      fi
+    else
+      curl -fsSL https://ollama.com/install.sh | sh
+    fi
+
+    if ! command -v ollama &>/dev/null; then
+      warn "Ollama installation failed — skipping semantic memory"
+      echo "MEMORY_EMBEDDINGS_ENABLED=false" >> "$HIVEMIND_DIR/.env"
+      return
+    fi
+
+    ok "Ollama installed"
+  fi
+
+  # Start Ollama if not running
+  if ! ollama list &>/dev/null 2>&1; then
+    info "Starting Ollama..."
+    ollama serve &>/dev/null &
+    sleep 3
+  fi
+
+  # Pull the embedding model if not present
+  if [ "$has_model" = false ]; then
+    info "Pulling nomic-embed-text model (~274MB)..."
+    ollama pull nomic-embed-text
+  fi
+
+  ok "Semantic memory ready (Ollama + nomic-embed-text)"
+  echo "MEMORY_EMBEDDINGS_ENABLED=true" >> "$HIVEMIND_DIR/.env"
+  echo "MEMORY_EMBEDDINGS_PROVIDER=ollama" >> "$HIVEMIND_DIR/.env"
+}
+
+# ----------------------------------------------------------
+# Remote access — just asks the question and records the answer.
+# All real setup (verification, Cloudflare API calls, health checks) lives
+# in the Remote Access wizard in the web UI, not here. This just records
+# intent so print_success can point the admin at the right place.
+# ----------------------------------------------------------
+setup_remote_access_prompt() {
+  echo ""
+  echo -e "${BOLD}${CYAN}🌐 Remote Access${NC}"
+  echo -e "  Give your desktop app a public URL to reach this instance from anywhere."
+  echo ""
+  echo -e "  ${BOLD}1)${NC} I already have a tunnel (paste + verify a URL)"
+  echo -e "  ${BOLD}2)${NC} Guide me through a free Cloudflare Tunnel"
+  echo -e "  ${BOLD}3)${NC} Later"
+  echo ""
+
+  local choice="3"
+  if [ -t 0 ] || [ -e /dev/tty ]; then
+    read -rp "$(echo -e "${CYAN}▸${NC}") Choice [1/2/3, default 3]: " choice < /dev/tty 2>/dev/null || choice="3"
+  else
+    info "Non-interactive install — deferring remote access setup"
+  fi
+  choice="${choice:-3}"
+
+  case "$choice" in
+    1) REMOTE_ACCESS_CHOICE="byo" ;;
+    2) REMOTE_ACCESS_CHOICE="cloudflare" ;;
+    *) REMOTE_ACCESS_CHOICE="later" ;;
+  esac
+
+  echo "REMOTE_ACCESS_SETUP_CHOICE=$REMOTE_ACCESS_CHOICE" >> "$HIVEMIND_DIR/.env"
+  ok "Recorded remote access choice: $REMOTE_ACCESS_CHOICE (finish setup in the wizard)"
+}
+
+# ----------------------------------------------------------
+# Build and start
+# ----------------------------------------------------------
+build_and_start() {
+  cd "$HIVEMIND_DIR"
+
+  # Detect version from current tag
+  local version
+  version="$(git describe --tags --exact-match 2>/dev/null | sed 's/^v//' || git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//' || echo 'dev')"
+
+  # Pull prebuilt images from GHCR (all custom images)
+  info "Pulling prebuilt images (version: $version)..."
+  local pull_ok=true
+  if ! HIVEMIND_VERSION="$version" docker compose pull app workspace connector sdk-proxy 2>/dev/null; then
+    # Retry with latest tag in case version-specific tag doesn't exist yet
+    if ! HIVEMIND_VERSION="latest" docker compose pull app workspace connector sdk-proxy 2>/dev/null; then
+      pull_ok=false
+    fi
+  fi
+
+  if [ "$pull_ok" = true ]; then
+    ok "Prebuilt images pulled successfully"
+  else
+    warn "Prebuilt images not available — building from source (this may take a while)..."
+    HIVEMIND_VERSION="$version" docker compose build --build-arg HIVEMIND_VERSION="$version"
+  fi
+
+  info "Starting Hivemind..."
+  HIVEMIND_VERSION="$version" docker compose up -d
+
+  # Wait for Rails to be healthy
+  echo -n "Waiting for Hivemind to be ready..."
+  local attempts=0
+  while ! curl -sf http://localhost:8080 &>/dev/null; do
+    sleep 3
+    echo -n "."
+    attempts=$((attempts + 1))
+    if [ $attempts -gt 40 ]; then
+      echo ""
+      warn "Taking longer than expected. Check logs with: docker compose logs rails"
+      return
+    fi
+  done
+  echo ""
+  ok "Hivemind is running!"
+}
+
+# ----------------------------------------------------------
+# Install CLI
+# ----------------------------------------------------------
+install_cli() {
+  local cli_src="$HIVEMIND_DIR/bin/hivemind"
+  local cli_dest="/usr/local/bin/hivemind"
+
+  if [ ! -f "$cli_src" ]; then
+    warn "CLI script not found at $cli_src — skipping"
+    return
+  fi
+
+  info "Installing hivemind CLI..."
+
+  # Detect if we can write to /usr/local/bin
+  if [ -w "/usr/local/bin" ]; then
+    ln -sf "$cli_src" "$cli_dest"
+  elif command -v sudo &>/dev/null; then
+    sudo ln -sf "$cli_src" "$cli_dest"
+  else
+    warn "Cannot write to /usr/local/bin — add $cli_src to your PATH manually"
+    return
+  fi
+
+  ok "CLI installed: hivemind (→ $cli_dest)"
+}
+
+# ----------------------------------------------------------
+# Done
+# ----------------------------------------------------------
+print_success() {
+  echo ""
+  echo -e "${BOLD}${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+  echo -e "${BOLD}${GREEN}🐝 Hivemind is ready!${NC}"
+  echo -e "${BOLD}${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+  echo ""
+  # Detect IP for network access
+  local ip
+  ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "")
+
+  echo -e "  ${BOLD}Open:${NC}      http://localhost:8080"
+  if [ -n "$ip" ]; then
+    echo -e "  ${BOLD}Network:${NC}   http://${ip}:8080"
+  fi
+  echo -e "  ${BOLD}Location:${NC}  $HIVEMIND_DIR"
+  echo -e "  ${BOLD}Logs:${NC}      cd $HIVEMIND_DIR && docker compose logs -f"
+  echo -e "  ${BOLD}Stop:${NC}      hivemind stop"
+  echo -e "  ${BOLD}Restart:${NC}   hivemind restart"
+  echo -e "  ${BOLD}Update:${NC}    hivemind update"
+  echo -e "  ${BOLD}CLI Help:${NC}  hivemind --help"
+  echo ""
+  echo -e "  ${CYAN}Next: Create your account and add your first agent in Mission Control.${NC}"
+  echo -e "  ${CYAN}Add API keys and integrations under Settings → Integrations.${NC}"
+
+  local wizard_url="http://localhost:8080/remote_access"
+  if [ -n "$ip" ]; then
+    wizard_url="http://${ip}:8080/remote_access"
+  fi
+  case "${REMOTE_ACCESS_CHOICE:-later}" in
+    byo)        echo -e "  ${CYAN}Remote access: finish verifying your tunnel URL at ${wizard_url}${NC}" ;;
+    cloudflare) echo -e "  ${CYAN}Remote access: finish the guided Cloudflare setup at ${wizard_url}${NC}" ;;
+    *)          echo -e "  ${CYAN}Remote access (optional): set it up anytime at ${wizard_url}${NC}" ;;
+  esac
+  echo ""
+  echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+  echo -e "${YELLOW}⚠  Heads up!${NC}"
+  echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+  echo ""
+  echo -e "  Hivemind moves fast and is under active development."
+  echo -e "  It is ${BOLD}not fully battle-tested${NC} — expect rough edges."
+  echo ""
+  echo -e "  ${BOLD}Found a bug?${NC}    https://github.com/hivementality-ai/hivemind/issues"
+  echo -e "  ${BOLD}Need help?${NC}      https://discord.gg/ckyVareyvk"
+  echo -e "  ${BOLD}Want to help?${NC}   PRs welcome — see CONTRIBUTING.md"
+  echo ""
+}
+
+# ----------------------------------------------------------
+# Main
+# ----------------------------------------------------------
+main() {
+  header
+  detect_os
+  install_prerequisites
+  install_docker
+  ensure_docker_access
+  check_compose
+  setup_repo
+  setup_env
+  setup_shared_workspace
+  setup_memory_embeddings
+  setup_remote_access_prompt
+  install_cli
+  build_and_start
+  print_success
+}
+
+main "$@"

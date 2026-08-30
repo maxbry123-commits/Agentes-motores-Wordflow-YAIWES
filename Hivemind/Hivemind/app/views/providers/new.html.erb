@@ -1,0 +1,480 @@
+<div class="max-w-3xl mx-auto px-6 py-8">
+  <!-- Header -->
+  <div class="flex items-center gap-3 mb-8">
+    <%= link_to providers_path, class: "text-text-muted hover:text-white transition" do %>
+      ← Back to Providers
+    <% end %>
+    <span class="text-text-muted">/</span>
+    <h1 class="text-3xl font-bold text-white">Add Provider</h1>
+  </div>
+
+  <!-- Form -->
+  <div class="bg-surface-card rounded-xl border border-border-default p-8">
+    <%= form_with model: @provider, url: providers_path, method: :post, class: "space-y-6" do |f| %>
+      <% if @provider.errors.any? %>
+        <div class="bg-red-900/50 border border-red-600 text-red-200 px-4 py-3 rounded-lg text-sm">
+          <h3 class="font-semibold mb-2"><%= pluralize(@provider.errors.count, "error") %> prevented this provider from being saved:</h3>
+          <ul class="list-disc list-inside space-y-1">
+            <% @provider.errors.full_messages.each do |message| %>
+              <li><%= message %></li>
+            <% end %>
+          </ul>
+        </div>
+      <% end %>
+
+      <!-- Provider Type Selector -->
+      <div class="space-y-3">
+        <label class="block text-text-primary font-semibold">Choose Provider Type</label>
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3" id="provider-type-grid">
+          <% provider_type_options = {
+            "anthropic" => { desc: "Claude models — advanced reasoning & code", color: "orange" },
+            "openai"    => { desc: "GPT & o-series models — versatile AI", color: "green" },
+            "ollama"    => { desc: "Run open-source models locally", color: "purple" },
+            "openai_compatible" => { desc: "llama.cpp, vLLM, LocalAI, LM Studio, or any OpenAI-compatible API", color: "blue" }
+          } %>
+          <% @available_types.each do |type| %>
+            <% info = provider_type_options[type] %>
+            <label class="provider-type-card relative flex items-center gap-3 p-4 bg-surface-raised rounded-lg cursor-pointer hover:bg-surface-overlay transition border-2 border-transparent"
+                   data-type="<%= type %>"
+                   data-needs-key="<%= %w[openai anthropic openai_compatible].include?(type) %>">
+              <input type="radio" name="provider_config[adapter_type]" value="<%= type %>"
+                     class="sr-only provider-type-radio"
+                     <%= "checked" if @available_types.length == 1 %>>
+              <div class="w-10 h-10 <%= provider_badge_bg(type) %> rounded-lg flex items-center justify-center text-white font-bold text-sm flex-shrink-0">
+                <%= provider_badge_icon(type) %>
+              </div>
+              <div class="flex-1 min-w-0">
+                <span class="text-white text-sm font-medium block"><%= type == "openai_compatible" ? "OpenAI Compatible" : type.titleize %></span>
+                <p class="text-text-muted text-xs"><%= info[:desc] %></p>
+              </div>
+              <div class="provider-type-check hidden absolute top-2 right-2 w-5 h-5 bg-brand rounded-full flex items-center justify-center">
+                <svg class="w-3 h-3 text-white" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clip-rule="evenodd" /></svg>
+              </div>
+            </label>
+          <% end %>
+        </div>
+      </div>
+
+      <!-- Configuration Section (hidden until type selected) -->
+      <div id="config-section" class="space-y-6 hidden">
+        <!-- Provider Name -->
+        <div id="name-section" class="hidden">
+          <label class="block text-text-primary font-semibold mb-2">Provider Name</label>
+          <%= f.text_field :name,
+              class: "w-full px-4 py-3 bg-surface-raised border border-border-default rounded-lg text-white placeholder-text-muted focus:outline-none focus:ring-2 focus:ring-brand focus:border-transparent text-sm",
+              placeholder: "e.g. LocalAI, OpenRouter, Together AI...",
+              id: "provider-name-input",
+              autocomplete: "off" %>
+          <p class="text-text-faint text-xs mt-1">Give this provider a unique name. Agents will use this name to reference it.</p>
+        </div>
+
+        <!-- Base URL Section (openai-compatible providers) -->
+        <div id="openai-base-url-section" class="hidden">
+          <label class="block text-text-primary font-semibold mb-2">Base URL</label>
+          <input type="text"
+                 name="provider_config[base_url]"
+                 id="openai-base-url-input"
+                 class="w-full px-4 py-3 bg-surface-raised border border-border-default rounded-lg text-white placeholder-text-muted focus:outline-none focus:ring-2 focus:ring-brand focus:border-transparent font-mono text-sm"
+                 placeholder="https://api.example.com/v1"
+                 autocomplete="off">
+          <p class="text-text-faint text-xs mt-1">The API base URL for this provider (e.g. <code class="text-text-muted">https://api.minimax.chat/v1</code>).</p>
+        </div>
+
+        <!-- Security Notice -->
+        <div class="bg-blue-900/30 border border-blue-700/50 rounded-lg p-4">
+          <p class="text-blue-300 text-sm flex items-start gap-2">
+            <span class="text-lg">🔒</span>
+            <span><strong>Security:</strong> All API keys are encrypted at rest.</span>
+          </p>
+        </div>
+
+        <!-- API Key Section (cloud providers only) -->
+        <div id="api-key-section" class="space-y-4 hidden">
+          <div>
+            <label class="block text-text-primary font-semibold mb-2">API Key</label>
+            <%= f.text_field :api_key,
+                class: "w-full px-4 py-3 bg-surface-raised border border-border-default rounded-lg text-white placeholder-text-muted focus:outline-none focus:ring-2 focus:ring-brand focus:border-transparent font-mono text-sm",
+                placeholder: "Enter API key...",
+                id: "api-key-input",
+                autocomplete: "off" %>
+            <p class="text-text-faint text-xs mt-2" id="api-key-hint"></p>
+          </div>
+        </div>
+
+        <!-- Ollama Advanced Settings -->
+        <div id="ollama-settings" class="hidden">
+          <details class="mt-4">
+            <summary class="text-text-muted text-sm cursor-pointer hover:text-white transition select-none flex items-center gap-2">
+              <span class="text-lg">▶</span> Advanced Settings
+            </summary>
+            <div class="mt-3 p-4 bg-surface-overlay rounded-lg border border-border-default space-y-3">
+              <div>
+                <label class="block text-text-primary font-medium text-sm mb-1">Ollama URL</label>
+                <input type="text"
+                       id="ollama-custom-url"
+                       name="provider_config[base_url]"
+                       class="w-full px-3 py-2 bg-surface-raised border border-border-default rounded-lg text-white placeholder-text-muted focus:outline-none focus:ring-2 focus:ring-purple-500 focus:border-transparent font-mono text-sm"
+                       placeholder="http://host.docker.internal:11434"
+                       value="http://host.docker.internal:11434">
+                <p class="text-text-faint text-xs mt-1">
+                  Change this if Ollama is running on another machine (e.g. <code class="text-text-muted">http://192.168.1.100:11434</code>)
+                </p>
+                <button type="button" onclick="detectOllamaModels()"
+                        class="mt-2 px-3 py-1.5 bg-purple-600 hover:bg-purple-700 text-white text-xs font-medium rounded-lg transition cursor-pointer">
+                  Check Connection
+                </button>
+              </div>
+            </div>
+          </details>
+        </div>
+
+        <!-- OpenAI Compatible — Check Connection button -->
+        <div id="openai-compatible-settings" class="hidden">
+          <button type="button" onclick="detectOpenaiCompatibleModels()"
+                  class="mt-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white text-xs font-medium rounded-lg transition cursor-pointer">
+            Check Connection & Detect Models
+          </button>
+        </div>
+
+        <!-- Model Selection -->
+        <div class="space-y-4">
+          <label class="block text-text-primary font-semibold">Select Available Models</label>
+
+          <!-- Static model lists (anthropic/openai) — sourced from LlmModelRegistry -->
+          <div id="anthropic-models" class="space-y-2 hidden">
+            <% LlmModelRegistry.supported_for_provider("anthropic").each do |model| %>
+              <label class="flex items-start gap-3 p-4 bg-surface-raised rounded-lg cursor-pointer hover:bg-surface-overlay transition group border border-border-default/50">
+                <input type="checkbox" name="provider_config[models][]" value="<%= model.api_id %>"
+                       class="mt-1 w-4 h-4 rounded border-gray-500 text-brand focus:ring-brand bg-surface-overlay flex-shrink-0">
+                <div class="flex-1">
+                  <span class="text-white text-sm font-medium block"><%= model.display_name %></span>
+                  <p class="text-text-muted text-xs"><%= model.description %></p>
+                </div>
+              </label>
+            <% end %>
+          </div>
+
+          <div id="openai-models" class="space-y-2 hidden">
+            <% LlmModelRegistry.supported_for_provider("openai").each do |model| %>
+              <label class="flex items-start gap-3 p-4 bg-surface-raised rounded-lg cursor-pointer hover:bg-surface-overlay transition group border border-border-default/50">
+                <input type="checkbox" name="provider_config[models][]" value="<%= model.api_id %>"
+                       class="mt-1 w-4 h-4 rounded border-gray-500 text-brand focus:ring-brand bg-surface-overlay flex-shrink-0">
+                <div class="flex-1">
+                  <span class="text-white text-sm font-medium block"><%= model.display_name %></span>
+                  <p class="text-text-muted text-xs"><%= model.description %></p>
+                </div>
+              </label>
+            <% end %>
+          </div>
+
+          <!-- Dynamic model lists (ollama/openai_compatible) -->
+          <div id="ollama-models-container" class="space-y-2 hidden">
+            <p class="text-text-muted text-sm">Click "Check Connection" above to detect installed Ollama models.</p>
+          </div>
+          <div id="openai-compatible-models-container" class="space-y-2 hidden">
+            <p class="text-text-muted text-sm">Click "Check Connection" above to detect loaded models.</p>
+          </div>
+          <div id="openai-compatible-custom-model-section" class="hidden mt-3">
+            <div class="flex gap-2">
+              <input type="text" id="openai-compatible-custom-model"
+                     class="flex-1 px-3 py-2 bg-surface-raised border border-border-default rounded-lg text-white placeholder-text-muted focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono text-sm"
+                     placeholder="Enter model name (e.g. minimax-01)">
+              <button type="button" onclick="addCustomOpenaiCompatibleModel()"
+                      class="px-3 py-2 bg-blue-600 hover:bg-blue-700 text-white text-xs font-medium rounded-lg transition cursor-pointer whitespace-nowrap">
+                Add Model
+              </button>
+            </div>
+            <p class="text-text-faint text-xs mt-1">
+              Manually add models if the server doesn't support the <code class="text-text-muted">/v1/models</code> endpoint.
+            </p>
+          </div>
+        </div>
+
+        <!-- Default Model Selection -->
+        <div id="default-model-section" class="space-y-2">
+          <label class="block text-text-primary font-semibold text-sm">Default Model</label>
+          <select name="provider_config[default_model]" id="default-model-select"
+                  class="w-full px-4 py-2 bg-surface-raised border border-border-default rounded-lg text-white text-sm focus:outline-none focus:ring-2 focus:ring-brand">
+            <option value="">Select a default...</option>
+          </select>
+        </div>
+
+        <!-- Form Actions -->
+        <div class="flex gap-3 pt-4 border-t border-border-default">
+          <%= f.submit "Add Provider", class: "px-6 py-2 bg-brand hover:bg-brand-dark text-white font-semibold rounded-lg transition cursor-pointer" %>
+          <%= link_to "Cancel", providers_path, class: "px-6 py-2 bg-surface-raised hover:bg-surface-overlay text-white font-semibold rounded-lg transition" %>
+        </div>
+      </div>
+    <% end %>
+  </div>
+
+  <script>
+    // Provider type switching
+    const typeCards = document.querySelectorAll('.provider-type-card');
+    const configSection = document.getElementById('config-section');
+    const apiKeySection = document.getElementById('api-key-section');
+    const apiKeyInput = document.getElementById('api-key-input');
+    const apiKeyHint = document.getElementById('api-key-hint');
+    const defaultModelSelect = document.getElementById('default-model-select');
+
+    const modelSections = {
+      anthropic: document.getElementById('anthropic-models'),
+      openai: document.getElementById('openai-models'),
+      ollama: document.getElementById('ollama-models-container'),
+      openai_compatible: document.getElementById('openai-compatible-models-container')
+    };
+
+    const customModelSection = document.getElementById('openai-compatible-custom-model-section');
+
+    const settingSections = {
+      ollama: document.getElementById('ollama-settings'),
+      openai_compatible: document.getElementById('openai-compatible-settings')
+    };
+
+    // Model lists sourced from LlmModelRegistry — do not edit here.
+    const defaultModels = {
+      anthropic: <%= LlmModelRegistry.supported_for_provider("anthropic").map { |m| { id: m.api_id, name: m.display_name } }.to_json.html_safe %>,
+      openai:    <%= LlmModelRegistry.supported_for_provider("openai").map { |m| { id: m.api_id, name: m.display_name } }.to_json.html_safe %>
+    };
+
+    const apiKeyHints = {
+      anthropic: 'Get a key at <a href="https://console.anthropic.com/" target="_blank" class="text-brand-light hover:underline">console.anthropic.com</a>. Standard API keys (<code class="text-text-muted">sk-ant-api*</code>) recommended for production. OAuth tokens (<code class="text-text-muted">sk-ant-oat*</code>) from Pro/Max subscriptions work but may be restricted by Anthropic\'s terms.',
+      openai: 'Get a key at <a href="https://platform.openai.com/" target="_blank" class="text-brand-light hover:underline">platform.openai.com</a>',
+      ollama: 'Leave blank for local Ollama (no API key needed).',
+      openai_compatible: 'Required for cloud providers (Minimax, OpenRouter, Together AI). Leave blank for local servers.'
+    };
+
+    const apiKeyPlaceholders = {
+      anthropic: 'sk-ant-...',
+      openai: 'sk-...',
+      ollama: 'Leave blank for local Ollama',
+      openai_compatible: 'API key (optional for local servers)'
+    };
+
+    const existingTypes = <%= ProviderConfig.pluck(:adapter_type).to_json.html_safe %>;
+    const nameSection = document.getElementById('name-section');
+    const nameInput = document.getElementById('provider-name-input');
+    const openaiBaseUrlSection = document.getElementById('openai-base-url-section');
+
+    function selectProviderType(type) {
+      // Update card styling
+      typeCards.forEach(card => {
+        const radio = card.querySelector('.provider-type-radio');
+        const check = card.querySelector('.provider-type-check');
+        if (card.dataset.type === type) {
+          card.classList.add('border-brand');
+          card.classList.remove('border-transparent');
+          check.classList.remove('hidden');
+          radio.checked = true;
+        } else {
+          card.classList.remove('border-brand');
+          card.classList.add('border-transparent');
+          check.classList.add('hidden');
+          radio.checked = false;
+        }
+      });
+
+      // Show config section
+      configSection.classList.remove('hidden');
+
+      // Show name field when adding a second provider of the same type
+      const isDuplicate = existingTypes.includes(type);
+      if (isDuplicate) {
+        nameSection.classList.remove('hidden');
+        nameInput.required = true;
+      } else {
+        nameSection.classList.add('hidden');
+        nameInput.required = false;
+        nameInput.value = '';
+      }
+
+      // Show base URL for openai-compatible providers and duplicate openai
+      if (type === 'openai_compatible' || (type === 'openai' && isDuplicate)) {
+        openaiBaseUrlSection.classList.remove('hidden');
+      } else {
+        openaiBaseUrlSection.classList.add('hidden');
+      }
+
+      // Toggle API key section (show for all types except ollama)
+      const needsKey = ['openai', 'anthropic', 'openai_compatible'].includes(type);
+      if (needsKey) {
+        apiKeySection.classList.remove('hidden');
+      } else {
+        apiKeySection.classList.add('hidden');
+      }
+      apiKeyInput.placeholder = apiKeyPlaceholders[type] || 'Enter API key...';
+      apiKeyHint.innerHTML = apiKeyHints[type] || '';
+
+      // Toggle custom model entry
+      if (type === 'openai_compatible') {
+        customModelSection.classList.remove('hidden');
+      } else {
+        customModelSection.classList.add('hidden');
+      }
+
+      // Toggle advanced settings
+      Object.keys(settingSections).forEach(k => {
+        if (settingSections[k]) settingSections[k].classList.add('hidden');
+      });
+      if (settingSections[type]) settingSections[type].classList.remove('hidden');
+
+      // Toggle model sections
+      Object.keys(modelSections).forEach(k => {
+        if (modelSections[k]) modelSections[k].classList.add('hidden');
+      });
+      if (modelSections[type]) modelSections[type].classList.remove('hidden');
+
+      // Update default model dropdown
+      updateDefaultModelDropdown(type);
+    }
+
+    function updateDefaultModelDropdown(type) {
+      defaultModelSelect.innerHTML = '<option value="">Select a default...</option>';
+      const models = defaultModels[type];
+      if (models) {
+        models.forEach(m => {
+          const opt = document.createElement('option');
+          opt.value = m.id;
+          opt.textContent = m.name;
+          defaultModelSelect.appendChild(opt);
+        });
+      }
+    }
+
+    typeCards.forEach(card => {
+      card.addEventListener('click', () => selectProviderType(card.dataset.type));
+    });
+
+    // Auto-select if only one type available
+    if (typeCards.length === 1) {
+      selectProviderType(typeCards[0].dataset.type);
+    }
+
+    // Ollama model detection
+    function detectOllamaModels() {
+      const urlInput = document.getElementById('ollama-custom-url');
+      const url = urlInput ? urlInput.value : 'http://host.docker.internal:11434';
+      const container = document.getElementById('ollama-models-container');
+
+      container.innerHTML = '<p class="text-text-muted text-sm">Detecting models...</p>';
+
+      fetch(`/setup/ollama_models?url=${encodeURIComponent(url)}`)
+        .then(r => r.json())
+        .then(data => {
+          if (data.status === 'connected' && data.models.length > 0) {
+            let html = '<p class="text-green-300 text-sm font-medium mb-2">\u2713 Connected \u2014 ' + data.models.length + ' model(s) found</p>';
+            html += '<div class="space-y-2">';
+            data.models.forEach((m, i) => {
+              html += `
+                <label class="flex items-start gap-3 p-4 bg-surface-raised rounded-lg cursor-pointer hover:bg-surface-overlay transition group border border-border-default/50">
+                  <input type="checkbox" name="provider_config[models][]" value="${m.id}" ${i === 0 ? 'checked' : ''}
+                         class="mt-1 w-4 h-4 rounded border-gray-500 text-purple-600 focus:ring-purple-500 bg-surface-overlay flex-shrink-0">
+                  <div class="flex-1">
+                    <span class="text-white text-sm font-medium block">${m.name}</span>
+                    <p class="text-text-muted text-xs">${m.parameter_size || m.size + 'GB'}${m.family ? ' \u00b7 ' + m.family : ''}</p>
+                  </div>
+                </label>`;
+            });
+            html += '</div>';
+            container.innerHTML = html;
+
+            // Update default model dropdown with detected models
+            defaultModelSelect.innerHTML = '<option value="">Select a default...</option>';
+            data.models.forEach(m => {
+              const opt = document.createElement('option');
+              opt.value = m.id;
+              opt.textContent = m.name;
+              defaultModelSelect.appendChild(opt);
+            });
+          } else if (data.status === 'connected') {
+            container.innerHTML = '<p class="text-yellow-300 text-sm">Ollama is running but no models installed. Run: <code class="text-text-primary font-mono text-xs">ollama pull llama3.2:3b</code></p>';
+          } else {
+            container.innerHTML = `<p class="text-red-300 text-sm mb-2">\u26a0 Error: ${data.message || 'Could not connect'}</p><p class="text-text-faint text-xs">Install Ollama from <a href="https://ollama.com/" target="_blank" class="text-brand-light hover:underline">ollama.com</a></p>`;
+          }
+        })
+        .catch(() => {
+          container.innerHTML = '<p class="text-red-300 text-sm mb-2">\u26a0 Could not reach Ollama. Make sure it is installed and running.</p><p class="text-text-faint text-xs">Install Ollama from <a href="https://ollama.com/" target="_blank" class="text-brand-light hover:underline">ollama.com</a></p>';
+        });
+    }
+
+    // OpenAI Compatible model detection
+    function detectOpenaiCompatibleModels() {
+      const urlInput = document.getElementById('openai-base-url-input');
+      const url = urlInput ? urlInput.value.trim() : '';
+      if (!url) { alert('Enter a Base URL first.'); return; }
+      const apiKey = apiKeyInput ? apiKeyInput.value.trim() : '';
+      const container = document.getElementById('openai-compatible-models-container');
+
+      container.innerHTML = '<p class="text-text-muted text-sm">Detecting models...</p>';
+
+      let fetchUrl = `/setup/openai_compatible_models?url=${encodeURIComponent(url)}`;
+      if (apiKey) fetchUrl += `&api_key=${encodeURIComponent(apiKey)}`;
+      fetch(fetchUrl)
+        .then(r => r.json())
+        .then(data => {
+          if (data.status === 'connected' && data.models.length > 0) {
+            let html = '<p class="text-green-300 text-sm font-medium mb-2">\u2713 Connected \u2014 ' + data.models.length + ' model(s) loaded</p>';
+            html += '<div class="space-y-2">';
+            data.models.forEach((m, i) => {
+              html += `
+                <label class="flex items-start gap-3 p-4 bg-surface-raised rounded-lg cursor-pointer hover:bg-surface-overlay transition group border border-border-default/50">
+                  <input type="checkbox" name="provider_config[models][]" value="${m.id}" ${i === 0 ? 'checked' : ''}
+                         class="mt-1 w-4 h-4 rounded border-gray-500 text-blue-600 focus:ring-blue-500 bg-surface-overlay flex-shrink-0">
+                  <div class="flex-1">
+                    <span class="text-white text-sm font-medium block">${m.name}</span>
+                  </div>
+                </label>`;
+            });
+            html += '</div>';
+            container.innerHTML = html;
+
+            // Update default model dropdown with detected models
+            defaultModelSelect.innerHTML = '<option value="">Select a default...</option>';
+            data.models.forEach(m => {
+              const opt = document.createElement('option');
+              opt.value = m.id;
+              opt.textContent = m.name;
+              defaultModelSelect.appendChild(opt);
+            });
+          } else if (data.status === 'connected') {
+            container.innerHTML = '<p class="text-yellow-300 text-sm">Server is running but no model is loaded. Make sure your server has a model available.</p>';
+          } else {
+            container.innerHTML = `<p class="text-red-300 text-sm mb-2">\u26a0 Error: ${data.message || 'Could not connect'}</p><p class="text-text-faint text-xs">Make sure your OpenAI-compatible server is running and accessible.</p>`;
+          }
+        })
+        .catch(() => {
+          container.innerHTML = '<p class="text-red-300 text-sm mb-2">\u26a0 Could not reach server. Make sure it is running.</p><p class="text-text-faint text-xs">Make sure your OpenAI-compatible server is running and accessible.</p>';
+        });
+    }
+
+    function addCustomOpenaiCompatibleModel() {
+      const input = document.getElementById('openai-compatible-custom-model');
+      const modelId = input.value.trim();
+      if (!modelId) return;
+
+      const container = document.getElementById('openai-compatible-models-container');
+      // Clear placeholder text if present
+      const placeholder = container.querySelector('p.text-text-muted');
+      if (placeholder) placeholder.remove();
+
+      const label = document.createElement('label');
+      label.className = 'flex items-start gap-3 p-4 bg-surface-raised rounded-lg cursor-pointer hover:bg-surface-overlay transition group border border-border-default/50';
+      label.innerHTML = `
+        <input type="checkbox" name="provider_config[models][]" value="${modelId}" checked
+               class="mt-1 w-4 h-4 rounded border-gray-500 text-blue-600 focus:ring-blue-500 bg-surface-overlay flex-shrink-0">
+        <div class="flex-1">
+          <span class="text-white text-sm font-medium block">${modelId}</span>
+        </div>`;
+      container.appendChild(label);
+
+      // Add to default model dropdown
+      const opt = document.createElement('option');
+      opt.value = modelId;
+      opt.textContent = modelId;
+      if (defaultModelSelect.options.length <= 1) opt.selected = true;
+      defaultModelSelect.appendChild(opt);
+
+      input.value = '';
+    }
+  </script>
+</div>

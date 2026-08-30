@@ -1,0 +1,848 @@
+<div class="max-w-3xl mx-auto px-6 py-8">
+  <div class="mb-8">
+    <h1 class="text-2xl font-bold text-white">Integrations</h1>
+    <p class="text-text-muted mt-1">Connect external services to give your agents more capabilities</p>
+  </div>
+
+  <!-- GitHub -->
+  <div class="bg-surface-card rounded-xl border border-border-default p-6 mb-6">
+    <div class="flex items-center justify-between mb-4">
+      <div class="flex items-center gap-3">
+        <div class="w-10 h-10 bg-surface-overlay/20 rounded-lg flex items-center justify-center">
+          <svg class="w-6 h-6 text-text-primary" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/></svg>
+        </div>
+        <div>
+          <h2 class="text-lg font-semibold text-white">GitHub</h2>
+          <p class="text-text-faint text-sm">Manage repos, PRs, issues, and actions via gh CLI</p>
+        </div>
+      </div>
+      <span class="px-3 py-1 rounded-full text-xs font-medium
+        <%= @github_configured ? 'bg-green-900 text-green-300' : 'bg-surface-raised text-text-muted' %>">
+        <%= @github_configured ? "Connected" : "Not configured" %>
+      </span>
+    </div>
+
+    <%= form_tag update_github_integrations_path, method: :patch do %>
+      <div class="space-y-4">
+        <div>
+          <label class="block text-text-muted text-sm mb-1">Personal Access Token</label>
+          <%= password_field_tag :github_token, nil,
+              placeholder: "ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+              class: "w-full px-4 py-3 bg-surface-raised border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand",
+              autocomplete: "off" %>
+          <p class="text-gray-600 text-xs mt-1">
+            Generate at
+            <a href="https://github.com/settings/tokens?type=beta" target="_blank" class="text-brand-light hover:text-brand-light">github.com/settings/tokens</a>
+            — recommended scopes: repo, read:org, workflow
+          </p>
+        </div>
+        <div class="flex items-center justify-between">
+          <% if @github_configured %>
+            <button type="button" onclick="testGitHub()" class="text-brand-light hover:text-brand-light text-sm font-medium cursor-pointer">
+              Test Connection
+            </button>
+          <% else %>
+            <span></span>
+          <% end %>
+          <%= submit_tag @github_configured ? "Update" : "Connect GitHub",
+              class: "px-4 py-2 bg-brand hover:bg-brand-dark text-white text-sm font-medium rounded-lg transition cursor-pointer" %>
+        </div>
+      </div>
+    <% end %>
+
+    <% if @github_configured %>
+      <div class="mt-3 bg-surface-base/50 rounded-lg px-4 py-3">
+        <p class="text-text-muted text-xs">Agents can use <code class="text-text-primary">gh</code> commands in the workspace: <code class="text-text-primary">gh repo list</code>, <code class="text-text-primary">gh pr create</code>, <code class="text-text-primary">gh issue list</code>, etc.</p>
+      </div>
+    <% end %>
+  </div>
+
+  <script>
+    function testGitHub() {
+      fetch("<%= test_github_integrations_path %>")
+        .then(r => r.json())
+        .then(data => {
+          if (data.status === "connected") {
+            alert(`✅ Connected as ${data.user} (${data.name})`)
+          } else {
+            alert(`❌ ${data.message}`)
+          }
+        })
+        .catch(() => alert("❌ Connection failed"))
+    }
+  </script>
+
+  <!-- Gmail -->
+  <div class="bg-surface-card rounded-xl border border-border-default p-6 mb-6">
+    <div class="flex items-center justify-between mb-4">
+      <div class="flex items-center gap-3">
+        <div class="w-10 h-10 bg-red-600/20 rounded-lg flex items-center justify-center">
+          <svg class="w-6 h-6 text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"/></svg>
+        </div>
+        <div>
+          <h2 class="text-lg font-semibold text-white">Gmail</h2>
+          <p class="text-text-faint text-sm">Read inbox, search, send emails via IMAP/SMTP</p>
+        </div>
+      </div>
+      <span class="px-3 py-1 rounded-full text-xs font-medium
+        <%= @gmail_configured ? 'bg-green-900 text-green-300' : 'bg-surface-raised text-text-muted' %>">
+        <%= @gmail_configured ? "Connected" : "Not configured" %>
+      </span>
+    </div>
+
+    <%= form_tag update_gmail_integrations_path, method: :patch do %>
+      <div class="space-y-4">
+        <div>
+          <label class="block text-text-muted text-sm mb-1">Gmail Address</label>
+          <%= text_field_tag :gmail_address, nil,
+              placeholder: "you@gmail.com",
+              class: "w-full px-4 py-3 bg-surface-raised border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand",
+              autocomplete: "off" %>
+        </div>
+        <div>
+          <label class="block text-text-muted text-sm mb-1">App Password</label>
+          <%= password_field_tag :gmail_app_password, nil,
+              placeholder: "16-character app password",
+              class: "w-full px-4 py-3 bg-surface-raised border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand",
+              autocomplete: "off" %>
+          <p class="text-gray-600 text-xs mt-1">
+            Get one at
+            <a href="https://myaccount.google.com/apppasswords" target="_blank" class="text-brand-light hover:text-brand-light">myaccount.google.com/apppasswords</a>
+            (requires 2FA enabled)
+          </p>
+        </div>
+        <div class="flex justify-end">
+          <%= submit_tag @gmail_configured ? "Update" : "Connect Gmail",
+              class: "px-4 py-2 bg-brand hover:bg-brand-dark text-white text-sm font-medium rounded-lg transition cursor-pointer" %>
+        </div>
+      </div>
+    <% end %>
+  </div>
+
+  <!-- Email / SMTP -->
+  <div class="bg-surface-card rounded-xl border border-border-default p-6 mb-6">
+    <div class="flex items-center justify-between mb-4">
+      <div class="flex items-center gap-3">
+        <div class="w-10 h-10 bg-emerald-600/20 rounded-lg flex items-center justify-center">
+          <svg class="w-6 h-6 text-emerald-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"/></svg>
+        </div>
+        <div>
+          <h2 class="text-lg font-semibold text-white">Email (SMTP)</h2>
+          <p class="text-text-faint text-sm">Send emails via any SMTP provider</p>
+        </div>
+      </div>
+      <span class="px-3 py-1 rounded-full text-xs font-medium
+        <%= @email_configured ? 'bg-green-900 text-green-300' : 'bg-surface-raised text-text-muted' %>">
+        <%= @email_configured ? "Connected" : "Not configured" %>
+      </span>
+    </div>
+
+    <%= form_tag update_email_integrations_path, method: :patch do %>
+      <div class="space-y-4">
+        <div class="grid grid-cols-2 gap-4">
+          <div>
+            <label class="block text-text-muted text-sm mb-1">SMTP Host</label>
+            <%= text_field_tag :smtp_host, nil,
+                placeholder: "live.smtp.mailtrap.io",
+                class: "w-full px-4 py-3 bg-surface-raised border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand",
+                autocomplete: "off" %>
+          </div>
+          <div>
+            <label class="block text-text-muted text-sm mb-1">SMTP Port</label>
+            <%= text_field_tag :smtp_port, nil,
+                placeholder: "587",
+                class: "w-full px-4 py-3 bg-surface-raised border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand",
+                autocomplete: "off" %>
+          </div>
+        </div>
+        <div class="grid grid-cols-2 gap-4">
+          <div>
+            <label class="block text-text-muted text-sm mb-1">Username</label>
+            <%= text_field_tag :smtp_username, nil,
+                placeholder: "SMTP username or API key",
+                class: "w-full px-4 py-3 bg-surface-raised border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand",
+                autocomplete: "off" %>
+          </div>
+          <div>
+            <label class="block text-text-muted text-sm mb-1">Password</label>
+            <%= password_field_tag :smtp_password, nil,
+                placeholder: "SMTP password",
+                class: "w-full px-4 py-3 bg-surface-raised border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand",
+                autocomplete: "off" %>
+          </div>
+        </div>
+        <div class="grid grid-cols-2 gap-4">
+          <div>
+            <label class="block text-text-muted text-sm mb-1">From Address</label>
+            <%= text_field_tag :from_address, nil,
+                placeholder: "noreply@yourdomain.com",
+                class: "w-full px-4 py-3 bg-surface-raised border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand",
+                autocomplete: "off" %>
+          </div>
+          <div>
+            <label class="block text-text-muted text-sm mb-1">From Name <span class="text-gray-600">(optional)</span></label>
+            <%= text_field_tag :from_name, nil,
+                placeholder: "Hivemind",
+                class: "w-full px-4 py-3 bg-surface-raised border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand",
+                autocomplete: "off" %>
+          </div>
+        </div>
+        <div class="flex items-center justify-between">
+          <p class="text-gray-600 text-xs">Works with Mailtrap, SendGrid, Mailgun, Amazon SES, or any SMTP server</p>
+          <%= submit_tag @email_configured ? "Update" : "Connect Email",
+              class: "px-4 py-2 bg-brand hover:bg-brand-dark text-white text-sm font-medium rounded-lg transition cursor-pointer" %>
+        </div>
+      </div>
+    <% end %>
+  </div>
+
+  <!-- Google Workspace -->
+  <div class="bg-surface-card rounded-xl border border-border-default p-6 mb-6">
+    <div class="flex items-center justify-between mb-4">
+      <div class="flex items-center gap-3">
+        <div class="w-10 h-10 bg-blue-600/20 rounded-lg flex items-center justify-center">
+          <svg class="w-6 h-6 text-blue-400" viewBox="0 0 24 24" fill="currentColor"><path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 01-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z"/><path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/><path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/><path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/></svg>
+        </div>
+        <div>
+          <h2 class="text-lg font-semibold text-white">Google Workspace</h2>
+          <p class="text-text-faint text-sm">Gmail, Calendar, and Drive access for agents</p>
+        </div>
+      </div>
+      <span class="px-3 py-1 rounded-full text-xs font-medium
+        <%= @gws_connected ? 'bg-green-900 text-green-300' : 'bg-surface-raised text-text-muted' %>">
+        <%= @gws_connected ? "Connected" : "Not configured" %>
+      </span>
+    </div>
+
+    <% if @gws_connected %>
+      <div class="space-y-4">
+        <div class="bg-surface-base/50 rounded-lg px-4 py-3">
+          <p class="text-text-muted text-sm">
+            Signed in as <strong class="text-white"><%= @gws_email || "unknown" %></strong>
+          </p>
+        </div>
+        <div class="flex items-center justify-between">
+          <%= link_to "Re-authorize", oauth_google_authorize_path, class: "text-brand-light hover:underline text-sm font-medium", data: { turbo: false } %>
+          <%= button_to "Disconnect", oauth_google_disconnect_path, method: :delete,
+              class: "text-red-400 hover:text-red-300 text-sm font-medium",
+              data: { turbo_confirm: "Disconnect Google Workspace?" } %>
+        </div>
+      </div>
+    <% elsif @gws_oauth_configured %>
+      <div class="space-y-4">
+        <div class="bg-surface-base rounded-lg border border-border-default p-4">
+          <p class="text-text-muted text-sm">OAuth client configured. Click below to sign in with your Google account.</p>
+        </div>
+        <div class="flex justify-end">
+          <%= link_to "Connect Google Account", oauth_google_authorize_path,
+              class: "px-4 py-2 bg-brand hover:bg-brand-dark text-white text-sm font-medium rounded-lg transition",
+              data: { turbo: false } %>
+        </div>
+      </div>
+    <% end %>
+
+    <% unless @gws_connected %>
+      <div class="<%= @gws_oauth_configured ? 'mt-4 pt-4 border-t border-border-default' : '' %>">
+        <% unless @gws_oauth_configured %>
+          <div class="bg-surface-base rounded-lg border border-border-default p-4 mb-4">
+            <p class="text-text-muted text-sm mb-3">Connect Google Workspace so agents can use Drive, Calendar, and Gmail.</p>
+            <ol class="text-text-muted text-sm space-y-2 list-decimal list-inside">
+              <li>Go to <a href="https://console.cloud.google.com/apis/credentials" target="_blank" class="text-brand-light hover:underline">Google Cloud Console > Credentials</a></li>
+              <li>Click <strong class="text-white">Create Credentials</strong> > <strong class="text-white">OAuth client ID</strong></li>
+              <li>Select <strong class="text-white">Web application</strong> as the type</li>
+              <li>Add <code class="text-amber-300"><%= request.base_url %>/oauth/google/callback</code> as an authorized redirect URI</li>
+              <li>Copy the <strong class="text-white">Client ID</strong> and <strong class="text-white">Client Secret</strong> below</li>
+            </ol>
+            <p class="text-text-faint text-xs mt-3">Also enable the Google Drive, Calendar, and Gmail APIs in your project's <a href="https://console.cloud.google.com/apis/library" target="_blank" class="text-brand-light hover:underline">API Library</a>.</p>
+          </div>
+        <% end %>
+
+        <%= form_tag update_google_workspace_integrations_path, method: :patch do %>
+          <div class="space-y-3">
+            <div>
+              <label class="block text-text-muted text-sm mb-1">Client ID</label>
+              <%= text_field_tag :google_client_id, nil,
+                  placeholder: "123456789-abc.apps.googleusercontent.com",
+                  class: "w-full px-4 py-3 bg-surface-raised border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand font-mono text-xs",
+                  autocomplete: "off" %>
+            </div>
+            <div>
+              <label class="block text-text-muted text-sm mb-1">Client Secret</label>
+              <%= password_field_tag :google_client_secret, nil,
+                  placeholder: "GOCSPX-...",
+                  class: "w-full px-4 py-3 bg-surface-raised border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand font-mono text-xs",
+                  autocomplete: "off" %>
+            </div>
+            <div class="flex justify-end">
+              <%= submit_tag @gws_oauth_configured ? "Update Credentials" : "Save & Connect",
+                class: "px-4 py-2 bg-brand hover:bg-brand-dark text-white text-sm font-medium rounded-lg transition cursor-pointer" %>
+            </div>
+          </div>
+        <% end %>
+      </div>
+    <% end %>
+  </div>
+
+  <!-- Jira -->
+  <div class="bg-surface-card rounded-xl border border-border-default p-6 mb-6">
+    <div class="flex items-center justify-between mb-4">
+      <div class="flex items-center gap-3">
+        <div class="w-10 h-10 bg-brand/20 rounded-lg flex items-center justify-center">
+          <svg class="w-6 h-6 text-brand-light" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01"/></svg>
+        </div>
+        <div>
+          <h2 class="text-lg font-semibold text-white">Jira</h2>
+          <p class="text-text-faint text-sm">Manage issues, projects, and workflows</p>
+        </div>
+      </div>
+      <span class="px-3 py-1 rounded-full text-xs font-medium
+        <%= @jira_configured ? 'bg-green-900 text-green-300' : 'bg-surface-raised text-text-muted' %>">
+        <%= @jira_configured ? "Connected" : "Not configured" %>
+      </span>
+    </div>
+
+    <%= form_tag update_jira_integrations_path, method: :patch do %>
+      <div class="space-y-4">
+        <div>
+          <label class="block text-text-muted text-sm mb-1">Instance URL</label>
+          <%= text_field_tag :jira_base_url, nil,
+              placeholder: "https://your-domain.atlassian.net",
+              class: "w-full px-4 py-3 bg-surface-raised border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand",
+              autocomplete: "off" %>
+        </div>
+        <div>
+          <label class="block text-text-muted text-sm mb-1">Email</label>
+          <%= text_field_tag :jira_email, nil,
+              placeholder: "you@company.com",
+              class: "w-full px-4 py-3 bg-surface-raised border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand",
+              autocomplete: "off" %>
+        </div>
+        <div>
+          <label class="block text-text-muted text-sm mb-1">API Token</label>
+          <%= password_field_tag :jira_api_token, nil,
+              placeholder: "Atlassian API token",
+              class: "w-full px-4 py-3 bg-surface-raised border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand",
+              autocomplete: "off" %>
+          <p class="text-gray-600 text-xs mt-1">
+            Generate at
+            <a href="https://id.atlassian.com/manage-profile/security/api-tokens" target="_blank" class="text-brand-light hover:text-brand-light">id.atlassian.com/manage-profile/security/api-tokens</a>
+          </p>
+        </div>
+        <div class="flex items-center justify-between">
+          <% if @jira_configured %>
+            <button type="button"
+                    data-action="click->jira-test#test"
+                    data-controller="jira-test"
+                    class="text-brand-light hover:text-brand-light text-sm font-medium">
+              Test Connection
+            </button>
+          <% else %>
+            <span></span>
+          <% end %>
+          <%= submit_tag @jira_configured ? "Update" : "Connect Jira",
+              class: "px-4 py-2 bg-brand hover:bg-brand-dark text-white text-sm font-medium rounded-lg transition cursor-pointer" %>
+        </div>
+      </div>
+    <% end %>
+  </div>
+
+  <!-- Trello -->
+  <div class="bg-surface-card rounded-xl border border-border-default p-6 mb-6">
+    <div class="flex items-center justify-between mb-4">
+      <div class="flex items-center gap-3">
+        <div class="w-10 h-10 bg-blue-600/20 rounded-lg flex items-center justify-center">
+          <svg class="w-6 h-6 text-blue-400" fill="currentColor" viewBox="0 0 24 24"><path d="M21 2H3c-.6 0-1 .4-1 1v18c0 .6.4 1 1 1h18c.6 0 1-.4 1-1V3c0-.6-.4-1-1-1zM10.4 18.8c0 .6-.5 1.1-1.1 1.1H5.1c-.6 0-1.1-.5-1.1-1.1V5.2c0-.6.5-1.1 1.1-1.1h4.2c.6 0 1.1.5 1.1 1.1v13.6zm9.6-5.6c0 .6-.5 1.1-1.1 1.1h-4.2c-.6 0-1.1-.5-1.1-1.1V5.2c0-.6.5-1.1 1.1-1.1h4.2c.6 0 1.1.5 1.1 1.1v8z"/></svg>
+        </div>
+        <div>
+          <h2 class="text-lg font-semibold text-white">Trello</h2>
+          <p class="text-text-faint text-sm">Manage boards, cards, and lists via Trello API</p>
+        </div>
+      </div>
+      <span class="px-3 py-1 rounded-full text-xs font-medium
+        <%= @trello_configured ? 'bg-green-900 text-green-300' : 'bg-surface-raised text-text-muted' %>">
+        <%= @trello_configured ? "Connected" : "Not configured" %>
+      </span>
+    </div>
+
+    <%= form_tag update_trello_integrations_path, method: :patch do %>
+      <div class="space-y-4">
+        <div>
+          <label class="block text-text-muted text-sm mb-1">API Key</label>
+          <%= text_field_tag :trello_api_key, nil,
+              placeholder: "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+              class: "w-full px-4 py-3 bg-surface-raised border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand",
+              autocomplete: "off" %>
+          <p class="text-gray-600 text-xs mt-1">
+            Get your key at
+            <a href="https://trello.com/power-ups/admin" target="_blank" class="text-brand-light hover:text-brand-light">trello.com/power-ups/admin</a>
+          </p>
+        </div>
+        <div>
+          <label class="block text-text-muted text-sm mb-1">API Token</label>
+          <%= password_field_tag :trello_api_token, nil,
+              placeholder: "ATTAxxxxxxxxxxxxxxxxxxxx",
+              class: "w-full px-4 py-3 bg-surface-raised border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand",
+              autocomplete: "off" %>
+          <p class="text-gray-600 text-xs mt-1">
+            Generate a token by authorizing your API key — see
+            <a href="https://developer.atlassian.com/cloud/trello/guides/rest-api/authorization/" target="_blank" class="text-brand-light hover:text-brand-light">Trello auth docs</a>
+          </p>
+        </div>
+        <div class="flex items-center justify-between">
+          <% if @trello_configured %>
+            <button type="button" onclick="testTrello()" class="text-brand-light hover:text-brand-light text-sm font-medium cursor-pointer">
+              Test Connection
+            </button>
+          <% else %>
+            <span></span>
+          <% end %>
+          <%= submit_tag @trello_configured ? "Update" : "Connect Trello",
+              class: "px-4 py-2 bg-brand hover:bg-brand-dark text-white text-sm font-medium rounded-lg transition cursor-pointer" %>
+        </div>
+      </div>
+    <% end %>
+
+    <% if @trello_configured %>
+      <div class="mt-3 bg-surface-base/50 rounded-lg px-4 py-3">
+        <p class="text-text-muted text-xs">Agents can manage Trello boards, create/move cards, and track project progress via the Trello REST API.</p>
+      </div>
+    <% end %>
+  </div>
+
+  <script>
+    function testTrello() {
+      fetch("<%= test_trello_integrations_path %>")
+        .then(r => r.json())
+        .then(data => {
+          if (data.status === "connected") {
+            alert(`✅ Connected as ${data.user} (@${data.username})`)
+          } else {
+            alert(`❌ ${data.message}`)
+          }
+        })
+        .catch(() => alert("❌ Connection failed"))
+    }
+  </script>
+
+  <!-- Web Search -->
+  <div class="bg-surface-card rounded-xl border border-border-default p-6 mb-6">
+    <div class="flex items-center justify-between mb-4">
+      <div class="flex items-center gap-3">
+        <div class="w-10 h-10 bg-surface-overlay/20 rounded-lg flex items-center justify-center">
+          <svg class="w-6 h-6 text-text-primary" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+        </div>
+        <div>
+          <h2 class="text-lg font-semibold text-white">Web Search</h2>
+          <p class="text-text-faint text-sm">Configure search provider for the web_search tool</p>
+        </div>
+      </div>
+      <span class="px-3 py-1 rounded-full text-xs font-medium
+        <%= @search_configured ? 'bg-green-900 text-green-300' : 'bg-surface-raised text-text-muted' %>">
+        <%= @search_configured ? "#{@search_provider.titleize}" : "DuckDuckGo (default)" %>
+      </span>
+    </div>
+
+    <%= form_tag update_search_integrations_path, method: :patch do %>
+      <div class="space-y-4">
+        <div>
+          <label class="block text-text-muted text-sm mb-1">Provider</label>
+          <select name="search_provider" id="search_provider"
+            class="w-full px-4 py-3 bg-surface-raised border border-border-default rounded-lg text-white focus:outline-none focus:ring-2 focus:ring-brand"
+            onchange="toggleSearchApiKey(this.value)">
+            <option value="duckduckgo" <%= 'selected' if @search_provider == 'duckduckgo' %>>DuckDuckGo (no API key needed)</option>
+            <option value="brave" <%= 'selected' if @search_provider == 'brave' %>>Brave Search</option>
+            <option value="searchapi" <%= 'selected' if @search_provider == 'searchapi' %>>SearchAPI.io</option>
+            <option value="serpapi" <%= 'selected' if @search_provider == 'serpapi' %>>SerpAPI</option>
+          </select>
+        </div>
+        <div id="search-api-key-field" style="<%= 'display:none' if @search_provider == 'duckduckgo' %>">
+          <label class="block text-text-muted text-sm mb-1">API Key</label>
+          <%= password_field_tag :search_api_key, nil,
+              placeholder: "Enter API key",
+              class: "w-full px-4 py-3 bg-surface-raised border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand",
+              autocomplete: "off" %>
+          <p class="text-gray-600 text-xs mt-1" id="search-key-help">
+            <% case @search_provider %>
+            <% when "brave" %>
+              Get your key at <a href="https://brave.com/search/api/" target="_blank" class="text-brand-light hover:text-brand-light">brave.com/search/api</a> — free tier: 2,000 queries/mo
+            <% when "searchapi" %>
+              Get your key at <a href="https://www.searchapi.io/" target="_blank" class="text-brand-light hover:text-brand-light">searchapi.io</a> — free tier: 100 queries/mo
+            <% when "serpapi" %>
+              Get your key at <a href="https://serpapi.com/" target="_blank" class="text-brand-light hover:text-brand-light">serpapi.com</a> — free tier: 100 queries/mo
+            <% else %>
+              Select a provider above to see signup details
+            <% end %>
+          </p>
+        </div>
+        <div class="flex items-center justify-between">
+          <% if @search_configured %>
+            <button type="button" onclick="testSearch()" class="text-brand-light hover:text-brand-light text-sm font-medium cursor-pointer">
+              Test Connection
+            </button>
+          <% else %>
+            <span></span>
+          <% end %>
+          <%= submit_tag @search_configured ? "Update" : "Save",
+              class: "px-4 py-2 bg-brand hover:bg-brand-dark text-white text-sm font-medium rounded-lg transition cursor-pointer" %>
+        </div>
+      </div>
+    <% end %>
+
+    <% if @search_configured %>
+      <div class="mt-3 bg-surface-base/50 rounded-lg px-4 py-3">
+        <p class="text-text-muted text-xs">Agents use <code class="text-text-primary">web_search</code> with <%= @search_provider.titleize %>. Supports optional <code class="text-text-primary">count</code>, <code class="text-text-primary">country</code>, and <code class="text-text-primary">language</code> parameters.</p>
+      </div>
+    <% end %>
+  </div>
+
+  <script>
+    function toggleSearchApiKey(value) {
+      const field = document.getElementById('search-api-key-field');
+      const help = document.getElementById('search-key-help');
+      if (value === 'duckduckgo') {
+        field.style.display = 'none';
+      } else {
+        field.style.display = 'block';
+        const links = {
+          brave: 'Get your key at <a href="https://brave.com/search/api/" target="_blank" class="text-brand-light hover:text-brand-light">brave.com/search/api</a> — free tier: 2,000 queries/mo',
+          searchapi: 'Get your key at <a href="https://www.searchapi.io/" target="_blank" class="text-brand-light hover:text-brand-light">searchapi.io</a> — free tier: 100 queries/mo',
+          serpapi: 'Get your key at <a href="https://serpapi.com/" target="_blank" class="text-brand-light hover:text-brand-light">serpapi.com</a> — free tier: 100 queries/mo'
+        };
+        help.innerHTML = links[value] || 'Select a provider to see signup details';
+      }
+    }
+
+    function testSearch() {
+      fetch("<%= test_search_integrations_path %>")
+        .then(r => r.json())
+        .then(data => {
+          if (data.status === "connected") {
+            alert(`✅ ${data.provider} working — got ${data.results} results ("${data.first_result}")`)
+          } else {
+            alert(`❌ ${data.message}`)
+          }
+        })
+        .catch(() => alert("❌ Connection failed"))
+    }
+  </script>
+
+  <!-- Messaging Channels -->
+  <div class="bg-surface-card rounded-xl border border-border-default p-6 mb-6">
+    <div class="flex items-center justify-between">
+      <div class="flex items-center gap-3">
+        <div class="w-10 h-10 bg-brand/20 rounded-lg flex items-center justify-center">
+          <svg class="w-6 h-6 text-brand-light" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"/></svg>
+        </div>
+        <div>
+          <h2 class="text-lg font-semibold text-white">Messaging Channels</h2>
+          <p class="text-text-faint text-sm">Discord, Slack, Telegram, WhatsApp, Signal</p>
+        </div>
+      </div>
+      <%= link_to "Manage Channels", channels_path, class: "text-brand-light hover:underline text-sm font-medium" %>
+    </div>
+  </div>
+
+  <!-- Embeddings -->
+  <div class="bg-surface-card rounded-xl border border-border-default p-6 mb-6">
+    <div class="flex items-center justify-between mb-4">
+      <div class="flex items-center gap-3">
+        <div class="w-10 h-10 bg-violet-600/20 rounded-lg flex items-center justify-center">
+          <svg class="w-6 h-6 text-violet-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M9.75 3.104v5.714a2.25 2.25 0 01-.659 1.591L5 14.5M9.75 3.104c-.251.023-.501.05-.75.082m.75-.082a24.301 24.301 0 014.5 0m0 0v5.714c0 .597.237 1.17.659 1.591L19.8 15.3M14.25 3.104c.251.023.501.05.75.082M19.8 15.3l-1.57.393A9.065 9.065 0 0112 15a9.065 9.065 0 00-6.23.693L5 14.5m14.8.8l1.402 1.402c1.232 1.232.65 3.318-1.067 3.611A48.309 48.309 0 0112 21c-2.773 0-5.491-.235-8.135-.687-1.718-.293-2.3-2.379-1.067-3.61L5 14.5"/></svg>
+        </div>
+        <div>
+          <h2 class="text-lg font-semibold text-white">Embeddings</h2>
+          <p class="text-text-faint text-sm">Vector embeddings power agent memory search and retrieval</p>
+        </div>
+      </div>
+      <span class="px-3 py-1 rounded-full text-xs font-medium
+        <%= @embedding_healthy ? 'bg-green-900 text-green-300' : 'bg-surface-raised text-text-muted' %>">
+        <%= @embedding_healthy ? "Healthy" : "Not available" %>
+      </span>
+    </div>
+
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
+      <div class="bg-surface-raised rounded-lg p-3">
+        <p class="text-text-muted text-xs">Provider</p>
+        <p class="text-white font-semibold text-sm"><%= @embedding_provider || "None" %></p>
+      </div>
+      <div class="bg-surface-raised rounded-lg p-3">
+        <p class="text-text-muted text-xs">Modalities</p>
+        <p class="text-white font-semibold text-sm"><%= (@embedding_capabilities[:modalities] || [:text]).map(&:to_s).join(", ") %></p>
+      </div>
+      <div class="bg-surface-raised rounded-lg p-3">
+        <p class="text-text-muted text-xs">Memories</p>
+        <p class="text-white font-semibold text-sm"><%= @memory_count %></p>
+      </div>
+      <div class="bg-surface-raised rounded-lg p-3">
+        <p class="text-text-muted text-xs">Embedded</p>
+        <p class="text-white font-semibold text-sm"><%= @embedded_count %></p>
+      </div>
+    </div>
+
+    <!-- Gemini API Key -->
+    <div class="mt-4 pt-4 border-t border-border-default">
+      <h3 class="text-white text-sm font-medium mb-2">Gemini Embedding Key</h3>
+      <% if @gemini_key_configured %>
+        <div class="flex items-center justify-between">
+          <p class="text-green-400 text-sm">API key configured</p>
+          <%= form_tag update_embedding_key_integrations_path, method: :patch do %>
+            <div class="flex items-center gap-2">
+              <%= password_field_tag :gemini_embedding_api_key, nil,
+                  placeholder: "Replace key (AIza...)",
+                  class: "px-3 py-2 bg-surface-raised border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand font-mono text-xs w-64",
+                  autocomplete: "off" %>
+              <%= submit_tag "Update", class: "px-3 py-2 bg-brand hover:bg-brand-dark text-white text-xs font-medium rounded-lg transition cursor-pointer" %>
+            </div>
+          <% end %>
+        </div>
+      <% else %>
+        <%= form_tag update_embedding_key_integrations_path, method: :patch do %>
+          <div class="flex items-center gap-2">
+            <%= password_field_tag :gemini_embedding_api_key, nil,
+                placeholder: "Google AI API key (AIza...)",
+                class: "flex-1 px-3 py-2 bg-surface-raised border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand font-mono text-xs",
+                autocomplete: "off" %>
+            <%= submit_tag "Save Key", class: "px-3 py-2 bg-brand hover:bg-brand-dark text-white text-xs font-medium rounded-lg transition cursor-pointer" %>
+          </div>
+          <p class="text-text-faint text-xs mt-1">
+            Get a key at <a href="https://aistudio.google.com/apikey" target="_blank" class="text-brand-light hover:underline">aistudio.google.com</a> — required for Gemini multimodal embeddings
+          </p>
+        <% end %>
+      <% end %>
+    </div>
+
+    <div class="flex items-center justify-between mt-4">
+      <% if @embedding_migration_active %>
+        <span class="text-yellow-400 text-sm">Migration in progress</span>
+      <% else %>
+        <span></span>
+      <% end %>
+      <a href="<%= embedding_migration_path %>" class="px-4 py-2 bg-brand hover:bg-brand-dark text-white text-sm font-medium rounded-lg transition">
+        <%= @embedding_migration_active ? "View Migration" : "Switch Provider" %>
+      </a>
+    </div>
+
+    <% if @embedding_provider %>
+      <div class="mt-3 bg-surface-base/50 rounded-lg px-4 py-3">
+        <p class="text-text-muted text-xs">
+          Using <strong class="text-text-primary"><%= @embedding_provider %></strong> for memory indexing.
+          <% if @embedding_capabilities[:modalities]&.include?(:image) %>
+            Multimodal search is available (text, images, audio, video).
+          <% else %>
+            Text-only search. Switch to Gemini for multimodal memory.
+          <% end %>
+        </p>
+      </div>
+    <% end %>
+  </div>
+
+    <!-- Cloud Storage -->
+  <div class="bg-surface-card rounded-xl border border-border-default p-6 mb-6">
+    <div class="flex items-center justify-between mb-4">
+      <div class="flex items-center gap-3">
+        <div class="w-10 h-10 bg-brand/20 rounded-lg flex items-center justify-center">
+          <svg class="w-6 h-6 text-brand-light" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M3 15a4 4 0 004 4h9a5 5 0 10-.1-9.999 5.002 5.002 0 10-9.78 2.096A4.001 4.001 0 003 15z"/></svg>
+        </div>
+        <div>
+          <h2 class="text-lg font-semibold text-white">Cloud Storage</h2>
+          <p class="text-text-faint text-sm">Connect Google Drive, S3, Dropbox, OneDrive, B2, SFTP via rclone</p>
+        </div>
+      </div>
+      <span class="px-3 py-1 rounded-full text-xs font-medium
+        <%= @remotes.any? ? 'bg-green-900 text-green-300' : 'bg-surface-raised text-text-muted' %>">
+        <%= @remotes.any? ? "#{@remotes.size} remote#{"s" if @remotes.size > 1}" : "None configured" %>
+      </span>
+    </div>
+
+    <!-- Existing remotes -->
+    <% if @remotes.any? %>
+      <div class="space-y-2 mb-6">
+        <% @remotes.each do |remote| %>
+          <div class="flex items-center justify-between bg-surface-base rounded-lg px-4 py-3">
+            <div class="flex items-center gap-3">
+              <span class="text-green-400">●</span>
+              <span class="text-white font-medium"><%= remote %></span>
+            </div>
+            <div class="flex items-center gap-2">
+              <%= button_to remove_cloud_remote_integrations_path(remote_name: remote),
+                  method: :delete,
+                  class: "text-red-400 hover:text-red-300 text-sm",
+                  data: { turbo_confirm: "Remove #{remote}?" } do %>
+                Remove
+              <% end %>
+            </div>
+          </div>
+        <% end %>
+      </div>
+    <% end %>
+
+    <!-- Add new remote -->
+    <div data-controller="cloud-remote">
+      <h3 class="text-white font-medium mb-3">Add Remote</h3>
+
+      <div class="mb-4">
+        <label class="block text-text-muted text-sm mb-1">Backend</label>
+        <select data-cloud-remote-target="backendSelect"
+                data-action="change->cloud-remote#selectBackend"
+                class="w-full px-4 py-3 bg-surface-raised border border-border-default rounded-lg text-white focus:outline-none focus:ring-2 focus:ring-brand">
+          <option value="">Choose a storage backend...</option>
+          <% @backends.each do |key, info| %>
+            <option value="<%= key %>" data-needs-token="<%= info[:needs_token] %>"><%= info[:name] %></option>
+          <% end %>
+        </select>
+      </div>
+
+      <!-- OAuth backends (Drive, Dropbox, OneDrive) -->
+      <div data-cloud-remote-target="oauthSection" style="display: none;">
+        <%= form_tag add_cloud_remote_integrations_path, method: :post do %>
+          <input type="hidden" name="backend" data-cloud-remote-target="backendField">
+          <div class="space-y-4">
+            <div>
+              <label class="block text-text-muted text-sm mb-1">Remote Name</label>
+              <%= text_field_tag :remote_name, nil,
+                  placeholder: "e.g. gdrive, mydropbox",
+                  class: "w-full px-4 py-3 bg-surface-raised border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand" %>
+            </div>
+
+            <div class="bg-surface-base rounded-lg p-4">
+              <p class="text-text-primary text-sm font-medium mb-2">Get your token:</p>
+              <ol class="text-text-muted text-sm space-y-1 list-decimal list-inside">
+                <li>Install rclone on your local machine: <code class="text-text-primary bg-surface-card px-1 rounded">curl https://rclone.org/install.sh | sudo bash</code></li>
+                <li>Run: <code class="text-text-primary bg-surface-card px-1 rounded">rclone authorize "<span data-cloud-remote-target="authBackend">drive</span>"</code></li>
+                <li>Follow the browser prompts to authorize</li>
+                <li>Copy the JSON token that appears and paste it below</li>
+              </ol>
+            </div>
+
+            <div>
+              <label class="block text-text-muted text-sm mb-1">Token</label>
+              <%= text_area_tag :token, nil,
+                  placeholder: '{"access_token":"...","token_type":"Bearer","refresh_token":"...","expiry":"..."}',
+                  rows: 3,
+                  class: "w-full px-4 py-3 bg-surface-raised border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand font-mono text-xs" %>
+            </div>
+
+            <div class="flex justify-end">
+              <%= submit_tag "Connect", class: "px-4 py-2 bg-brand hover:bg-brand-dark text-white text-sm font-medium rounded-lg transition cursor-pointer" %>
+            </div>
+          </div>
+        <% end %>
+      </div>
+
+      <!-- S3 backend -->
+      <div data-cloud-remote-target="s3Section" style="display: none;">
+        <%= form_tag add_cloud_remote_integrations_path, method: :post do %>
+          <input type="hidden" name="backend" value="s3">
+          <div class="space-y-4">
+            <div>
+              <label class="block text-text-muted text-sm mb-1">Remote Name</label>
+              <%= text_field_tag :remote_name, nil, placeholder: "e.g. aws, minio",
+                  class: "w-full px-4 py-3 bg-surface-raised border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand" %>
+            </div>
+            <div>
+              <label class="block text-text-muted text-sm mb-1">Provider</label>
+              <select name="provider" class="w-full px-4 py-3 bg-surface-raised border border-border-default rounded-lg text-white focus:outline-none focus:ring-2 focus:ring-brand">
+                <option value="AWS">Amazon S3</option>
+                <option value="Minio">MinIO</option>
+                <option value="DigitalOcean">DigitalOcean Spaces</option>
+                <option value="Cloudflare">Cloudflare R2</option>
+                <option value="Wasabi">Wasabi</option>
+                <option value="Other">Other S3-compatible</option>
+              </select>
+            </div>
+            <div class="grid grid-cols-2 gap-4">
+              <div>
+                <label class="block text-text-muted text-sm mb-1">Access Key ID</label>
+                <%= text_field_tag :access_key_id, nil, class: "w-full px-4 py-3 bg-surface-raised border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand" %>
+              </div>
+              <div>
+                <label class="block text-text-muted text-sm mb-1">Secret Access Key</label>
+                <%= password_field_tag :secret_access_key, nil, class: "w-full px-4 py-3 bg-surface-raised border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand" %>
+              </div>
+            </div>
+            <div class="grid grid-cols-2 gap-4">
+              <div>
+                <label class="block text-text-muted text-sm mb-1">Region</label>
+                <%= text_field_tag :region, "us-east-1", class: "w-full px-4 py-3 bg-surface-raised border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand" %>
+              </div>
+              <div>
+                <label class="block text-text-muted text-sm mb-1">Endpoint <span class="text-gray-600">(non-AWS only)</span></label>
+                <%= text_field_tag :endpoint, nil, placeholder: "https://...", class: "w-full px-4 py-3 bg-surface-raised border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand" %>
+              </div>
+            </div>
+            <div class="flex justify-end">
+              <%= submit_tag "Connect", class: "px-4 py-2 bg-brand hover:bg-brand-dark text-white text-sm font-medium rounded-lg transition cursor-pointer" %>
+            </div>
+          </div>
+        <% end %>
+      </div>
+
+      <!-- B2 backend -->
+      <div data-cloud-remote-target="b2Section" style="display: none;">
+        <%= form_tag add_cloud_remote_integrations_path, method: :post do %>
+          <input type="hidden" name="backend" value="b2">
+          <div class="space-y-4">
+            <div>
+              <label class="block text-text-muted text-sm mb-1">Remote Name</label>
+              <%= text_field_tag :remote_name, nil, placeholder: "e.g. backblaze",
+                  class: "w-full px-4 py-3 bg-surface-raised border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand" %>
+            </div>
+            <div>
+              <label class="block text-text-muted text-sm mb-1">Account ID</label>
+              <%= text_field_tag :account, nil, class: "w-full px-4 py-3 bg-surface-raised border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand" %>
+            </div>
+            <div>
+              <label class="block text-text-muted text-sm mb-1">Application Key</label>
+              <%= password_field_tag :key, nil, class: "w-full px-4 py-3 bg-surface-raised border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand" %>
+            </div>
+            <div class="flex justify-end">
+              <%= submit_tag "Connect", class: "px-4 py-2 bg-brand hover:bg-brand-dark text-white text-sm font-medium rounded-lg transition cursor-pointer" %>
+            </div>
+          </div>
+        <% end %>
+      </div>
+
+      <!-- SFTP backend -->
+      <div data-cloud-remote-target="sftpSection" style="display: none;">
+        <%= form_tag add_cloud_remote_integrations_path, method: :post do %>
+          <input type="hidden" name="backend" value="sftp">
+          <div class="space-y-4">
+            <div>
+              <label class="block text-text-muted text-sm mb-1">Remote Name</label>
+              <%= text_field_tag :remote_name, nil, placeholder: "e.g. myserver",
+                  class: "w-full px-4 py-3 bg-surface-raised border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand" %>
+            </div>
+            <div class="grid grid-cols-3 gap-4">
+              <div class="col-span-2">
+                <label class="block text-text-muted text-sm mb-1">Host</label>
+                <%= text_field_tag :host, nil, placeholder: "192.168.1.100",
+                    class: "w-full px-4 py-3 bg-surface-raised border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand" %>
+              </div>
+              <div>
+                <label class="block text-text-muted text-sm mb-1">Port</label>
+                <%= text_field_tag :port, "22",
+                    class: "w-full px-4 py-3 bg-surface-raised border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand" %>
+              </div>
+            </div>
+            <div>
+              <label class="block text-text-muted text-sm mb-1">Username</label>
+              <%= text_field_tag :user, nil, class: "w-full px-4 py-3 bg-surface-raised border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand" %>
+            </div>
+            <div>
+              <label class="block text-text-muted text-sm mb-1">Password <span class="text-gray-600">(or use key file)</span></label>
+              <%= password_field_tag :pass, nil, class: "w-full px-4 py-3 bg-surface-raised border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand" %>
+            </div>
+            <div>
+              <label class="block text-text-muted text-sm mb-1">SSH Key File Path <span class="text-gray-600">(optional)</span></label>
+              <%= text_field_tag :key_file, nil, placeholder: "/workspace/.ssh/id_rsa",
+                  class: "w-full px-4 py-3 bg-surface-raised border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand" %>
+            </div>
+            <div class="flex justify-end">
+              <%= submit_tag "Connect", class: "px-4 py-2 bg-brand hover:bg-brand-dark text-white text-sm font-medium rounded-lg transition cursor-pointer" %>
+            </div>
+          </div>
+        <% end %>
+      </div>
+    </div>
+  </div>
+</div>

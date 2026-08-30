@@ -1,0 +1,364 @@
+<%= form_with(model: agent, class: "space-y-6") do |form| %>
+  <% if agent.errors.any? %>
+    <div class="bg-red-900/50 border border-red-600 text-red-200 p-4 rounded-lg">
+      <ul class="list-disc list-inside text-sm">
+        <% agent.errors.full_messages.each do |message| %>
+          <li><%= message %></li>
+        <% end %>
+      </ul>
+    </div>
+  <% end %>
+
+  <!-- Identity -->
+  <div class="bg-surface-card rounded-xl border border-border-default p-6">
+    <h2 class="text-lg font-semibold text-white mb-4">Identity</h2>
+
+    <!-- Avatar -->
+    <div class="flex items-center gap-4 mb-6">
+      <% if agent.avatar.attached? %>
+        <%= image_tag rails_blob_path(agent.avatar, only_path: true), class: "w-16 h-16 rounded-xl object-cover border-2 border-border-default" %>
+      <% else %>
+        <div class="w-16 h-16 bg-brand rounded-xl flex items-center justify-center text-white font-bold text-2xl">
+          <%= agent.name.present? ? agent.name[0].upcase : "?" %>
+        </div>
+      <% end %>
+      <div>
+        <%= form.label :avatar, "Avatar", class: "block text-sm font-medium text-text-primary mb-1" %>
+        <%= form.file_field :avatar, accept: "image/*",
+            class: "text-sm text-text-muted file:mr-2 file:py-2 file:px-4 file:rounded-lg file:border-0 file:text-sm file:font-medium file:bg-surface-raised file:text-text-primary hover:file:bg-surface-overlay file:cursor-pointer" %>
+        <p class="text-text-faint text-xs mt-1">Square image recommended. PNG, JPG, or WebP.</p>
+      </div>
+    </div>
+
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+      <div>
+        <%= form.label :name, class: "block text-sm font-medium text-text-primary mb-1" %>
+        <%= form.text_field :name, placeholder: "Agent name",
+            class: "w-full px-4 py-3 bg-surface-raised border border-border-default rounded-lg text-white placeholder-text-muted focus:outline-none focus:ring-2 focus:ring-brand" %>
+      </div>
+      <div>
+        <%= form.label :role, class: "block text-sm font-medium text-text-primary mb-1" %>
+        <%= form.select :role,
+            options_for_select(
+              AgentTemplate.distinct.order(:role).pluck(:role).map { |r| [r, r] },
+              agent.role
+            ),
+            { include_blank: "— Select Role —" },
+            { class: "w-full px-4 py-3 bg-surface-raised border border-border-default rounded-lg text-white focus:outline-none focus:ring-2 focus:ring-brand" } %>
+      </div>
+      <div>
+        <%= form.label :team_id, "Team", class: "block text-sm font-medium text-text-primary mb-1" %>
+        <%= form.collection_select :team_id, @teams || Team.order(:name), :id, :name,
+            { include_blank: "— No team —" },
+            { class: "w-full px-4 py-3 bg-surface-raised border border-border-default rounded-lg text-white focus:outline-none focus:ring-2 focus:ring-brand" } %>
+      </div>
+      <div>
+        <%= form.label :title, "Title", class: "block text-sm font-medium text-text-primary mb-1" %>
+        <%= form.text_field :title, placeholder: "e.g. Head of Research",
+            class: "w-full px-4 py-3 bg-surface-raised border border-border-default rounded-lg text-white placeholder-text-muted focus:outline-none focus:ring-2 focus:ring-brand" %>
+      </div>
+      <div>
+        <%= form.label :reports_to_id, "Reports To", class: "block text-sm font-medium text-text-primary mb-1" %>
+        <%
+          manager_candidates = if agent.team_id.present?
+            Agent.where(team_id: agent.team_id).where.not(id: [agent.id] + agent.org_subtree.map(&:id)).order(:name)
+          else
+            Agent.where.not(id: agent.id).order(:name)
+          end
+        %>
+        <%= form.collection_select :reports_to_id, manager_candidates, :id, :name,
+            { include_blank: "— No manager —" },
+            { class: "w-full px-4 py-3 bg-surface-raised border border-border-default rounded-lg text-white focus:outline-none focus:ring-2 focus:ring-brand" } %>
+      </div>
+      <div>
+        <%= form.label :enabled, class: "block text-sm font-medium text-text-primary mb-1" %>
+        <div class="flex items-center gap-3 mt-2">
+          <%= form.check_box :enabled, class: "w-5 h-5 rounded border-gray-500 text-brand focus:ring-brand bg-surface-overlay" %>
+          <span class="text-text-primary">Agent is active and available</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Model Configuration -->
+  <div class="bg-surface-card rounded-xl border border-border-default p-6"
+       data-controller="model-select"
+       data-model-select-url-value="<%= api_v1_providers_models_path %>"
+       data-model-select-current-value="<%= agent.llm_model %>">
+    <h2 class="text-lg font-semibold text-white mb-4">Model</h2>
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+      <div>
+        <%= form.label :model_provider, "Provider", class: "block text-sm font-medium text-text-primary mb-1" %>
+        <%= form.select :model_provider,
+            options_for_select(
+              ProviderConfig.enabled_providers.map { |p| [p.adapter_type.titleize, p.adapter_type] },
+              agent.model_provider
+            ),
+            {},
+            { class: "w-full px-4 py-3 bg-surface-raised border border-border-default rounded-lg text-white focus:outline-none focus:ring-2 focus:ring-brand",
+              data: { model_select_target: "provider", action: "change->model-select#providerChanged" } } %>
+      </div>
+      <div>
+        <%= form.label :llm_model, "Model", class: "block text-sm font-medium text-text-primary mb-1" %>
+        <%= form.select :llm_model,
+            options_for_select([], agent.llm_model),
+            {},
+            { class: "w-full px-4 py-3 bg-surface-raised border border-border-default rounded-lg text-white focus:outline-none focus:ring-2 focus:ring-brand",
+              data: { model_select_target: "model" } } %>
+        <p class="text-text-faint text-xs mt-1">Models are auto-detected from your providers.</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- Advanced Model Settings -->
+  <div class="bg-surface-card rounded-xl border border-border-default p-6">
+    <details <% if (agent.model_config || {}).slice("context_window", "max_output_tokens", "temperature", "top_p", "top_k", "repeat_penalty").values.any?(&:present?) %>open<% end %>>
+      <summary class="text-lg font-semibold text-white cursor-pointer select-none hover:text-brand transition">Advanced Model Settings</summary>
+      <p class="text-text-muted text-sm mt-2 mb-4">Override inference parameters for this agent. Leave blank to use defaults.</p>
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div>
+          <%= form.label :context_window, "Context Window", class: "block text-sm font-medium text-text-primary mb-1" %>
+          <%= form.number_field :context_window, value: (agent.model_config || {})["context_window"], placeholder: "auto",
+              class: "w-full px-4 py-3 bg-surface-raised border border-border-default rounded-lg text-white placeholder-text-muted focus:outline-none focus:ring-2 focus:ring-brand" %>
+          <p class="text-text-faint text-xs mt-1">Total context window size in tokens. Required for custom Ollama models not in the built-in list.</p>
+        </div>
+        <div>
+          <%= form.label :max_output_tokens, "Max Output Tokens", class: "block text-sm font-medium text-text-primary mb-1" %>
+          <%= form.number_field :max_output_tokens, value: (agent.model_config || {})["max_output_tokens"], placeholder: "8192",
+              class: "w-full px-4 py-3 bg-surface-raised border border-border-default rounded-lg text-white placeholder-text-muted focus:outline-none focus:ring-2 focus:ring-brand" %>
+          <p class="text-text-faint text-xs mt-1">Maximum tokens the model can generate per response.</p>
+        </div>
+        <div>
+          <%= form.label :temperature, "Temperature", class: "block text-sm font-medium text-text-primary mb-1" %>
+          <%= form.number_field :temperature, value: (agent.model_config || {})["temperature"], placeholder: "model default", step: 0.1, min: 0, max: 2,
+              class: "w-full px-4 py-3 bg-surface-raised border border-border-default rounded-lg text-white placeholder-text-muted focus:outline-none focus:ring-2 focus:ring-brand" %>
+          <p class="text-text-faint text-xs mt-1">Controls randomness (0.0 = deterministic, 2.0 = very creative).</p>
+        </div>
+        <div>
+          <%= form.label :top_p, "Top P", class: "block text-sm font-medium text-text-primary mb-1" %>
+          <%= form.number_field :top_p, value: (agent.model_config || {})["top_p"], placeholder: "model default", step: 0.1, min: 0, max: 1,
+              class: "w-full px-4 py-3 bg-surface-raised border border-border-default rounded-lg text-white placeholder-text-muted focus:outline-none focus:ring-2 focus:ring-brand" %>
+          <p class="text-text-faint text-xs mt-1">Nucleus sampling threshold (0.0–1.0). Ollama and OpenAI Compatible only.</p>
+        </div>
+        <div>
+          <%= form.label :top_k, "Top K", class: "block text-sm font-medium text-text-primary mb-1" %>
+          <%= form.number_field :top_k, value: (agent.model_config || {})["top_k"], placeholder: "model default",
+              class: "w-full px-4 py-3 bg-surface-raised border border-border-default rounded-lg text-white placeholder-text-muted focus:outline-none focus:ring-2 focus:ring-brand" %>
+          <p class="text-text-faint text-xs mt-1">Limits token selection to top K candidates. Ollama only.</p>
+        </div>
+        <div>
+          <%= form.label :repeat_penalty, "Repeat Penalty", class: "block text-sm font-medium text-text-primary mb-1" %>
+          <%= form.number_field :repeat_penalty, value: (agent.model_config || {})["repeat_penalty"], placeholder: "model default", step: 0.05, min: 0,
+              class: "w-full px-4 py-3 bg-surface-raised border border-border-default rounded-lg text-white placeholder-text-muted focus:outline-none focus:ring-2 focus:ring-brand" %>
+          <p class="text-text-faint text-xs mt-1">Penalizes repeated tokens (1.0 = no penalty). Ollama only.</p>
+        </div>
+        <div>
+          <%= form.label :effort, "Reasoning Effort", class: "block text-sm font-medium text-text-primary mb-1" %>
+          <%= form.select :effort,
+              options_for_select(
+                [ [ "Provider default", "" ] ] + Agent::EFFORT_LEVELS.map { |l| [ l, l ] },
+                (agent.model_config || {})["effort"].to_s
+              ),
+              {},
+              class: "w-full px-4 py-3 bg-surface-raised border border-border-default rounded-lg text-white focus:outline-none focus:ring-2 focus:ring-brand" %>
+          <p class="text-text-faint text-xs mt-1">Controls thinking depth &amp; token spend on reasoning models (Claude Opus/Sonnet/Fable, OpenAI o-series). Blank inherits the provider default.</p>
+        </div>
+      </div>
+    </details>
+  </div>
+
+  <!-- Thinking / Reasoning -->
+  <div class="bg-surface-card rounded-xl border border-border-default p-6">
+    <h2 class="text-lg font-semibold text-white mb-4">Thinking</h2>
+    <p class="text-text-muted text-sm mb-4">Enable extended thinking for complex reasoning tasks. Thinking is internal — it won't appear in the agent's visible response unless you enable debug mode.</p>
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+      <div>
+        <%= form.label :thinking_enabled, class: "block text-sm font-medium text-text-primary mb-1" %>
+        <div class="flex items-center gap-3 mt-2">
+          <%= form.check_box :thinking_enabled, class: "w-5 h-5 rounded border-gray-500 text-brand focus:ring-brand bg-surface-overlay" %>
+          <span class="text-text-primary">Enable extended thinking</span>
+        </div>
+        <p class="text-text-faint text-xs mt-1">Uses more tokens. Best for complex reasoning, code architecture, and multi-step problems.</p>
+      </div>
+      <div>
+        <%= form.label :thinking_budget_tokens, "Token budget", class: "block text-sm font-medium text-text-primary mb-1" %>
+        <%= form.number_field :thinking_budget_tokens, placeholder: "10000",
+            class: "w-full px-4 py-3 bg-surface-raised border border-border-default rounded-lg text-white placeholder-text-muted focus:outline-none focus:ring-2 focus:ring-brand" %>
+        <p class="text-text-faint text-xs mt-1">Max tokens for thinking (1,000–128,000). Higher = deeper reasoning.</p>
+      </div>
+      <div>
+        <%= form.label :thinking_visibility, "Visibility", class: "block text-sm font-medium text-text-primary mb-1" %>
+        <%= form.select :thinking_visibility,
+            options_for_select([
+              ["Hidden (default)", "hidden"],
+              ["Debug (show in UI)", "debug"]
+            ], agent.thinking_visibility || "hidden"),
+            {},
+            { class: "w-full px-4 py-3 bg-surface-raised border border-border-default rounded-lg text-white focus:outline-none focus:ring-2 focus:ring-brand" } %>
+        <p class="text-text-faint text-xs mt-1">Debug mode shows the agent's thought process in real-time.</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- Custom Instructions -->
+  <div class="bg-surface-card rounded-xl border border-border-default p-6">
+    <div class="flex items-center justify-between mb-4">
+      <div>
+        <h2 class="text-lg font-semibold text-white">Additional Context</h2>
+        <p class="text-text-muted text-sm mt-1">Provide any additional context or guidance for this agent.</p>
+      </div>
+    </div>
+    <%= form.text_area :custom_instructions,
+        rows: 10,
+        placeholder: "What domain or technologies does this agent focus on?\nAny specific coding standards or conventions to follow?\nPreferred communication style?\nAny projects, repos, or tools this agent should know about?",
+        class: "w-full px-4 py-3 bg-surface-raised border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand font-mono text-sm leading-relaxed resize-y" %>
+    <p class="text-text-faint text-xs mt-2">Markdown supported. Changes take effect immediately on the next message.</p>
+  </div>
+
+  <!-- Tools -->
+  <div class="bg-surface-card rounded-xl border border-border-default p-6" data-controller="tool-select">
+    <div class="mb-4 flex items-center justify-between">
+      <div>
+        <h2 class="text-lg font-semibold text-white">Tools</h2>
+        <p class="text-text-muted text-sm mt-1">Select which tools this agent can use. Leave all unchecked to grant access to every tool.</p>
+      </div>
+      <span class="text-text-faint text-sm" data-tool-select-target="counter"></span>
+    </div>
+
+    <div class="space-y-4">
+      <% grouped_tools(Tool.enabled.order(:name)).each do |category, tools| %>
+        <div data-tool-select-target="category">
+          <div class="flex items-center justify-between mb-2">
+            <h3 class="text-sm font-medium text-text-muted"><%= category %></h3>
+            <button type="button" class="text-xs text-brand hover:text-brand-light transition"
+                    data-action="click->tool-select#toggleCategory">select all</button>
+          </div>
+          <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-2">
+            <% tools.each do |tool| %>
+              <label class="flex items-center gap-2 px-3 py-2 rounded-lg bg-surface-raised/50 hover:bg-surface-raised transition cursor-pointer">
+                <%= check_box_tag "agent[tool_ids][]", tool.id,
+                    agent.tool_ids.include?(tool.id),
+                    class: "w-4 h-4 rounded border-gray-500 text-brand focus:ring-brand bg-surface-overlay",
+                    data: { action: "change->tool-select#updateCounter" } %>
+                <span class="text-text-primary text-sm truncate" title="<%= tool.description %>"><%= tool.name %></span>
+              </label>
+            <% end %>
+          </div>
+        </div>
+      <% end %>
+    </div>
+
+    <!-- Hidden field to allow clearing all tools -->
+    <%= hidden_field_tag "agent[tool_ids][]", "" %>
+  </div>
+
+  <!-- Skills -->
+  <% if Skill.enabled.any? %>
+  <div class="bg-surface-card rounded-xl border border-border-default p-6">
+    <div class="mb-4">
+      <h2 class="text-lg font-semibold text-white">Skills</h2>
+      <p class="text-text-muted text-sm mt-1">Select skills to inject into this agent's prompt. Required tools are added automatically.</p>
+    </div>
+
+    <div class="bg-amber-900/20 border border-amber-700/30 rounded-lg px-4 py-3 mb-4">
+      <p class="text-amber-300 text-xs">Adding a skill automatically assigns its required tools. Removing a skill removes those tools (unless another skill still needs them).</p>
+    </div>
+
+    <div class="space-y-2">
+      <% Skill.enabled.includes(:tools).order(:name).each do |skill| %>
+        <label class="flex items-start gap-3 px-4 py-3 rounded-lg bg-surface-raised/50 hover:bg-surface-raised transition cursor-pointer">
+          <%= check_box_tag "agent[skill_ids][]", skill.id,
+              agent.skill_ids.include?(skill.id),
+              class: "w-4 h-4 mt-0.5 rounded border-gray-500 text-amber-600 focus:ring-amber-500 bg-surface-overlay flex-shrink-0" %>
+          <div class="min-w-0">
+            <span class="text-gray-200 text-sm font-medium"><%= skill.name %></span>
+            <% if skill.description.present? %>
+              <p class="text-text-faint text-xs mt-0.5 truncate"><%= skill.description %></p>
+            <% end %>
+            <% if skill.tools.any? %>
+              <div class="flex flex-wrap gap-1 mt-1">
+                <% skill.tools.each do |tool| %>
+                  <span class="px-1.5 py-0.5 text-xs rounded bg-brand-glow/30 text-brand-light"><%= tool.name %></span>
+                <% end %>
+              </div>
+            <% end %>
+          </div>
+        </label>
+      <% end %>
+    </div>
+
+    <%= hidden_field_tag "agent[skill_ids][]", "" %>
+  </div>
+  <% end %>
+
+  <!-- Budgets -->
+  <div class="bg-surface-card rounded-xl border border-border-default p-6">
+    <h2 class="text-lg font-semibold text-white mb-4">Budgets</h2>
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+      <div>
+        <%= form.label :daily_budget_limit, "Daily limit (cents)", class: "block text-sm font-medium text-text-primary mb-1" %>
+        <%= form.number_field :daily_budget_limit, placeholder: "e.g. 500 = $5.00",
+            class: "w-full px-4 py-3 bg-surface-raised border border-border-default rounded-lg text-white placeholder-text-muted focus:outline-none focus:ring-2 focus:ring-brand" %>
+      </div>
+      <div>
+        <%= form.label :monthly_budget_limit, "Monthly limit (cents)", class: "block text-sm font-medium text-text-primary mb-1" %>
+        <%= form.number_field :monthly_budget_limit, placeholder: "e.g. 10000 = $100.00",
+            class: "w-full px-4 py-3 bg-surface-raised border border-border-default rounded-lg text-white placeholder-text-muted focus:outline-none focus:ring-2 focus:ring-brand" %>
+      </div>
+    </div>
+  </div>
+
+  <!-- Network Egress Policy -->
+  <div class="bg-surface-card rounded-xl border border-border-default p-6" data-controller="egress-policy">
+    <h2 class="text-lg font-semibold text-white mb-2">Network Egress Policy</h2>
+    <p class="text-text-muted text-sm mb-4">Control which external domains this agent can reach via HTTP tools.</p>
+
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+      <div>
+        <%= form.label :egress_policy_mode, "Mode", class: "block text-sm font-medium text-text-primary mb-1" %>
+        <% current_mode = agent.egress_policy.dig("mode") || "" %>
+        <%= form.select :egress_policy_mode,
+            options_for_select([
+              ["Allow all (default)", ""],
+              ["Allowlist — only listed domains", "allowlist"],
+              ["Blocklist — block listed domains", "blocklist"]
+            ], current_mode),
+            {},
+            { class: "w-full px-4 py-3 bg-surface-raised border border-border-default rounded-lg text-white focus:outline-none focus:ring-2 focus:ring-brand",
+              data: { egress_policy_target: "mode", action: "change->egress-policy#modeChanged" } } %>
+      </div>
+      <div>
+        <%= form.label :egress_policy_log_blocked, class: "block text-sm font-medium text-text-primary mb-1" %>
+        <div class="flex items-center gap-3 mt-2">
+          <%= form.check_box :egress_policy_log_blocked,
+              { checked: agent.egress_policy.dig("log_blocked") == true,
+                class: "w-5 h-5 rounded border-gray-500 text-brand focus:ring-brand bg-surface-overlay" },
+              "true", "false" %>
+          <span class="text-text-primary">Log blocked requests to audit log</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="mt-4" data-egress-policy-target="rulesSection">
+      <%= form.label :egress_policy_rules, "Domain patterns (one per line)", class: "block text-sm font-medium text-text-primary mb-1" %>
+      <% current_rules = Array(agent.egress_policy.dig("rules")).map { |r| r["pattern"] }.compact.join("\n") %>
+      <%= form.text_area :egress_policy_rules,
+          value: current_rules,
+          rows: 4,
+          placeholder: "*.github.com\napi.example.com\n10.0.0.0/8",
+          class: "w-full px-4 py-3 bg-surface-raised border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand font-mono text-sm leading-relaxed resize-y" %>
+      <p class="text-text-faint text-xs mt-1">Supports glob patterns (*.example.com) and CIDR notation (10.0.0.0/8).</p>
+    </div>
+  </div>
+
+  <!-- Actions -->
+  <div class="flex items-center gap-4">
+    <%= form.submit agent.persisted? ? "Save Changes" : "Create Agent",
+        class: "px-6 py-3 bg-brand hover:bg-brand-dark text-white font-semibold rounded-lg transition cursor-pointer" %>
+    <% if agent.persisted? %>
+      <%= link_to "Cancel", agent_path(agent), class: "px-6 py-3 text-text-muted hover:text-white transition" %>
+    <% else %>
+      <%= link_to "Cancel", agents_path, class: "px-6 py-3 text-text-muted hover:text-white transition" %>
+    <% end %>
+  </div>
+<% end %>
