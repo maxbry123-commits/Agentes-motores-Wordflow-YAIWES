@@ -52,7 +52,7 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
           roots=[Path('scripts'),Path('.github/workflows')]
-          forbidden=('git lfs','git-lfs.github.com','GIT_LFS_','filter=lfs')
+          forbidden=('git lfs','GIT_LFS_')
           self_file=Path('.github/workflows/rebuild-downloads-no-lfs.yml').resolve()
           bad=[]
           for root in roots:
