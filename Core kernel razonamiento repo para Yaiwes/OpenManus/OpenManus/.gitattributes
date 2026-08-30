@@ -25,6 +25,3 @@
 # Specify custom diff driver for specific file types
 *.md diff=markdown
 *.json diff=json
-*.mp4 filter=lfs diff=lfs merge=lfs -text
-*.mov filter=lfs diff=lfs merge=lfs -text
-*.webm filter=lfs diff=lfs merge=lfs -text
