@@ -11,6 +11,7 @@ on:
       - 'scripts/extract_kernel.py'
       - 'scripts/extract_extra.py'
       - 'scripts/skill_guard.py'
+      - 'scripts/forensic_verify_rebuild.py'
   workflow_dispatch:
 permissions:
   contents: write
@@ -40,6 +41,8 @@ jobs:
           set -euo pipefail
           rm -rf 'Download code/archivos'
           rm -rf 'Core kernel razonamiento repo para Yaiwes'
+          rm -rf OpenHands OpenCode Temporal
+          rm -f FORENSIC-REBUILD-REPORT.json
           mkdir -p 'Download code/archivos'
           mkdir -p 'Core kernel razonamiento repo para Yaiwes'
       - name: Forensic preflight - no LFS operational artifacts
@@ -62,6 +65,26 @@ jobs:
           if bad:
               raise SystemExit('FORENSIC FAIL: forbidden LFS usage/artifact in operational code: '+repr(bad))
           print('FORENSIC PASS: operational scripts/workflows contain no LFS calls/configuration')
+          PY
+      - name: Clean deterministic main extraction roots
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import ast, shutil
+          from pathlib import Path
+          src=Path('scripts/extract_inventory.py').read_text()
+          tree=ast.parse(src)
+          names=None
+          for node in tree.body:
+              if isinstance(node, ast.Assign) and any(isinstance(t,ast.Name) and t.id=='NAMES' for t in node.targets):
+                  names=ast.literal_eval(node.value)
+                  break
+          if not names or len(names)!=119:
+              raise SystemExit('FORENSIC FAIL: expected 119 deterministic extraction roots')
+          for name in names.values():
+              shutil.rmtree(name, ignore_errors=True)
+          print('FORENSIC PASS: removed 119 previous main extraction roots')
           PY
       - name: Rebuild main 01-119 from restored 119 queue
         shell: bash
@@ -97,33 +120,4 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          import json
-          from pathlib import Path
-          main=Path('Download code/archivos/RESEARCH_DOWNLOAD_MANIFEST.jsonl')
-          kernel=Path('Core kernel razonamiento repo para Yaiwes/RESEARCH_DOWNLOAD_MANIFEST.jsonl')
-          extra=Path('Download code/archivos/EXTRA_AGENTS_MANIFEST.jsonl')
-          assert main.exists(), 'main manifest missing'
-          assert kernel.exists(), 'kernel manifest missing'
-          assert extra.exists(), 'extra manifest missing'
-          main_rows=[json.loads(x) for x in main.read_text().splitlines() if x.strip()]
-          kernel_rows=[json.loads(x) for x in kernel.read_text().splitlines() if x.strip()]
-          extra_rows=[json.loads(x) for x in extra.read_text().splitlines() if x.strip()]
-          assert len(main_rows)==119, f'main manifest count={len(main_rows)}'
-          assert len({r['number'] for r in main_rows})==119, 'main numbering not unique'
-          assert all(r.get('status')=='COMPLETE' for r in main_rows), 'main incomplete status'
-          assert len(kernel_rows)==35, f'kernel manifest count={len(kernel_rows)}'
-          assert len(extra_rows)==3, f'extra manifest count={len(extra_rows)}'
-          for root in (Path('Download code/archivos'), Path('Core kernel razonamiento repo para Yaiwes')):
-              for p in root.rglob('*'):
-                  if p.is_file() and p.suffix=='.zip':
-                      assert p.stat().st_size <= 17*1000*1000, f'ZIP too large: {p}'
-          for root in (Path('Download code/archivos'), Path('Core kernel razonamiento repo para Yaiwes')):
-              for p in root.rglob('*'):
-                  if not p.is_file() or '.git' in p.parts: continue
-                  try: text=p.read_text(errors='ignore')
-                  except Exception: continue
-                  if 'git-lfs.github.com' in text or 'filter=lfs' in text:
-                      raise SystemExit(f'LFS pointer/config text detected: {p}')
-          print('FORENSIC PASS: main=119 kernel=35 extra=3; extraction completed; ZIP safety verified; no LFS pointer/config text detected')
-          PY
+          python3 scripts/forensic_verify_rebuild.py
