@@ -11,11 +11,29 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
-      - name: Checkout main
+      - name: Checkout main without LFS
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
-      - name: Paso 1 - Descargar ZIP
+          lfs: false
+      - name: Forensic preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          bad=[]
+          for root in (Path('scripts'), Path('.github/workflows')):
+              for p in root.rglob('*'):
+                  if not p.is_file() or p.name=='wordflow-inventario.yml': continue
+                  try: t=p.read_text(errors='ignore')
+                  except Exception: continue
+                  for token in ('git lfs','git-lfs.github.com','GIT_LFS_','filter=lfs'):
+                      if token in t: bad.append((str(p),token))
+          if bad: raise SystemExit(f'FORENSIC FAIL: forbidden LFS operational reference: {bad}')
+          print('FORENSIC PASS: workflow/scripts are LFS-free')
+          PY
+      - name: Paso 1 - Descargar ZIP 01-119
         shell: bash
         run: |
           set -euo pipefail
