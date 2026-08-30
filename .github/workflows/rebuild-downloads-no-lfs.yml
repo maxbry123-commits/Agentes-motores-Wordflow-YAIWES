@@ -1,0 +1,76 @@
+name: Rebuild downloads NO-LFS
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/rebuild-downloads-no-lfs.yml'
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: rebuild-downloads-no-lfs
+  cancel-in-progress: false
+jobs:
+  rebuild:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Checkout main without LFS
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+          lfs: false
+      - name: Remove Git LFS capability from runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          if dpkg-query -W -f='${Status}' git-lfs 2>/dev/null | grep -q 'install ok installed'; then
+            sudo apt-get purge -y git-lfs
+          fi
+          ! command -v git-lfs
+      - name: Prepare tooling
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y zip unzip
+      - name: Clean prior generated downloads
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf 'Download code/archivos'
+          rm -rf 'Core kernel razonamiento repo para Yaiwes'
+          mkdir -p 'Download code/archivos'
+          mkdir -p 'Core kernel razonamiento repo para Yaiwes'
+      - name: Rebuild kernel 01-35 from existing locked downloader
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/research_download_kernel.py 'Core kernel razonamiento repo para Yaiwes' '_work/kernel-rebuild'
+      - name: Rebuild main 37-119 from existing locked downloader
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/research_download_chain.py 'Download code/archivos' '_work/main-rebuild'
+      - name: Rebuild extra agents from existing downloader
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/research_download_extra.py 'Download code/archivos' '_work/extra-rebuild'
+      - name: Forensic verification
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f 'Core kernel razonamiento repo para Yaiwes/RESEARCH_DOWNLOAD_MANIFEST.jsonl'
+          kernel_count=$(grep -c '"status": "COMPLETE"' 'Core kernel razonamiento repo para Yaiwes/RESEARCH_DOWNLOAD_MANIFEST.jsonl')
+          test "$kernel_count" -eq 35
+          test -f 'Download code/archivos/RESEARCH_DOWNLOAD_MANIFEST.jsonl'
+          main_count=$(grep -c '"status": "COMPLETE"' 'Download code/archivos/RESEARCH_DOWNLOAD_MANIFEST.jsonl')
+          test "$main_count" -eq 83
+          test -f 'Download code/archivos/EXTRA_AGENTS_MANIFEST.jsonl'
+          extra_count=$(grep -c '"status": "COMPLETE"' 'Download code/archivos/EXTRA_AGENTS_MANIFEST.jsonl')
+          test "$extra_count" -eq 3
+          ! find . -type f -not -path './.git/*' -print0 | xargs -0 grep -Il 'git-lfs.github.com' | grep .
+          ! git grep -n -E 'git[[:space:]]+lfs|GIT_LFS_' -- . ':!.git' || true
+          echo "FORENSIC PASS: kernel=35 main=83 extra=3; no LFS pointer text detected"
