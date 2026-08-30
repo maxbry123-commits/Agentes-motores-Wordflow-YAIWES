@@ -6,9 +6,6 @@ permissions:
 concurrency:
   group: dest-main-serial
   cancel-in-progress: false
-env:
-  GIT_LFS_SKIP_SMUDGE: '1'
-  GIT_LFS_SKIP_PUSH: '1'
 jobs:
   extract:
     runs-on: ubuntu-latest
@@ -18,13 +15,15 @@ jobs:
         with:
           fetch-depth: 1
           lfs: false
-      - name: off LFS hooks
+      - name: Paso 1 - validar entorno sin LFS
+        shell: bash
         run: |
-          git lfs uninstall || true
-          git config lfs.allowincompletepush true
-          git config filter.lfs.required false
+          set -euo pipefail
+          ! command -v git-lfs
+          ! git config --get-regexp '^filter\.lfs\.' >/dev/null 2>&1
       - name: EXTRACT kernel slugs
         run: |
           set -euo pipefail
-          sudo apt-get update -y && sudo apt-get install -y unzip
+          sudo apt-get update -y
+          sudo apt-get install -y unzip
           python3 scripts/extract_kernel.py 'Core kernel razonamiento repo para Yaiwes'
