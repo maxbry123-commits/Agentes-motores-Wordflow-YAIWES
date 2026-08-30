@@ -1,0 +1,89 @@
+name: yaiwes-sheriff-15m
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+    inputs:
+      apply_moves:
+        description: 'mover docs a Documentos proyectos agentes'
+        type: boolean
+        default: false
+      apply_delete_md:
+        description: 'borrar md/texto no cableado'
+        type: boolean
+        default: false
+permissions:
+  contents: write
+jobs:
+  loop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: status zip extract ubicar
+        run: |
+          python3 - <<'PY'
+          import json, os, time
+          from pathlib import Path
+          root = Path('.')
+          dest_zip = root/'Download code'/'archivos'
+          kernel = root/'Core kernel razonamiento repo para Yaiwes'
+          docs = root/'Documentos proyectos agentes'
+          docs.mkdir(parents=True, exist_ok=True)
+          zips = sorted(p.name for p in dest_zip.glob('*.zip')) if dest_zip.exists() else []
+          slugs = sorted({p.name.split('_')[0] for p in dest_zip.glob('*_*.zip')}) if dest_zip.exists() else []
+          roots_main = sorted([p.name for p in root.iterdir() if p.is_dir() and p.name not in {'.git','.github','Download code','scripts','TOOLS','ROOTS','FORENSIC-ZIP','Skills download code repo','tarea en curso grock gpt skills','Método de trabajo','Core kernel razonamiento repo para Yaiwes','Documentos proyectos agentes'}])
+          k_dirs = sorted([p.name for p in kernel.iterdir() if p.is_dir()]) if kernel.exists() else []
+          k_zips = sorted([p.name for p in kernel.glob('*.zip')]) if kernel.exists() else []
+          keep_md = ('METODO-DE-TRABAJO.md','GUIA-DESPLIEGUE-ZIP-UNIVERSAL.md','GUIA-DESPLIEGUE-ZIP-UNIVERSAL-PARCCHE-01.md')
+          loose_md = [p.name for p in root.glob('*.md') if p.name not in keep_md]
+          st = {
+            'ts': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+            'zip_archivos': len(zips),
+            'slugs_zip': len(slugs),
+            'raices_main': len(roots_main),
+            'kernel_dirs': len(k_dirs),
+            'kernel_zips': len(k_zips),
+            'loose_md': loose_md,
+            'download_code_vive_agentes': False,
+            'resuelto_zip': len(slugs) >= 119,
+            'resuelto_extract_main': len(roots_main) >= 89,
+            'resuelto_kernel': len(k_dirs) >= 30,
+          }
+          (docs/'LOOP-STATUS.json').write_text(json.dumps(st, indent=2)+'\n')
+          print(json.dumps(st, indent=2))
+          PY
+      - name: mover docs despliegue si apply_moves
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.apply_moves }}
+        run: |
+          mkdir -p "Documentos proyectos agentes"
+          for f in GUIA-DESPLIEGUE-ZIP-UNIVERSAL.md GUIA-DESPLIEGUE-ZIP-UNIVERSAL-PARCCHE-01.md; do
+            if [ -f "$f" ]; then git mv -f "$f" "Documentos proyectos agentes/$f" || mv "$f" "Documentos proyectos agentes/$f"; fi
+          done
+      - name: borrar md no cableado si apply_delete_md
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.apply_delete_md }}
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          keep = {
+            'METODO-DE-TRABAJO.md',
+            'README.md',
+            'LICENSE',
+          }
+          keep_prefix = ('GUIA-DESPLIEGUE',)
+          for p in Path('.').glob('*.md'):
+            if p.name in keep: continue
+            if p.name.startswith(keep_prefix): continue
+            print('DELETE', p.name); p.unlink()
+          PY
+      - name: commit status
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          git diff --cached --quiet && echo NOCHANGE && exit 0
+          git commit -m "chore(loop15): status zip extract ubicar"
+          git pull --rebase origin main || true
+          git push origin HEAD:main
