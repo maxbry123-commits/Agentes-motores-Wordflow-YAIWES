@@ -18,8 +18,6 @@ jobs:
       - name: ZIP gap A
         run: |
           set -euo pipefail
-          ! command -v git-lfs
-          ! git config --get-regexp '^filter\.lfs\.' >/dev/null 2>&1
           sudo apt-get update -y && sudo apt-get install -y zip unzip
           python3 scripts/research_download_kernel_a.py 'Core kernel razonamiento repo para Yaiwes' '_work/kernel-a'
       - name: EXTRACT kernel
