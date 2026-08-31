@@ -1,0 +1,16 @@
+[
+  {
+    "repo": "MiMo-Code",
+    "path": "packages/console/app/src/asset/lander/opencode-comparison-min.mp4",
+    "chunks_dir": "MiMo-Code/packages/console/app/src/asset/lander/opencode-comparison-min.mp4.chunks",
+    "bytes": 16908501,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "MiMo-Code",
+    "path": "packages/console/app/src/asset/lander/opencode-min.mp4",
+    "chunks_dir": "MiMo-Code/packages/console/app/src/asset/lander/opencode-min.mp4.chunks",
+    "bytes": 10368838,
+    "chunk_bytes": 8388608
+  }
+]
