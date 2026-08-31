@@ -1,0 +1,66 @@
+node_modules/
+.env
+.env.local
+.env.*.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets — NEVER commit
+*.key
+*.pem
+*.p12
+credentials.json
+service-account.json
+.windsurf/usage.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Build
+dist/
+build/
+.cache/
+
+# Temp
+tmp/
+temp/
+*.tmp
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Secrets — NEVER commit
+*.key
+*.pem
+*.p12
+credentials.json
+service-account.json
+# Aiyu-multi-agent — .windsurf/ is tracked in git (it IS the package payload)
+# Use .npmignore to control npm publish exclusions
+.windsurf/.version
+# Aiyu MultiAgent
+ROADMAP-PRODUCTION.md
+.npmrc
+.agent/memory/
+.agent/plans/
+
+# Dashboard (Next.js)
+aiyu-multi-agent-dashboard/.next/
+aiyu-multi-agent-dashboard/out/
+aiyu-multi-agent-dashboard/node_modules/
+aiyu-multi-agent-dashboard/package-lock.json
