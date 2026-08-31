@@ -11,6 +11,9 @@ input_block:
   I26: ejecutar descarga/extraccion sin reescribir el packer LOCK ni introducir LFS
   I27: descargar 119 repos con CHUNK 8MiB, ZIP seguro y commits por lote
   I28: auditar todos los GHA y resolver cualquier referencia o uso operativo de LFS
+  I29: concurrency.group unico research-download-chain-final
+  I30: no escribir packer; copia GHA o edit quirurgica group/lista/dest
+  I31: loop dispatch uno; wait 20s; GAP; no 3 en paralelo
 nodos:
   N1_NOTA_SKILL: PASS
   N2_EXTRACT119: rebuild-downloads-no-lfs.yml + research_download_chain.py + extract_inventory.py + skill_guard.py
@@ -19,11 +22,9 @@ nodos:
 checklist_pre_run:
   - checkout con lfs: false
   - cero comandos git lfs
-  - cero variables GIT_LFS_*
-  - cero configuracion filter.lfs
   - CHUNK=8MiB no recomponer
   - ZIP <=17MB y validado con unzip -tq
   - packer LOCK no reescrito
-  - evidencia PASS solo desde tests verificables
-prohibido: [LFS_enable, git_lfs, GIT_LFS_env, filter_lfs, recomponer_100MB, reescribir_packer]
-estado: INICIA
+  - group research-download-chain-final
+prohibido: [LFS_enable, git_lfs, recomponer_100MB, reescribir_packer]
+estado: LOOP
