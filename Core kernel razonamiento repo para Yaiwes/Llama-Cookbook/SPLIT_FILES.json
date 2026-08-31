@@ -1,0 +1,23 @@
+[
+  {
+    "repo": "Llama-Cookbook",
+    "path": "3p-integrations/groq/groq-api-cookbook/rag-langchain-presidential-speeches/presidential_speeches.csv",
+    "chunks_dir": "Llama-Cookbook/3p-integrations/groq/groq-api-cookbook/rag-langchain-presidential-speeches/presidential_speeches.csv.chunks",
+    "bytes": 22729058,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "Llama-Cookbook",
+    "path": "end-to-end-use-cases/blog_generator/blog_metadata/3rd_party_integrations.txt",
+    "chunks_dir": "Llama-Cookbook/end-to-end-use-cases/blog_generator/blog_metadata/3rd_party_integrations.txt.chunks",
+    "bytes": 24815245,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "Llama-Cookbook",
+    "path": "end-to-end-use-cases/long_context/H2O/data/summarization/cnn_dailymail.jsonl",
+    "chunks_dir": "Llama-Cookbook/end-to-end-use-cases/long_context/H2O/data/summarization/cnn_dailymail.jsonl.chunks",
+    "bytes": 8551520,
+    "chunk_bytes": 8388608
+  }
+]
