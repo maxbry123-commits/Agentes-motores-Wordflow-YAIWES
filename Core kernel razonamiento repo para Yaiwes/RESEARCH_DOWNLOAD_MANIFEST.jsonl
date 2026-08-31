@@ -41,3 +41,5 @@
 {"number": 7, "parts": 1, "slug": "E2B", "source": "https://github.com/e2b-dev/e2b.git", "source_commit": "5a56c87e9db0e221b138662805af7743e75f1082", "status": "COMPLETE"}
 {"number": 8, "parts": 1, "slug": "Cloudflare-Sandbox-SDK", "source": "https://github.com/cloudflare/sandbox-sdk.git", "source_commit": "20f9da4a9eb297db64375c0a98753626e91b52ac", "status": "COMPLETE"}
 {"number": 9, "parts": 3, "slug": "AutoGen", "source": "https://github.com/microsoft/autogen.git", "source_commit": "027ecf0a379bcc1d09956d46d12d44a3ad9cee14", "status": "COMPLETE"}
+{"number": 10, "parts": 18, "slug": "CrewAI", "source": "https://github.com/crewAIInc/crewAI.git", "source_commit": "381fef73be1803d0b4676f88cbae57d332cb9cac", "status": "COMPLETE"}
+{"number": 11, "parts": 1, "slug": "MiMo", "source": "https://github.com/XiaomiMiMo/MiMo.git", "source_commit": "3a3fe65e6081c9f340ff0d24d82c4d7a96a247c5", "status": "COMPLETE"}
