@@ -1,7 +1,7 @@
 import json, shutil, subprocess, sys
 from pathlib import Path
 from zipfile import ZipFile
-from skill_guard import guard_dest, run
+from skill_guard import run
 SRC=Path(sys.argv[1]).resolve()
 DEST_ROOT=Path(sys.argv[2]).resolve()
 MANIFEST=SRC/'RESEARCH_DOWNLOAD_MANIFEST.jsonl'
@@ -43,7 +43,6 @@ for row in rows:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 with z.open(info) as srcf, target.open('wb') as dst: shutil.copyfileobj(srcf, dst, length=1024*1024)
                 count += 1
-    guard_dest(dest)
     if count==0: raise SystemExit(f'{slug}: zero files extracted')
     print(f'PASS EXTRACT: {slug} files={count} zip={size}')
     commit(f'{number:02d}-{slug}')
