@@ -1,0 +1,1491 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+@import "./theme/palette.css";
+@import "./theme/style-profiles.css";
+
+/* Tailwind aliases for the semantic color card. The core names intentionally
+   mirror Orca/shadcn; this does not import or require the shadcn component
+   library. `inline` keeps utilities connected to the active runtime palette. */
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+
+  --color-accent-strong: var(--accent-strong);
+  --color-primary-muted: var(--primary-muted);
+  --color-success: var(--success);
+  --color-success-foreground: var(--success-foreground);
+  --color-warning: var(--warning);
+  --color-warning-foreground: var(--warning-foreground);
+  --color-warning-background: var(--warning-background);
+  --color-warning-border: var(--warning-border);
+  --color-info: var(--info);
+  --color-info-foreground: var(--info-foreground);
+  --color-ai-action: var(--ai-action);
+  --color-ai-action-foreground: var(--ai-action-foreground);
+  --color-backdrop: var(--backdrop);
+  --color-code-background: var(--code-background);
+  --color-report-canvas: var(--report-canvas);
+  --color-office-wall: var(--office-wall);
+  --color-office-wall-grain: var(--office-wall-grain);
+  --color-office-wall-crown: var(--office-wall-crown);
+  --color-office-trim: var(--office-trim);
+  --color-office-trim-shadow: var(--office-trim-shadow);
+  --color-office-floor: var(--office-floor);
+  --color-office-floor-plank: var(--office-floor-plank);
+  --color-office-floor-sheen: var(--office-floor-sheen);
+  --color-office-label: var(--office-label);
+  --color-office-label-foreground: var(--office-label-foreground);
+
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+    "Microsoft YaHei", "Hiragino Sans GB", "Noto Sans CJK SC", sans-serif;
+  --font-mono: "SF Mono", "Fira Code", "Cascadia Code", Menlo, Consolas,
+    monospace;
+}
+
+/* Base resolution (no attribute / explicit light). */
+:root {
+  --motion-fast: 120ms;
+  --motion-standard: 180ms;
+  --motion-slow: 260ms;
+  --motion-ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --motion-ease-standard: cubic-bezier(0.2, 0, 0, 1);
+}
+
+/* Japanese gets a JP-first sans stack so shared Han characters render in
+   Japanese glyph forms, not the Simplified-Chinese forms the default stack
+   would pick (Han unification). Scoped via <html lang="ja">, which the locale
+   store keeps in sync. */
+:root:lang(ja) {
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI",
+    "Hiragino Kaku Gothic ProN", "Hiragino Sans", "Yu Gothic", "YuGothic",
+    "Meiryo", "Noto Sans JP", sans-serif;
+}
+
+/* Traditional Chinese (Hant script) gets a Traditional-first sans stack so
+   shared Han characters render in Traditional forms, not the Simplified ones
+   the default stack would pick. Scoped via <html lang="zh-Hant"> — region-
+   neutral (serves both Taiwan and Hong Kong Traditional readers). */
+:root:lang(zh-Hant) {
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI",
+    "PingFang TC", "Microsoft JhengHei", "Noto Sans TC",
+    "Noto Sans CJK TC", sans-serif;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  background: var(--app-background-wash), var(--background);
+  color: var(--foreground);
+  overflow: hidden;
+  transition: background-color 0.4s ease, color 0.4s ease;
+}
+
+::selection {
+  background: color-mix(in srgb, var(--primary) 28%, transparent);
+  color: var(--foreground);
+}
+
+/* ==================== Interaction + motion foundation ====================
+   Motion explains hierarchy and confirms intent; it should not turn the shell
+   into a moving background. Keep transforms on explicitly marked controls and
+   reserve ambient loops for real live/loading state. Pointer cursors are global
+   because a clickable control should never make the user guess. */
+
+:where(button, [role="button"], summary, a[href], select):not(:disabled):not([aria-disabled="true"]) {
+  cursor: pointer;
+}
+
+:where(button:disabled, [role="button"][aria-disabled="true"]) {
+  cursor: default;
+}
+
+.oa-pressable {
+  transition:
+    transform var(--motion-fast) var(--motion-ease-standard),
+    border-color var(--motion-standard) var(--motion-ease-standard),
+    background-color var(--motion-standard) var(--motion-ease-standard),
+    color var(--motion-standard) var(--motion-ease-standard),
+    box-shadow var(--motion-standard) var(--motion-ease-standard);
+}
+
+.oa-icon-action,
+.oa-icon-action > svg,
+.oa-nav-icon {
+  transition:
+    transform var(--motion-fast) var(--motion-ease-out),
+    color var(--motion-standard) var(--motion-ease-standard),
+    background-color var(--motion-standard) var(--motion-ease-standard),
+    opacity var(--motion-standard) var(--motion-ease-standard);
+}
+
+.oa-nav-item,
+.oa-nav-row {
+  transition:
+    transform var(--motion-fast) var(--motion-ease-out),
+    color var(--motion-standard) var(--motion-ease-standard),
+    background-color var(--motion-standard) var(--motion-ease-standard);
+}
+
+.oa-status-surface {
+  transition:
+    border-color var(--motion-slow) var(--motion-ease-standard),
+    background-color var(--motion-slow) var(--motion-ease-standard),
+    box-shadow var(--motion-slow) var(--motion-ease-standard);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .oa-pressable:hover:not(:disabled):not([aria-disabled="true"]) {
+    transform: translateY(-1px);
+    box-shadow: 0 5px 14px color-mix(in srgb, var(--foreground) 9%, transparent);
+  }
+
+  .oa-pressable:active:not(:disabled):not([aria-disabled="true"]) {
+    transform: translateY(0) scale(0.98);
+    box-shadow: none;
+  }
+
+  .oa-icon-action:hover:not(:disabled):not([aria-disabled="true"]) {
+    transform: translateY(-1px);
+  }
+
+  .oa-icon-action:hover:not(:disabled):not([aria-disabled="true"]) > svg {
+    transform: scale(1.1);
+  }
+
+  .oa-icon-action:active:not(:disabled):not([aria-disabled="true"]) {
+    transform: translateY(0) scale(0.92);
+  }
+
+  .oa-nav-item:hover .oa-nav-icon {
+    transform: translateX(1px) scale(1.04);
+  }
+
+  .oa-nav-row:hover {
+    transform: translateX(1px);
+  }
+}
+
+@keyframes oa-view-enter {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes oa-dialog-enter {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes oa-backdrop-enter {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes oa-disclosure-enter {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes oa-popover-enter {
+  from {
+    opacity: 0;
+    transform: translateY(3px) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes oa-suggestion-enter {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes oa-tracked-graph-node-enter {
+  from {
+    opacity: 0;
+    transform: translate(var(--oa-graph-enter-x), var(--oa-graph-enter-y)) scale(0.72);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes oa-tracked-graph-edge-enter {
+  from { stroke-dashoffset: 1; }
+  to { stroke-dashoffset: 0; }
+}
+
+@keyframes oa-tracked-graph-preview-enter {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.98);
+    border-color: color-mix(in srgb, var(--primary) 58%, var(--border));
+  }
+  to {
+    opacity: 1;
+    transform: none;
+    border-color: var(--border);
+  }
+}
+
+.oa-tracked-graph-node {
+  transition: opacity var(--motion-standard) var(--motion-ease-standard);
+}
+
+.oa-tracked-graph-preview-enter {
+  animation: oa-tracked-graph-preview-enter var(--motion-slow) var(--motion-ease-out) backwards;
+  transform-origin: bottom right;
+}
+
+.oa-tracked-graph-node-enter {
+  animation: oa-tracked-graph-node-enter var(--motion-slow) var(--motion-ease-out) backwards;
+  transform-box: fill-box;
+  transform-origin: center;
+}
+
+.oa-tracked-graph-edge {
+  stroke-dasharray: 1;
+  animation: oa-tracked-graph-edge-enter var(--motion-slow) var(--motion-ease-out) backwards;
+  transition:
+    opacity var(--motion-standard) var(--motion-ease-standard),
+    stroke-width var(--motion-fast) var(--motion-ease-standard);
+}
+
+.oa-tracked-graph-node-mark {
+  transform-box: fill-box;
+  transform-origin: center;
+  transition: transform var(--motion-fast) var(--motion-ease-out);
+}
+
+.oa-tracked-graph-node[data-focus-state="active"] .oa-tracked-graph-node-mark {
+  transform: scale(1.14);
+}
+
+.oa-tracked-graph-node[data-focus-state="related"] .oa-tracked-graph-node-mark {
+  transform: scale(1.035);
+}
+
+.oa-tracked-graph-hover-halo,
+.oa-tracked-graph-label {
+  transition: opacity var(--motion-standard) var(--motion-ease-standard);
+}
+
+.oa-tracked-graph-node-enter[data-enter-phase="1"],
+.oa-tracked-graph-edge[data-enter-phase="1"] {
+  animation-delay: calc(var(--motion-fast) / 4);
+}
+
+.oa-tracked-graph-node-enter[data-enter-phase="2"],
+.oa-tracked-graph-edge[data-enter-phase="2"] {
+  animation-delay: calc(var(--motion-fast) / 2);
+}
+
+.oa-tracked-graph-node-enter[data-enter-phase="3"],
+.oa-tracked-graph-edge[data-enter-phase="3"] {
+  animation-delay: calc(var(--motion-fast) - var(--motion-fast) / 4);
+}
+
+.oa-tracked-graph-node-enter[data-enter-phase="4"],
+.oa-tracked-graph-edge[data-enter-phase="4"] {
+  animation-delay: var(--motion-fast);
+}
+
+.oa-view-enter {
+  animation: oa-view-enter var(--motion-standard) var(--motion-ease-out) both;
+}
+
+.oa-dialog-surface {
+  animation: oa-dialog-enter var(--motion-slow) var(--motion-ease-out) both;
+}
+
+.oa-dialog-backdrop {
+  animation: oa-backdrop-enter var(--motion-standard) ease-out both;
+}
+
+/* Keep direct pointer resizing attached to the cursor, then soften only the
+   primitive's discrete 200px -> 44px collapse snap. Panel classes are applied
+   to react-resizable-panels' nested content element, so this rule deliberately
+   targets the direct flex item from the product-owned group seam. */
+.oa-page-sidebar-resizable[data-collapse-motion="armed"]
+  > [data-panel][data-collapse-state] {
+  transition: flex-grow var(--motion-standard) var(--motion-ease-out);
+}
+
+/* The expanded navigator keeps a hard 200px layout floor. Pointer travel past
+   that floor is represented as a damped, clipped overdrag: content retains its
+   layout width, the separator follows the resisted edge, and the working pane
+   shifts only for the duration of the gesture. Releasing before the commit
+   boundary uses a deliberately light spring; a committed gesture blends this
+   offset back into the primitive-owned 200px -> 44px collapse. */
+.oa-page-sidebar-resizable {
+  --oa-page-sidebar-overdrag: 0px;
+}
+
+.oa-page-sidebar-resizable > [data-page-sidebar-panel="navigator"] {
+  clip-path: inset(0 var(--oa-page-sidebar-overdrag) 0 0);
+}
+
+.oa-page-sidebar-resizable > [data-slot="resizable-handle"],
+.oa-page-sidebar-resizable > [data-page-sidebar-panel="content"] {
+  transform: translateX(calc(-1 * var(--oa-page-sidebar-overdrag)));
+}
+
+.oa-page-sidebar-resizable[data-overdrag-motion]
+  > [data-page-sidebar-panel="navigator"] {
+  transition: clip-path 240ms cubic-bezier(0.2, 1.3, 0.35, 1);
+}
+
+.oa-page-sidebar-resizable[data-overdrag-motion]
+  > [data-slot="resizable-handle"],
+.oa-page-sidebar-resizable[data-overdrag-motion]
+  > [data-page-sidebar-panel="content"] {
+  transition: transform 240ms cubic-bezier(0.2, 1.3, 0.35, 1);
+}
+
+.oa-page-sidebar-resizable[data-overdrag-state="resisting"]
+  > [data-slot="resizable-handle"] {
+  background-color: color-mix(in srgb, var(--primary) 48%, var(--border));
+}
+
+.oa-page-sidebar-resizable[data-overdrag-state="armed"]
+  > [data-slot="resizable-handle"] {
+  background-color: color-mix(in srgb, var(--primary) 78%, var(--border));
+}
+
+/* Page-owned navigators become touch surfaces inside the phone drawer.
+   A 40px height floor removes the old 18–28px rows; icon controls keep 36px
+   of horizontal room so adjacent workspace names remain distinguishable. */
+.oa-page-sidebar-dialog :is(button, [role="button"]) {
+  min-height: 2.5rem;
+}
+
+.oa-page-sidebar-dialog button:has(svg) {
+  min-width: 2.25rem;
+}
+
+/* Workspace tree controls stay compact for a fine pointer, but touch-capable
+   desktop/tablet layouts must not collapse them back into 20px hit targets. */
+@media (hover: none), (pointer: coarse) {
+  .oa-workspace-row-action {
+    min-width: 2.25rem;
+    min-height: 2.25rem;
+  }
+}
+
+.oa-page-sidebar-dialog :is(
+  input:not([type="checkbox"]):not([type="radio"]),
+  select
+) {
+  min-height: 2.5rem;
+}
+
+.oa-disclosure-enter {
+  transform-origin: top;
+  animation: oa-disclosure-enter var(--motion-standard) var(--motion-ease-out) both;
+}
+
+.oa-popover-enter {
+  transform-origin: top;
+  animation: oa-popover-enter var(--motion-standard) var(--motion-ease-out) both;
+}
+
+.oa-suggestion-enter {
+  animation: oa-suggestion-enter var(--motion-standard) var(--motion-ease-out) backwards;
+}
+
+.oa-sortable-placeholder {
+  background: color-mix(in srgb, var(--primary) 7%, transparent);
+  border-color: color-mix(in srgb, var(--primary) 32%, var(--border));
+  outline: 1px dashed color-mix(in srgb, var(--primary) 32%, var(--border));
+  outline-offset: -1px;
+  box-shadow: none;
+}
+
+.oa-sortable-placeholder > * {
+  visibility: hidden;
+}
+
+.oa-sortable-overlay {
+  pointer-events: none;
+  z-index: 80;
+  will-change: transform;
+  border: 1px solid color-mix(in srgb, var(--primary) 28%, var(--border));
+  background: var(--secondary);
+  box-shadow: 0 10px 28px color-mix(in srgb, var(--foreground) 12%, transparent);
+}
+
+/* ==================== Typography scale ====================
+   Five semantic sizes covering the entire app. New code should
+   prefer these over arbitrary `text-[Npx]` so size choices stay
+   consistent and a future global tweak is one edit.
+   - .text-display  hero numbers (UTA NLV, Portfolio total)
+   - .text-title    page H2 / dialog title
+   - .text-body     primary body text, table rows, buttons
+   - .text-caption  secondary descriptions, subtitles
+   - .text-micro    badges, timestamps, table metadata */
+
+.text-display {
+  @apply text-[28px] md:text-[36px] font-bold leading-tight tabular-nums;
+}
+.text-title {
+  @apply text-[16px] font-semibold leading-snug;
+}
+.text-body {
+  @apply text-[13px] leading-relaxed;
+}
+.text-caption {
+  @apply text-[12px] leading-relaxed;
+}
+.text-micro {
+  @apply text-[11px] tracking-wide;
+}
+
+/* Page headers normally keep compact actions inline. Dense operational
+   controls can opt into a content-pane-aware stack so their title and status
+   retain full width after app/local sidebars are accounted for. */
+@container (max-width: 34rem) {
+  .oa-page-header-stack-actions {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 0.75rem;
+  }
+
+  .oa-page-header-stack-actions > :first-child {
+    width: 100%;
+  }
+
+  .oa-page-header-actions {
+    width: 100%;
+  }
+
+  .oa-uta-header-divider {
+    display: none;
+  }
+}
+
+/* ==================== Live-data pulse ====================
+   Small breathing dot used in PageHeader to communicate "this
+   surface is auto-refreshing". 2.4s cycle so it reads as ambient
+   not anxious. Color is the success/green token to keep the
+   association with "alive + healthy". */
+
+@keyframes live-pulse {
+  0%, 100% {
+    opacity: 0.55;
+    transform: scale(0.92);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.08);
+  }
+}
+.live-pulse {
+  animation: live-pulse 2.4s ease-in-out infinite;
+}
+.live-pulse::after {
+  content: '';
+  position: absolute;
+  inset: -3px;
+  border-radius: 9999px;
+  background: var(--success);
+  opacity: 0.3;
+  animation: live-pulse 2.4s ease-in-out infinite;
+  animation-delay: 0.3s;
+}
+
+@keyframes onboarding-slide-forward {
+  from {
+    opacity: 0;
+    transform: translateX(22px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+@keyframes onboarding-slide-back {
+  from {
+    opacity: 0;
+    transform: translateX(-22px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+@keyframes onboarding-completion-pop {
+  0% {
+    opacity: 0;
+    transform: scale(0.76);
+  }
+  62% {
+    opacity: 1;
+    transform: scale(1.06);
+  }
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@keyframes onboarding-completion-ring {
+  0% {
+    opacity: 0;
+    transform: scale(0.72);
+  }
+  45% {
+    opacity: 0.55;
+  }
+  100% {
+    opacity: 0;
+    transform: scale(1.42);
+  }
+}
+
+@keyframes onboarding-completion-line {
+  0% {
+    opacity: 0;
+    transform: scaleX(0);
+  }
+  35% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+    transform: scaleX(1);
+  }
+}
+
+.oa-onboarding-slide-forward {
+  animation: onboarding-slide-forward 0.42s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.oa-onboarding-slide-back {
+  animation: onboarding-slide-back 0.42s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.oa-onboarding-step-layout {
+  display: grid;
+  min-height: 0;
+  flex: 1 1 0%;
+  gap: 1rem;
+  align-content: start;
+  overflow-y: auto;
+  padding-bottom: 0.75rem;
+  padding-top: 0.75rem;
+}
+
+.oa-onboarding-title {
+  overflow-wrap: normal;
+  text-wrap: balance;
+  word-break: keep-all;
+}
+
+html[lang="ja"] .oa-onboarding-title {
+  line-break: strict;
+  overflow-wrap: anywhere;
+  word-break: normal;
+}
+
+.oa-onboarding-completion {
+  position: relative;
+  width: 5rem;
+  height: 5rem;
+  margin-bottom: 1.25rem;
+}
+
+.oa-onboarding-completion-ring {
+  position: relative;
+  display: grid;
+  width: 4.5rem;
+  height: 4.5rem;
+  place-items: center;
+  border: 1px solid color-mix(in srgb, var(--success) 38%, var(--border));
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--success) 12%, var(--background));
+  box-shadow: inset 0 0 0 0.5rem color-mix(in srgb, var(--success) 7%, transparent);
+  animation: onboarding-completion-pop 0.58s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.oa-onboarding-completion-ring::after {
+  position: absolute;
+  inset: -0.5rem;
+  content: "";
+  border: 1px solid var(--success);
+  border-radius: inherit;
+  animation: onboarding-completion-ring 0.72s 0.12s ease-out both;
+}
+
+.oa-onboarding-completion-line {
+  position: absolute;
+  width: 1.25rem;
+  height: 1px;
+  border-radius: 999px;
+  background: var(--success);
+  opacity: 0;
+  transform-origin: center;
+  animation: onboarding-completion-line 0.62s ease-out both;
+}
+
+.oa-onboarding-completion-line-a {
+  top: 0.55rem;
+  left: 3.85rem;
+  transform: rotate(-22deg) scaleX(0);
+  animation-delay: 0.16s;
+}
+
+.oa-onboarding-completion-line-b {
+  top: 3.55rem;
+  left: 4.2rem;
+  transform: rotate(16deg) scaleX(0);
+  animation-delay: 0.23s;
+}
+
+.oa-onboarding-completion-line-c {
+  top: 1.15rem;
+  left: -0.25rem;
+  transform: rotate(18deg) scaleX(0);
+  animation-delay: 0.2s;
+}
+
+@media (min-width: 768px) {
+  .oa-onboarding-step-layout {
+    grid-template-columns: minmax(0, 360px) minmax(300px, 340px);
+    gap: 1.5rem;
+    align-items: start;
+    justify-content: center;
+    padding-top: clamp(3rem, 10vh, 5rem);
+  }
+}
+
+@media (min-width: 900px) {
+  .oa-onboarding-step-layout {
+    grid-template-columns: minmax(0, 420px) minmax(320px, 350px);
+  }
+}
+
+@media (min-width: 1024px) {
+  .oa-onboarding-step-layout {
+    grid-template-columns: minmax(0, 540px) minmax(340px, 360px);
+  }
+}
+
+/* Skeleton placeholder — theme-aware shimmer for first-load states. The block
+   is the tertiary surface (reads on both the page bg and bg-secondary cards); a
+   soft overlay band sweeps across at an ambient cadence (sibling to live-pulse's
+   2.4s, a touch quicker so it reads as "loading" without feeling anxious). Size
+   + radius come from the element's own utility classes. Honors reduced motion. */
+@keyframes skeleton-sweep {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+.skeleton {
+  background-color: var(--muted);
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--accent-strong) 50%,
+    transparent 100%
+  );
+  background-size: 200% 100%;
+  background-repeat: no-repeat;
+  animation: skeleton-sweep 1.6s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .oa-onboarding-slide-forward,
+  .oa-onboarding-slide-back,
+  .oa-onboarding-completion-ring,
+  .oa-onboarding-completion-ring::after,
+  .oa-onboarding-completion-line {
+    animation: none;
+  }
+  .skeleton {
+    animation: none;
+    background-image: none;
+    opacity: 0.7;
+  }
+  .live-pulse,
+  .live-pulse::after,
+  .thinking-dot,
+  .message-enter,
+  .page-fade-in,
+  .oa-view-enter,
+  .oa-dialog-surface,
+  .oa-dialog-backdrop,
+  .oa-disclosure-enter,
+  .oa-popover-enter,
+  .oa-suggestion-enter {
+    animation: none;
+  }
+  .oa-sortable-overlay {
+    box-shadow: none;
+  }
+  .oa-tracked-graph-node-enter,
+  .oa-tracked-graph-edge,
+  .oa-tracked-graph-preview-enter {
+    animation: none;
+  }
+  .oa-pressable,
+  .oa-icon-action,
+  .oa-icon-action > svg,
+  .oa-nav-item,
+  .oa-nav-row,
+  .oa-nav-icon,
+  .oa-status-surface {
+    transition-duration: 0.01ms;
+  }
+  .oa-tracked-graph-node,
+  .oa-tracked-graph-edge,
+  .oa-tracked-graph-node-mark,
+  .oa-tracked-graph-hover-halo,
+  .oa-tracked-graph-label {
+    transition-duration: 0.01ms;
+  }
+  .oa-pressable:hover,
+  .oa-pressable:active,
+  .oa-icon-action:hover,
+  .oa-icon-action:active,
+  .oa-nav-row:hover,
+  .oa-nav-item:hover .oa-nav-icon {
+    transform: none;
+  }
+}
+
+/* ==================== Button utility classes ==================== */
+
+.btn-primary {
+  @apply px-4 py-2 text-[13px] font-medium rounded-lg
+    bg-primary border border-primary text-primary-foreground
+    hover:bg-primary/90 transition-all active:scale-[0.98]
+    disabled:opacity-40 disabled:cursor-default cursor-pointer
+    focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 focus-visible:ring-offset-2 focus-visible:ring-offset-background;
+}
+
+.btn-secondary {
+  @apply px-4 py-2 text-[13px] font-medium rounded-lg border border-border text-muted-foreground
+    hover:bg-muted hover:text-foreground transition-all active:scale-[0.98]
+    disabled:opacity-40 disabled:cursor-default cursor-pointer
+    focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 focus-visible:ring-offset-2 focus-visible:ring-offset-background;
+}
+
+.btn-danger {
+  @apply px-4 py-2 text-[13px] font-medium rounded-lg border border-destructive/30 text-destructive
+    hover:bg-destructive/10 transition-all active:scale-[0.98]
+    disabled:opacity-40 disabled:cursor-default cursor-pointer
+    focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-destructive/40 focus-visible:ring-offset-2 focus-visible:ring-offset-background;
+}
+
+.btn-primary-sm {
+  @apply px-3 py-1.5 text-xs font-medium rounded-md
+    bg-primary border border-primary text-primary-foreground
+    hover:bg-primary/90 transition-all active:scale-[0.98]
+    disabled:opacity-40 disabled:cursor-default cursor-pointer
+    focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 focus-visible:ring-offset-1 focus-visible:ring-offset-background;
+}
+
+.btn-secondary-sm {
+  @apply px-3 py-1.5 text-xs font-medium rounded-md border border-border text-muted-foreground
+    hover:bg-muted hover:text-foreground transition-all active:scale-[0.98]
+    disabled:opacity-40 disabled:cursor-default cursor-pointer
+    focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 focus-visible:ring-offset-1 focus-visible:ring-offset-background;
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 3px;
+}
+
+/* Hide scrollbar utility — content still scrolls (programmatically or via
+   wheel/trackpad), the bar itself just doesn't render. Used on the tab
+   strip so a long row of tabs doesn't reserve a thick horizontal track. */
+.scrollbar-hide {
+  scrollbar-width: none;       /* Firefox */
+  -ms-overflow-style: none;    /* IE / old Edge */
+}
+.scrollbar-hide::-webkit-scrollbar {
+  display: none;               /* Chromium / WebKit */
+}
+
+/* ==================== Markdown typography ====================
+   Messages and documents share parsing and element semantics, but not density.
+   The default remains compact enough for chat/runtime surfaces; the reading
+   modifier is used by durable Markdown reports and issue documents. */
+.markdown-content {
+  --markdown-font-size: 15px;
+  --markdown-leading: 1.65;
+  color: inherit;
+  font-size: var(--markdown-font-size);
+  line-height: var(--markdown-leading);
+  overflow-wrap: break-word;
+  word-break: normal;
+}
+
+.markdown-content > :first-child {
+  margin-top: 0;
+}
+
+.markdown-content > :last-child {
+  margin-bottom: 0;
+}
+
+.markdown-content p {
+  margin: 0.65em 0;
+  text-wrap: pretty;
+}
+
+.markdown-content strong {
+  color: color-mix(in srgb, var(--foreground) 94%, var(--muted-foreground));
+  font-weight: 650;
+}
+
+.markdown-content del {
+  color: var(--muted-foreground);
+  text-decoration-thickness: 1px;
+}
+
+.markdown-content kbd {
+  display: inline-block;
+  min-width: 1.6em;
+  margin-inline: 0.08em;
+  border: 1px solid var(--border);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--secondary) 76%, var(--card));
+  padding: 0.05em 0.38em;
+  color: var(--foreground);
+  font-family: var(--font-mono);
+  font-size: 0.78em;
+  line-height: 1.45;
+  vertical-align: 0.08em;
+}
+
+.markdown-content hr {
+  height: 0;
+  margin: 1.5em 0;
+  border: 0;
+  border-top: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
+}
+
+.markdown-content pre {
+  margin: 0.75em 0;
+  overflow-wrap: normal;
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--background);
+  padding: 12px 14px;
+  font-size: 13px;
+  line-height: 1.6;
+  tab-size: 2;
+}
+
+.markdown-content code {
+  font-family: var(--font-mono);
+  font-size: 0.86em;
+}
+
+.markdown-content :not(pre) > code {
+  border: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
+  border-radius: 4px;
+  background: var(--code-background);
+  padding: 0.12em 0.38em;
+  overflow-wrap: anywhere;
+  -webkit-box-decoration-break: clone;
+  box-decoration-break: clone;
+}
+
+.markdown-content ul,
+.markdown-content ol {
+  margin: 0.7em 0;
+  padding-left: 1.4em;
+}
+
+/* Tailwind preflight resets list-style to none — restore markers. */
+.markdown-content ul {
+  list-style: disc;
+}
+.markdown-content ol {
+  list-style: decimal;
+}
+
+.markdown-content li {
+  margin: 0.3em 0;
+  padding-left: 0.12em;
+  text-wrap: pretty;
+}
+
+.markdown-content li > ul,
+.markdown-content li > ol {
+  margin-block: 0.3em;
+}
+
+.markdown-content li::marker {
+  color: color-mix(in srgb, var(--muted-foreground) 82%, transparent);
+}
+
+.markdown-content input[type="checkbox"] {
+  width: 0.95em;
+  height: 0.95em;
+  margin: 0 0.45em 0 0;
+  accent-color: var(--primary);
+  vertical-align: -0.08em;
+}
+
+/* Obsidian-style [[name]] wikilinks → clickable entity references. */
+.markdown-content a.wikilink {
+  display: inline-block;
+  max-width: 100%;
+  color: var(--primary);
+  cursor: pointer;
+  text-decoration: none;
+  vertical-align: baseline;
+  overflow-wrap: anywhere;
+  border-bottom: 1px dashed color-mix(in srgb, var(--primary) 45%, transparent);
+}
+.markdown-content a.wikilink:hover {
+  border-bottom-style: solid;
+}
+
+.markdown-content a.session-signature {
+  color: var(--primary);
+  cursor: pointer;
+  font-weight: 600;
+  text-decoration: none;
+  border-radius: 4px;
+  padding: 0 2px;
+}
+
+.markdown-content a.session-signature:hover {
+  background: color-mix(in srgb, currentColor 10%, transparent);
+  text-decoration: underline;
+}
+
+.markdown-content blockquote {
+  margin: 0.9em 0;
+  border-left: 2px solid color-mix(in srgb, var(--primary) 72%, var(--border));
+  border-radius: 0 6px 6px 0;
+  background: color-mix(in srgb, var(--primary) 5%, transparent);
+  padding: 0.65em 0.9em;
+  color: color-mix(in srgb, var(--foreground) 72%, var(--muted-foreground));
+}
+
+.markdown-content blockquote > :first-child {
+  margin-top: 0;
+}
+
+.markdown-content blockquote > :last-child {
+  margin-bottom: 0;
+}
+
+.markdown-table-shell {
+  max-width: 100%;
+  margin: 0.9em 0;
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--card) 52%, transparent);
+  overscroll-behavior-inline: contain;
+}
+
+.markdown-content table {
+  width: 100%;
+  min-width: 34rem;
+  border-collapse: separate;
+  border-spacing: 0;
+  margin: 0;
+  font-size: 0.9em;
+  line-height: 1.5;
+}
+
+.markdown-content th,
+.markdown-content td {
+  border: 0;
+  border-right: 1px solid color-mix(in srgb, var(--border) 78%, transparent);
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 78%, transparent);
+  padding: 0.65em 0.8em;
+  text-align: left;
+  vertical-align: top;
+}
+
+.markdown-content tr > :last-child {
+  border-right: 0;
+}
+
+.markdown-content tbody tr:last-child > * {
+  border-bottom: 0;
+}
+
+.markdown-content th {
+  background: color-mix(in srgb, var(--muted) 58%, var(--card));
+  color: var(--foreground);
+  font-size: 0.9em;
+  font-weight: 650;
+  white-space: nowrap;
+}
+
+.markdown-content tbody tr:nth-child(even) td {
+  background: color-mix(in srgb, var(--muted) 14%, transparent);
+}
+
+.markdown-content img {
+  max-width: 100%;
+  height: auto;
+  margin: 1em auto;
+  border: 1px solid color-mix(in srgb, var(--border) 74%, transparent);
+  border-radius: 8px;
+}
+
+.markdown-content a {
+  color: var(--primary);
+  text-decoration-line: underline;
+  text-decoration-color: color-mix(in srgb, currentColor 36%, transparent);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 0.16em;
+  overflow-wrap: anywhere;
+}
+
+.markdown-content a:hover {
+  text-decoration-color: currentColor;
+}
+
+.markdown-content h1 {
+  margin: 1.2em 0 0.55em;
+  color: var(--foreground);
+  font-size: 1.45em;
+  font-weight: 680;
+  line-height: 1.28;
+  letter-spacing: -0.015em;
+  text-wrap: balance;
+}
+
+.markdown-content h2 {
+  margin: 1.25em 0 0.5em;
+  color: var(--foreground);
+  font-size: 1.22em;
+  font-weight: 670;
+  line-height: 1.35;
+  letter-spacing: -0.01em;
+  text-wrap: balance;
+}
+
+.markdown-content h3 {
+  margin: 1em 0 0.4em;
+  color: var(--foreground);
+  font-size: 1.05em;
+  font-weight: 650;
+  line-height: 1.4;
+}
+
+.markdown-content h4 {
+  margin: 0.95em 0 0.35em;
+  color: var(--foreground);
+  font-size: 1em;
+  font-weight: 650;
+  line-height: 1.45;
+}
+
+.markdown-content h1:first-child,
+.markdown-content h2:first-child,
+.markdown-content h3:first-child,
+.markdown-content h4:first-child {
+  margin-top: 0;
+}
+
+/* Durable reports use a narrower measure, clearer section rhythm, and slightly
+   larger text. This is deliberately not a card: the document remains the one
+   dominant surface inside the existing application shell. */
+.markdown-content--reading {
+  --markdown-font-size: 15px;
+  --markdown-leading: 1.72;
+  color: color-mix(in srgb, var(--foreground) 84%, var(--muted-foreground));
+  font-kerning: normal;
+  text-rendering: optimizeLegibility;
+}
+
+.markdown-content--reading p {
+  margin-block: 0.82em;
+}
+
+.markdown-content--reading strong {
+  font-weight: 620;
+}
+
+/* Long CJK italics are difficult to scan and commonly appear as report decks.
+   Treat a first-paragraph, all-emphasis block as editorial standfirst text. */
+.markdown-content--reading > p:first-of-type:has(> em:only-child) {
+  max-width: 44rem;
+  margin: 0 0 2.2rem;
+  border-left: 2px solid color-mix(in srgb, var(--primary) 58%, var(--border));
+  padding-left: 1rem;
+  color: color-mix(in srgb, var(--foreground) 70%, var(--muted-foreground));
+  font-size: 0.98em;
+  line-height: 1.78;
+}
+
+.markdown-content--reading > p:first-of-type:has(> em:only-child) em {
+  font-style: normal;
+}
+
+.markdown-content--reading h1 {
+  max-width: 100%;
+  margin-bottom: 1.35rem;
+  font-size: clamp(1.45rem, 2.3vw, 1.75rem);
+  font-weight: 660;
+  line-height: 1.24;
+  letter-spacing: -0.02em;
+  text-wrap: pretty;
+}
+
+/* Inbox supplies a stable document title above provenance. When the stored
+ * report opens with that exact Markdown heading, keep the source untouched but
+ * avoid rendering the same title twice. The outer h1 preserves the document
+ * outline for assistive technology. */
+.inbox-report-body--repeats-heading .markdown-content--reading > h1:first-child {
+  display: none;
+}
+
+.markdown-content--reading h2 {
+  margin-top: 2.6em;
+  margin-bottom: 0.75em;
+  border-top: 1px solid color-mix(in srgb, var(--border) 64%, transparent);
+  padding-top: 0.85em;
+  font-size: 1.24em;
+  font-weight: 660;
+  line-height: 1.35;
+  letter-spacing: -0.012em;
+}
+
+.markdown-content--reading h3 {
+  margin-top: 1.75em;
+  margin-bottom: 0.5em;
+  font-size: 1.04em;
+  font-weight: 650;
+}
+
+.markdown-content--reading h4 {
+  margin-top: 1.35em;
+}
+
+.markdown-content--reading hr {
+  width: min(100%, 10rem);
+  margin: 2.25em 0;
+  border-top-color: color-mix(in srgb, var(--border) 78%, transparent);
+}
+
+.markdown-content--reading blockquote {
+  margin-block: 1.35em;
+  padding: 0.8em 1em;
+  font-size: 0.94em;
+  line-height: 1.65;
+}
+
+.markdown-content--reading ul,
+.markdown-content--reading ol {
+  margin-block: 0.8em;
+  padding-left: 1.35em;
+}
+
+.markdown-content--reading li {
+  margin-block: 0.34em;
+  padding-left: 0.12em;
+}
+
+.markdown-content--reading .markdown-table-shell {
+  margin-block: 1.25em 1.8em;
+  border-color: color-mix(in srgb, var(--border) 72%, transparent);
+  background: transparent;
+}
+
+.markdown-content--reading table {
+  font-size: 0.84em;
+  line-height: 1.42;
+}
+
+.markdown-content--reading th,
+.markdown-content--reading td {
+  padding: 0.58em 0.72em;
+}
+
+.markdown-content--reading th {
+  background: color-mix(in srgb, var(--muted) 38%, var(--card));
+  font-size: 0.88em;
+  font-weight: 620;
+}
+
+.markdown-content--reading .code-block-wrapper {
+  margin-block: 1.35em;
+}
+
+@media (max-width: 639px) {
+  .markdown-content--reading {
+    --markdown-font-size: 14.5px;
+    --markdown-leading: 1.7;
+  }
+
+  .markdown-content--reading h1 {
+    font-size: 1.45rem;
+  }
+
+  .markdown-content--reading h2 {
+    font-size: 1.2em;
+  }
+
+  .markdown-content table {
+    min-width: 30rem;
+  }
+}
+
+/* Issue What visual editor. Tiptap owns the editable DOM, while these rules
+   deliberately reuse read-mode typography so the always-editable body still
+   feels like part of the Issue rather than a separate source application. */
+.what-editor-content .ProseMirror {
+  min-height: 12rem;
+  padding: 0.75rem 1rem;
+  outline: none;
+  cursor: text;
+}
+.what-editor-content .ProseMirror > *:first-child {
+  margin-top: 0;
+}
+.what-editor-content .ProseMirror > *:last-child {
+  margin-bottom: 0;
+}
+.what-editor-content .ProseMirror-focused {
+  background: transparent;
+}
+.what-editor-content .ProseMirror-selectednode {
+  outline: 2px solid color-mix(in srgb, var(--primary) 45%, transparent);
+  border-radius: 4px;
+}
+.what-editor-content .ProseMirror p.is-editor-empty:first-child::before {
+  color: var(--muted-foreground);
+  content: attr(data-placeholder);
+  float: left;
+  height: 0;
+  pointer-events: none;
+}
+
+/* Thinking animation */
+@keyframes blink {
+  0%,
+  20% {
+    opacity: 0.2;
+  }
+  50% {
+    opacity: 1;
+  }
+  80%,
+  100% {
+    opacity: 0.2;
+  }
+}
+.thinking-dot {
+  animation: blink 0.9s infinite;
+  font-size: 20px;
+  line-height: 1;
+}
+.thinking-dot:nth-child(2) {
+  animation-delay: 0.15s;
+}
+.thinking-dot:nth-child(3) {
+  animation-delay: 0.3s;
+}
+
+/* Message entrance animation */
+@keyframes fadeSlideIn {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.message-enter {
+  animation: fadeSlideIn 0.3s ease-out;
+}
+
+/* Page transition animation */
+@keyframes pageFadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+.page-fade-in {
+  animation: pageFadeIn 150ms ease-out;
+}
+
+/* Code block wrapper for copy button */
+.code-block-wrapper {
+  position: relative;
+}
+.code-block-wrapper .code-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background: var(--muted);
+  border: 1px solid var(--border);
+  border-bottom: none;
+  border-radius: 6px 6px 0 0;
+  padding: 4px 8px 4px 12px;
+  font-size: 12px;
+  color: var(--muted-foreground);
+  font-family: var(--font-mono);
+}
+.code-block-wrapper .code-copy-btn {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  background: none;
+  border: none;
+  color: var(--muted-foreground);
+  cursor: pointer;
+  font-size: 12px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  transition: color 0.15s, background 0.15s;
+  font-family: var(--font-sans);
+}
+.code-block-wrapper .code-copy-btn:hover {
+  color: var(--foreground);
+  /* Theme-aware wash — navy in Daybreak, white in Midnight. The old
+     hardcoded rgba(255,255,255,…) was invisible in light mode. */
+  background: var(--accent-strong);
+}
+.code-block-wrapper .code-copy-btn.copied {
+  color: var(--success);
+}
+.code-block-wrapper pre {
+  margin-top: 0 !important;
+  border-top-left-radius: 0 !important;
+  border-top-right-radius: 0 !important;
+}
+
+/* Workspace Manager lives beside both the activity rail and the Ask Alice
+   sidebar, so viewport breakpoints overestimate the width it can actually use.
+   Size the layout against the page container and keep every grid track
+   shrinkable so long conversation titles cannot force horizontal overflow. */
+.workspace-manager-layout {
+  container: workspace-manager-layout / inline-size;
+}
+
+.workspace-manager-suggestions {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.workspace-manager-suggestions-section {
+  container: workspace-manager-suggestions / inline-size;
+}
+
+@container workspace-manager-layout (min-width: 34rem) {
+  .workspace-manager-composer-actions {
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+  }
+}
+
+@container workspace-manager-layout (min-width: 48rem) {
+  .workspace-manager-hero {
+    flex-direction: row;
+    align-items: flex-end;
+    justify-content: space-between;
+  }
+
+  .workspace-manager-stats {
+    width: 18rem;
+  }
+}
+
+@container workspace-manager-suggestions (min-width: 34rem) {
+  .workspace-manager-suggestions {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+/* Final cascade-level safety net. Several domain animations are declared
+   below the first reduced-motion block, so this lives at EOF on purpose. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
