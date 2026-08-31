@@ -1,0 +1,80 @@
+name: Go
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "go/**"
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "go/**"
+  workflow_dispatch:
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v7
+        with:
+          version: latest
+          working-directory: go
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    env:
+      KIMI_BASE_URL: ${{ secrets.KIMI_BASE_URL }}
+      KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install kimi-cli
+        run: |
+          uv tool install --python 3.13 kimi-cli
+          mkdir -p ~/.kimi
+          cat > ~/.kimi/config.toml <<TOML
+          default_model = "kimi-for-coding"
+
+          [models.kimi-for-coding]
+          provider = "kimi-for-coding"
+          model = "kimi-for-coding"
+          max_context_size = 262144
+
+          [providers.kimi-for-coding]
+          type = "kimi"
+          base_url = "$KIMI_BASE_URL"
+          api_key = "$KIMI_API_KEY"
+          TOML
+          kimi --print -c hi
+
+      - name: Run unit tests
+        working-directory: go
+        run: go test -cover -v $(go list ./... | grep -v /test/)
+
+      - name: Run integration tests
+        working-directory: go
+        run: |
+          go build -o test/integration/testdata/mock_kimi test/integration/testdata/mock_kimi.go
+          go test -race -count=5 -v ./test/integration/...
+
+      - name: Run e2e tests
+        working-directory: go
+        run: go test -race -count=5 -v ./test/e2e/...

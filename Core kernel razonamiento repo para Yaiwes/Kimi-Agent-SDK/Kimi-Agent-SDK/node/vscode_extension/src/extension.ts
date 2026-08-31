@@ -1,0 +1,149 @@
+import * as vscode from "vscode";
+import * as util from "util";
+
+import { KimiWebviewProvider } from "./KimiWebviewProvider";
+import { onSettingsChange, VSCodeSettings } from "./config/vscode-settings";
+import { initCLIManager, BaselineManager } from "./managers";
+import { Events } from "../shared/bridge";
+import { updateLoginContext } from "./utils/context";
+import { enableLogs, setLogSink } from "@moonshot-ai/kimi-agent-sdk";
+
+let outputChannel: vscode.OutputChannel;
+let provider: KimiWebviewProvider;
+
+export function activate(context: vscode.ExtensionContext) {
+  outputChannel = vscode.window.createOutputChannel("Kimi Code");
+
+  enableLogs("kimi-sdk:*");
+  setLogSink((...args: any[]) => {
+    console.log(...args);
+
+    const message = util.format(...args).replace(/\x1b\[[0-9;]*m/g, "");
+    outputChannel.appendLine(message);
+  });
+  console.log("Kimi SDK logs enabled");
+
+  const remoteInfo = vscode.env.remoteName ? ` (remote: ${vscode.env.remoteName})` : "";
+  log(`Kimi Code extension activating...${remoteInfo}`);
+
+  initCLIManager(context);
+
+  provider = new KimiWebviewProvider(context.extensionUri, context.workspaceState, () => outputChannel.show());
+
+  // Initialize context state
+  updateLoginContext();
+
+  context.subscriptions.push(provider);
+  context.subscriptions.push(outputChannel);
+
+  context.subscriptions.push(
+    vscode.workspace.registerTextDocumentContentProvider("kimi-baseline", {
+      provideTextDocumentContent: async (uri: vscode.Uri) => {
+        const params = new URLSearchParams(uri.query);
+        const workDir = params.get("workDir");
+        const sessionId = params.get("sessionId");
+        if (!workDir || !sessionId) {
+          return "";
+        }
+
+        const relativePath = uri.path.slice(1);
+        const content = BaselineManager.getBaselineContent(workDir, sessionId, relativePath);
+        return content ?? "";
+      },
+    }),
+  );
+
+  context.subscriptions.push(
+    onSettingsChange((changedKeys) => {
+      provider.broadcast(Events.ExtensionConfigChanged, {
+        config: VSCodeSettings.getExtensionConfig(),
+        changedKeys,
+      });
+    }),
+  );
+
+  context.subscriptions.push(
+    vscode.window.registerWebviewViewProvider("kimi.webview", provider, {
+      webviewOptions: { retainContextWhenHidden: true },
+    }),
+  );
+
+  const commands: Record<string, () => void | Promise<void>> = {
+    "kimi.clearAllState": async () => {
+      await context.globalState.update("kimi.config", undefined);
+      await context.globalState.update("kimi.mcpServers", undefined);
+      await context.workspaceState.update("kimi.mcpEnabled", undefined);
+      vscode.window.showInformationMessage("Kimi: All state cleared!");
+    },
+    "kimi.openInTab": () => {
+      log("Opening Kimi in new tab");
+      provider.createPanel();
+    },
+    "kimi.openInSideBar": async () => {
+      log("Opening Kimi in side bar");
+      await vscode.commands.executeCommand("kimi.webview.focus");
+    },
+    "kimi.focusInput": async () => {
+      log("Focusing Kimi input");
+      await vscode.commands.executeCommand("kimi.webview.focus");
+      provider.broadcast(Events.FocusInput, {});
+    },
+    "kimi.insertMention": async () => {
+      const editor = vscode.window.activeTextEditor;
+      if (!editor) {
+        vscode.window.showWarningMessage("No active editor");
+        return;
+      }
+      const document = editor.document;
+      const selection = editor.selection;
+      const relativePath = vscode.workspace.asRelativePath(document.uri);
+
+      let mention: string;
+      if (selection.isEmpty) {
+        mention = `@${relativePath}`;
+      } else {
+        const startLine = selection.start.line + 1;
+        const endLine = selection.end.line + 1;
+        mention = startLine === endLine ? `@${relativePath}:${startLine}` : `@${relativePath}:${startLine}-${endLine}`;
+      }
+
+      log(`Inserting mention: ${mention}`);
+      await vscode.commands.executeCommand("kimi.webview.focus");
+      provider.broadcast(Events.InsertMention, { mention });
+    },
+    "kimi.newConversation": async () => {
+      log("Starting new conversation");
+      await vscode.commands.executeCommand("kimi.webview.focus");
+      provider.broadcast(Events.NewConversation, {});
+    },
+    "kimi.showLogs": () => {
+      outputChannel.show();
+    },
+    "kimi.resetKimi": async () => {
+      log("Resetting Kimi");
+      provider.reloadAllWebviews();
+    },
+    "kimi.logout": async () => {
+      log("Logout requested via command palette");
+      await vscode.commands.executeCommand("kimi.webview.focus");
+      vscode.window.showInformationMessage("Please use the logout button in Kimi settings.");
+    },
+  };
+
+  for (const [id, handler] of Object.entries(commands)) {
+    context.subscriptions.push(vscode.commands.registerCommand(id, handler));
+  }
+
+  log("Kimi extension activated");
+}
+
+export function deactivate() {
+  log("Kimi extension deactivating...");
+}
+
+function log(message: string) {
+  const timestamp = new Date().toISOString();
+  outputChannel?.appendLine(`[${timestamp}] ${message}`);
+}
+
+export { log };
