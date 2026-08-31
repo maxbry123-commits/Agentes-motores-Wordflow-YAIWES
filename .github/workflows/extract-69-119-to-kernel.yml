@@ -1,0 +1,24 @@
+name: Extract 69-119 to kernel
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: dest-main-serial
+  cancel-in-progress: false
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          lfs: false
+      - name: EXTRACT 69-119 slugs into kernel dest
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y unzip
+          python3 scripts/extract_69_119_kernel.py 'Download code/archivos' 'Core kernel razonamiento repo para Yaiwes'
