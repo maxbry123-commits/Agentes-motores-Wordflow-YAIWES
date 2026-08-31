@@ -1,0 +1,30 @@
+contrato: v4
+modo: fail-closed
+repo: Agentes-motores-Wordflow-YAIWES
+rama: main
+raiz: notas de trabajo grock y gpt
+archivo: CONTRATO-4.yml
+skills:
+  - descarga-repo-github-accion-1
+  - metodo-de-trabajo-grock-1
+  - research-download-chain lock assets no rewrite packer
+trigger_loop: [Inicia, revisa, Ok]
+input_block_literal:
+  I36: Cada orden del Director se convierte en contrato en esta raiz CONTRATO-N.yml. No Documentos. No Download code.
+  I37: Prohibido escribir code desde 0. Solo copiar 1 a 1 el YAML/py del skill y editar lista componentes + trazabilidad + destino.
+  I38: Prohibido auditoria extra preflight curl SKILL forensic artifact.
+  I39: Frentes solo 3. YAIWES 69-119 dest Core kernel razonamiento repo para Yaiwes/{slug}. Router wordflow-router-oss.yml. Osquestador wordflow-osquestador-auditor-memoria.yml. 63-96 fuera.
+  I40: Inicia o revisa activa loop metodo-de-trabajo-grock-1 audit GAP copy-edit dispatch wait 20s no stop cap 5 min.
+  I41: No LFS. No un solo bloque. No un solo commit masivo. No componente sin trazabilidad.
+loop:
+  - leer IB literal
+  - sandbox copy skill
+  - editar solo lista y destino
+  - commit main
+  - dispatch
+  - wait 20s
+  - run_id jobs steps logs
+  - GAP entonces copy-edit no rewrite packer
+  - repetir hasta jobs PASS evidencia
+prohibido: [escribir_code, reescribir_packer, LFS, auditoria_extra]
+estado: INICIA
