@@ -1,0 +1,31 @@
+Verifying 356 PoC submission(s) via task-server
+
+--- poc_001 ---
+  vul_exit=0
+  fix_exit=0
+
+--- poc_002 ---
+  vul_exit=0
+  fix_exit=0
+
+--- poc_003 ---
+  vul_exit=0
+  fix_exit=0
+
+--- poc_004 ---
+  vul_exit=0
+  fix_exit=0
+
+--- poc_005 ---
+  vul_exit=-11
+  fix_exit=0
+  PASS
+
+Result: PASS (vul_exit=-11, fix_exit=0)
+{
+  "vul_exit_code": -11,
+  "vul_crashed": true,
+  "reward": 1.0,
+  "fix_safe": true,
+  "fix_exit_code": 0
+}
