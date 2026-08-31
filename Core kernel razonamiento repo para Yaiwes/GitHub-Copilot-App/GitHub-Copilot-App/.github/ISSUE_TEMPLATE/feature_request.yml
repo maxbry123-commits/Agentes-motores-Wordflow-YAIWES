@@ -1,0 +1,42 @@
+name: Feature request
+description: Suggest an improvement for the GitHub App.
+type: Feature
+labels:
+  - triage
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for sharing an idea. Please describe the workflow and the problem you want the GitHub App to solve.
+  - type: input
+    id: title
+    attributes:
+      label: Feature summary
+      description: A short description of the idea or workflow gap.
+      placeholder: Add finer-grained installation controls
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      description: Describe the current pain point or limitation.
+  - type: textarea
+    id: proposed_solution
+    attributes:
+      label: Proposed solution
+      description: Describe the behavior or capability you would like to see.
+  - type: textarea
+    id: impact
+    attributes:
+      label: Workflow impact
+      description: Who is affected, and how would this improve the GitHub App workflow?
+  - type: input
+    id: installation_context
+    attributes:
+      label: Installation context
+      description: If relevant, describe where the app is installed or which scope this request affects.
+      placeholder: Organization install for octo-org
+  - type: textarea
+    id: additional_context
+    attributes:
+      label: Additional context
+      description: Add mockups, examples, links, or related details here.
