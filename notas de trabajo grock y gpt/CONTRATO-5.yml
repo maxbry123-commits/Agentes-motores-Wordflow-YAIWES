@@ -1,0 +1,29 @@
+contrato: v5
+modo: fail-closed
+repo_contratos: Agentes-motores-Wordflow-YAIWES
+rama: main
+raiz: notas de trabajo grock y gpt
+archivo: CONTRATO-5.yml
+skills:
+  - metodo-de-trabajo-grock-1
+  - descarga-repo-github-accion-1
+trigger_loop: [Inicia, revisa, Ok]
+input_block_literal:
+  I42: Destinos confirmados. control-layer permanece. extensions permanece. .github se queda.
+  I43: NO MOVER ninguno de control-layer extensions .github. Solo limpiar basura.
+  I44: Purge YAML muertos en agentes/.github/workflows. Conservar research-download-chain.yml research-download-chain-63-96.yml runner-initialization-probe.yml y el GHA de limpieza.
+  I45: Basura raiz agentes = zip sueltos loop-engineer-main.zip maxbry_continuous_loop.zip maxbry_continuous_loop_v2.zip. No tocar Download code. No tocar agente-yaiwes.
+  I46: Limpieza la hace GitHub Action no Grok a mano. Copiar YAML skill extract-kernel. Solo editar lista rm. No escribir packer. No LFS. No auditoria extra.
+  I47: Frentes download 69-119 YAIWES kernel. Router wordflow-router-oss. Osquestador wordflow-osquestador-auditor-memoria. 63-96 fuera de cola.
+  I48: Inicia o revisa activa loop. Dispatch wait 20s auditar jobs. GAP copy-edit lista. Cap 5 min avisar.
+loop:
+  - leer IB literal
+  - copy skill YAML
+  - editar solo lista
+  - commit main
+  - dispatch
+  - wait 20s
+  - jobs steps
+  - GAP entonces editar lista no packer
+prohibido: [mover_control_layer, mover_extensions, borrar_.github, escribir_code, reescribir_packer, LFS, auditoria_extra]
+estado: INICIA
