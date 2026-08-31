@@ -1,0 +1,83 @@
+import { source } from "@/lib/source";
+import { DocsPage, DocsBody, DocsTitle, DocsDescription } from "fumadocs-ui/layouts/docs/page";
+import { notFound } from "next/navigation";
+import { getMDXComponents } from "@/mdx-components";
+import type { Metadata } from "next";
+import type { MDXContent } from "mdx/types";
+import type { TOCItemType } from "fumadocs-core/toc";
+
+const docsOgImage =
+  "https://www.agent-swarm.dev/api/og?title=agent-swarm.dev+Documentation&subtitle=Reference+guides%2C+architecture%2C+and+operating+manuals+for+multi-agent+AI+coding+teams.";
+
+interface DocsPageData {
+  title: string;
+  description?: string;
+  body: MDXContent;
+  toc: TOCItemType[];
+  full?: boolean;
+}
+
+export default async function Page(props: { params: Promise<{ slug?: string[] }> }) {
+  const params = await props.params;
+  const page = source.getPage(params.slug);
+  if (!page) notFound();
+
+  const data = page.data as unknown as DocsPageData;
+  const MDX = data.body;
+
+  return (
+    <DocsPage toc={data.toc} full={data.full}>
+      <DocsTitle>{data.title}</DocsTitle>
+      <DocsDescription>{data.description}</DocsDescription>
+      <DocsBody>
+        <MDX components={getMDXComponents()} />
+      </DocsBody>
+    </DocsPage>
+  );
+}
+
+export async function generateStaticParams() {
+  return source.generateParams();
+}
+
+export async function generateMetadata(props: {
+  params: Promise<{ slug?: string[] }>;
+}): Promise<Metadata> {
+  const params = await props.params;
+  const page = source.getPage(params.slug);
+  if (!page) notFound();
+
+  const title = page.data.title;
+  const description = page.data.description;
+  const slug = params.slug?.join("/") ?? "";
+  const url = `https://docs.agent-swarm.dev/docs${slug ? `/${slug}` : ""}`;
+
+  return {
+    title,
+    description,
+    alternates: {
+      canonical: url,
+    },
+    openGraph: {
+      title: `${title} | agent-swarm.dev`,
+      description,
+      url,
+      siteName: "agent-swarm.dev Docs",
+      type: "article",
+      images: [
+        {
+          url: docsOgImage,
+          width: 1200,
+          height: 630,
+          alt: `${title} — agent-swarm.dev Documentation`,
+        },
+      ],
+    },
+    twitter: {
+      card: "summary_large_image",
+      title: `${title} | agent-swarm.dev`,
+      description,
+      images: [docsOgImage],
+    },
+  };
+}

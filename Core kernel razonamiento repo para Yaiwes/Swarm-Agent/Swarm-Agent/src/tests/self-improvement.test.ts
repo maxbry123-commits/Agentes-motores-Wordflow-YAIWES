@@ -1,0 +1,586 @@
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { unlink } from "node:fs/promises";
+import {
+  closeDb,
+  completeTask,
+  createAgent,
+  createTaskExtended,
+  failTask,
+  getAgentById,
+  initDb,
+} from "../be/db";
+import { SqliteMemoryStore } from "../be/memory/providers/sqlite-store";
+import {
+  isAutomaticOrRecurringTaskCompletion,
+  isScheduledTaskCompletion,
+  shouldPersistTaskCompletionMemory,
+} from "../memory/automatic-task-gate";
+import { getBasePrompt } from "../prompts/base-prompt";
+
+const TEST_DB_PATH = "./test-self-improvement.sqlite";
+
+describe("Self-Improvement Mechanisms", () => {
+  const leadId = "aaaa0000-0000-4000-8000-000000000001";
+  const workerId = "bbbb0000-0000-4000-8000-000000000002";
+  const otherWorkerId = "cccc0000-0000-4000-8000-000000000003";
+  let store: SqliteMemoryStore;
+
+  beforeAll(async () => {
+    for (const suffix of ["", "-wal", "-shm"]) {
+      try {
+        await unlink(TEST_DB_PATH + suffix);
+      } catch {
+        // File doesn't exist
+      }
+    }
+
+    closeDb();
+    initDb(TEST_DB_PATH);
+    store = new SqliteMemoryStore();
+
+    await createAgent({ id: leadId, name: "Test Lead", isLead: true, status: "idle" });
+    await createAgent({ id: workerId, name: "Test Worker", isLead: false, status: "idle" });
+    await createAgent({ id: otherWorkerId, name: "Other Worker", isLead: false, status: "idle" });
+  });
+
+  afterAll(async () => {
+    closeDb();
+    for (const suffix of ["", "-wal", "-shm"]) {
+      try {
+        await unlink(TEST_DB_PATH + suffix);
+      } catch {
+        // File doesn't exist
+      }
+    }
+  });
+
+  // ==========================================================================
+  // P2: store-progress memory indexing for completed and failed tasks
+  // ==========================================================================
+
+  describe("store-progress memory indexing", () => {
+    test("completed task creates agent-scoped memory with output", async () => {
+      const task = await createTaskExtended("Test task for completion", {
+        agentId: workerId,
+        source: "mcp",
+        priority: 50,
+      });
+
+      const output = "Successfully completed the task with great results";
+      await completeTask(task.id, output);
+
+      // Simulate what store-progress does: create memory for completed task
+      const taskContent = `Task: ${task.task}\n\nOutput:\n${output}`;
+      const memory = await store.store({
+        agentId: workerId,
+        content: taskContent,
+        name: `Task: ${task.task.slice(0, 80)}`,
+        scope: "agent",
+        source: "task_completion",
+        sourceTaskId: task.id,
+      });
+
+      expect(memory.scope).toBe("agent");
+      expect(memory.source).toBe("task_completion");
+      expect(memory.sourceTaskId).toBe(task.id);
+      expect(memory.content).toContain("Output:");
+      expect(memory.content).toContain(output);
+      expect(memory.content).not.toContain("undefined");
+    });
+
+    test("completed task with undefined output uses fallback", async () => {
+      const task = await createTaskExtended("Task without output", {
+        agentId: workerId,
+        source: "mcp",
+        priority: 50,
+      });
+
+      const output: string | undefined = undefined;
+      await completeTask(task.id, output);
+
+      // Simulate store-progress logic with undefined guard
+      const taskContent = `Task: ${task.task}\n\nOutput:\n${output || "(no output)"}`;
+
+      expect(taskContent).toContain("(no output)");
+      expect(taskContent).not.toContain("undefined");
+    });
+
+    test("failed task creates memory with failure reason", async () => {
+      const task = await createTaskExtended("Task that will fail", {
+        agentId: workerId,
+        source: "mcp",
+        priority: 50,
+      });
+
+      const failureReason = "Could not connect to external API";
+      await failTask(task.id, failureReason);
+
+      // Simulate store-progress failed task memory creation
+      const taskContent = `Task: ${task.task}\n\nFailure reason:\n${failureReason}\n\nThis task failed. Learn from this to avoid repeating the mistake.`;
+      const memory = await store.store({
+        agentId: workerId,
+        content: taskContent,
+        name: `Task: ${task.task.slice(0, 80)}`,
+        scope: "agent",
+        source: "task_completion",
+        sourceTaskId: task.id,
+      });
+
+      expect(memory.source).toBe("task_completion");
+      expect(memory.content).toContain("Failure reason:");
+      expect(memory.content).toContain(failureReason);
+      expect(memory.content).toContain("Learn from this");
+    });
+
+    test("failed task with undefined failureReason uses fallback", () => {
+      const failureReason: string | undefined = undefined;
+
+      // Simulate store-progress logic with undefined guard
+      const taskContent = `Task: Some task\n\nFailure reason:\n${failureReason || "No reason provided"}\n\nThis task failed.`;
+
+      expect(taskContent).toContain("No reason provided");
+      expect(taskContent).not.toContain("undefined");
+    });
+
+    test("short task content is skipped (< 30 chars)", () => {
+      // Simulate the length check in store-progress
+      const shortContent = "Task: X\n\nOutput:\n";
+      expect(shortContent.length).toBeLessThan(30);
+      // In store-progress, this would return early without creating memory
+    });
+
+    test("manual task completions persist memory by default", async () => {
+      const task = await createTaskExtended("Manual implementation task", {
+        agentId: workerId,
+        source: "mcp",
+        priority: 50,
+        tags: ["memory", "bug-fix"],
+      });
+
+      expect(isScheduledTaskCompletion(task)).toBe(false);
+      expect(shouldPersistTaskCompletionMemory(task)).toBe(true);
+    });
+
+    test("scheduled task completions skip memory by default", async () => {
+      const task = await createTaskExtended("Run heartbeat checklist", {
+        agentId: workerId,
+        source: "schedule",
+        priority: 50,
+        tags: ["scheduled", "schedule:heartbeat-checklist"],
+      });
+
+      expect(isScheduledTaskCompletion(task)).toBe(true);
+      expect(isAutomaticOrRecurringTaskCompletion(task)).toBe(true);
+      expect(shouldPersistTaskCompletionMemory(task)).toBe(false);
+    });
+
+    test("heartbeat checklist completions skip memory without schedule tags", async () => {
+      const task = await createTaskExtended("Run heartbeat checklist", {
+        agentId: workerId,
+        source: "mcp",
+        priority: 60,
+        taskType: "heartbeat-checklist",
+        tags: ["checklist", "auto-generated"],
+      });
+
+      expect(isScheduledTaskCompletion(task)).toBe(false);
+      expect(isAutomaticOrRecurringTaskCompletion(task)).toBe(true);
+      expect(shouldPersistTaskCompletionMemory(task)).toBe(false);
+    });
+
+    test("boot triage completions skip memory by default", async () => {
+      const task = await createTaskExtended("Triage reboot-interrupted work", {
+        agentId: workerId,
+        source: "mcp",
+        priority: 80,
+        taskType: "boot-triage",
+        tags: ["boot", "triage", "auto-generated"],
+      });
+
+      expect(isAutomaticOrRecurringTaskCompletion(task)).toBe(true);
+      expect(shouldPersistTaskCompletionMemory(task)).toBe(false);
+    });
+
+    test("monitor and digest completions skip memory by default", async () => {
+      const monitorTask = await createTaskExtended("Check Claude Code changelog", {
+        agentId: workerId,
+        source: "schedule",
+        priority: 50,
+        taskType: "monitoring",
+        tags: ["health", "schedule:claude-code-changelog-monitor"],
+      });
+      const digestTask = await createTaskExtended("Compile daily blocker digest", {
+        agentId: workerId,
+        source: "schedule",
+        priority: 50,
+        tags: ["scheduled", "schedule:daily-blocker-digest"],
+      });
+
+      expect(isAutomaticOrRecurringTaskCompletion(monitorTask)).toBe(true);
+      expect(shouldPersistTaskCompletionMemory(monitorTask)).toBe(false);
+      expect(isAutomaticOrRecurringTaskCompletion(digestTask)).toBe(true);
+      expect(shouldPersistTaskCompletionMemory(digestTask)).toBe(false);
+    });
+
+    test("scheduled task completions can opt in to memory persistence", async () => {
+      const task = await createTaskExtended("Daily digest found reusable incident pattern", {
+        agentId: workerId,
+        source: "schedule",
+        priority: 50,
+        tags: ["scheduled", "schedule:daily-blocker-digest"],
+      });
+
+      expect(shouldPersistTaskCompletionMemory(task, true)).toBe(true);
+    });
+  });
+
+  // ==========================================================================
+  // P3: Swarm memory auto-promotion
+  // ==========================================================================
+
+  describe("swarm memory auto-promotion", () => {
+    test("research task type promotes to swarm scope", async () => {
+      const task = await createTaskExtended("Research best practices for testing", {
+        agentId: workerId,
+        source: "mcp",
+        priority: 50,
+        taskType: "research",
+      });
+
+      await completeTask(task.id, "Found several useful patterns");
+
+      // Simulate the shouldShareWithSwarm logic
+      const shouldShareWithSwarm =
+        task.taskType === "research" ||
+        task.tags?.includes("knowledge") ||
+        task.tags?.includes("shared");
+
+      expect(shouldShareWithSwarm).toBe(true);
+
+      // Verify swarm memory can be created
+      const swarmMemory = await store.store({
+        agentId: workerId,
+        scope: "swarm",
+        name: `Shared: ${task.task.slice(0, 80)}`,
+        content: `Task completed by agent ${workerId}:\n\nTask: ${task.task}\n\nOutput:\nFound several useful patterns`,
+        source: "task_completion",
+        sourceTaskId: task.id,
+      });
+
+      expect(swarmMemory.scope).toBe("swarm");
+      expect(swarmMemory.source).toBe("task_completion");
+    });
+
+    test("knowledge-tagged task promotes to swarm scope", async () => {
+      const task = await createTaskExtended("Document API conventions", {
+        agentId: workerId,
+        source: "mcp",
+        priority: 50,
+        tags: ["knowledge"],
+      });
+
+      const shouldShareWithSwarm =
+        task.taskType === "research" ||
+        task.tags?.includes("knowledge") ||
+        task.tags?.includes("shared");
+
+      expect(shouldShareWithSwarm).toBe(true);
+    });
+
+    test("shared-tagged task promotes to swarm scope", async () => {
+      const task = await createTaskExtended("Build shared utility", {
+        agentId: workerId,
+        source: "mcp",
+        priority: 50,
+        tags: ["shared", "utility"],
+      });
+
+      const shouldShareWithSwarm =
+        task.taskType === "research" ||
+        task.tags?.includes("knowledge") ||
+        task.tags?.includes("shared");
+
+      expect(shouldShareWithSwarm).toBe(true);
+    });
+
+    test("regular task does NOT promote to swarm scope", async () => {
+      const task = await createTaskExtended("Fix a typo", {
+        agentId: workerId,
+        source: "mcp",
+        priority: 50,
+        taskType: "quick-fix",
+        tags: ["bug-fix"],
+      });
+
+      const shouldShareWithSwarm =
+        task.taskType === "research" ||
+        task.tags?.includes("knowledge") ||
+        task.tags?.includes("shared");
+
+      expect(shouldShareWithSwarm).toBe(false);
+    });
+
+    test("failed task does NOT promote to swarm scope", async () => {
+      const task = await createTaskExtended("Research something", {
+        agentId: workerId,
+        source: "mcp",
+        priority: 50,
+        taskType: "research",
+      });
+
+      const status = "failed";
+      // In store-progress, shouldShareWithSwarm only fires for status === "completed"
+      const shouldShareWithSwarm =
+        status === "completed" &&
+        (task.taskType === "research" ||
+          task.tags?.includes("knowledge") ||
+          task.tags?.includes("shared"));
+
+      expect(shouldShareWithSwarm).toBe(false);
+    });
+  });
+
+  // ==========================================================================
+  // P6: inject-learning tool
+  // ==========================================================================
+
+  describe("inject-learning tool logic", () => {
+    test("lead agent can inject learning into worker memory (swarm-scoped)", async () => {
+      const callerAgent = await getAgentById(leadId);
+      expect(callerAgent).not.toBeNull();
+      expect(callerAgent!.isLead).toBe(true);
+
+      const category = "best-practice";
+      const learning = "Always run lint before committing";
+      const content = `[Lead Feedback — ${category}]\n\n${learning}`;
+
+      const memory = await store.store({
+        agentId: workerId,
+        scope: "swarm",
+        name: `Lead feedback: ${category} — ${learning.slice(0, 60)}`,
+        content,
+        source: "manual",
+      });
+
+      expect(memory.agentId).toBe(workerId);
+      expect(memory.scope).toBe("swarm");
+      expect(memory.content).toContain("[Lead Feedback — best-practice]");
+      expect(memory.content).toContain(learning);
+    });
+
+    test("non-lead agent is rejected", async () => {
+      const callerAgent = await getAgentById(workerId);
+      expect(callerAgent).not.toBeNull();
+      expect(callerAgent!.isLead).toBe(false);
+
+      // In the tool handler, this check prevents non-leads from injecting
+      const canInject = callerAgent!.isLead;
+      expect(canInject).toBe(false);
+    });
+
+    test("injected learning is visible to target worker in memory search", async () => {
+      // Create memory with embedding for searchability
+      const content = "[Lead Feedback — mistake-pattern]\n\nNever force-push to main branch";
+      const memory = await store.store({
+        agentId: workerId,
+        scope: "agent",
+        name: "Lead feedback: mistake-pattern — Never force-push to main branch",
+        content,
+        source: "manual",
+      });
+
+      const embedding = new Float32Array([0.7, 0.3, 0.0]);
+      await store.updateEmbedding(memory.id, embedding, "test-model");
+
+      // Worker can find it via search
+      const results = await store.search(new Float32Array([0.7, 0.3, 0.0]), workerId, {
+        isLead: false,
+        scope: "agent",
+      });
+
+      const found = results.find((r) => r.id === memory.id);
+      expect(found).toBeDefined();
+      expect(found!.content).toContain("Never force-push");
+    });
+
+    test("injected learning is NOT visible to other workers", async () => {
+      const content = "[Lead Feedback — preference]\n\nUse bun instead of npm";
+      const memory = await store.store({
+        agentId: workerId,
+        scope: "agent",
+        name: "Lead feedback: preference — Use bun instead of npm",
+        content,
+        source: "manual",
+      });
+
+      const embedding = new Float32Array([0.2, 0.8, 0.1]);
+      await store.updateEmbedding(memory.id, embedding, "test-model");
+
+      // Other worker should NOT see it
+      const results = await store.search(new Float32Array([0.2, 0.8, 0.1]), otherWorkerId, {
+        isLead: false,
+        scope: "agent",
+      });
+
+      const found = results.find((r) => r.id === memory.id);
+      expect(found).toBeUndefined();
+    });
+
+    test("learning categories are properly formatted", () => {
+      const categories = ["mistake-pattern", "best-practice", "codebase-knowledge", "preference"];
+
+      for (const category of categories) {
+        const content = `[Lead Feedback — ${category}]\n\nSome learning`;
+        expect(content).toContain(`[Lead Feedback — ${category}]`);
+      }
+    });
+  });
+
+  // ==========================================================================
+  // P7: Memory search agent ID security
+  // ==========================================================================
+
+  describe("memory search agent ID security", () => {
+    test("agent can only search their own memories (not others)", async () => {
+      // Create private memories for worker and other worker
+      const workerMemory = await store.store({
+        agentId: workerId,
+        scope: "agent",
+        name: "Worker Private Secret",
+        content: "My secret API key pattern",
+        source: "manual",
+      });
+      await store.updateEmbedding(workerMemory.id, new Float32Array([0.5, 0.5, 0.0]), "test-model");
+
+      const otherMemory = await store.store({
+        agentId: otherWorkerId,
+        scope: "agent",
+        name: "Other Worker Secret",
+        content: "Other agent's private data",
+        source: "manual",
+      });
+      await store.updateEmbedding(otherMemory.id, new Float32Array([0.5, 0.5, 0.0]), "test-model");
+
+      // Worker searching with their own ID should see their memory but not other's
+      const workerResults = await store.search(new Float32Array([0.5, 0.5, 0.0]), workerId, {
+        isLead: false,
+        scope: "all",
+      });
+
+      const workerNames = workerResults.map((r) => r.name);
+      expect(workerNames).toContain("Worker Private Secret");
+      expect(workerNames).not.toContain("Other Worker Secret");
+    });
+
+    test("missing agent ID should be rejected (endpoint logic)", () => {
+      // Simulate the endpoint logic: searchAgentId = myAgentId (from header only)
+      const myAgentId: string | undefined = undefined;
+      const searchAgentId = myAgentId; // No fallback to body.agentId
+
+      // The endpoint requires both query and searchAgentId
+      const isValid = !!searchAgentId;
+      expect(isValid).toBe(false);
+    });
+
+    test("agent ID from header is used, not from body", () => {
+      // Simulate the fixed logic
+      const headerAgentId = workerId;
+      const _bodyAgentId = otherWorkerId; // attacker trying to access other agent's memories
+
+      // Fixed code: searchAgentId = myAgentId (from header only)
+      const searchAgentId = headerAgentId; // NOT: headerAgentId || bodyAgentId
+
+      expect(searchAgentId).toBe(workerId);
+      expect(searchAgentId).not.toBe(otherWorkerId);
+    });
+  });
+
+  // ==========================================================================
+  // P2: Self-awareness in base prompt
+  // ==========================================================================
+
+  describe("base prompt memory guidance", () => {
+    const MEMORY_SKILL_POINTER =
+      "You MUST use the `memory` skill before you store, edit, or delete a memory.";
+
+    test("a worker prompt names memory-store and the memory skill", async () => {
+      const prompt = await getBasePrompt({ role: "worker", agentId: workerId });
+
+      expect(prompt).toContain("`memory-store`");
+      expect(prompt).toContain(MEMORY_SKILL_POINTER);
+    });
+
+    test("a lead prompt names memory-store and the memory skill", async () => {
+      const prompt = await getBasePrompt({ role: "lead", agentId: leadId });
+
+      expect(prompt).toContain("`memory-store`");
+      expect(prompt).toContain(MEMORY_SKILL_POINTER);
+    });
+
+    test("neither role carries the retired self-awareness section", async () => {
+      const workerPrompt = await getBasePrompt({ role: "worker", agentId: workerId });
+      const leadPrompt = await getBasePrompt({ role: "lead", agentId: leadId });
+
+      expect(workerPrompt).not.toContain("How You Are Built");
+      expect(leadPrompt).not.toContain("How You Are Built");
+    });
+  });
+
+  // ==========================================================================
+  // P4: Session summary "no significant learnings" filter
+  // ==========================================================================
+
+  describe("session summary filtering", () => {
+    test("'no significant learnings' response is filtered out", () => {
+      const summary = "No significant learnings.";
+
+      const shouldIndex =
+        summary &&
+        summary.length > 20 &&
+        !summary.trim().toLowerCase().includes("no significant learnings");
+
+      expect(shouldIndex).toBe(false);
+    });
+
+    test("summary with actual learnings passes filter", () => {
+      const summary =
+        "- Discovered that the API requires Bearer prefix on auth headers\n- Found that bun test runs faster with --bail flag";
+
+      const shouldIndex =
+        summary &&
+        summary.length > 20 &&
+        !summary.trim().toLowerCase().includes("no significant learnings");
+
+      expect(shouldIndex).toBe(true);
+    });
+
+    test("very short summary is filtered out", () => {
+      const summary = "Done.";
+
+      const shouldIndex =
+        summary &&
+        summary.length > 20 &&
+        !summary.trim().toLowerCase().includes("no significant learnings");
+
+      expect(shouldIndex).toBe(false);
+    });
+
+    test("case-insensitive matching for 'no significant learnings'", () => {
+      const variants = [
+        "No Significant Learnings.",
+        "NO SIGNIFICANT LEARNINGS",
+        "no significant learnings",
+        "  No significant learnings.  ",
+      ];
+
+      for (const summary of variants) {
+        const shouldIndex =
+          summary &&
+          summary.length > 20 &&
+          !summary.trim().toLowerCase().includes("no significant learnings");
+
+        expect(shouldIndex).toBe(false);
+      }
+    });
+  });
+});

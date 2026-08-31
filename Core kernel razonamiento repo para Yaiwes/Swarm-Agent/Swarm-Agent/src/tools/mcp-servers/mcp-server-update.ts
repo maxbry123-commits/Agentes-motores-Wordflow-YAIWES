@@ -1,0 +1,95 @@
+import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import * as z from "zod";
+import { getAgentById, getMcpServerById, updateMcpServer } from "@/be/db";
+import { can } from "@/rbac";
+import { createToolRegistrar, swarmToolOutputSchema, toolErr, toolOk } from "@/tools/utils";
+
+export const registerMcpServerUpdateTool = (server: McpServer) => {
+  createToolRegistrar(server)(
+    "mcp-server-update",
+    {
+      title: "Update MCP Server",
+      annotations: { destructiveHint: false },
+      description: "Update an MCP server's configuration. Only the owner or lead can update.",
+      inputSchema: z.object({
+        id: z.string().describe("ID of the MCP server to update"),
+        name: z.string().optional().describe("New name"),
+        description: z.string().optional().describe("New description"),
+        transport: z.enum(["stdio", "http", "sse"]).optional().describe("New transport type"),
+        command: z.string().optional().describe("New command (stdio)"),
+        args: z.string().optional().describe("New JSON array of arguments (stdio)"),
+        url: z.string().optional().describe("New URL (http/sse)"),
+        headers: z.string().optional().describe("New JSON object of non-secret headers"),
+        envConfigKeys: z.string().optional().describe("New env config key mappings"),
+        headerConfigKeys: z.string().optional().describe("New header config key mappings"),
+        extraAuthorizeParams: z
+          .string()
+          .optional()
+          .describe(
+            'JSON object string of extra OAuth authorize-request params, e.g. {"access_type":"offline","prompt":"consent"}',
+          ),
+        isEnabled: z.boolean().optional().describe("Toggle enabled/disabled"),
+      }),
+      outputSchema: swarmToolOutputSchema({
+        yourAgentId: z.string().optional(),
+        server: z.looseObject({}).optional(),
+      }),
+    },
+    async (args, requestInfo, _meta) => {
+      if (!requestInfo.agentId) {
+        return toolErr("Agent ID not found.");
+      }
+
+      try {
+        const existing = await getMcpServerById(args.id);
+        if (!existing) {
+          return toolErr("MCP server not found.", { data: { yourAgentId: requestInfo.agentId } });
+        }
+
+        // Only owner or lead can update
+        const agent = await getAgentById(requestInfo.agentId);
+        const decision = can({
+          principal: {
+            kind: "agent",
+            agentId: requestInfo.agentId,
+            isLead: agent?.isLead ?? false,
+          },
+          verb: "mcp-server.update.any",
+          resource: { kind: "owned", ownerAgentId: existing.ownerAgentId },
+          source: "mcp",
+        });
+        if (!decision.allow) {
+          return toolErr("Only the owning agent or lead can update this MCP server.", {
+            data: { yourAgentId: requestInfo.agentId },
+          });
+        }
+
+        const updates: Parameters<typeof updateMcpServer>[1] = {};
+        if (args.name !== undefined) updates.name = args.name;
+        if (args.description !== undefined) updates.description = args.description;
+        if (args.transport !== undefined) updates.transport = args.transport;
+        if (args.command !== undefined) updates.command = args.command;
+        if (args.args !== undefined) updates.args = args.args;
+        if (args.url !== undefined) updates.url = args.url;
+        if (args.headers !== undefined) updates.headers = args.headers;
+        if (args.envConfigKeys !== undefined) updates.envConfigKeys = args.envConfigKeys;
+        if (args.headerConfigKeys !== undefined) updates.headerConfigKeys = args.headerConfigKeys;
+        if (args.extraAuthorizeParams !== undefined)
+          updates.extraAuthorizeParams = args.extraAuthorizeParams;
+        if (args.isEnabled !== undefined) updates.isEnabled = args.isEnabled;
+
+        const updated = await updateMcpServer(args.id, updates);
+        if (!updated) {
+          return toolErr("Update failed.", { data: { yourAgentId: requestInfo.agentId } });
+        }
+
+        return toolOk(`Updated MCP server "${updated.name}" to version ${updated.version}.`, {
+          data: { yourAgentId: requestInfo.agentId, server: updated },
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Unknown error";
+        return toolErr(`Failed: ${message}`, { data: { yourAgentId: requestInfo.agentId } });
+      }
+    },
+  );
+};

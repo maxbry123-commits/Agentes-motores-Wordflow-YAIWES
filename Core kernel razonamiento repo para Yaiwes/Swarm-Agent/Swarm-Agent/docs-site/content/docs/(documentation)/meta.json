@@ -1,0 +1,19 @@
+{
+  "title": "Documentation",
+  "description": "Guides, concepts, and reference for agent-swarm.dev",
+  "root": true,
+  "pages": [
+    "index",
+    "getting-started",
+    "architecture",
+    "concepts",
+    "apps",
+    "ui",
+    "playbooks",
+    "guides",
+    "integrations",
+    "reference",
+    "releases",
+    "contributing"
+  ]
+}

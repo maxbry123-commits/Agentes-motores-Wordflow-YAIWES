@@ -1,0 +1,223 @@
+import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import * as z from "zod";
+import { getAllTasks } from "@/be/db";
+import { ownerCtx, type ToolCtx } from "@/tools/task-tool-ctx";
+import {
+  createToolRegistrar,
+  type SwarmToolResult,
+  swarmToolOutputSchema,
+  toolOk,
+} from "@/tools/utils";
+import type { AgentTask, AgentTaskSummary } from "@/types";
+import { AgentTaskStatusSchema, AssetKeySchema } from "@/types";
+
+const TaskSummarySchema = z.looseObject({
+  id: z.string().optional(),
+  key: z.string().optional(),
+  agentId: z.string().nullable().optional(),
+  // Slim rows (default) carry `taskPreview` (~300 chars); `includeFull` rows
+  // carry the full `task` text. Exactly one is present.
+  task: z.string().optional(),
+  taskPreview: z.string().optional(),
+  status: AgentTaskStatusSchema.optional(),
+  taskType: z.string().optional(),
+  tags: z.array(z.string()).optional(),
+  priority: z.number().optional(),
+  dependsOn: z.array(z.string()).optional(),
+  offeredTo: z.string().optional(),
+  createdAt: z.string().optional(),
+  lastUpdatedAt: z.string().optional(),
+  finishedAt: z.string().optional(),
+  progress: z.string().optional(),
+});
+
+export const getTasksInputSchema = z.object({
+  status: AgentTaskStatusSchema.optional().describe(
+    "Filter by task status (unassigned, offered, pending, in_progress, completed, failed).",
+  ),
+  mineOnly: z.boolean().optional().describe("Only return tasks assigned to you."),
+  unassigned: z.boolean().optional().describe("Only return unassigned tasks in the pool."),
+  offeredToMe: z
+    .boolean()
+    .optional()
+    .describe("Only return tasks offered to you (awaiting accept/reject)."),
+  readyOnly: z.boolean().optional().describe("Only return tasks whose dependencies are met."),
+  taskType: z.string().optional().describe("Filter by task type (e.g., 'bug', 'feature')."),
+  tags: z.array(z.string()).optional().describe("Filter by any matching tag."),
+  search: z.string().optional().describe("Search in task description."),
+  scheduleId: z
+    .string()
+    .uuid()
+    .optional()
+    .describe("Filter by schedule ID to find tasks created by a specific schedule."),
+  key: AssetKeySchema.optional().describe("Filter by exact logical namespace."),
+  keyPrefix: AssetKeySchema.optional().describe("Filter by namespace subtree."),
+  includeHeartbeat: z
+    .boolean()
+    .optional()
+    .describe("Include heartbeat/system tasks in results (excluded by default)."),
+  limit: z
+    .number()
+    .int()
+    .min(1)
+    .max(100)
+    .optional()
+    .describe("Max tasks to return (default: 25, max: 100)."),
+  includeFull: z
+    .boolean()
+    .optional()
+    .describe("Return the full `task` text instead of a ~300-char `taskPreview`. Default false."),
+});
+
+export const getTasksOutputSchema = swarmToolOutputSchema({
+  // Plain string, NOT .uuid(): agents may join with custom IDs (AGENT_ID env /
+  // join-swarm agentId), and a UUID constraint here makes the response fail MCP
+  // output validation after the handler already ran.
+  yourAgentId: z.string().optional(),
+  tasks: z.array(TaskSummarySchema).optional(),
+});
+
+type GetTasksArgs = z.infer<typeof getTasksInputSchema>;
+
+const TASK_DETAILS_CELL_CAP = 180;
+
+function escapeMarkdownCell(value: unknown): string {
+  const text = String(value ?? "—");
+  const compact =
+    text.length > TASK_DETAILS_CELL_CAP ? `${text.slice(0, TASK_DETAILS_CELL_CAP - 1)}…` : text;
+  return compact
+    .replaceAll("\\", "\\\\")
+    .replaceAll("|", "\\|")
+    .replace(/\r\n|\r|\n/g, "<br>");
+}
+
+function renderTaskSummaries(
+  tasks: Array<{
+    id?: string;
+    agentId?: string | null;
+    task?: string;
+    taskPreview?: string;
+    status?: string;
+    priority?: number;
+  }>,
+): string {
+  if (tasks.length === 0) return "No tasks matched the current filters.";
+
+  const header = "| ID | Status | Priority | Agent | Task |";
+  const separator = "| --- | --- | ---: | --- | --- |";
+  const rows = tasks.map((task) => {
+    const cells = [
+      task.id,
+      task.status,
+      task.priority,
+      task.agentId,
+      task.taskPreview ?? task.task,
+    ].map(escapeMarkdownCell);
+    return `| ${cells.join(" | ")} |`;
+  });
+  return [header, separator, ...rows].join("\n");
+}
+
+export async function getTasksHandler(
+  ctx: ToolCtx,
+  {
+    status,
+    mineOnly,
+    unassigned,
+    offeredToMe,
+    readyOnly,
+    taskType,
+    tags,
+    search,
+    scheduleId,
+    key,
+    keyPrefix,
+    includeHeartbeat,
+    limit,
+    includeFull,
+  }: GetTasksArgs,
+): Promise<SwarmToolResult> {
+  const agentId = ctx.kind === "owner" ? ctx.agentId : undefined;
+
+  // Build filters. User context is hard-scoped by requestedByUserId and ignores
+  // agent-specific shortcuts like mineOnly/offeredToMe.
+  const taskFilters = {
+    status,
+    agentId: ctx.kind === "owner" && mineOnly ? (agentId ?? undefined) : undefined,
+    unassigned: ctx.kind === "owner" ? unassigned : undefined,
+    offeredTo: ctx.kind === "owner" && offeredToMe ? (agentId ?? undefined) : undefined,
+    readyOnly,
+    taskType,
+    tags,
+    search,
+    scheduleId,
+    key,
+    keyPrefix,
+    includeHeartbeat,
+    limit,
+    requestedByUserId: ctx.kind === "user" ? ctx.userId : undefined,
+  };
+  // Default to slim rows (full `task` text → ~300-char `taskPreview`).
+  const tasks: Array<AgentTask | AgentTaskSummary> = includeFull
+    ? await getAllTasks(taskFilters)
+    : await getAllTasks(taskFilters, { slim: true });
+
+  // Slim rows carry a truncated `task`; surface it as `taskPreview` so the
+  // agent knows it is truncated. `includeFull` returns the full `task`.
+  const taskSummaries = tasks.map((t) => ({
+    id: t.id,
+    key: t.key,
+    agentId: t.agentId,
+    ...(includeFull ? { task: t.task } : { taskPreview: t.task }),
+    status: t.status,
+    taskType: t.taskType,
+    tags: t.tags,
+    priority: t.priority,
+    dependsOn: t.dependsOn,
+    offeredTo: t.offeredTo,
+    createdAt: t.createdAt,
+    lastUpdatedAt: t.lastUpdatedAt,
+    finishedAt: t.finishedAt,
+    progress: t.progress,
+  }));
+
+  // Build filter description for message
+  const filters: string[] = [];
+  if (status) filters.push(`status='${status}'`);
+  if (ctx.kind === "owner" && mineOnly) filters.push("mine only");
+  if (ctx.kind === "owner" && unassigned) filters.push("unassigned");
+  if (ctx.kind === "owner" && offeredToMe) filters.push("offered to me");
+  if (readyOnly) filters.push("ready only");
+  if (taskType) filters.push(`type='${taskType}'`);
+  if (tags?.length) filters.push(`tags=[${tags.join(", ")}]`);
+  if (search) filters.push(`search='${search}'`);
+  if (scheduleId) filters.push(`scheduleId='${scheduleId}'`);
+  if (key) filters.push(`key='${key}'`);
+  if (keyPrefix) filters.push(`keyPrefix='${keyPrefix}'`);
+
+  const filterMsg = filters.length > 0 ? ` (${filters.join(", ")})` : "";
+  const data = {
+    yourAgentId: agentId,
+    tasks: taskSummaries,
+  };
+
+  return toolOk(`Found ${taskSummaries.length} task(s)${filterMsg}.`, {
+    details: renderTaskSummaries(taskSummaries),
+    data,
+  });
+}
+
+export const registerGetTasksTool = (server: McpServer) => {
+  createToolRegistrar(server)(
+    "get-tasks",
+    {
+      title: "Get tasks",
+      description:
+        "Returns a list of tasks in the swarm with various filters. Sorted by priority (desc) then lastUpdatedAt (desc). Each row carries a `taskPreview` (~300 chars) — enough to pool-triage; pass includeFull:true (or call `get-task-details` by id) for the full `task` text.",
+      annotations: { readOnlyHint: true },
+      inputSchema: getTasksInputSchema,
+      outputSchema: getTasksOutputSchema,
+    },
+    async (args, info, _meta) => getTasksHandler(ownerCtx(info), args),
+  );
+};

@@ -1,0 +1,175 @@
+import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import * as z from "zod";
+import {
+  cancelTask,
+  getAgentById,
+  getDbClient,
+  getTaskById,
+  updateAgentStatusFromCapacity,
+} from "@/be/db";
+import { can } from "@/rbac";
+import { assertOwnsTask, ownerCtx, type ToolCtx } from "@/tools/task-tool-ctx";
+import {
+  createToolRegistrar,
+  type SwarmToolResult,
+  swarmToolOutputSchema,
+  toolErr,
+  toolOk,
+} from "@/tools/utils";
+import type { AgentTask } from "@/types";
+import { looseAgentTaskOutputSchema } from "./get-task-details";
+
+export const cancelTaskInputSchema = z.object({
+  taskId: z.uuid().describe("The ID of the task to cancel."),
+  reason: z.string().optional().describe("Reason for cancellation."),
+});
+
+export const cancelTaskOutputSchema = swarmToolOutputSchema({
+  yourAgentId: z.string().optional(),
+  task: looseAgentTaskOutputSchema.optional(),
+});
+
+type CancelTaskArgs = z.infer<typeof cancelTaskInputSchema>;
+
+type CancelTaskTxnResult = {
+  success: boolean;
+  message: string;
+  task?: AgentTask;
+};
+
+export async function cancelTaskHandler(
+  ctx: ToolCtx,
+  { taskId, reason }: CancelTaskArgs,
+): Promise<SwarmToolResult> {
+  if (ctx.kind === "owner" && !ctx.agentId) {
+    return toolErr('Agent ID not found. Set the "X-Agent-ID" header.');
+  }
+
+  const agentId = ctx.kind === "owner" ? ctx.agentId : undefined;
+
+  const result = await getDbClient().transaction(
+    async (): Promise<CancelTaskTxnResult | SwarmToolResult> => {
+      if (ctx.kind === "owner") {
+        const ownerAgentId = ctx.agentId;
+        if (!ownerAgentId) {
+          return {
+            success: false,
+            message: 'Agent ID not found. Set the "X-Agent-ID" header.',
+          };
+        }
+        const callerAgent = await getAgentById(ownerAgentId);
+
+        if (!callerAgent) {
+          return {
+            success: false,
+            message: "Caller agent not found.",
+          };
+        }
+
+        const existingTask = await getTaskById(taskId);
+
+        if (!existingTask) {
+          return {
+            success: false,
+            message: `Task "${taskId}" not found.`,
+          };
+        }
+
+        // Verify the requester has permission (lead or task creator)
+        const decision = can({
+          principal: { kind: "agent", agentId: callerAgent.id, isLead: callerAgent.isLead },
+          verb: "task.cancel.any",
+          resource: {
+            kind: "task",
+            taskId: existingTask.id,
+            creatorAgentId: existingTask.creatorAgentId,
+          },
+          source: "mcp",
+        });
+        if (!decision.allow) {
+          return {
+            success: false,
+            message: "Only the lead or task creator can cancel tasks.",
+          };
+        }
+
+        const cancelled = await cancelTask(taskId, reason);
+
+        if (!cancelled) {
+          return {
+            success: false,
+            message: `Cannot cancel task in status "${existingTask.status}". Only pending/in_progress tasks can be cancelled.`,
+          };
+        }
+
+        // Update agent status based on capacity
+        if (cancelled.agentId) {
+          await updateAgentStatusFromCapacity(cancelled.agentId);
+        }
+
+        return {
+          success: true,
+          message: `Task "${taskId}" has been cancelled.`,
+          task: cancelled,
+        };
+      }
+
+      const existingTask = await getTaskById(taskId);
+
+      if (!existingTask) {
+        return {
+          success: false,
+          message: `Task "${taskId}" not found.`,
+        };
+      }
+
+      const ownershipError = assertOwnsTask(ctx, existingTask, "task.cancel.own");
+      if (ownershipError) return ownershipError;
+
+      const cancelled = await cancelTask(taskId, reason);
+
+      if (!cancelled) {
+        return {
+          success: false,
+          message: `Cannot cancel task in status "${existingTask.status}". Only pending/in_progress tasks can be cancelled.`,
+        };
+      }
+
+      if (cancelled.agentId) {
+        await updateAgentStatusFromCapacity(cancelled.agentId);
+      }
+
+      return {
+        success: true,
+        message: `Task "${taskId}" has been cancelled.`,
+        task: cancelled,
+      };
+    },
+  );
+
+  // assertOwnsTask already returns a fully-formed SwarmToolResult — pass it through.
+  if ("ok" in result) return result;
+
+  const data = { yourAgentId: agentId, task: result.task };
+  // Text channel must carry the cancelled task too — most harnesses never show
+  // the model structuredContent.
+  const details = result.task ? JSON.stringify(result.task, null, 2) : undefined;
+  return result.success
+    ? toolOk(result.message, { data, details })
+    : toolErr(result.message, { data, details });
+}
+
+export const registerCancelTaskTool = (server: McpServer) => {
+  createToolRegistrar(server)(
+    "cancel-task",
+    {
+      title: "Cancel Task",
+      description:
+        "Cancel a task that is pending or in progress. Only the lead or task creator can cancel tasks. The worker will be notified via hooks.",
+      annotations: { destructiveHint: true },
+      inputSchema: cancelTaskInputSchema,
+      outputSchema: cancelTaskOutputSchema,
+    },
+    async (args, info, _meta) => cancelTaskHandler(ownerCtx(info), args),
+  );
+};

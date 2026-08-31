@@ -1,0 +1,244 @@
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, mock, test } from "bun:test";
+import { unlink } from "node:fs/promises";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { closeDb, initDb } from "../be/db";
+import {
+  deleteOAuthTokens,
+  getOAuthTokens,
+  storeOAuthTokens,
+  upsertOAuthApp,
+} from "../be/db-queries/oauth";
+import {
+  registerGetOauthAccessTokenTool,
+  resolveOAuthAccessToken,
+} from "../tools/oauth-access-token";
+import {
+  clearVolatileSecretsForTesting,
+  refreshSecretScrubberCache,
+  scrubSecrets,
+} from "../utils/secret-scrubber";
+
+const TEST_DB_PATH = "./test-oauth-access-token-tool.sqlite";
+const originalFetch = globalThis.fetch;
+
+const testApp = {
+  clientId: "client-id",
+  clientSecret: "client-secret",
+  authorizeUrl: "https://example.com/oauth/authorize",
+  tokenUrl: "https://example.com/oauth/token",
+  redirectUri: "http://localhost:3013/callback",
+  scopes: "read,write",
+};
+
+beforeAll(async () => {
+  initDb(TEST_DB_PATH);
+  await upsertOAuthApp("linear", testApp);
+  await upsertOAuthApp("jira", {
+    ...testApp,
+    tokenUrl: "https://example.com/jira/oauth/token",
+  });
+  await upsertOAuthApp("custom-provider", {
+    ...testApp,
+    tokenUrl: "https://example.com/custom/oauth/token",
+  });
+});
+
+beforeEach(async () => {
+  await deleteOAuthTokens("linear");
+  await deleteOAuthTokens("jira");
+  await deleteOAuthTokens("custom-provider");
+  globalThis.fetch = originalFetch;
+  clearVolatileSecretsForTesting();
+  refreshSecretScrubberCache();
+});
+
+afterEach(() => {
+  globalThis.fetch = originalFetch;
+  clearVolatileSecretsForTesting();
+  refreshSecretScrubberCache();
+});
+
+afterAll(async () => {
+  globalThis.fetch = originalFetch;
+  closeDb();
+  await unlink(TEST_DB_PATH).catch(() => {});
+  await unlink(`${TEST_DB_PATH}-wal`).catch(() => {});
+  await unlink(`${TEST_DB_PATH}-shm`).catch(() => {});
+});
+
+describe("resolveOAuthAccessToken", () => {
+  test("registered MCP tool returns a seeded provider token", async () => {
+    await storeOAuthTokens("custom-provider", {
+      accessToken: "mcp-tool-access-token-plain-value",
+      refreshToken: "mcp-tool-refresh-token",
+      expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+    });
+    const server = new McpServer({ name: "oauth-access-token-test", version: "1.0.0" });
+    registerGetOauthAccessTokenTool(server);
+    const tool = (
+      server as unknown as {
+        _registeredTools: Record<
+          string,
+          { handler: (args: unknown, extra: unknown) => Promise<unknown> }
+        >;
+      }
+    )._registeredTools["get-oauth-access-token"];
+    if (!tool) throw new Error("get-oauth-access-token tool was not registered");
+
+    const result = (await tool.handler(
+      { provider: "custom-provider", minValiditySeconds: 300 },
+      {},
+    )) as {
+      content: Array<{ type: string; text: string }>;
+      structuredContent: {
+        success: boolean;
+        message: string;
+        details?: string;
+        provider?: string;
+        accessToken?: string;
+        expiresAt?: string;
+        tokenType?: string;
+      };
+      isError?: boolean;
+    };
+
+    // New SwarmToolResult contract (src/tools/utils.ts): ok:true -> isError:false,
+    // structuredContent.success:true, and data (token fields) spread at the top
+    // level alongside the envelope keys.
+    // Captured before toMatchObject runs (bun's `expect.any()` matcher mutates
+    // the received object in place for diff reporting).
+    const expiresAt = result.structuredContent.expiresAt;
+    expect(result.isError).toBe(false);
+    expect(result.structuredContent).toMatchObject({
+      success: true,
+      provider: "custom-provider",
+      accessToken: "mcp-tool-access-token-plain-value",
+      expiresAt: expect.any(String),
+      tokenType: "Bearer",
+    });
+    // message summarizes the outcome (provider + expiry) — required, non-empty.
+    expect(result.structuredContent.message).toMatch(
+      /custom-provider OAuth access token resolved; expires at/,
+    );
+    // details carries the actual token payload (allowSecretEgress: true means
+    // the central scrubber does not redact it, since the tool's whole purpose
+    // is handing over the plaintext token).
+    expect(result.structuredContent.details).toBe("mcp-tool-access-token-plain-value");
+
+    // content[0].text is composed as message + "\n\n" + details, so both
+    // channels (text for pi/opencode/claude-managed, structuredContent for
+    // Codex) carry the same information per the "both channels self-sufficient"
+    // rule in runbooks/mcp-tool-results.md.
+    expect(result.content).toHaveLength(1);
+    expect(result.content[0].type).toBe("text");
+    expect(result.content[0].text).toBe(
+      `custom-provider OAuth access token resolved; expires at ${expiresAt}.\n\nmcp-tool-access-token-plain-value`,
+    );
+  });
+
+  test("registered MCP tool reports a real error via isError + structuredContent.success:false on failure", async () => {
+    // No tokens stored for "custom-provider" in this test — resolveOAuthAccessToken
+    // throws "custom-provider OAuth tokens are not connected".
+    const server = new McpServer({ name: "oauth-access-token-test-err", version: "1.0.0" });
+    registerGetOauthAccessTokenTool(server);
+    const tool = (
+      server as unknown as {
+        _registeredTools: Record<
+          string,
+          { handler: (args: unknown, extra: unknown) => Promise<unknown> }
+        >;
+      }
+    )._registeredTools["get-oauth-access-token"];
+    if (!tool) throw new Error("get-oauth-access-token tool was not registered");
+
+    const result = (await tool.handler({ provider: "custom-provider" }, {})) as {
+      content: Array<{ type: string; text: string }>;
+      structuredContent: { success: boolean; message: string };
+      isError?: boolean;
+    };
+
+    // New contract: failures are truthful — isError:true, structuredContent.success:false,
+    // and the real error text (not a generic/placeholder string) reaches content[0].text.
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent.success).toBe(false);
+    expect(result.structuredContent.message).toBe(
+      "Failed to resolve OAuth access token: custom-provider OAuth tokens are not connected",
+    );
+    expect(result.content[0].text).toBe(
+      "Failed to resolve OAuth access token: custom-provider OAuth tokens are not connected",
+    );
+  });
+
+  test("returns a fresh access token and registers it for scrubber redaction", async () => {
+    const accessToken = "linear-access-token-plain-value-1234567890";
+    await storeOAuthTokens("linear", {
+      accessToken,
+      refreshToken: "linear-refresh-token",
+      expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+    });
+
+    const result = await resolveOAuthAccessToken("linear");
+
+    expect(result).toEqual({
+      provider: "linear",
+      accessToken,
+      expiresAt: result.expiresAt,
+      tokenType: "Bearer",
+    });
+    expect(scrubSecrets(`Authorization: Bearer ${accessToken}`)).toBe(
+      "Authorization: Bearer [REDACTED:LINEAR_OAUTH_ACCESS_TOKEN]",
+    );
+  });
+
+  test("supports any configured OAuth provider slug", async () => {
+    await storeOAuthTokens("custom-provider", {
+      accessToken: "custom-provider-access-token-plain-value",
+      refreshToken: "custom-provider-refresh-token",
+      expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+    });
+
+    const result = await resolveOAuthAccessToken("custom-provider");
+
+    expect(result.provider).toBe("custom-provider");
+    expect(result.accessToken).toBe("custom-provider-access-token-plain-value");
+  });
+
+  test("refreshes Jira before returning a near-expiry token", async () => {
+    await storeOAuthTokens("jira", {
+      accessToken: "old-jira-access-token",
+      refreshToken: "old-jira-refresh-token",
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    });
+
+    const fetchSpy = mock(() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            access_token: "new-jira-access-token-plain-value",
+            token_type: "Bearer",
+            expires_in: 3600,
+            refresh_token: "new-jira-refresh-token",
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        ),
+      ),
+    );
+    globalThis.fetch = fetchSpy;
+
+    const result = await resolveOAuthAccessToken("jira");
+
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(result.accessToken).toBe("new-jira-access-token-plain-value");
+    expect((await getOAuthTokens("jira"))?.refreshToken).toBe("new-jira-refresh-token");
+  });
+
+  test("rejects a near-expiry token when no refresh token is available", async () => {
+    await storeOAuthTokens("jira", {
+      accessToken: "stale-jira-access-token",
+      refreshToken: null,
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    });
+
+    await expect(resolveOAuthAccessToken("jira")).rejects.toThrow(/could not be refreshed/);
+  });
+});

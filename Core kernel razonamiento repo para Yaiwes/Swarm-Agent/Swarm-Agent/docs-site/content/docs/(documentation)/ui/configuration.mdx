@@ -1,0 +1,77 @@
+---
+title: "Configuration"
+description: "Manage operator-facing swarm settings from the dashboard — feature flags, thresholds, and defaults grouped by subsystem"
+---
+
+The **Configuration** page (Settings → Configuration, at `/settings/configuration` in the dashboard) surfaces the environment variables that shape how your swarm behaves — steering, memory retrieval, heartbeat and crash recovery, harness selection, integration toggles, security, workflow limits, and branding — as editable settings, so you can tune a running deployment without shelling into the host to edit `.env` files.
+
+![The Configuration settings page](/ui/configuration-page.png)
+
+## How values resolve
+
+Every setting on this page corresponds to an environment variable the API server reads. Saving a value from the dashboard stores it as a **global swarm config** entry (the same `swarm_config` store used by the `get-config` / `set-config` MCP tools), and the server applies it via an automatic config reload shortly after the save.
+
+Precedence rules:
+
+- **At boot**, real environment variables win: a variable set in the server's environment takes precedence over a stored value until the next reload.
+- **After a save or reload**, stored values win: the server re-injects global config over the process environment.
+- Settings marked with a **Restart required** badge are only read at server startup — saving them stores the value, but it takes effect on the next restart.
+
+Each row shows a source chip when the underlying environment variable is set on the server, so you can tell whether the effective value comes from the environment, the stored config, or both.
+
+## Groups
+
+| Group | Examples |
+| --- | --- |
+| Steering | `STEERING_ENABLED`, `SLACK_THREAD_STEERING`, `SLACK_THREAD_STEERING_MODE` |
+| Memory | `MEMORY_HYBRID_SEARCH`, `MEMORY_GRAPH_EXPANSION`, `MEMORY_RATERS`, `EMBEDDING_MODEL` |
+| Heartbeat & crash recovery | `HEARTBEAT_INTERVAL_MS`, `HEARTBEAT_STALL_THRESHOLD_MIN`, `RUNTIME_STALE_THRESHOLD_MIN`, `HEARTBEAT_PIN_CRASH_RESUME` |
+| Harness & tools | `SCRIPTS_ONLY_MCP`, `MULTI_RUNTIME_ENABLED`, `CAPABILITIES`, `WORKER_API_READY_TIMEOUT_SECONDS` |
+| Database queries | `DB_QUERY_BOUNDED_ENABLED`, `DB_QUERY_HTTP_BUDGET_MS`, `DB_QUERY_HTTP_MAX_ROWS`, `DB_QUERY_MCP_BUDGET_MS`, `DB_QUERY_MCP_MAX_ROWS`, `DB_QUERY_CONCURRENCY_CAP` |
+| Integrations | `SLACK_DISABLE`, `SLACK_ALLOW_DEV_SOCKET_MODE`, `SLACK_RENDER_V2`, `GITHUB_DISABLE`, `LINEAR_DISABLE`, `SLACK_ALERTS_CHANNEL`, `AGENT_FS_REQUEST_TIMEOUT_MS` |
+| Security & access | `RBAC_ENABLED`, `BUDGET_ADMISSION_DISABLED`, `MCP_OAUTH_ALLOW_PRIVATE_HOSTS` |
+| Workflows & scheduler | `WORKFLOW_MAX_ITERATIONS`, `SCHEDULER_INTERVAL_MS` |
+| Telemetry & observability | `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_SERVICE_NAME`, `ANONYMIZED_TELEMETRY` |
+| Branding & URLs | `SWARM_ORG_NAME`, `SWARM_BRAND_COLOR`, `DASHBOARD_URL` |
+
+Harness **provider and model selection are deliberately absent** from this page — they are configured per agent. A global value would silently become the default for every agent in the swarm, so those knobs live on each agent's own configuration instead.
+
+Settings with deeper behavior link out to the relevant guide (for example the [task steering](/docs/guides/task-steering) and [harness providers](/docs/guides/harness-providers) guides) directly from the row.
+
+![Editing a configuration group](/ui/configuration-group.png)
+
+## Editing
+
+Controls match the value type:
+
+- **Toggles** (feature flags) persist immediately when switched.
+- **Selects** (enumerated values such as `SLACK_THREAD_STEERING_MODE`) persist on change.
+- **Text and number inputs** show a Save button once the value differs from what is stored.
+
+Every row shows its default, and rows with a stored value offer a **Reset** action that deletes the stored entry and returns the setting to its default (or to the environment value, if one is set). The **Reload config** button in the header forces an immediate config reload — useful after changing environment variables outside the dashboard.
+
+<Callout type="info" title="Credentials live elsewhere">
+  This page intentionally excludes secrets. Integration credentials (Slack tokens, GitHub app keys, OAuth secrets) are managed on the [Integrations](/docs/guides/slack-integration) pages, and swarm-wide secret values on the Secrets page — see the [secrets encryption guide](/docs/guides/secrets-encryption).
+</Callout>
+
+<Callout type="info" title="Multiple runtimes per agent">
+  `MULTI_RUNTIME_ENABLED` is off by default: one worker process serves one agent, and that worker's reported concurrency becomes the agent's task limit. Turning it on lets several processes serve the same agent — each is tracked with its own capacity and liveness, and the agent's limit moves to its agent-scoped `AGENT_MAX_TASKS` setting (seeded from the agent's current limit the first time it registers, so enabling the flag does not change what the swarm enforces).
+
+  Workers must be updated before enabling it: with the flag on, a worker that does not identify its runtime is rejected at registration and shutdown. A worker that stops reporting for `RUNTIME_STALE_THRESHOLD_MIN` (default 5 minutes) stops counting toward its agent, and an agent whose last live worker expires is marked offline. See the [multi-runtime agents guide](/docs/guides/multi-runtime-agents) for the rollout order, shared-workspace Compose example, rollback behavior, and the [heartbeat and crash recovery runbook](https://github.com/desplega-ai/agent-swarm/blob/main/runbooks/heartbeat-crash-recovery.md).
+
+  **Workspace state is not shared for you.** Work for one agent can continue on a different process than the one that started it, so runtimes sharing an `AGENT_ID` need compatible workspace state. In Docker Compose or similar deployments, give them the same persistent workspace/repository volume when continuation depends on local files. If their workspaces are independent, task continuation must rely only on state that can be reconstructed from shared sources — the repository, the control plane, or attachments — because enabling this setting does not synchronize arbitrary local filesystem state between workers.
+</Callout>
+
+<Callout type="warn" title="WORKER_API_READY_TIMEOUT_SECONDS is bootstrap-only">
+  Every worker and lead container's `docker-entrypoint.sh` polls the control-plane API's public `GET /health` endpoint before doing anything else that depends on it (fetching config, syncing skills, restoring services). If the API never becomes reachable within `WORKER_API_READY_TIMEOUT_SECONDS` (a positive integer, default `90`), the container logs a stable `[entrypoint] FATAL: API readiness timed out after Ns waiting for <url>; exiting.` line and exits non-zero rather than starting half-provisioned.
+
+  This check runs **before** the container can reach the API at all, so it can only ever read the value from its own process environment — a row saved here documents and validates the setting (and is what the **Restart required** badge refers to), but it cannot reach an already-waiting container. Set it as a real deployment environment variable on the worker/lead container, not just in the dashboard.
+</Callout>
+
+## Access control
+
+Reading configuration requires dashboard access (API key). Writes go through the config API's RBAC gate (`config.write.any`): operator and user tokens can save, and agent principals are restricted to lead agents.
+
+## Adding a new setting
+
+If you are contributing a new operator-facing environment variable to Agent Swarm, register it in the configuration catalog at `apps/ui/src/lib/configuration-catalog.ts` (group, value kind, default, description, and docs link) so it appears on this page. Reserved bootstrap keys (`API_KEY`, `SECRETS_ENCRYPTION_KEY`) and credentials must never be added to the catalog.

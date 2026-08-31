@@ -1,0 +1,209 @@
+---
+title: Memory System
+description: Persistent AI agent memory — vector embeddings, semantic search, TTL expiry, and reranking with recency and access signals so agents accumulate knowledge across Claude Code sessions instead of starting fresh.
+---
+
+Agent Swarm agents aren't stateless. They build compounding knowledge through multiple automatic mechanisms. The memory system uses provider abstractions, vector search, reranking, and typed recall-edge capture so the swarm can surface the right memory and retain why it mattered.
+
+<Callout type="info">
+The memory system was redesigned in [#212](https://github.com/desplega-ai/agent-swarm/issues/212) to add TTL-based expiry, reranking with recency and access signals, and swappable provider interfaces.
+</Callout>
+
+## How Memory Works
+
+Every agent has a searchable memory backed by embeddings and stored in SQLite. The system is built on two provider abstractions:
+
+- **`EmbeddingProvider`** — Converts text to vectors. Default implementation uses OpenAI `text-embedding-3-small` (512 dimensions). The model, dimensions, API key, and base URL are configurable via `EMBEDDING_MODEL`, `EMBEDDING_DIMENSIONS`, `EMBEDDING_API_KEY`, and `EMBEDDING_API_BASE_URL` — point it at any OpenAI-compatible endpoint (Azure OpenAI, Together, vLLM, Ollama, etc.). Swappable for other providers in code.
+- **`MemoryStore`** — Persists and retrieves memories. Default implementation uses SQLite with [sqlite-vec](https://alexgarcia.xyz/sqlite-vec/) for KNN vector search. Falls back to brute-force cosine similarity when the extension is unavailable.
+
+### Memory Sources
+
+Memories are automatically created from:
+
+- **Session summaries** — At the end of each session, a lightweight model (default: Gemini 3 Flash via OpenRouter, configurable through `MEMORY_RATER_LLM_MODEL`) extracts key learnings: mistakes made, patterns discovered, failed approaches, and codebase knowledge. These summaries become searchable memories. Requires `OPENROUTER_API_KEY` — without it the Stop hook skips session-summary indexing entirely.
+- **Task completions** — Every completed (or failed) task's output is indexed. Failed tasks include notes about what went wrong, so the agent avoids repeating the same mistake.
+- **Explicit stores** — Agents call the `memory-store` tool (or `ctx.swarm.memory_store` from a script) with a title, content, scope, and tags. This is the write path the system prompt names, and it works on every harness, including remote ones.
+- **File-based notes** — On harnesses with a file hook (claude, pi, opencode), files written to `/workspace/personal/memory/` or `/workspace/shared/memory/<agentId>/` are indexed automatically.
+- **Lead-to-worker injection** — The lead agent can push specific learnings into any worker's memory using the `inject-learning` tool, closing the feedback loop.
+
+### Memory Scopes
+
+| Scope | Path | Visibility |
+|-------|------|-----------|
+| Agent (private) | `memory-store` with `scope: "agent"` (default), or `/workspace/personal/memory/` | Only the owning agent |
+| Swarm (shared) | `memory-store` with `scope: "swarm"`, `inject-learning`, or `/workspace/shared/memory/<agentId>/` | All agents in the swarm |
+
+### Automatic Scope Promotion
+
+The `inject-learning` tool creates swarm-scoped memories by default, so learnings injected by the lead are available to all workers.
+
+## TTL & Expiry
+
+Memories have a time-to-live (TTL) based on their source type. Expired memories are automatically filtered from search results but not proactively deleted from the database.
+
+| Source | TTL | Rationale |
+|--------|-----|-----------|
+| `task_completion` | 7 days | Task outputs become stale quickly |
+| `session_summary` | 3 days | Session context is ephemeral |
+| `file_index` | 30 days | File contents may change |
+| `manual` | Never expires | Explicitly stored knowledge is permanent |
+
+Expired memories can still be retrieved by ID via `memory-get` — only search results are filtered. The `memory-delete` tool provides explicit cleanup when needed.
+
+## Memory Retrieval & Reranking
+
+Before starting each task, the runner automatically searches for relevant memories and includes them in the agent's context.
+
+### Search Process
+
+1. Task description is used as the search query
+2. An embedding is generated via the `EmbeddingProvider`
+3. Candidate memories are retrieved via KNN search (sqlite-vec) or brute-force cosine similarity (fallback)
+4. Reciprocal-rank fusion blends vector matches with a full-text pass before reranking by default; set `MEMORY_HYBRID_SEARCH=0` to use vector-only retrieval
+5. The candidate set is expanded with 1-hop memory-link neighbors by default; set `MEMORY_GRAPH_EXPANSION=0` to disable it (see [Graph Expansion](#graph-expansion))
+6. Candidates below the minimum similarity floor are dropped, then the survivors are **reranked** using a composite score
+7. Top matches are included in the task context as "Relevant Past Knowledge"
+
+Every retrieval row records its provenance (`retrievalSource`: `vec`, `fts`, `hybrid`, `fallback`, or `graph`), so the [usefulness readout](#usefulness-readout) can compare how often each retrieval arm's results actually get cited.
+
+### Reranking
+
+Raw vector similarity alone isn't enough — a curated manual memory from last month can still be more useful than a noisy session summary from yesterday. The reranker computes:
+
+```
+finalScore = similarity × sourceQuality × recencyDecay × accessBoost
+```
+
+| Signal | Formula | Effect |
+|--------|---------|--------|
+| **Source quality** | manual `1.5`, file notes `1.0`, task completions `0.7`, session summaries `0.5` | Curated knowledge ranks above ephemeral auto-generated snapshots |
+| **Recency decay** | Source-aware by default: manual `∞`, file notes `180d`, task completions `14d`, session summaries `7d` | Long-lived curated memories stay relevant; ephemeral memories decay faster |
+| **Access boost** | `1 + min(accessCount/10, 0.5) × recencyFactor` | Frequently accessed memories get up to 1.5× boost |
+
+Before reranking, candidates with raw cosine similarity below `MEMORY_MIN_SIMILARITY` (default `0.1`) are discarded as noise. The remaining candidate set is fetched at 3× the requested limit, then narrowed after reranking. This ensures that a highly relevant but older memory can still surface if its similarity is strong enough.
+
+### Graph Expansion
+
+By default, search results gain **1-hop graph neighbors**: after the store returns its candidates and before reranking, the expander follows outgoing `memory_link` rows (resolved wikilinks pointing at live memories) from each candidate and injects the linked memories as additional candidates. A memory that is lexically and semantically distant from the query can therefore still surface because a strong hit links to it — `"Auth flow gotchas, see [[deploy-checklist]]"` pulls the checklist into results for an auth query. Set `MEMORY_GRAPH_EXPANSION=0` or `false` to disable expansion.
+
+Mechanics:
+
+- **Derived score** — `parentRawSimilarity × linkStrength × damping` (damping `0.7`), so neighbors rank below the hit that pulled them in. The parent's *pre-decay* similarity is used; the neighbor's own recency decay is applied exactly once by the reranker.
+- **Cap** — at most 5 new candidates per search, selected by the reranker's composite score (not raw similarity), so stale low-value links can't crowd out better ones.
+- **ACL + filters** — neighbors respect the caller's scope (`agent`/`swarm`/`all`), lead visibility, `source` filter, and expiry rules; expansion can never widen what a search is allowed to see.
+- **Provenance** — expanded results carry `retrievalSource: "graph"`, so the usefulness readout measures whether graph hits earn citations before the flag is enabled more widely.
+- **Fail-open** — an expansion failure never poisons search; the original candidates are returned unchanged. With the flag off, results are byte-identical to no-expansion.
+
+Both memory retrieval features retain explicit rollback flags so operators can compare per-arm citation data or restore the previous retrieval path without changing code.
+
+### Usefulness Readout
+
+`GET /api/memory/usefulness` (query params `days`, `threshold`) answers "is memory useful?" from the measurement tables the raters populate:
+
+- **Volume** — retrieval rows, distinct memories, and search/get event split in the window.
+- **Per-arm breakdown** — retrievals and citation rate grouped by `retrievalSource` (search events only), so `vec`/`fts`/`hybrid`/`graph` can be compared head-to-head.
+- **Citation rate per memory-source** — how often `manual` vs `file_index` vs `task_completion` vs `session_summary` memories get cited in task evidence (`positive/ratings` in `[0,1]`, plus the signed `avgSignal` mean).
+- **Posterior movement** — how many Beta-Binomial usefulness posteriors have moved off the prior, and how many sit above `threshold`.
+
+The same data renders as the **Usefulness panel** on the dashboard's `/memory` page (summary tiles + per-source and per-arm charts).
+
+### Manual Search
+
+Agents can search and manage memories using MCP tools:
+
+- **`memory-store`** — Create a memory: `content`, `name`, `scope` (`agent` or `swarm`), optional `tags`, `taskId`, and `intent`. Long content is chunked on headings and embedded in the background. The owner is always the caller, for both scopes.
+- **`memory-search`** — Search with natural language queries. Calls now require an `intent` string so retrievals can be attributed to a concrete task or question, and response payloads may include `rateHint` nudges when a retrieved memory looks worth rating.
+- **`memory-get`** — Retrieve full details of a specific memory by ID (increments access count). Like `memory-search`, it requires an `intent` string and records the retrieval event for downstream recall analysis.
+- **`memory-edit`** — Edit an existing memory in place without changing its ID. Use `mode: "replace"` to rewrite the full content or `mode: "exact"` for a surgical single-substring replacement guarded by uniqueness and optional version checks.
+- **`memory-delete`** — Delete a memory. Agents can delete their own; leads can also delete swarm-scoped memories.
+- **`memory_rate`** — Record an explicit usefulness rating (`useful: true | false`) on a retrieved memory so the rater pipeline learns what surfaces well. Optional `referencesSource` (free-form `<source>:<identifier>`, e.g. `github:owner/repo#N`, `linear:KEY-N`) creates an edge from the memory to the external artifact it cites.
+
+### Recall Edges & Memory Links
+
+Search and retrieval events feed a lightweight memory graph:
+
+- **Intent-tagged retrieval rows** capture why a memory was searched or opened, not just that it was touched.
+- **Typed memory links** connect memories to other memories (`[[wikilinks]]` in content) and to external artifacts such as GitHub PRs, agent-fs paths, and other entity references resolved from memory content.
+- **Forward sequel edges** preserve "this led to that" relationships between related memories, improving future recall and analysis.
+
+The link graph has a full read side:
+
+- **Traversal** — `memory-get` (and `GET /api/memory/:id`) returns the memory's outgoing `links` and inbound `backlinks`, ACL-filtered: linked-memory metadata is only included when the viewer may see the target, and hidden or deleted targets are indistinguishable from unresolved wikilinks.
+- **Search expansion** — resolved memory-to-memory links power [Graph Expansion](#graph-expansion) when enabled.
+- **Self-maintenance** — editing a memory prunes links derived from removed content (re-resolving links from the new content in one transaction) while preserving `sequel` edges, so the graph tracks what memories actually say. A wikilink that pointed at a not-yet-existing memory re-resolves on the next edit once the target exists.
+
+## Writing Memories
+
+Store a memory as soon as something worth keeping is learned, with the `memory-store` tool:
+
+```
+memory-store({
+  name: "API auth header needs the Bearer prefix",
+  content: "The API requires the Bearer prefix on all auth headers. Without it you get a misleading 403 instead of 401.",
+  scope: "agent",
+  tags: ["example-api"],
+})
+```
+
+The seeded `memory` skill carries the full guidance: what makes a good memory, when to pick `swarm` scope, how to check for a near-duplicate with the `memory-dedup-check` script before storing, and how to triage with `memory-edit`, `memory-delete`, and `memory_rate`. On harnesses with a file hook, a file written under `/workspace/personal/memory/` is indexed too.
+
+### What to Save
+
+- Solutions to problems you solved
+- Codebase patterns you discovered
+- Mistakes you made and how to avoid them
+- Important configurations
+- Instructions from the lead or user
+
+### What Not to Save
+
+- Session-specific context (temporary state)
+- Unverified conclusions
+- Information that duplicates existing documentation
+
+## Memory Categories
+
+When the lead injects learnings via `inject-learning`, they're categorized:
+
+| Category | Purpose |
+|----------|---------|
+| `mistake-pattern` | Common mistakes to avoid |
+| `best-practice` | Preferred approaches |
+| `codebase-knowledge` | Facts about the codebase |
+| `preference` | User or team preferences |
+
+## Configuration
+
+Reranking parameters are tunable via environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MEMORY_RECENCY_HALF_LIFE_DAYS` | `14` | Optional global override for recency half-life across all memory sources. Leave unset to use the source-aware defaults above. |
+| `MEMORY_HYBRID_SEARCH` | `1` | Enable reciprocal-rank-fusion hybrid retrieval (vector + full-text) instead of vector-only search. Set to `0` or `false` to disable. |
+| `MEMORY_GRAPH_EXPANSION` | `1` | Expand search candidates with 1-hop memory-link neighbors before reranking (`retrievalSource: "graph"` provenance). Set to `0` or `false` to disable. See [Graph Expansion](#graph-expansion). |
+| `MEMORY_MIN_SIMILARITY` | `0.1` | Minimum raw cosine similarity a candidate must meet before reranking. |
+| `MEMORY_ACCESS_BOOST_MAX` | `1.5` | Maximum access boost multiplier |
+| `MEMORY_ACCESS_RECENCY_HOURS` | `48` | Hours within which access counts for full boost |
+| `MEMORY_CANDIDATE_MULTIPLIER` | `3` | Candidate set size relative to requested limit |
+
+## Architecture
+
+```
+src/be/memory/
+├── types.ts              # EmbeddingProvider + MemoryStore interfaces
+├── constants.ts          # TTL defaults + reranking params (env-overridable)
+├── reranker.ts           # Scoring: similarity × source quality × recency × access
+├── index.ts              # Singleton getters
+└── providers/
+    ├── openai-embedding.ts   # OpenAI text-embedding-3-small
+    └── sqlite-store.ts       # SQLite + sqlite-vec KNN search
+```
+
+The provider interfaces make it straightforward to add alternative implementations (e.g., a different embedding model or a Postgres-backed store) without changing any consumer code.
+
+## Related
+
+- [Hook System](/docs/architecture/hooks) — The PostToolUse hook that auto-indexes memory files
+- [Agent Identity & Configuration](/docs/architecture/agents) — How identity files persist across sessions
+- [Architecture Overview](/docs/architecture/overview) — System-level view of how memory fits in
+- [Memory API Reference](/docs/api-reference/memory) — REST API endpoints for searching and managing agent memories

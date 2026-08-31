@@ -1,0 +1,470 @@
+/**
+ * Config store persistence for Codex OAuth credentials.
+ *
+ * Stores/retrieves credentials via the swarm API config store at global scope.
+ * The entrypoint fetches them at boot and writes ~/.codex/auth.json.
+ *
+ * Multi-slot support: credentials are keyed as `codex_oauth_0`, `codex_oauth_1`,
+ * etc. The legacy `codex_oauth` key is treated as slot 0 (read-only fallback)
+ * until the 071 migration renames it.
+ */
+
+import { deriveCodexKeySuffix } from "./auth-json.js";
+import { refreshAccessToken } from "./flow.js";
+import type { CodexOAuthCredentials } from "./types.js";
+
+/** Legacy single-credential key — kept for backwards-compat fallback reads. */
+const CODEX_OAUTH_KEY_LEGACY = "codex_oauth";
+
+/**
+ * How long a slot's refresh lock stays valid before another caller may steal
+ * it — bounds the blast radius of a caller that acquires the lock and then
+ * dies mid-refresh (crash recovery), matching `REFRESH_LOCK_TTL_MS` in
+ * `src/oauth/ensure-token.ts`.
+ */
+const REFRESH_LOCK_TTL_MS = 2 * 60 * 1000;
+/** Max time to wait for another caller's in-flight refresh before giving up. */
+const REFRESH_LOCK_WAIT_MS = 30 * 1000;
+const REFRESH_LOCK_POLL_MS = 250;
+
+/**
+ * How far ahead of actual expiry a token is treated as needing refresh —
+ * matches the default `bufferMs` in `isTokenExpiringSoon`
+ * (`src/be/db-queries/oauth.ts`), the tracker-OAuth path's equivalent skew.
+ *
+ * Without this, a token that is still technically valid but seconds from
+ * expiry sails through the fast path (`Date.now() < creds.expires`) with no
+ * lock at all — two pool callers can both read it as "valid", proceed to use
+ * it, and race an independent refresh moments later. Treating near-expiry
+ * the same as already-expired routes both callers through the same
+ * lock-and-re-read critical section below, so only one of them refreshes.
+ *
+ * Widened from 5 min to 12 h (2026-07-06): with the live-verified 10-day
+ * access-token TTL, no pool-slot session outlives 12 h, so this eliminates
+ * the "benign mid-session-expiry twin" entirely (a session drawing a slot
+ * that then expires mid-turn) at the cost of ~0.2% more refreshes. Must stay
+ * strictly less than pi-ai's own zero-skew refresh check
+ * (`src/utils/internal-ai/credentials.ts` → `getOAuthApiKey`) so
+ * `getValidCodexOAuth` always wins the race and pi-ai never observes a token
+ * this function would already have refreshed (Risk R4) — see the ordering
+ * test in `codex-oauth-storage.test.ts`.
+ */
+const REFRESH_SKEW_MS = 12 * 60 * 60 * 1000;
+
+/**
+ * Live-verified 2026-07-06 by decoding the JWTs of all 12 pool slots
+ * (`exp - iat` = 14400 min = 10 days) for our ChatGPT Team workspace. Used by
+ * {@link isStaleByAge} to derive a token's issue time (`expires - TTL`) since
+ * the config store only persists `expires`, not `iat`.
+ */
+const ACCESS_TOKEN_TTL_MS = 10 * 24 * 60 * 60 * 1000;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** True once `expires` is within `REFRESH_SKEW_MS` of now (or already past). */
+function isExpiringSoon(expires: number): boolean {
+  return Date.now() >= expires - REFRESH_SKEW_MS;
+}
+
+/** True once the token was issued more than `maxAgeMs` ago (derived as `expires - ACCESS_TOKEN_TTL_MS`). */
+function isStaleByAge(expires: number, maxAgeMs: number): boolean {
+  const issuedAt = expires - ACCESS_TOKEN_TTL_MS;
+  return Date.now() - issuedAt > maxAgeMs;
+}
+
+export type CodexOAuthRefreshFailureReason = "refresh_rejected" | "lock_timeout";
+
+/**
+ * Thrown by {@link getValidCodexOAuth} when a slot has stored credentials but
+ * revalidation could not complete — as opposed to returning `null`, which is
+ * reserved for "no credentials configured for this slot". Distinguishing the
+ * two lets pool callers (`resolveCodexAuthMode` in codex-adapter.ts) fail
+ * loudly with an actionable reason instead of silently falling back to a
+ * stale/blanked auth.json.
+ */
+export class CodexOAuthRefreshError extends Error {
+  constructor(
+    public readonly slot: number,
+    public readonly reason: CodexOAuthRefreshFailureReason,
+    public readonly keySuffix: string,
+    public readonly status?: number,
+    public readonly body?: string,
+  ) {
+    super(
+      reason === "lock_timeout"
+        ? `[codex-oauth] slot ${slot} [...${keySuffix}] timed out waiting for refresh lock`
+        : `[codex-oauth] slot ${slot} [...${keySuffix}] refresh rejected (${status ?? "unknown status"} ${body ?? ""})`.trim(),
+    );
+    this.name = "CodexOAuthRefreshError";
+  }
+}
+
+/**
+ * Acquire the cross-process refresh lock for a Codex OAuth slot via the API
+ * server's `oauth_refresh_locks` table (migration 077). Worker-side code
+ * can't reach that table directly (no `bun:sqlite`/`be/db` imports), so this
+ * goes over HTTP — same table the tracker-OAuth path
+ * (`src/oauth/ensure-token.ts`) locks directly since it runs API-side.
+ *
+ * Returns the lock's `owner` token on success, or `null` if another caller
+ * currently holds it.
+ */
+async function acquireCodexRefreshLock(
+  apiUrl: string,
+  apiKey: string,
+  slot: number,
+): Promise<string | null> {
+  const key = codexOAuthKeyForSlot(slot);
+  const res = await fetch(`${apiUrl}/api/oauth/refresh-locks/${encodeURIComponent(key)}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({ ttlMs: REFRESH_LOCK_TTL_MS }),
+  });
+
+  if (res.status === 409) return null;
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(
+      `Failed to acquire codex-oauth refresh lock (slot ${slot}): HTTP ${res.status} ${text}`,
+    );
+  }
+
+  const data = (await res.json()) as { owner: string };
+  return data.owner;
+}
+
+/** Release a lock acquired via {@link acquireCodexRefreshLock}. Best-effort — the TTL reclaims it either way. */
+async function releaseCodexRefreshLock(
+  apiUrl: string,
+  apiKey: string,
+  slot: number,
+  owner: string,
+): Promise<void> {
+  const key = codexOAuthKeyForSlot(slot);
+  try {
+    await fetch(`${apiUrl}/api/oauth/refresh-locks/${encodeURIComponent(key)}`, {
+      method: "DELETE",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({ owner }),
+    });
+  } catch (err) {
+    console.error(
+      `[codex-oauth] Failed to release refresh lock for slot ${slot} (non-fatal):`,
+      err,
+    );
+  }
+}
+
+/** Derive the swarm_config key for a given slot index. */
+export function codexOAuthKeyForSlot(slot: number): string {
+  return `codex_oauth_${slot}`;
+}
+
+/**
+ * Load all stored Codex OAuth credential slots from the config store.
+ * Returns slots sorted by slot index (ascending).
+ *
+ * Backwards-compat: during a rolling upgrade the control plane may still
+ * only expose the legacy single-row `codex_oauth` key (pre-071-migration).
+ * If no `codex_oauth_0` entry exists, the legacy row is reported as slot 0
+ * — mirroring {@link loadCodexOAuth}'s existing slot-0 fallback — so callers
+ * (`resolveCodexOAuthCredentialInfo` in runner.ts) treat it as pool-backed
+ * and set `codexSlot`. Without this, `resolveCodexAuthMode` (codex-adapter.ts)
+ * skips its locked `getValidCodexOAuth(..., 0)` revalidation for an existing
+ * chatgpt-mode auth.json, and once the boot-seeded access token (which had
+ * its refresh_token deliberately blanked for non-standalone sources — see
+ * docker-entrypoint.sh) expires, every task fails authentication with no way
+ * to renew it.
+ */
+export async function loadAllCodexOAuthSlots(
+  apiUrl: string,
+  apiKey: string,
+): Promise<Array<{ slot: number; creds: CodexOAuthCredentials }>> {
+  let res: Response;
+  try {
+    res = await fetch(`${apiUrl}/api/config/resolved?includeSecrets=true`, {
+      headers: { Authorization: `Bearer ${apiKey}` },
+    });
+  } catch {
+    return [];
+  }
+
+  if (!res.ok) return [];
+
+  const data = (await res.json()) as { configs: Array<{ key: string; value: string }> };
+  const slotPattern = /^codex_oauth_(\d+)$/;
+  const results: Array<{ slot: number; creds: CodexOAuthCredentials }> = [];
+  let hasSlot0 = false;
+
+  for (const entry of data.configs ?? []) {
+    const match = slotPattern.exec(entry.key);
+    if (!match || !entry.value) continue;
+    const slot = Number(match[1]);
+    if (slot === 0) hasSlot0 = true;
+    try {
+      results.push({ slot, creds: JSON.parse(entry.value) as CodexOAuthCredentials });
+    } catch {
+      // skip entries with unparseable values
+    }
+  }
+
+  if (!hasSlot0) {
+    const legacyEntry = data.configs?.find((c) => c.key === CODEX_OAUTH_KEY_LEGACY);
+    if (legacyEntry?.value) {
+      try {
+        results.push({ slot: 0, creds: JSON.parse(legacyEntry.value) as CodexOAuthCredentials });
+      } catch {
+        // skip unparseable legacy entry
+      }
+    }
+  }
+
+  return results.sort((a, b) => a.slot - b.slot);
+}
+
+export async function storeCodexOAuth(
+  apiUrl: string,
+  apiKey: string,
+  creds: CodexOAuthCredentials,
+  slot = 0,
+): Promise<void> {
+  const key = codexOAuthKeyForSlot(slot);
+  const res = await fetch(`${apiUrl}/api/config`, {
+    method: "PUT",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      scope: "global",
+      key,
+      value: JSON.stringify(creds),
+      isSecret: true,
+      description: `Codex ChatGPT OAuth credentials slot ${slot} (stored by codex-login)`,
+    }),
+  });
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`Failed to store ${key} config: HTTP ${res.status} ${text}`);
+  }
+}
+
+export async function loadCodexOAuth(
+  apiUrl: string,
+  apiKey: string,
+  slot = 0,
+): Promise<CodexOAuthCredentials | null> {
+  const slotKey = codexOAuthKeyForSlot(slot);
+
+  let res: Response;
+  try {
+    res = await fetch(`${apiUrl}/api/config/resolved?includeSecrets=true`, {
+      headers: { Authorization: `Bearer ${apiKey}` },
+    });
+  } catch {
+    return null;
+  }
+
+  if (!res.ok) {
+    return null;
+  }
+
+  const data = (await res.json()) as { configs: Array<{ key: string; value: string }> };
+
+  // Try the slot-keyed entry first.
+  let entry = data.configs?.find((c) => c.key === slotKey);
+
+  // Backwards-compat: if slot 0 requested and no slot key found, check legacy key.
+  // Do NOT auto-migrate — the 071 migration handles that.
+  if (!entry && slot === 0) {
+    entry = data.configs?.find((c) => c.key === CODEX_OAUTH_KEY_LEGACY);
+  }
+
+  if (!entry?.value) return null;
+
+  try {
+    return JSON.parse(entry.value) as CodexOAuthCredentials;
+  } catch {
+    console.error("[codex-oauth] Failed to parse codex_oauth config value");
+    return null;
+  }
+}
+
+export async function deleteCodexOAuth(apiUrl: string, apiKey: string, slot = 0): Promise<void> {
+  const key = codexOAuthKeyForSlot(slot);
+
+  const res = await fetch(`${apiUrl}/api/config/resolved?includeSecrets=true`, {
+    headers: { Authorization: `Bearer ${apiKey}` },
+  });
+
+  if (!res.ok) return;
+
+  const data = (await res.json()) as { configs: Array<{ id: string; key: string }> };
+  const entry = data.configs?.find((c) => c.key === key);
+  if (!entry) return;
+
+  await fetch(`${apiUrl}/api/config/${entry.id}`, {
+    method: "DELETE",
+    headers: { Authorization: `Bearer ${apiKey}` },
+  });
+}
+
+/**
+ * Best-effort persistence of refreshed OAuth credentials back to the config
+ * store. Wraps {@link storeCodexOAuth} with a try/catch + `console.error` —
+ * a write failure MUST NOT block the current caller from using the refreshed
+ * `apiKey`. Called from `src/utils/internal-ai/credentials.ts` after token
+ * rotation so the new refresh token isn't lost in-memory.
+ */
+export async function persistCodexOAuth(
+  apiUrl: string,
+  apiKey: string,
+  creds: CodexOAuthCredentials,
+  slot = 0,
+): Promise<void> {
+  try {
+    await storeCodexOAuth(apiUrl, apiKey, creds, slot);
+  } catch (err) {
+    console.error("[codex-oauth] persistCodexOAuth failed (non-fatal):", err);
+  }
+}
+
+/**
+ * Load the slot's credentials and refresh them if the access token has
+ * expired.
+ *
+ * Codex refresh tokens are single-use — OpenAI rotates the refresh token on
+ * every exchange and revokes the whole token family (on a delay) if a
+ * stale/already-rotated refresh token is ever replayed. Since a pool slot is
+ * shared across concurrently-running tasks (each a separate worker process),
+ * two callers racing this function with the same expired `creds.refresh`
+ * would both exchange it — the loser replays a token OpenAI already
+ * considers rotated, which eventually revokes the slot. Guard the
+ * refresh-and-persist critical section with the same cross-process lock the
+ * tracker-OAuth path uses (`src/oauth/ensure-token.ts`), re-reading the
+ * stored credentials after acquiring the lock so a caller that lost the race
+ * picks up the winner's freshly-rotated tokens instead of re-exchanging.
+ *
+ * A token that is still valid but within `REFRESH_SKEW_MS` of expiry is
+ * treated the same as an already-expired one — it also goes through the
+ * lock-and-re-read path below — so two callers can't both observe it as
+ * "valid" and independently refresh it moments apart.
+ *
+ * `opts.maxAgeMs`, when set, additionally treats a token as needing refresh
+ * once it was issued more than that long ago (see {@link isStaleByAge}) — on
+ * top of the near-expiry skew above, not instead of it. This is how the
+ * locked keep-warm sweep (`POST /api/oauth/keep-warm/codex`) reuses this same
+ * function to refresh slots proactively (~weekly, `maxAgeMs` ≈ 7 days) rather
+ * than waiting for a task to draw a slot within `REFRESH_SKEW_MS` of expiry.
+ * Default behavior (opts omitted) is unchanged.
+ *
+ * Throws {@link CodexOAuthRefreshError} when the slot has credentials but
+ * revalidation could not complete (refresh rejected by OpenAI, or timed out
+ * waiting for the lock) — as opposed to returning `null`, which is reserved
+ * for "no credentials configured for this slot". Callers that must never
+ * throw (e.g. `resolveCredential` in `src/utils/internal-ai/credentials.ts`)
+ * already wrap this call in try/catch.
+ */
+export async function getValidCodexOAuth(
+  apiUrl: string,
+  apiKey: string,
+  slot = 0,
+  opts?: { maxAgeMs?: number },
+): Promise<CodexOAuthCredentials | null> {
+  const needsRefresh = (c: CodexOAuthCredentials): boolean =>
+    isExpiringSoon(c.expires) ||
+    (opts?.maxAgeMs !== undefined && isStaleByAge(c.expires, opts.maxAgeMs));
+
+  let creds = await loadCodexOAuth(apiUrl, apiKey, slot);
+  if (!creds) return null;
+  if (!needsRefresh(creds)) return creds;
+
+  const waitStartedAt = Date.now();
+  for (;;) {
+    // Re-read before attempting the lock — another caller may have already
+    // refreshed since our last read, above or on a prior loop iteration.
+    creds = await loadCodexOAuth(apiUrl, apiKey, slot);
+    if (!creds) return null;
+    if (!needsRefresh(creds)) return creds;
+
+    const owner = await acquireCodexRefreshLock(apiUrl, apiKey, slot);
+    if (!owner) {
+      if (Date.now() - waitStartedAt > REFRESH_LOCK_WAIT_MS) {
+        console.error(`[codex-oauth] Timed out waiting for slot ${slot} refresh lock`);
+        throw new CodexOAuthRefreshError(
+          slot,
+          "lock_timeout",
+          deriveCodexKeySuffix(creds.access, creds.accountId),
+        );
+      }
+      await sleep(REFRESH_LOCK_POLL_MS);
+      continue;
+    }
+
+    try {
+      // Re-read again now that we hold the lock — another caller may have
+      // rotated the refresh token between our last read and lock acquisition.
+      const lockedCreds = await loadCodexOAuth(apiUrl, apiKey, slot);
+      if (!lockedCreds) return null;
+      if (!needsRefresh(lockedCreds)) return lockedCreds;
+
+      console.log("[codex-oauth] Token expired or expiring soon, refreshing...");
+      const result = await refreshAccessToken(lockedCreds.refresh);
+      if (result.type !== "success") {
+        console.error("[codex-oauth] Token refresh failed");
+        throw new CodexOAuthRefreshError(
+          slot,
+          "refresh_rejected",
+          deriveCodexKeySuffix(lockedCreds.access, lockedCreds.accountId),
+          result.status,
+          result.error,
+        );
+      }
+
+      const refreshed: CodexOAuthCredentials = {
+        access: result.access,
+        refresh: result.refresh,
+        expires: result.expires,
+        accountId: lockedCreds.accountId,
+      };
+
+      // A persist failure here MUST be fatal to this refresh: returning the
+      // in-memory `refreshed` credentials without durably storing them means
+      // the next caller reads the now-stale `lockedCreds.refresh` and
+      // replays it, triggering exactly the family revocation this lock
+      // exists to prevent. Let the error propagate instead of swallowing it.
+      try {
+        await storeCodexOAuth(apiUrl, apiKey, refreshed, slot);
+      } catch (persistErr) {
+        // `lockedCreds.refresh` is already single-use/rotated with OpenAI —
+        // it can never be exchanged again. If we can't durably store the new
+        // `refreshed` token, quarantine the slot (delete it from the config
+        // store) so the next caller's `loadCodexOAuth` finds nothing and
+        // returns null instead of reading back and replaying the
+        // now-consumed old refresh token. Best-effort: a delete failure here
+        // leaves the corrupted state, but we still surface the original
+        // persist error so this call treats the slot as unusable.
+        await deleteCodexOAuth(apiUrl, apiKey, slot).catch((deleteErr) => {
+          console.error(
+            `[codex-oauth] Failed to quarantine slot ${slot} after persist failure (non-fatal):`,
+            deleteErr,
+          );
+        });
+        throw persistErr;
+      }
+
+      return refreshed;
+    } finally {
+      await releaseCodexRefreshLock(apiUrl, apiKey, slot, owner);
+    }
+  }
+}

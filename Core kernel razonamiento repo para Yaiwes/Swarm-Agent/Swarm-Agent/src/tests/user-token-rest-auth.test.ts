@@ -1,0 +1,269 @@
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { unlinkSync } from "node:fs";
+import {
+  createServer as createHttpServer,
+  type IncomingMessage,
+  type Server,
+  type ServerResponse,
+} from "node:http";
+import {
+  closeDb,
+  createAgent,
+  createTaskExtended,
+  createUser,
+  getDbClient,
+  initDb,
+} from "../be/db";
+import { type IdentityActor, mintToken, revokeToken } from "../be/users";
+import { handleCore } from "../http/core";
+import { handleTasks } from "../http/tasks";
+import { getPathSegments, parseQueryParams } from "../http/utils";
+import { listenOnFreePort } from "./test-net";
+
+const TEST_DB_PATH = "./test-user-token-rest-auth.sqlite";
+const API_KEY = "test-api-key";
+const ACTOR: IdentityActor = { kind: "operator", id: "op:test" };
+
+function createTestServer(): Server {
+  return createHttpServer(async (req: IncomingMessage, res: ServerResponse) => {
+    const pathSegments = getPathSegments(req.url || "");
+    const queryParams = parseQueryParams(req.url || "");
+    const myAgentId = req.headers["x-agent-id"] as string | undefined;
+
+    if (await handleCore(req, res, myAgentId, API_KEY)) return;
+    if (await handleTasks(req, res, pathSegments, queryParams, myAgentId)) return;
+
+    res.writeHead(404);
+    res.end("Not Found");
+  });
+}
+
+function cleanupDb() {
+  for (const suffix of ["", "-wal", "-shm"]) {
+    try {
+      unlinkSync(`${TEST_DB_PATH}${suffix}`);
+    } catch {}
+  }
+}
+
+describe("normal REST API user-bound token auth", () => {
+  let server: Server;
+  let port: number;
+
+  beforeAll(async () => {
+    cleanupDb();
+    initDb(TEST_DB_PATH);
+    await createAgent({ name: "Lead", isLead: true, status: "idle" });
+    server = createTestServer();
+    port = await listenOnFreePort(server);
+  });
+
+  afterAll(() => {
+    server.close();
+    closeDb();
+    cleanupDb();
+  });
+
+  test("POST /api/tasks accepts active user token and forces requester/audit user", async () => {
+    const user = await createUser({ name: "Token REST User" });
+    const other = await createUser({ name: "Other User" });
+    const { plaintext } = await mintToken(user.id, "rest", ACTOR);
+
+    const res = await fetch(`http://localhost:${port}/api/tasks`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${plaintext}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        task: "created through user token",
+        requestedByUserId: other.id,
+      }),
+    });
+
+    expect(res.status).toBe(201);
+    const body = (await res.json()) as { id: string; requestedByUserId?: string };
+    expect(body.requestedByUserId).toBe(user.id);
+
+    const row = await getDbClient().get<{
+      requestedByUserId: string | null;
+      created_by: string | null;
+      updated_by: string | null;
+    }>("SELECT requestedByUserId, created_by, updated_by FROM agent_tasks WHERE id = ?", [body.id]);
+    expect(row?.requestedByUserId).toBe(user.id);
+    expect(row?.created_by).toBe(user.id);
+    expect(row?.updated_by).toBe(user.id);
+  });
+
+  test("global API key still creates unattributed tasks by default", async () => {
+    const res = await fetch(`http://localhost:${port}/api/tasks`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ task: "created through global key" }),
+    });
+
+    expect(res.status).toBe(201);
+    const body = (await res.json()) as { id: string; requestedByUserId?: string };
+    expect(body.requestedByUserId).toBeUndefined();
+  });
+
+  test("global API key caller cannot spoof requestedByUserId via body — falls back to owned task context", async () => {
+    const legitRequester = await createUser({ name: "Legit Requester" });
+    const attacker = await createUser({ name: "Attacker" });
+    const agent = await createAgent({ name: "spoof-test-agent", isLead: false, status: "idle" });
+    const ownedTask = await createTaskExtended("owned task for spoof test", {
+      agentId: agent.id,
+      requestedByUserId: legitRequester.id,
+    });
+
+    const res = await fetch(`http://localhost:${port}/api/tasks`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${API_KEY}`,
+        "Content-Type": "application/json",
+        "x-agent-id": agent.id,
+        "x-source-task-id": ownedTask.id,
+      },
+      body: JSON.stringify({
+        task: "created through global key with spoofed requestedByUserId",
+        requestedByUserId: attacker.id,
+      }),
+    });
+
+    expect(res.status).toBe(201);
+    const body = (await res.json()) as { id: string; requestedByUserId?: string };
+    expect(body.requestedByUserId).toBe(legitRequester.id);
+    expect(body.requestedByUserId).not.toBe(attacker.id);
+  });
+
+  test("global API key caller + body requestedByUserId, flag=false → stays unattributed, body ignored", async () => {
+    // Strict opt-out posture: with TRUST_BODY_REQUESTED_BY_USER_ID=false an
+    // operator/global-key caller cannot spoof attribution via the request
+    // body. This is the anti-spoofing behavior upstream #939 introduced.
+    process.env.TRUST_BODY_REQUESTED_BY_USER_ID = "false";
+    try {
+      const someUser = await createUser({ name: "Some User (flag off)" });
+
+      const res = await fetch(`http://localhost:${port}/api/tasks`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          task: "created from the UI session view, flag off",
+          requestedByUserId: someUser.id,
+        }),
+      });
+
+      expect(res.status).toBe(201);
+      const body = (await res.json()) as { id: string; requestedByUserId?: string };
+      expect(body.requestedByUserId).toBeUndefined();
+    } finally {
+      delete process.env.TRUST_BODY_REQUESTED_BY_USER_ID;
+    }
+  });
+
+  describe("TRUST_BODY_REQUESTED_BY_USER_ID default-on (shared-key deployments)", () => {
+    beforeAll(() => {
+      // Default posture — the flag is unset (which means ON).
+      expect(process.env.TRUST_BODY_REQUESTED_BY_USER_ID).toBeUndefined();
+    });
+
+    test("global API key caller + valid body requestedByUserId (no owned task context) → attributed to that user", async () => {
+      // Default-on behavior: the UI shares one operator key across all
+      // users, so there is no ownership-gated task context to fall back
+      // to — the body-supplied id is the only signal available, and it is
+      // trusted once validated against a real user row (opt out with
+      // TRUST_BODY_REQUESTED_BY_USER_ID=false).
+      const uiUser = await createUser({ name: "UI Picker User" });
+
+      const res = await fetch(`http://localhost:${port}/api/tasks`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          task: "created from the UI session view",
+          requestedByUserId: uiUser.id,
+        }),
+      });
+
+      expect(res.status).toBe(201);
+      const body = (await res.json()) as { id: string; requestedByUserId?: string };
+      expect(body.requestedByUserId).toBe(uiUser.id);
+    });
+
+    test("global API key caller + bogus body requestedByUserId → stays unattributed (NULL), not a crash", async () => {
+      const res = await fetch(`http://localhost:${port}/api/tasks`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          task: "created with a nonexistent requestedByUserId",
+          requestedByUserId: "does-not-exist",
+        }),
+      });
+
+      expect(res.status).toBe(201);
+      const body = (await res.json()) as { id: string; requestedByUserId?: string };
+      expect(body.requestedByUserId).toBeUndefined();
+    });
+
+    test("owned task context still takes precedence over body even when flag is on", async () => {
+      const legitRequester = await createUser({ name: "Legit Requester (flag on)" });
+      const attacker = await createUser({ name: "Attacker (flag on)" });
+      const agent = await createAgent({
+        name: "spoof-test-agent-flag-on",
+        isLead: false,
+        status: "idle",
+      });
+      const ownedTask = await createTaskExtended("owned task for spoof test, flag on", {
+        agentId: agent.id,
+        requestedByUserId: legitRequester.id,
+      });
+
+      const res = await fetch(`http://localhost:${port}/api/tasks`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${API_KEY}`,
+          "Content-Type": "application/json",
+          "x-agent-id": agent.id,
+          "x-source-task-id": ownedTask.id,
+        },
+        body: JSON.stringify({
+          task: "created through global key with spoofed requestedByUserId, flag on",
+          requestedByUserId: attacker.id,
+        }),
+      });
+
+      expect(res.status).toBe(201);
+      const body = (await res.json()) as { id: string; requestedByUserId?: string };
+      expect(body.requestedByUserId).toBe(legitRequester.id);
+      expect(body.requestedByUserId).not.toBe(attacker.id);
+    });
+  });
+
+  test("revoked user token is unauthorized for normal API", async () => {
+    const user = await createUser({ name: "Revoked REST User" });
+    const { tokenId, plaintext } = await mintToken(user.id, "revoked", ACTOR);
+    await revokeToken(tokenId, ACTOR);
+
+    const res = await fetch(`http://localhost:${port}/api/tasks`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${plaintext}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ task: "should not be created" }),
+    });
+
+    expect(res.status).toBe(401);
+  });
+});

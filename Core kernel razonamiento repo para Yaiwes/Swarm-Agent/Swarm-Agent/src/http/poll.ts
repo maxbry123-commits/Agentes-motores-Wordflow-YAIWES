@@ -1,0 +1,685 @@
+import type { IncomingMessage, ServerResponse } from "node:http";
+import { ensure } from "@desplega.ai/business-use";
+import { z } from "zod";
+import { canClaim } from "../be/budget-admission";
+import {
+  type BudgetRefusalContext,
+  emitBudgetRefusalSideEffects,
+} from "../be/budget-refusal-notify";
+import {
+  claimMentions,
+  claimOfferedTask,
+  claimTask,
+  getAgentById,
+  getAllChannelActivityCursors,
+  getDbClient,
+  getInboxSummary,
+  getOfferedTasksForAgent,
+  getPendingTaskForAgent,
+  getTaskAttachments,
+  getTaskById,
+  getUnassignedTaskIdsForAgent,
+  getUserById,
+  hasCapacity,
+  recordBudgetRefusalNotification,
+  startTask,
+  updateAgentStatusFromCapacity,
+  upsertChannelActivityCursor,
+} from "../be/db";
+import { renderIdentity, resolveIdentity } from "../be/identity";
+import { touchRuntimeInstance } from "../be/multi-runtime";
+import { hasCapability } from "../server";
+import { fetchChannelActivity } from "../slack/channel-activity";
+import { telemetry } from "../telemetry";
+import {
+  AgentTaskSchema,
+  BudgetRefusedTriggerSchema,
+  TaskAttachmentSchema,
+  UserCommsPrefsSchema,
+  UserSchema,
+} from "../types";
+import { isMultiRuntimeEnabled } from "../utils/multi-runtime";
+import { getUserCommsPrefs } from "../utils/requester-comms";
+import { route, runtimeInstanceHeader } from "./route-def";
+import { jsonError } from "./utils";
+
+// ─── Budget-refused trigger envelope ────────────────────────────────────────
+
+/**
+ * Build the `budget_refused` trigger envelope from a `canClaim` refusal. Lives
+ * here (not in budget-admission) because it's the API-shape contract — workers
+ * read this on the wire (Phase 4 teaches them how).
+ *
+ * Phase 5: each refusal site additionally calls
+ * `recordBudgetRefusalNotification` (in-txn) and
+ * `emitBudgetRefusalSideEffects` (after-commit) to drive the lead follow-up
+ * + workflow bus emit. See `src/be/budget-refusal-notify.ts`.
+ */
+function buildBudgetRefusedTrigger(refusal: {
+  cause: "agent" | "global" | "user";
+  agentSpend?: number;
+  agentBudget?: number;
+  globalSpend?: number;
+  globalBudget?: number;
+  userSpend?: number;
+  userBudget?: number;
+  resetAt: string;
+}): { type: "budget_refused"; [key: string]: unknown } {
+  const trigger: { type: "budget_refused"; [key: string]: unknown } = {
+    type: "budget_refused",
+    cause: refusal.cause,
+    resetAt: refusal.resetAt,
+  };
+  if (refusal.agentSpend !== undefined) trigger.agentSpend = refusal.agentSpend;
+  if (refusal.agentBudget !== undefined) trigger.agentBudget = refusal.agentBudget;
+  if (refusal.globalSpend !== undefined) trigger.globalSpend = refusal.globalSpend;
+  if (refusal.globalBudget !== undefined) trigger.globalBudget = refusal.globalBudget;
+  if (refusal.userSpend !== undefined) trigger.userSpend = refusal.userSpend;
+  if (refusal.userBudget !== undefined) trigger.userBudget = refusal.userBudget;
+  return trigger;
+}
+
+// ─── Route Definitions ───────────────────────────────────────────────────────
+
+// Slim attachment projection sent on `task_assigned` triggers — mirrors the
+// fields built by `attachmentsForTrigger` below (id, name, mimeType, sizeBytes).
+const PollTriggerAttachmentSchema = TaskAttachmentSchema.pick({
+  id: true,
+  name: true,
+  mimeType: true,
+  sizeBytes: true,
+});
+
+// Requester projection sent on `task_assigned` triggers — either the resolved
+// user's identity fields, or (when no `requestedByUserId` is recorded) just a
+// rendered `name` for the UNKNOWN-identity sentinel.
+const PollRequestedBySchema = UserSchema.pick({
+  name: true,
+  email: true,
+  role: true,
+  notes: true,
+}).extend({
+  // Structured communication preferences from `users.metadata.comms`.
+  comms: UserCommsPrefsSchema.optional(),
+});
+
+const PollTaskOfferedTriggerSchema = z.object({
+  type: z.literal("task_offered"),
+  taskId: z.string(),
+  task: AgentTaskSchema,
+  requestedBy: PollRequestedBySchema.optional(),
+});
+
+const PollTaskAssignedTriggerSchema = z.object({
+  type: z.literal("task_assigned"),
+  taskId: z.string(),
+  task: AgentTaskSchema.extend({
+    attachments: z.array(PollTriggerAttachmentSchema),
+  }),
+  requestedBy: PollRequestedBySchema.optional(),
+});
+
+// `budget_refused` reuses the canonical `BudgetRefusedTriggerSchema` entity
+// (src/types.ts) — it was already defined as the wire shape for this exact
+// `/api/poll` trigger back in Phase 3, mirrored by `buildBudgetRefusedTrigger`
+// below.
+
+const PollUnreadMentionsTriggerSchema = z.object({
+  type: z.literal("unread_mentions"),
+  mentionsCount: z.number(),
+  claimedChannels: z.array(z.string()),
+});
+
+const PollChannelActivityTriggerSchema = z.object({
+  type: z.literal("channel_activity"),
+  count: z.number(),
+  messages: z.array(
+    z.object({
+      channelId: z.string(),
+      channelName: z.string().optional(),
+      ts: z.string(),
+      user: z.string(),
+      text: z.string(),
+    }),
+  ),
+  cursorUpdates: z.array(z.object({ channelId: z.string(), ts: z.string() })),
+});
+
+const PollTriggerSchema = z.discriminatedUnion("type", [
+  PollTaskOfferedTriggerSchema,
+  PollTaskAssignedTriggerSchema,
+  BudgetRefusedTriggerSchema,
+  PollUnreadMentionsTriggerSchema,
+  PollChannelActivityTriggerSchema,
+]);
+
+const pollResponseSchema = z.object({
+  trigger: PollTriggerSchema.nullable(),
+});
+
+const pollTriggers = route({
+  method: "get",
+  path: "/api/poll",
+  pattern: ["api", "poll"],
+  summary: "Poll for triggers (tasks, mentions)",
+  tags: ["Poll"],
+  auth: { apiKey: true, agentId: true },
+  headers: runtimeInstanceHeader("poll for work"),
+  responses: {
+    200: { description: "Trigger data or null", schema: pollResponseSchema },
+    400: { description: "Missing X-Agent-ID" },
+    404: { description: "Agent not found" },
+  },
+});
+
+// ─── Channel Activity Throttle ──────────────────────────────────────────────
+
+const CHANNEL_ACTIVITY_INTERVAL_MS = 60_000; // Check at most once per 60s
+let lastChannelActivityCheckAt = 0;
+
+function getRequesterNotes(notes: string | undefined): string | undefined {
+  return typeof notes === "string" && notes.trim().length > 0 ? notes : undefined;
+}
+
+/**
+ * Resolve the requester projection for a task trigger. If the task carries a
+ * machine-recorded external id (today: the Slack user field) but no
+ * requestedByUserId, render the explicit UNKNOWN sentinel instead of silently
+ * omitting the section: never a substituted human (Rule 33 /
+ * provenance-or-silence).
+ */
+async function buildTriggerRequestedBy(task: {
+  requestedByUserId?: string | null;
+  slackUserId?: string | null;
+}): Promise<z.infer<typeof PollRequestedBySchema> | undefined> {
+  const user = task.requestedByUserId ? await getUserById(task.requestedByUserId) : undefined;
+  if (user) {
+    return {
+      name: user.name,
+      email: user.email,
+      role: user.role,
+      notes: getRequesterNotes(user.notes),
+      comms: getUserCommsPrefs(user),
+    };
+  }
+  if (task.slackUserId) {
+    return { name: renderIdentity(await resolveIdentity("slack", task.slackUserId)) };
+  }
+  return undefined;
+}
+
+/**
+ * Slim attachment projection for the `task_assigned` poll trigger — just
+ * enough (id, name, mimeType, sizeBytes) for the worker to build a one-shot
+ * `/api/fs/tasks/{taskId}/files/{id}/raw` fetch recipe into the dispatch
+ * prompt, without shipping the full capabilities/provider blob over poll.
+ */
+async function attachmentsForTrigger(
+  taskId: string,
+): Promise<Array<{ id: string; name: string; mimeType?: string; sizeBytes?: number }>> {
+  return (await getTaskAttachments(taskId)).map((a) => ({
+    id: a.id,
+    name: a.name,
+    mimeType: a.mimeType,
+    sizeBytes: a.sizeBytes,
+  }));
+}
+
+// ─── Cursor Commit Endpoint ─────────────────────────────────────────────────
+
+const commitCursorsRoute = route({
+  method: "post",
+  path: "/api/channel-activity/commit-cursors",
+  pattern: ["api", "channel-activity", "commit-cursors"],
+  summary: "Commit channel activity cursors after successful processing",
+  tags: ["Poll"],
+  auth: { apiKey: true },
+  body: z.object({
+    cursorUpdates: z.array(
+      z.object({
+        channelId: z.string(),
+        ts: z.string(),
+      }),
+    ),
+  }),
+  responses: {
+    200: {
+      description: "Cursors committed",
+      schema: z.object({ success: z.literal(true), committed: z.number().int().nonnegative() }),
+    },
+    400: { description: "Invalid request" },
+  },
+});
+
+// ─── Handler ─────────────────────────────────────────────────────────────────
+
+export async function handlePoll(
+  req: IncomingMessage,
+  res: ServerResponse,
+  pathSegments: string[],
+  queryParams: URLSearchParams,
+  myAgentId: string | undefined,
+): Promise<boolean> {
+  const runtimeInstanceId = ((h) => (Array.isArray(h) ? h[0] : h))(
+    req.headers["x-runtime-instance-id"],
+  );
+  // Handle cursor commit endpoint
+  if (commitCursorsRoute.match(req.method, pathSegments)) {
+    const parsed = await commitCursorsRoute.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+    for (const { channelId, ts } of parsed.body.cursorUpdates) {
+      if (channelId && ts) {
+        await upsertChannelActivityCursor(channelId, ts);
+      }
+    }
+    commitCursorsRoute.respond(res, 200, {
+      success: true,
+      committed: parsed.body.cursorUpdates.length,
+    });
+    return true;
+  }
+
+  if (pollTriggers.match(req.method, pathSegments)) {
+    if (!myAgentId) {
+      jsonError(res, "Missing X-Agent-ID header", 400);
+      return true;
+    }
+
+    // Use transaction for consistent reads across all trigger checks
+    type PollTxnResult =
+      | { error: string; status: number }
+      | {
+          trigger: { type: string; [key: string]: unknown } | null;
+          /**
+           * Phase 5: when the trigger is `budget_refused`, the txn captures
+           * the dedup-row state + the refused task's Slack context so the
+           * after-commit step can resolve the template and create the lead
+           * follow-up. Undefined for any other trigger.
+           */
+          refusalSideEffects?: { context: BudgetRefusalContext; inserted: boolean };
+        };
+    let result: PollTxnResult;
+    try {
+      result = await getDbClient().transaction(async () => {
+        const agent = await getAgentById(myAgentId);
+        if (!agent) {
+          return { error: "Agent not found", status: 404 };
+        }
+
+        // A process whose runtime has been retired must not be handed work: it
+        // would execute alongside whatever replaced it. Dispatch is gated on a
+        // live runtime identity rather than on X-Agent-ID alone, which only
+        // names the logical agent. Polling is worker activity, so this also
+        // refreshes liveness — it cannot revive a retired runtime, since the
+        // update only matches one that is still live.
+        if (
+          isMultiRuntimeEnabled() &&
+          !(runtimeInstanceId && (await touchRuntimeInstance(runtimeInstanceId, agent.id)))
+        ) {
+          return { trigger: null };
+        }
+
+        // Check for offered tasks first (highest priority for both workers and leads)
+        // Atomically claim the task for review to prevent duplicate processing.
+        // Capacity is checked in the same transaction as the claim: with
+        // several runtimes serving one agent these polls run concurrently, and
+        // an unguarded claim here would let each of them take a task past the
+        // agent's logical limit.
+        const offeredTasks = (await hasCapacity(myAgentId))
+          ? await getOfferedTasksForAgent(myAgentId)
+          : [];
+        const firstOfferedTask = offeredTasks[0];
+        if (firstOfferedTask) {
+          const claimedTask = await claimOfferedTask(firstOfferedTask.id, myAgentId);
+          if (claimedTask) {
+            const offeredRequestedBy = await buildTriggerRequestedBy(claimedTask);
+            return {
+              trigger: {
+                type: "task_offered",
+                taskId: claimedTask.id,
+                task: claimedTask,
+                ...(offeredRequestedBy && { requestedBy: offeredRequestedBy }),
+              },
+            };
+          }
+        }
+
+        // Check for pending tasks (assigned directly to this agent)
+        // Only return a task if agent has capacity (server-side enforcement)
+        if (await hasCapacity(myAgentId)) {
+          const pendingTask = await getPendingTaskForAgent(myAgentId);
+          if (pendingTask) {
+            // Budget admission gate (Phase 3). Runs in the same transaction as
+            // the capacity check so capacity AND budget gates share atomicity.
+            // Phase 5 also records the dedup row + captures the side-effect
+            // context here so the after-commit step can notify the lead.
+            const admission = await canClaim(myAgentId, new Date(), pendingTask.requestedByUserId);
+            if (!admission.allowed) {
+              const utcDate = new Date().toISOString().slice(0, 10);
+              const dedup = await recordBudgetRefusalNotification({
+                taskId: pendingTask.id,
+                date: utcDate,
+                agentId: myAgentId,
+                cause: admission.cause,
+                agentSpendUsd: admission.agentSpend,
+                agentBudgetUsd: admission.agentBudget,
+                globalSpendUsd: admission.globalSpend,
+                globalBudgetUsd: admission.globalBudget,
+                userSpendUsd: admission.userSpend,
+                userBudgetUsd: admission.userBudget,
+              });
+              return {
+                trigger: buildBudgetRefusedTrigger(admission),
+                refusalSideEffects: {
+                  context: {
+                    task: {
+                      id: pendingTask.id,
+                      task: pendingTask.task,
+                      requestedByUserId: pendingTask.requestedByUserId,
+                      slackChannelId: pendingTask.slackChannelId,
+                      slackThreadTs: pendingTask.slackThreadTs,
+                      slackUserId: pendingTask.slackUserId,
+                    },
+                    agentId: myAgentId,
+                    date: utcDate,
+                    cause: admission.cause,
+                    agentSpendUsd: admission.agentSpend,
+                    agentBudgetUsd: admission.agentBudget,
+                    globalSpendUsd: admission.globalSpend,
+                    globalBudgetUsd: admission.globalBudget,
+                    userSpendUsd: admission.userSpend,
+                    userBudgetUsd: admission.userBudget,
+                    resetAt: admission.resetAt,
+                  },
+                  inserted: dedup.inserted,
+                },
+              };
+            }
+
+            // Mark task as in_progress immediately to prevent duplicate polling
+            await startTask(pendingTask.id);
+            await updateAgentStatusFromCapacity(myAgentId);
+
+            // Lifecycle announcements go through `afterCommit`, not straight
+            // line: they must not claim "this task started" for a claim the
+            // transaction can still roll back.
+            getDbClient().afterCommit(() => {
+              ensure({
+                id: "started",
+                flow: "task",
+                runId: pendingTask.id,
+                depIds: ["created"],
+                data: {
+                  taskId: pendingTask.id,
+                  agentId: myAgentId,
+                  previousStatus: pendingTask.status,
+                },
+                validator: (data) => data.previousStatus === "pending",
+                // biome-ignore lint/correctness/noEmptyPattern: data unused, ctx needed
+                filter: ({}, ctx) => ctx.deps.length > 0,
+                conditions: [{ timeout_ms: 300_000 }], // 5 min: polling interval + queue wait
+              });
+
+              telemetry.taskEvent("started", {
+                taskId: pendingTask.id,
+                source: pendingTask.source,
+                agentId: myAgentId,
+              });
+            });
+
+            // Resolve requesting user if available (UNKNOWN sentinel handling
+            // lives in buildTriggerRequestedBy).
+            const assignedRequestedBy = await buildTriggerRequestedBy(pendingTask);
+
+            return {
+              trigger: {
+                type: "task_assigned",
+                taskId: pendingTask.id,
+                task: {
+                  ...pendingTask,
+                  status: "in_progress",
+                  attachments: await attachmentsForTrigger(pendingTask.id),
+                },
+                ...(assignedRequestedBy && { requestedBy: assignedRequestedBy }),
+              },
+            };
+          }
+        }
+
+        // Check for unread mentions (internal chat) - all agents can be woken by @mentions
+        // Uses atomic claiming via processing_since to prevent duplicate processing.
+        // Only idle agents poll, so busy workers won't be interrupted.
+        // Gated on the messaging capability: without it the read-messages /
+        // post-message tools aren't registered, so an unread_mentions trigger
+        // would instruct a missing tool and strand the claimed mentions.
+        const claimedChannels = hasCapability("messaging") ? await claimMentions(myAgentId) : [];
+        if (claimedChannels.length > 0) {
+          // Recalculate inbox summary now that we've claimed
+          const inbox = await getInboxSummary(myAgentId);
+          return {
+            trigger: {
+              type: "unread_mentions",
+              mentionsCount: inbox.mentionsCount,
+              claimedChannels: claimedChannels.map((c) => c.channelId), // Include for tracking
+            },
+          };
+        }
+
+        if (agent.isLead) {
+          // === LEAD-SPECIFIC TRIGGERS ===
+          // NOTE: tasks_finished trigger has been replaced by follow-up task creation
+          // in store-progress. When a worker completes/fails a task, a follow-up task
+          // is created and assigned to the lead, which is picked up via the normal
+          // task_assigned trigger above. This is more reliable and visible than the
+          // old poll-based notification approach.
+        } else {
+          // === WORKER-SPECIFIC TRIGGERS ===
+
+          // Auto-claim: atomically claim an unassigned task for this worker.
+          // claimTask() uses an atomic UPDATE WHERE status='unassigned', so only
+          // one worker wins if multiple poll simultaneously.
+          // This ensures session logs are correctly associated with the real task ID
+          // from the start (no reassociation needed).
+          //
+          // Routing affinity: `getUnassignedTaskIdsForAgent` (not the plain
+          // `getUnassignedTaskIds`) pre-filters candidates through
+          // `isAgentEligibleForTask`, so an ineligible task is never even
+          // offered to the budget gate below or the claim loop.
+          if (await hasCapacity(myAgentId)) {
+            const unassignedIds = await getUnassignedTaskIdsForAgent(myAgentId, 5);
+            // Budget admission gate (Phase 3). Pool path is workers-only —
+            // per-agent budgets matter most here, but we still check global.
+            // Only run the gate when there's at least one candidate task; an
+            // empty pool is "no work", not "refused".
+            // Phase 5: dedup row keyed on the FIRST candidate id (the one we
+            // would have claimed). That id is stable for the duration of the
+            // refusal, and the dedup is per-(task,date) so subsequent same-day
+            // refusals on the same lead-candidate are suppressed.
+            if (unassignedIds.length > 0) {
+              const candidateId = unassignedIds[0]!;
+              const candidateTask = await getTaskById(candidateId);
+              const admission = await canClaim(
+                myAgentId,
+                new Date(),
+                candidateTask?.requestedByUserId,
+              );
+              if (!admission.allowed) {
+                const utcDate = new Date().toISOString().slice(0, 10);
+                const dedup = await recordBudgetRefusalNotification({
+                  taskId: candidateId,
+                  date: utcDate,
+                  agentId: myAgentId,
+                  cause: admission.cause,
+                  agentSpendUsd: admission.agentSpend,
+                  agentBudgetUsd: admission.agentBudget,
+                  globalSpendUsd: admission.globalSpend,
+                  globalBudgetUsd: admission.globalBudget,
+                  userSpendUsd: admission.userSpend,
+                  userBudgetUsd: admission.userBudget,
+                });
+                return {
+                  trigger: buildBudgetRefusedTrigger(admission),
+                  refusalSideEffects: candidateTask
+                    ? {
+                        context: {
+                          task: {
+                            id: candidateTask.id,
+                            task: candidateTask.task,
+                            requestedByUserId: candidateTask.requestedByUserId,
+                            slackChannelId: candidateTask.slackChannelId,
+                            slackThreadTs: candidateTask.slackThreadTs,
+                            slackUserId: candidateTask.slackUserId,
+                          },
+                          agentId: myAgentId,
+                          date: utcDate,
+                          cause: admission.cause,
+                          agentSpendUsd: admission.agentSpend,
+                          agentBudgetUsd: admission.agentBudget,
+                          globalSpendUsd: admission.globalSpend,
+                          globalBudgetUsd: admission.globalBudget,
+                          userSpendUsd: admission.userSpend,
+                          userBudgetUsd: admission.userBudget,
+                          resetAt: admission.resetAt,
+                        },
+                        inserted: dedup.inserted,
+                      }
+                    : undefined,
+                };
+              }
+            }
+            for (const candidateId of unassignedIds) {
+              const claimed = await claimTask(candidateId, myAgentId);
+              if (claimed) {
+                await updateAgentStatusFromCapacity(myAgentId);
+                // Post-commit (see the `started` path above): a rolled-back
+                // claim must not report the task as claimed.
+                getDbClient().afterCommit(() => {
+                  telemetry.taskEvent("claimed", {
+                    taskId: claimed.id,
+                    source: claimed.source,
+                    agentId: myAgentId,
+                  });
+                });
+                const claimedRequestedBy = await buildTriggerRequestedBy(claimed);
+                return {
+                  trigger: {
+                    type: "task_assigned",
+                    taskId: claimed.id,
+                    task: { ...claimed, attachments: await attachmentsForTrigger(claimed.id) },
+                    ...(claimedRequestedBy && { requestedBy: claimedRequestedBy }),
+                  },
+                };
+              }
+              // Claim failed (another worker got it) — try next
+            }
+          }
+        }
+
+        // No trigger found
+        return { trigger: null };
+      });
+    } catch (error) {
+      console.error("[/api/poll] Database error:", error);
+      jsonError(
+        res,
+        `Database error occurred while polling for triggers: ${error instanceof Error ? error.message : String(error)}`,
+        500,
+      );
+      return true;
+    }
+
+    // Handle error case
+    if ("error" in result) {
+      jsonError(res, result.error, result.status ?? 500);
+      return true;
+    }
+
+    // Phase 5: after the refusal txn commits, run side effects (lead
+    // follow-up + workflow event bus). Errors here are logged inside the
+    // helper; we never let them affect the response the worker sees.
+    if (result.refusalSideEffects) {
+      await emitBudgetRefusalSideEffects(
+        result.refusalSideEffects.context,
+        result.refusalSideEffects.inserted,
+      );
+    }
+
+    // If no trigger found and agent is lead, check for Slack channel activity.
+    // This is the lowest-priority trigger, checked AFTER all others.
+    // Runs outside the transaction because it requires async Slack API calls.
+    // Throttled to avoid Slack API rate limits (~50 calls/min).
+    if (
+      result.trigger === null &&
+      process.env.LEAD_MONITOR_CHANNELS === "true" &&
+      Date.now() - lastChannelActivityCheckAt >= CHANNEL_ACTIVITY_INTERVAL_MS
+    ) {
+      const agent = await getAgentById(myAgentId);
+      if (agent?.isLead) {
+        lastChannelActivityCheckAt = Date.now();
+        try {
+          const cursors = await getAllChannelActivityCursors();
+          const cursorMap = new Map(cursors.map((c) => [c.channelId, c.lastSeenTs]));
+
+          // Parse optional channel allowlist from env
+          const allowedIds = process.env.LEAD_MONITOR_CHANNEL_IDS
+            ? process.env.LEAD_MONITOR_CHANNEL_IDS.split(",")
+                .map((s) => s.trim())
+                .filter(Boolean)
+            : undefined;
+
+          const { messages, seedCursors } = await fetchChannelActivity(cursorMap, allowedIds);
+
+          // Commit seed cursors immediately (cold-start initialization, no trigger)
+          for (const [channelId, ts] of seedCursors) {
+            await upsertChannelActivityCursor(channelId, ts);
+          }
+
+          if (messages.length > 0) {
+            // Compute cursor updates but DON'T commit them yet.
+            // They're included in the trigger payload so the runner can commit
+            // them after the lead successfully processes the messages.
+            const latestPerChannel = new Map<string, string>();
+            for (const msg of messages) {
+              const existing = latestPerChannel.get(msg.channelId);
+              if (!existing || Number.parseFloat(msg.ts) > Number.parseFloat(existing)) {
+                latestPerChannel.set(msg.channelId, msg.ts);
+              }
+            }
+
+            result = {
+              trigger: {
+                type: "channel_activity",
+                count: messages.length,
+                messages: messages.map((m) => ({
+                  channelId: m.channelId,
+                  channelName: m.channelName,
+                  ts: m.ts,
+                  user: m.user,
+                  text: m.text.slice(0, 500),
+                })),
+                cursorUpdates: Array.from(latestPerChannel.entries()).map(([channelId, ts]) => ({
+                  channelId,
+                  ts,
+                })),
+              },
+            };
+          }
+        } catch (err) {
+          console.warn("[/api/poll] Channel activity check failed:", err);
+          // Don't fail the poll — just skip this trigger
+        }
+      }
+    }
+
+    // Strip the internal-only `refusalSideEffects` field from the wire
+    // response — workers receive only the public trigger envelope.
+    const { refusalSideEffects: _omit, ...publicResult } = result as {
+      refusalSideEffects?: unknown;
+      [key: string]: unknown;
+    };
+    pollTriggers.respond(res, 200, publicResult as z.infer<typeof pollResponseSchema>);
+    return true;
+  }
+
+  return false;
+}

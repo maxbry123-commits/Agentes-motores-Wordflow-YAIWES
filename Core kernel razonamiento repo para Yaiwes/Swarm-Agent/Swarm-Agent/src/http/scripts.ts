@@ -1,0 +1,1150 @@
+import type { IncomingMessage, ServerResponse } from "node:http";
+import { z } from "zod";
+import { type AppValidationIssue, collectScriptReferences } from "../apps/definition";
+import { getScriptAppTypes } from "../apps/script-types";
+import { listAppRecords } from "../apps/store";
+import { resolveHttpAuditUserId } from "../be/audit-user";
+import { getAgentById, getDbClient, recordInlineScriptRun, upsertKv } from "../be/db";
+import { createEvent } from "../be/events";
+import {
+  getScriptApiConnectionDescriptors,
+  getScriptApiTypes,
+  getScriptMcpConnectionDescriptors,
+  getScriptMcpTypes,
+} from "../be/script-connections";
+import { buildScriptCredentialBindingsWithFailures } from "../be/script-credential-broker";
+import {
+  createScriptApi,
+  deleteScript,
+  deleteScriptApi,
+  getScript,
+  getScriptApiById,
+  getScriptApiSecret,
+  getScriptById,
+  listScriptApisForScript,
+  listScripts,
+  listScriptVersions,
+  restoreScratchScriptLastUsedIfUnchanged,
+  rotateScriptApiSecret,
+  touchScratchScriptLastUsed,
+  updateScriptApi,
+  upsertScriptByName,
+} from "../be/scripts/db";
+import { searchScripts } from "../be/scripts/embeddings";
+import { extractArgsJsonSchema } from "../be/scripts/extract-schema";
+import {
+  scriptSdkTypesWithGeneratedApis,
+  scriptStdlibTypesWithGeneratedApis,
+  typecheckScript,
+} from "../be/scripts/typecheck";
+import { can } from "../rbac";
+import { extractScriptSignature, type ScriptSignature } from "../scripts-runtime/extract-signature";
+import { runScript } from "../scripts-runtime/loader";
+import {
+  ScriptApiAuthModeSchema,
+  ScriptApiRecordSchema,
+  type ScriptDetail,
+  ScriptFsModeSchema,
+  type ScriptListItem,
+  type ScriptRecord,
+  ScriptRecordSchema,
+  type ScriptScope,
+  ScriptScopeSchema,
+  ScriptVersionRecordSchema,
+} from "../types";
+import { scrubObject, scrubSecrets } from "../utils/secret-scrubber";
+import { route, runtimeInstanceHeader } from "./route-def";
+import { json, jsonError } from "./utils";
+
+const scriptNameSchema = z.string().min(1).max(200);
+
+const upsertBodySchema = z.object({
+  name: scriptNameSchema,
+  source: z.string().min(1),
+  description: z.string().default(""),
+  intent: z.string().default(""),
+  scope: ScriptScopeSchema.default("agent"),
+  fsMode: ScriptFsModeSchema.default("none"),
+});
+
+const runBodySchema = z
+  .object({
+    name: scriptNameSchema.optional(),
+    source: z.string().min(1).optional(),
+    args: z.unknown().optional(),
+    intent: z.string().default(""),
+    scope: ScriptScopeSchema.optional(),
+    fsMode: ScriptFsModeSchema.default("none"),
+    idempotencyKey: z.string().max(200).optional(),
+  })
+  .refine((body) => Boolean(body.name) !== Boolean(body.source), {
+    message: "Provide exactly one of name or source",
+  });
+
+const searchBodySchema = z.object({
+  query: z.string().default(""),
+  scope: ScriptScopeSchema.optional(),
+  limit: z.number().int().min(1).max(100).default(10),
+});
+
+const nameParamsSchema = z.object({ name: scriptNameSchema });
+const scopeQuerySchema = z.object({ scope: ScriptScopeSchema.default("agent") });
+const optionalScopeQuerySchema = z.object({ scope: ScriptScopeSchema.optional() });
+const idParamsSchema = z.object({ id: z.string().uuid() });
+const listScriptsQuerySchema = z.object({
+  scope: ScriptScopeSchema.optional(),
+  includeScratch: z.enum(["true", "false"]).optional(),
+});
+
+// ─── Response schemas ──────────────────────────────────────────────────────
+// `signatureJson` is always produced by `signatureJsonFor` (below) /
+// `extractScriptSignature`, so `JSON.parse(script.signatureJson)` is always
+// exactly this shape.
+const scriptSignatureSchema = z.object({
+  argsType: z.string(),
+  resultType: z.string(),
+  description: z.string(),
+});
+
+// `argsJsonSchema` is an arbitrary JSON Schema blob produced by
+// `extractArgsJsonSchema` (always `zod.toJSONSchema()` output, i.e. a JSON
+// object) or `null` when the script exports no `argsSchema`. Modelled as an
+// open object rather than `z.unknown()` so the property stays REQUIRED in the
+// emitted spec — every route below always writes the key.
+const argsJsonSchemaValueSchema = z.record(z.string(), z.unknown()).nullable();
+
+/**
+ * `rowToScript` / `rowToScriptVersion` (src/be/scripts/db.ts) build their
+ * records by spreading a `SELECT *` row, so the audit columns added by
+ * migration 082 ride along on the wire for every route that serves a mapped
+ * row verbatim. Declared (optional — the TS row types don't model them, so
+ * `respond()` can't require them at the call site) so the spec stops omitting
+ * fields that are actually sent. The tidier fix is projecting them out in the
+ * row mappers, which lives outside this file.
+ */
+const rowAuditColumnsShape = {
+  created_by: z.string().nullable().optional(),
+  updated_by: z.string().nullable().optional(),
+};
+
+/** Lean projection served by `GET /api/scripts` — mirrors `ScriptListItem`. */
+const scriptListItemSchema = ScriptRecordSchema.omit({
+  source: true,
+  signatureJson: true,
+  argsJsonSchema: true,
+  contentHash: true,
+});
+
+/**
+ * Full record served by `GET /api/scripts/{id}` — mirrors `ScriptDetail`.
+ * `ScriptDetail` widens `signature`/`argsJsonSchema` to `unknown`, but the
+ * wire values are exactly what `typesRoute`/`searchRoute` below serve, and both
+ * keys are always written — so they are declared precisely (and required) here
+ * too rather than as an untyped, optional blob.
+ */
+const scriptDetailSchema = ScriptRecordSchema.omit({ argsJsonSchema: true }).extend({
+  signature: scriptSignatureSchema,
+  argsJsonSchema: argsJsonSchemaValueSchema,
+  ...rowAuditColumnsShape,
+});
+
+/** Mirrors `ScriptApiWithSecret` — a `ScriptApiRecord` plus the plaintext token. */
+const scriptApiWithSecretSchema = ScriptApiRecordSchema.extend({
+  token: z.string().nullable(),
+});
+
+// Mirrors `RunScriptOutput` (scripts-runtime/loader.ts), scrubbed via
+// `scrubObject`, plus the two optional persistence-side-effect markers this
+// route adds.
+const scriptRunResponseSchema = z.object({
+  result: z.unknown().optional(),
+  autoSaved: z.object({ slug: z.string(), reason: z.string() }).optional(),
+  kvSaved: z.object({ namespace: z.string(), key: z.string() }).optional(),
+  truncated: z.object({ stdout: z.boolean(), stderr: z.boolean() }),
+  durationMs: z.number(),
+  stdout: z.string(),
+  stderr: z.string(),
+  exitCode: z.number(),
+  error: z
+    .enum(["timeout", "oom", "killed", "import_violation", "eval_error", "executor_error"])
+    .optional(),
+  runtimeError: z
+    .object({
+      name: z.string(),
+      message: z.string(),
+      stack: z.string(),
+      userFrames: z.array(
+        z.object({
+          file: z.string(),
+          line: z.number(),
+          column: z.number(),
+          raw: z.string(),
+        }),
+      ),
+      userScriptLine: z.number().optional(),
+      userScriptColumn: z.number().optional(),
+    })
+    .optional(),
+});
+
+const searchResponseSchema = z.object({
+  results: z.array(
+    z.object({
+      name: z.string(),
+      signature: scriptSignatureSchema,
+      argsJsonSchema: argsJsonSchemaValueSchema,
+      description: z.string(),
+      score: z.number(),
+    }),
+  ),
+});
+
+const scriptTypesResponseSchema = z.object({
+  signature: scriptSignatureSchema,
+  argsJsonSchema: argsJsonSchemaValueSchema,
+  sdkTypes: z.string(),
+  stdlibTypes: z.string(),
+});
+
+const typeDefsResponseSchema = z.object({
+  sdkTypes: z.string(),
+  stdlibTypes: z.string(),
+});
+
+const upsertRoute = route({
+  method: "post",
+  path: "/api/scripts/upsert",
+  pattern: ["api", "scripts", "upsert"],
+  operationId: "scripts_upsert",
+  summary: "Create or update a reusable script",
+  description: "Explicit script upserts run a TypeScript typecheck before writing.",
+  tags: ["Scripts"],
+  body: upsertBodySchema,
+  responses: {
+    200: {
+      description: "Script upserted",
+      schema: z.object({
+        name: z.string(),
+        version: z.number(),
+        contentDeduped: z.boolean(),
+      }),
+    },
+    400: { description: "Validation or typecheck failure" },
+    403: { description: "Global write requires lead agent" },
+  },
+  rbac: { permission: "script.global.write" },
+});
+
+const runRoute = route({
+  method: "post",
+  path: "/api/scripts/run",
+  pattern: ["api", "scripts", "run"],
+  operationId: "scripts_run",
+  summary: "Run a reusable or inline script",
+  description:
+    "Inline source skips typecheck and is auto-saved as a scratch script only on success.",
+  tags: ["Scripts"],
+  headers: runtimeInstanceHeader("acquire work through the script SDK"),
+  body: runBodySchema,
+  responses: {
+    200: { description: "Script run completed", schema: scriptRunResponseSchema },
+    400: { description: "Validation error" },
+    404: { description: "Script not found" },
+    501: { description: "workspace-rw scripts are not supported in v1" },
+  },
+});
+
+const searchRoute = route({
+  method: "post",
+  path: "/api/scripts/search",
+  pattern: ["api", "scripts", "search"],
+  operationId: "scripts_search",
+  summary: "Search reusable scripts",
+  description: "Phase 3 search is substring-only over script name and metadata.",
+  tags: ["Scripts"],
+  body: searchBodySchema,
+  responses: {
+    200: { description: "Matching scripts", schema: searchResponseSchema },
+    400: { description: "Validation error" },
+  },
+  rbac: { permission: "script.search" },
+});
+
+const deleteRoute = route({
+  method: "delete",
+  path: "/api/scripts/{name}",
+  pattern: ["api", "scripts", null],
+  operationId: "scripts_delete",
+  summary: "Delete a reusable script",
+  tags: ["Scripts"],
+  params: nameParamsSchema,
+  query: scopeQuerySchema,
+  responses: {
+    200: { description: "Delete result", schema: z.object({ deleted: z.boolean() }) },
+    400: { description: "Validation error" },
+    403: { description: "Global delete requires lead agent" },
+    409: { description: "Script is referenced by an app definition" },
+  },
+  rbac: { permission: "script.global.delete" },
+});
+
+const typesRoute = route({
+  method: "get",
+  path: "/api/scripts/{name}/types",
+  pattern: ["api", "scripts", null, "types"],
+  operationId: "scripts_types",
+  summary: "Get script signature and authoring types",
+  tags: ["Scripts"],
+  params: nameParamsSchema,
+  query: optionalScopeQuerySchema,
+  responses: {
+    200: { description: "Script signature and type blobs", schema: scriptTypesResponseSchema },
+    404: { description: "Script not found" },
+  },
+});
+
+// ── Dashboard read routes ──
+// The worker-facing routes above resolve scripts relative to the calling agent
+// and therefore requireAgent (X-Agent-ID). The routes below are cross-scope
+// admin reads for the dashboard: API-key auth only, no agent identity — the
+// same model as /api/script-runs.
+
+const listScriptsRoute = route({
+  method: "get",
+  path: "/api/scripts",
+  pattern: ["api", "scripts"],
+  operationId: "scripts_list",
+  summary: "List saved scripts",
+  description:
+    "Dashboard read: lean projection without source. Scratch scripts are excluded unless includeScratch=true.",
+  tags: ["Scripts"],
+  query: listScriptsQuerySchema,
+  responses: {
+    200: {
+      description: "Saved scripts",
+      schema: z.object({ scripts: z.array(scriptListItemSchema) }),
+    },
+    400: { description: "Validation error" },
+  },
+});
+
+// Declared (and matched) BEFORE the by-id route: the by-id pattern
+// ["api", "scripts", null] matches any single segment, so the literal
+// "type-defs" segment must win first.
+const typeDefsRoute = route({
+  method: "get",
+  path: "/api/scripts/type-defs",
+  pattern: ["api", "scripts", "type-defs"],
+  operationId: "scripts_type_defs",
+  summary: "Get script SDK and stdlib type definitions",
+  description:
+    "Generated .d.ts blobs for editor integration (e.g. Monaco extraLibs), including per-app types. Cacheable.",
+  tags: ["Scripts"],
+  responses: {
+    200: {
+      description: "SDK and stdlib type definition blobs",
+      schema: typeDefsResponseSchema,
+    },
+  },
+});
+
+const getScriptByIdRoute = route({
+  method: "get",
+  path: "/api/scripts/{id}",
+  pattern: ["api", "scripts", null],
+  operationId: "scripts_get",
+  summary: "Get a saved script by id",
+  description: "Dashboard read: full record including source and parsed signature.",
+  tags: ["Scripts"],
+  params: idParamsSchema,
+  responses: {
+    200: { description: "Script detail", schema: z.object({ script: scriptDetailSchema }) },
+    404: { description: "Script not found" },
+  },
+});
+
+const listVersionsRoute = route({
+  method: "get",
+  path: "/api/scripts/{id}/versions",
+  pattern: ["api", "scripts", null, "versions"],
+  operationId: "scripts_versions",
+  summary: "List versions of a saved script",
+  description: "Dashboard read: version history, newest first.",
+  tags: ["Scripts"],
+  params: idParamsSchema,
+  responses: {
+    200: {
+      description: "Script versions",
+      // `listScriptVersions` spreads a `SELECT *` row — see `rowAuditColumnsShape`.
+      schema: z.object({
+        versions: z.array(ScriptVersionRecordSchema.extend(rowAuditColumnsShape)),
+      }),
+    },
+    404: { description: "Script not found" },
+  },
+});
+
+// ─── External API endpoint management (script_apis) ──────────────────────────
+// These authenticated dashboard routes create/manage the public endpoints that
+// `POST /api/x/script/<id>` (src/http/x.ts) serves.
+
+const apiEndpointParamsSchema = z.object({
+  id: z.string().uuid(),
+  endpointId: z.string(),
+});
+
+const createScriptApiBodySchema = z.object({
+  authMode: ScriptApiAuthModeSchema.default("bearer"),
+  label: z.string().max(200).optional(),
+  agentId: z.string().optional(),
+});
+
+const patchScriptApiBodySchema = z.object({
+  enabled: z.boolean().optional(),
+  label: z.string().max(200).nullable().optional(),
+});
+
+const createScriptApiRoute = route({
+  method: "post",
+  path: "/api/scripts/{id}/apis",
+  pattern: ["api", "scripts", null, "apis"],
+  operationId: "scripts_api_create",
+  summary: "Expose a script as an external HTTP API endpoint",
+  description: "Returns the endpoint plus the plaintext bearer token (when authMode is 'bearer').",
+  tags: ["Scripts"],
+  params: idParamsSchema,
+  body: createScriptApiBodySchema,
+  responses: {
+    201: { description: "Endpoint created", schema: scriptApiWithSecretSchema },
+    400: { description: "Validation error or script has no owning agent" },
+    404: { description: "Script not found" },
+  },
+  rbac: { permission: "script.api.create" },
+});
+
+const listScriptApisRoute = route({
+  method: "get",
+  path: "/api/scripts/{id}/apis",
+  pattern: ["api", "scripts", null, "apis"],
+  operationId: "scripts_api_list",
+  summary: "List external API endpoints for a script",
+  tags: ["Scripts"],
+  params: idParamsSchema,
+  responses: {
+    200: {
+      description: "Endpoints (without secrets)",
+      schema: z.object({ apis: z.array(ScriptApiRecordSchema) }),
+    },
+    404: { description: "Script not found" },
+  },
+});
+
+const revealScriptApiSecretRoute = route({
+  method: "get",
+  path: "/api/scripts/{id}/apis/{endpointId}/secret",
+  pattern: ["api", "scripts", null, "apis", null, "secret"],
+  operationId: "scripts_api_reveal_secret",
+  summary: "Reveal an endpoint's bearer token",
+  tags: ["Scripts"],
+  params: apiEndpointParamsSchema,
+  responses: {
+    200: {
+      description: "Decrypted token (null when authMode is 'none')",
+      schema: z.object({ token: z.string().nullable() }),
+    },
+    404: { description: "Endpoint not found" },
+  },
+  rbac: { permission: "script.api.read.secrets" },
+});
+
+const patchScriptApiRoute = route({
+  method: "patch",
+  path: "/api/scripts/{id}/apis/{endpointId}",
+  pattern: ["api", "scripts", null, "apis", null],
+  operationId: "scripts_api_update",
+  summary: "Enable/disable or relabel an external API endpoint",
+  tags: ["Scripts"],
+  params: apiEndpointParamsSchema,
+  body: patchScriptApiBodySchema,
+  responses: {
+    // `updateScriptApi` is typed `ScriptApiRecord | null` (the id could vanish
+    // between the existence check and the UPDATE); the handler sends its
+    // result verbatim without a null guard, so this is honestly nullable.
+    // Spelled as an explicit union, not `.nullable()`: `.nullable()` on a
+    // `.openapi()`-registered schema emits `allOf: [$ref, {type:[object,null]}]`,
+    // an intersection that `null` can never satisfy — i.e. it silently documents
+    // the opposite of the handler's behavior.
+    200: {
+      description: "Updated endpoint",
+      schema: z.union([ScriptApiRecordSchema, z.null()]),
+    },
+    404: { description: "Endpoint not found" },
+  },
+  rbac: { permission: "script.api.update" },
+});
+
+const rotateScriptApiRoute = route({
+  method: "post",
+  path: "/api/scripts/{id}/apis/{endpointId}/rotate",
+  pattern: ["api", "scripts", null, "apis", null, "rotate"],
+  operationId: "scripts_api_rotate",
+  summary: "Rotate an endpoint's bearer token",
+  tags: ["Scripts"],
+  params: apiEndpointParamsSchema,
+  responses: {
+    200: {
+      description: "Endpoint with new plaintext token",
+      schema: scriptApiWithSecretSchema,
+    },
+    400: { description: "Endpoint uses 'none' auth — nothing to rotate" },
+    404: { description: "Endpoint not found" },
+  },
+  rbac: { permission: "script.api.rotate" },
+});
+
+const deleteScriptApiRoute = route({
+  method: "delete",
+  path: "/api/scripts/{id}/apis/{endpointId}",
+  pattern: ["api", "scripts", null, "apis", null],
+  operationId: "scripts_api_delete",
+  summary: "Delete an external API endpoint",
+  tags: ["Scripts"],
+  params: apiEndpointParamsSchema,
+  responses: {
+    200: { description: "Deleted", schema: z.object({ deleted: z.boolean() }) },
+    404: { description: "Endpoint not found" },
+  },
+  rbac: { permission: "script.api.delete" },
+});
+
+/**
+ * Every app definition that references `scriptId`, as path-bearing issues.
+ *
+ * Two-pass by design: the tolerant collector walks the stored JSON (so an app
+ * whose definition no longer parses still reports its references with exact
+ * paths), and any app that failed to decode at all — invalid stored JSON, where
+ * the "definition" is a raw string — falls back to a substring probe. A broken
+ * app is not consent to break it further.
+ *
+ * Cost: O(apps x definition size) per delete, all in memory. Deletes are rare
+ * and single-app installs hold tens of apps, so no index is warranted.
+ */
+async function appScriptReferenceIssues(scriptId: string): Promise<AppValidationIssue[]> {
+  const issues: AppValidationIssue[] = [];
+  for (const app of await listAppRecords()) {
+    const paths = collectScriptReferences(app.definition).get(scriptId) ?? [];
+    if (
+      paths.length === 0 &&
+      app.definitionError !== undefined &&
+      JSON.stringify(app.definition ?? null).includes(scriptId)
+    ) {
+      paths.push("its (unparseable) definition");
+    }
+    for (const path of paths) {
+      issues.push({
+        path: `apps.${app.id}`,
+        message: `app "${app.name}" (${app.id}) uses this script at ${path}`,
+      });
+    }
+  }
+  return issues;
+}
+
+async function requireAgent(res: ServerResponse, agentId: string | undefined) {
+  if (!agentId) {
+    jsonError(res, "X-Agent-ID required for scripts API", 400);
+    return null;
+  }
+  const agent = await getAgentById(agentId);
+  if (!agent) {
+    jsonError(res, "Agent not found", 404);
+    return null;
+  }
+  return agent;
+}
+
+function signatureJsonFor(source: string): string {
+  return JSON.stringify(extractScriptSignature(source));
+}
+
+async function resolveScript(
+  name: string,
+  agentId: string,
+  scope?: ScriptScope,
+): Promise<ScriptRecord | null> {
+  if (scope === "global") return getScript({ name, scope: "global" });
+  if (scope === "agent") return getScript({ name, scope: "agent", scopeId: agentId });
+  return (
+    (await getScript({ name, scope: "agent", scopeId: agentId })) ??
+    getScript({ name, scope: "global" })
+  );
+}
+
+function scratchSlug(intent: string, source: string): string {
+  const base = (intent || "inline-script")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 48);
+  const hash = new Bun.CryptoHasher("sha256").update(source).digest("hex").slice(0, 8);
+  return `scratch-${base || "inline-script"}-${hash}`;
+}
+
+async function emitGlobalUpsertEvent(args: {
+  agentId: string;
+  script: ScriptRecord;
+  isNew: boolean;
+  isPromotion: boolean;
+}): Promise<void> {
+  await createEvent({
+    category: "system",
+    event: "script.global_upsert",
+    source: "api",
+    agentId: args.agentId,
+    data: {
+      scriptId: args.script.id,
+      name: args.script.name,
+      version: args.script.version,
+      contentHash: args.script.contentHash,
+      changedByAgentId: args.agentId,
+      isNew: args.isNew,
+      isPromotion: args.isPromotion,
+    },
+  });
+}
+
+export async function handleScripts(
+  req: IncomingMessage,
+  res: ServerResponse,
+  pathSegments: string[],
+  queryParams: URLSearchParams,
+  agentId: string | undefined,
+): Promise<boolean> {
+  if (upsertRoute.match(req.method, pathSegments)) {
+    const parsed = await upsertRoute.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+    const agent = await requireAgent(res, agentId);
+    if (!agent) return true;
+
+    // Global-scope writes require lead — the 403 this route has always
+    // documented, enforced since DES-445 slice 1. Agent-scope ops unchanged.
+    if (parsed.body.scope === "global") {
+      const decision = can({
+        principal: { kind: "agent", agentId: agent.id, isLead: agent.isLead },
+        verb: "script.global.write",
+        resource: { kind: "owned", scope: "global" },
+        source: "http",
+      });
+      if (!decision.allow) {
+        jsonError(res, "Global write requires lead agent", 403);
+        return true;
+      }
+    }
+
+    const typecheck = await typecheckScript(parsed.body.source, { agentId: agent.id });
+    if (!typecheck.ok) {
+      json(
+        res,
+        {
+          error: "typecheck_failed",
+          diagnostics: typecheck.diagnostics,
+          structured: typecheck.structured,
+        },
+        400,
+      );
+      return true;
+    }
+
+    const createdBy = await resolveHttpAuditUserId(req, agent.id);
+
+    const existingAgentScript =
+      parsed.body.scope === "global"
+        ? await getScript({ name: parsed.body.name, scope: "agent", scopeId: agent.id })
+        : null;
+    const argsJsonSchema = await extractArgsJsonSchema(parsed.body.source);
+    const result = await upsertScriptByName({
+      name: parsed.body.name,
+      scope: parsed.body.scope,
+      scopeId: parsed.body.scope === "agent" ? agent.id : null,
+      source: parsed.body.source,
+      description: parsed.body.description,
+      intent: parsed.body.intent,
+      signatureJson: signatureJsonFor(parsed.body.source),
+      argsJsonSchema,
+      fsMode: parsed.body.fsMode,
+      agentId: agent.id,
+      isScratch: false,
+      typeChecked: true,
+      createdBy,
+    });
+
+    if (parsed.body.scope === "global" && !result.contentDeduped) {
+      await emitGlobalUpsertEvent({
+        agentId: agent.id,
+        script: result.script,
+        isNew: result.isNew,
+        isPromotion: Boolean(existingAgentScript),
+      });
+    }
+
+    upsertRoute.respond(res, 200, {
+      name: result.script.name,
+      version: result.script.version,
+      contentDeduped: result.contentDeduped,
+    });
+    return true;
+  }
+
+  if (runRoute.match(req.method, pathSegments)) {
+    const parsed = await runRoute.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+    const agent = await requireAgent(res, agentId);
+    if (!agent) return true;
+
+    // Per-boot identity of the invoking worker process. Carried into the
+    // script runtime as system context so SDK work-acquisition calls present
+    // the same runtime the worker itself would — never script input.
+    const runtimeInstanceId = ((h) => (Array.isArray(h) ? h[0] : h))(
+      req.headers["x-runtime-instance-id"],
+    );
+
+    let source = parsed.body.source;
+    let fsMode = parsed.body.fsMode;
+    let namedScript: ScriptRecord | null = null;
+    if (parsed.body.name) {
+      const script = await resolveScript(parsed.body.name, agent.id, parsed.body.scope);
+      if (!script) {
+        jsonError(res, "Script not found", 404);
+        return true;
+      }
+      namedScript = script;
+      source = script.source;
+      fsMode = script.fsMode;
+    }
+
+    if (fsMode === "workspace-rw") {
+      jsonError(res, "workspace-rw scripts are not supported by /api/scripts/run in v1", 501);
+      return true;
+    }
+
+    const startedAt = new Date().toISOString();
+    // Touch before executing so an already-stale scratch script isn't reaped
+    // by the retention sweep while this run is still in flight.
+    const runStartTouch = namedScript?.isScratch
+      ? await touchScratchScriptLastUsed(namedScript.id)
+      : null;
+    const credentials = await buildScriptCredentialBindingsWithFailures({ agentId: agent.id });
+    const output = await runScript({
+      source: source as string,
+      args: parsed.body.args,
+      fsMode,
+      agentId: agent.id,
+      runtimeInstanceId,
+      egressSecrets: credentials.egressSecrets,
+      failedBindings: credentials.failedBindings,
+      apiConnections: getScriptApiConnectionDescriptors({ agentId: agent.id }),
+      mcpConnections: getScriptMcpConnectionDescriptors({ agentId: agent.id }),
+    });
+    const ok = output.exitCode === 0 && !output.error && !output.runtimeError;
+
+    if (namedScript?.isScratch && ok) {
+      await touchScratchScriptLastUsed(namedScript.id);
+    } else if (namedScript?.isScratch && runStartTouch) {
+      // Failed run — restore the pre-run timestamp so it doesn't buy the
+      // script another retention window, unless a concurrent run already
+      // touched it since.
+      await restoreScratchScriptLastUsedIfUnchanged(
+        namedScript.id,
+        namedScript.updatedAt,
+        runStartTouch,
+      );
+    }
+
+    // Persist output to KV when idempotencyKey is provided and run succeeded
+    let kvSaved: { namespace: string; key: string } | undefined;
+    if (parsed.body.idempotencyKey && ok) {
+      const kvNamespace = `script:executions`;
+      const kvKey = parsed.body.idempotencyKey;
+      const kvValue = {
+        result: output.result,
+        durationMs: output.durationMs,
+        scriptName: parsed.body.name ?? null,
+        executedAt: new Date().toISOString(),
+      };
+      await upsertKv({
+        namespace: kvNamespace,
+        key: kvKey,
+        value: kvValue,
+        valueType: "json",
+        expiresAt: null,
+      });
+      kvSaved = { namespace: kvNamespace, key: kvKey };
+    }
+
+    let autoSaved: { slug: string; reason: string } | undefined;
+    if (parsed.body.source && ok) {
+      const slug = scratchSlug(parsed.body.intent, parsed.body.source);
+      await upsertScriptByName({
+        name: slug,
+        scope: "agent",
+        scopeId: agent.id,
+        source: parsed.body.source,
+        description: `Scratch script: ${parsed.body.intent || slug}`,
+        intent: parsed.body.intent || "Inline script auto-saved after successful run",
+        signatureJson: signatureJsonFor(parsed.body.source),
+        fsMode: "none",
+        agentId: agent.id,
+        isScratch: true,
+        typeChecked: false,
+        changeReason: "Auto-saved successful inline run",
+      });
+      autoSaved = { slug, reason: "successful_inline_run" };
+    }
+
+    // Persist the inline run (no journal) so one-off executions show up alongside
+    // durable workflow runs in the Script Runs dashboard. Best-effort: recording
+    // must never fail the actual execution.
+    const runError = ok
+      ? undefined
+      : scrubSecrets(
+          [
+            output.error,
+            output.stderr || undefined,
+            output.runtimeError
+              ? `${output.runtimeError.name}: ${output.runtimeError.message}`
+              : undefined,
+          ]
+            .filter(Boolean)
+            .join(" — ") || `Script exited with code ${output.exitCode}`,
+        );
+    try {
+      await recordInlineScriptRun({
+        id: crypto.randomUUID(),
+        agentId: agent.id,
+        source: source as string,
+        // Scrub args + result before persisting: the stored row is later served
+        // raw by GET /api/script-runs/{id} to the dashboard, so it needs the same
+        // redaction guarantees as the scrubbed run response below.
+        args: scrubObject(parsed.body.args ?? null),
+        scriptName: parsed.body.name ?? "(inline source)",
+        status: ok ? "completed" : "failed",
+        output: scrubObject(output.result),
+        error: runError,
+        startedAt,
+        finishedAt: new Date().toISOString(),
+      });
+    } catch {
+      // swallow — the run already executed; persistence is observability only.
+    }
+
+    runRoute.respond(
+      res,
+      200,
+      scrubObject({
+        result: output.result,
+        autoSaved,
+        kvSaved,
+        truncated: output.truncated,
+        durationMs: output.durationMs,
+        stdout: output.stdout,
+        stderr: output.stderr,
+        exitCode: output.exitCode,
+        error: output.error,
+        runtimeError: output.runtimeError,
+      }),
+    );
+    return true;
+  }
+
+  if (searchRoute.match(req.method, pathSegments)) {
+    const parsed = await searchRoute.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+    const agent = await requireAgent(res, agentId);
+    if (!agent) return true;
+
+    const matches = await searchScripts({
+      query: parsed.body.query,
+      scope: parsed.body.scope,
+      scopeId: agent.id,
+      limit: parsed.body.limit,
+    });
+
+    searchRoute.respond(res, 200, {
+      results: matches.map(({ script, score }) => ({
+        name: script.name,
+        signature: JSON.parse(script.signatureJson),
+        argsJsonSchema: script.argsJsonSchema
+          ? (JSON.parse(script.argsJsonSchema) as Record<string, unknown>)
+          : null,
+        description: script.description,
+        score,
+      })),
+    });
+    return true;
+  }
+
+  // ── Dashboard reads (no requireAgent — API-key auth only, like /api/script-runs) ──
+
+  if (listScriptsRoute.match(req.method, pathSegments)) {
+    const parsed = await listScriptsRoute.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+    const scripts: ScriptListItem[] = (
+      await listScripts({
+        scope: parsed.query.scope,
+        includeScratch: parsed.query.includeScratch === "true",
+      })
+    ).map((script) => ({
+      id: script.id,
+      name: script.name,
+      scope: script.scope,
+      scopeId: script.scopeId,
+      description: script.description,
+      intent: script.intent,
+      version: script.version,
+      isScratch: script.isScratch,
+      typeChecked: script.typeChecked,
+      fsMode: script.fsMode,
+      createdByAgentId: script.createdByAgentId,
+      createdAt: script.createdAt,
+      updatedAt: script.updatedAt,
+    }));
+    listScriptsRoute.respond(res, 200, { scripts });
+    return true;
+  }
+
+  // Must be matched before getScriptByIdRoute — its ["api", "scripts", null]
+  // pattern would otherwise swallow the literal "type-defs" segment.
+  if (typeDefsRoute.match(req.method, pathSegments)) {
+    const apiTypes = getScriptApiTypes();
+    const mcpTypes = getScriptMcpTypes();
+    const appTypes = await getScriptAppTypes();
+    typeDefsRoute.respond(res, 200, {
+      sdkTypes: await scriptSdkTypesWithGeneratedApis(apiTypes, mcpTypes, appTypes),
+      stdlibTypes: await scriptStdlibTypesWithGeneratedApis(apiTypes, mcpTypes, appTypes),
+    });
+    return true;
+  }
+
+  if (getScriptByIdRoute.match(req.method, pathSegments)) {
+    const parsed = await getScriptByIdRoute.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+    const script = await getScriptById(parsed.params.id);
+    if (!script) {
+      jsonError(res, "Script not found", 404);
+      return true;
+    }
+    // `source` is author-supplied TS (same trust surface as script_runs.source,
+    // already served raw by GET /api/script-runs/{id}) — no env/secret material.
+    const detail = {
+      ...script,
+      signature: JSON.parse(script.signatureJson) as ScriptSignature,
+      argsJsonSchema: script.argsJsonSchema
+        ? (JSON.parse(script.argsJsonSchema) as Record<string, unknown>)
+        : null,
+    } satisfies ScriptDetail;
+    getScriptByIdRoute.respond(res, 200, { script: detail });
+    return true;
+  }
+
+  if (listVersionsRoute.match(req.method, pathSegments)) {
+    const parsed = await listVersionsRoute.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+    if (!(await getScriptById(parsed.params.id))) {
+      jsonError(res, "Script not found", 404);
+      return true;
+    }
+    listVersionsRoute.respond(res, 200, { versions: await listScriptVersions(parsed.params.id) });
+    return true;
+  }
+
+  if (typesRoute.match(req.method, pathSegments)) {
+    const parsed = await typesRoute.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+    const agent = await requireAgent(res, agentId);
+    if (!agent) return true;
+
+    const script = await resolveScript(parsed.params.name, agent.id, parsed.query.scope);
+    if (!script) {
+      jsonError(res, "Script not found", 404);
+      return true;
+    }
+    typesRoute.respond(res, 200, {
+      signature: JSON.parse(script.signatureJson),
+      argsJsonSchema: script.argsJsonSchema
+        ? (JSON.parse(script.argsJsonSchema) as Record<string, unknown>)
+        : null,
+      sdkTypes: await scriptSdkTypesWithGeneratedApis(
+        getScriptApiTypes({ agentId: agent.id }),
+        getScriptMcpTypes({ agentId: agent.id }),
+        await getScriptAppTypes({ agentId: agent.id }),
+      ),
+      stdlibTypes: await scriptStdlibTypesWithGeneratedApis(
+        getScriptApiTypes({ agentId: agent.id }),
+        getScriptMcpTypes({ agentId: agent.id }),
+        await getScriptAppTypes({ agentId: agent.id }),
+      ),
+    });
+    return true;
+  }
+
+  if (deleteRoute.match(req.method, pathSegments)) {
+    const parsed = await deleteRoute.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+    const agent = await requireAgent(res, agentId);
+    if (!agent) return true;
+
+    // Global-scope deletes require lead — the 403 this route has always
+    // documented, enforced since DES-445 slice 1. Agent-scope ops unchanged.
+    if (parsed.query.scope === "global") {
+      const decision = can({
+        principal: { kind: "agent", agentId: agent.id, isLead: agent.isLead },
+        verb: "script.global.delete",
+        resource: { kind: "owned", scope: "global" },
+        source: "http",
+      });
+      if (!decision.allow) {
+        jsonError(res, "Global delete requires lead agent", 403);
+        return true;
+      }
+    }
+
+    const identity = {
+      name: parsed.params.name,
+      scope: parsed.query.scope,
+      scopeId: parsed.query.scope === "agent" ? agent.id : null,
+    };
+    // The reference check and the delete run in one transaction: an app
+    // upsert that validated against this still-present script and committed a
+    // definition referencing it would otherwise slip between a check outside
+    // the transaction and the DELETE, leaving the app with a dangling
+    // scriptId that only an operator can edit out.
+    const outcome = await getDbClient().transaction(async () => {
+      const existing = await getScript(identity);
+      if (existing) {
+        // An app that wires this script as a source or a script action would be
+        // left with a dangling reference: its definition stops parsing and every
+        // write 409s "needs repair". Refuse the delete instead. UPDATES stay
+        // allowed — a contract break there is a pass error with zero row churn.
+        const references = await appScriptReferenceIssues(existing.id);
+        if (references.length > 0) return { blocked: references };
+      }
+      return { deleted: await deleteScript(identity) };
+    });
+    if ("blocked" in outcome) {
+      json(
+        res,
+        {
+          error: "script is referenced by an app definition",
+          issues: outcome.blocked,
+        },
+        409,
+      );
+      return true;
+    }
+    deleteRoute.respond(res, 200, { deleted: outcome.deleted });
+    return true;
+  }
+
+  // ── External API endpoint management (script_apis) ──
+  if (createScriptApiRoute.match(req.method, pathSegments)) {
+    const parsed = await createScriptApiRoute.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+    const script = await getScriptById(parsed.params.id);
+    if (!script) {
+      jsonError(res, "Script not found", 404);
+      return true;
+    }
+    // Run external calls as the script's owning agent (so its egress secrets +
+    // API connections resolve). Global scripts with no owner must name one.
+    const runAsAgentId = parsed.body.agentId ?? script.scopeId ?? script.createdByAgentId;
+    if (!runAsAgentId) {
+      jsonError(res, "agentId is required: this script has no owning agent to run as", 400);
+      return true;
+    }
+    const endpoint = await createScriptApi({
+      scriptId: script.id,
+      agentId: runAsAgentId,
+      authMode: parsed.body.authMode,
+      label: parsed.body.label ?? null,
+      createdBy: await resolveHttpAuditUserId(req, agentId),
+    });
+    createScriptApiRoute.respond(res, 201, endpoint);
+    return true;
+  }
+
+  if (listScriptApisRoute.match(req.method, pathSegments)) {
+    const parsed = await listScriptApisRoute.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+    if (!(await getScriptById(parsed.params.id))) {
+      jsonError(res, "Script not found", 404);
+      return true;
+    }
+    listScriptApisRoute.respond(res, 200, {
+      apis: await listScriptApisForScript(parsed.params.id),
+    });
+    return true;
+  }
+
+  if (revealScriptApiSecretRoute.match(req.method, pathSegments)) {
+    const parsed = await revealScriptApiSecretRoute.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+    const endpoint = await getScriptApiById(parsed.params.endpointId);
+    if (!endpoint || endpoint.scriptId !== parsed.params.id) {
+      jsonError(res, "Endpoint not found", 404);
+      return true;
+    }
+    revealScriptApiSecretRoute.respond(res, 200, { token: await getScriptApiSecret(endpoint.id) });
+    return true;
+  }
+
+  if (rotateScriptApiRoute.match(req.method, pathSegments)) {
+    const parsed = await rotateScriptApiRoute.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+    const endpoint = await getScriptApiById(parsed.params.endpointId);
+    if (!endpoint || endpoint.scriptId !== parsed.params.id) {
+      jsonError(res, "Endpoint not found", 404);
+      return true;
+    }
+    const rotated = await rotateScriptApiSecret(
+      endpoint.id,
+      await resolveHttpAuditUserId(req, agentId),
+    );
+    if (!rotated) {
+      jsonError(res, "Cannot rotate a token on a 'none' auth endpoint", 400);
+      return true;
+    }
+    rotateScriptApiRoute.respond(res, 200, rotated);
+    return true;
+  }
+
+  if (patchScriptApiRoute.match(req.method, pathSegments)) {
+    const parsed = await patchScriptApiRoute.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+    const endpoint = await getScriptApiById(parsed.params.endpointId);
+    if (!endpoint || endpoint.scriptId !== parsed.params.id) {
+      jsonError(res, "Endpoint not found", 404);
+      return true;
+    }
+    const updated = await updateScriptApi(endpoint.id, {
+      enabled: parsed.body.enabled,
+      label: parsed.body.label,
+      updatedBy: await resolveHttpAuditUserId(req, agentId),
+    });
+    patchScriptApiRoute.respond(res, 200, updated);
+    return true;
+  }
+
+  if (deleteScriptApiRoute.match(req.method, pathSegments)) {
+    const parsed = await deleteScriptApiRoute.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+    const endpoint = await getScriptApiById(parsed.params.endpointId);
+    if (!endpoint || endpoint.scriptId !== parsed.params.id) {
+      jsonError(res, "Endpoint not found", 404);
+      return true;
+    }
+    deleteScriptApiRoute.respond(res, 200, { deleted: await deleteScriptApi(endpoint.id) });
+    return true;
+  }
+
+  return false;
+}

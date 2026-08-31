@@ -1,0 +1,86 @@
+# Tests
+.encryption-key
+.page-session-secret
+
+.claude/scheduled_tasks.lock
+.claude/worktrees/
+.worktrees
+.roam
+
+# MCP
+.mcp.json
+# Not the one inside cc-plugin/
+!cc-plugin/.mcp.json
+
+.qa-use-tests.json
+
+# Docker agent bindings
+logs
+work
+
+# Ephemeral local QA scratchpad (per-provider env files, fixtures, logs).
+# Anything reusable belongs under scripts/ or src/tests/.
+tmp/
+
+# local-fs file-storage provider root (task attachments; AGENT_FS_LOCAL_DIR
+# defaults to ./data/fs when the server runs from the repo root)
+data/
+
+# dependencies (bun install)
+node_modules
+
+# output
+out
+dist
+*.tgz
+
+# code coverage
+coverage
+*.lcov
+
+# logs
+logs
+_.log
+report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
+
+# dotenv environment variable files
+.env
+.env.development.local
+.env.test.local
+.env.production.local
+.env.local
+.env.docker
+.env.docker-lead
+.env.docker-devin
+
+# caches
+.eslintcache
+.cache
+*.tsbuildinfo
+
+# IntelliJ based IDEs
+.idea
+
+# Finder (MacOS) folder config
+.DS_Store
+
+# SQLite database files
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+
+# Production docker-compose (Dokploy)
+docker-compose.desplega.yaml
+
+# Riptide artifacts (cloud-synced)
+.humanlayer/tasks/
+
+# Business-Use (local config with API key + DB)
+.business-use/
+
+# Opencode artifacts
+.opencode/
+
+# bun test --timings scratch dir (CI restores it from the actions cache)
+.bun-test-timings/

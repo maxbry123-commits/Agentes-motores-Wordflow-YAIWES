@@ -1,0 +1,250 @@
+#!/usr/bin/env bun
+/**
+ * Refresh the vendored models.dev snapshot at `src/be/modelsdev-cache.json`,
+ * plus the slim reasoning-capability snapshot at
+ * `src/providers/modelsdev-reasoning.json` derived from the same fetched data.
+ *
+ * Usage: `bun run scripts/refresh-modelsdev-pricing.ts`
+ *
+ * Not a CI job — operators run this periodically. Prints a diff summary
+ * (added / removed / changed rates) before writing so reviewers see what
+ * moved. See `src/providers/pricing-sources.md` for the surrounding workflow.
+ */
+
+import { readFileSync, writeFileSync } from "node:fs";
+import path from "node:path";
+import { PINNED_MODELSDEV_ENTRIES } from "../src/be/models-catalog";
+
+const CACHE_PATH = path.join(process.cwd(), "src", "be", "modelsdev-cache.json");
+const REASONING_SNAPSHOT_PATH = path.join(
+  process.cwd(),
+  "src",
+  "providers",
+  "modelsdev-reasoning.json",
+);
+const MODELSDEV_URL = "https://models.dev/api.json";
+// Limited-availability models that are intentionally vendored even when models.dev
+// does not list them yet. Shared with the live catalog (`src/be/models-catalog.ts`)
+// so both surfaces pin the same set. Add future manual pins as "provider/model-id".
+const PINNED_ENTRIES = PINNED_MODELSDEV_ENTRIES;
+
+// Providers actually reachable by the four local harnesses' model pickers
+// (mirrors `SNAPSHOT_ORDER` + `BEDROCK_SNAPSHOT_ID` in
+// `apps/ui/src/lib/agent-runtime-models.ts`). The full models.dev payload carries
+// 140+ providers and 5000+ models; `src/providers/reasoning-effort.ts` only
+// ever looks up these four, so the reasoning snapshot stays "slim" by scope
+// rather than by field count alone.
+const REASONING_SNAPSHOT_PROVIDERS = [
+  "anthropic",
+  "openai",
+  "openrouter",
+  "amazon-bedrock",
+] as const;
+
+interface CostBlock {
+  input?: number;
+  output?: number;
+  cache_read?: number;
+  cache_write?: number;
+}
+
+interface ReasoningOptionEntry {
+  type?: string;
+  values?: string[];
+  [key: string]: unknown;
+}
+
+interface ModelEntry {
+  id?: string;
+  cost?: CostBlock;
+  reasoning?: boolean;
+  reasoning_options?: ReasoningOptionEntry[];
+  [key: string]: unknown;
+}
+
+interface ProviderEntry {
+  models?: Record<string, ModelEntry>;
+}
+
+type Cache = Record<string, ProviderEntry>;
+
+interface SlimReasoningOption {
+  type: string;
+  values?: string[];
+}
+
+interface SlimModelEntry {
+  id: string;
+  reasoning: boolean;
+  reasoningOptions?: SlimReasoningOption[];
+}
+
+type SlimReasoningCache = Partial<
+  Record<(typeof REASONING_SNAPSHOT_PROVIDERS)[number], Record<string, SlimModelEntry>>
+>;
+
+/**
+ * Derive the slim `src/providers/modelsdev-reasoning.json` snapshot from a
+ * fully-fetched (or locally vendored) models.dev cache. Keeps only the fields
+ * `src/providers/reasoning-effort.ts` actually reads: `id`, the `reasoning`
+ * boolean support-gate, and any `reasoning_options` entries (camelCased,
+ * `min`/other keys dropped — the helper only reads `type` and `values`).
+ */
+export function deriveReasoningSnapshot(cache: Cache): SlimReasoningCache {
+  const snapshot: SlimReasoningCache = {};
+  for (const providerId of REASONING_SNAPSHOT_PROVIDERS) {
+    const models = cache[providerId]?.models;
+    if (!models) continue;
+    const slimModels: Record<string, SlimModelEntry> = {};
+    for (const [modelKey, model] of Object.entries(models)) {
+      const reasoningOptions = Array.isArray(model.reasoning_options)
+        ? model.reasoning_options
+            .filter((o) => typeof o.type === "string")
+            .map((o) => ({
+              type: o.type as string,
+              ...(Array.isArray(o.values) ? { values: o.values } : {}),
+            }))
+        : [];
+      slimModels[modelKey] = {
+        id: model.id ?? modelKey,
+        reasoning: Boolean(model.reasoning),
+        ...(reasoningOptions.length > 0 ? { reasoningOptions } : {}),
+      };
+    }
+    snapshot[providerId] = slimModels;
+  }
+  return snapshot;
+}
+
+function loadCurrent(): Cache | null {
+  try {
+    return JSON.parse(readFileSync(CACHE_PATH, "utf-8")) as Cache;
+  } catch {
+    return null;
+  }
+}
+
+async function fetchLatest(): Promise<Cache> {
+  const res = await fetch(MODELSDEV_URL);
+  if (!res.ok) {
+    throw new Error(`models.dev fetch failed: ${res.status} ${res.statusText}`);
+  }
+  return (await res.json()) as Cache;
+}
+
+function summarize(prev: Cache | null, next: Cache): void {
+  let added = 0;
+  let removed = 0;
+  let changed = 0;
+  const prevProviders = new Set(prev ? Object.keys(prev) : []);
+  const nextProviders = new Set(Object.keys(next));
+  for (const p of nextProviders) {
+    const prevModels = prev?.[p]?.models ?? {};
+    const nextModels = next[p]?.models ?? {};
+    for (const id of Object.keys(nextModels)) {
+      if (!(id in prevModels)) {
+        added += 1;
+        console.log(`  + ${p}/${id}`);
+        continue;
+      }
+      const a = prevModels[id]?.cost ?? {};
+      const b = nextModels[id]?.cost ?? {};
+      if (JSON.stringify(a) !== JSON.stringify(b)) {
+        changed += 1;
+        console.log(`  ~ ${p}/${id}: ${JSON.stringify(a)} -> ${JSON.stringify(b)}`);
+      }
+    }
+    for (const id of Object.keys(prevModels)) {
+      if (!(id in nextModels)) {
+        removed += 1;
+        console.log(`  - ${p}/${id}`);
+      }
+    }
+  }
+  for (const p of prevProviders) {
+    if (!nextProviders.has(p)) {
+      console.log(`  - provider removed: ${p}`);
+    }
+  }
+  console.log(`\nSummary: ${added} added, ${removed} removed, ${changed} changed.`);
+}
+
+function applyPinnedEntries(prev: Cache | null, next: Cache): void {
+  if (!prev) {
+    return;
+  }
+
+  for (const entryPath of PINNED_ENTRIES) {
+    const slashIndex = entryPath.indexOf("/");
+    if (slashIndex === -1) {
+      throw new Error(`Invalid pinned models.dev entry path: ${entryPath}`);
+    }
+
+    const provider = entryPath.slice(0, slashIndex);
+    const modelId = entryPath.slice(slashIndex + 1);
+    if (next[provider]?.models?.[modelId]) {
+      continue;
+    }
+
+    const pinnedEntry = prev[provider]?.models?.[modelId];
+    if (!pinnedEntry) {
+      throw new Error(
+        `Pinned models.dev entry ${entryPath} is missing from the current cache; restore it before refreshing.`,
+      );
+    }
+
+    next[provider] ??= {};
+    next[provider].models ??= {};
+    next[provider].models[modelId] = pinnedEntry;
+  }
+}
+
+/**
+ * models.dev prunes delisted models, but delisting is not retirement — those
+ * models stay runnable behind provider APIs, and dropping them from the
+ * snapshot silently breaks context-window lookups, reasoning-effort gating,
+ * and pricing for anyone pinned to them (bit us 2026-08: gpt-5.1/5.2-codex +
+ * 12 legacy anthropic ids vanished in one refresh). Carry last-known entries
+ * forward; fresh upstream data still wins whenever the model is listed.
+ */
+export function carryForwardDelistedModels(prev: Cache | null, next: Cache): number {
+  if (!prev) return 0;
+  let carried = 0;
+  for (const [provider, block] of Object.entries(prev)) {
+    for (const [id, entry] of Object.entries(block?.models ?? {})) {
+      if (next[provider]?.models?.[id]) continue;
+      next[provider] ??= {};
+      next[provider].models ??= {};
+      next[provider].models[id] = entry;
+      carried += 1;
+    }
+  }
+  return carried;
+}
+
+async function main(): Promise<void> {
+  console.log(`Fetching ${MODELSDEV_URL} ...`);
+  const next = await fetchLatest();
+  const prev = loadCurrent();
+  applyPinnedEntries(prev, next);
+  // Summarize first so the log still shows what models.dev delisted, then
+  // carry those entries forward into the written snapshot.
+  summarize(prev, next);
+  const carried = carryForwardDelistedModels(prev, next);
+  if (carried > 0) {
+    console.log(`Carried forward ${carried} delisted model entr${carried === 1 ? "y" : "ies"}.`);
+  }
+  writeFileSync(CACHE_PATH, `${JSON.stringify(next, null, 2)}\n`);
+  console.log(`Wrote ${CACHE_PATH}`);
+
+  const reasoningSnapshot = deriveReasoningSnapshot(next);
+  writeFileSync(REASONING_SNAPSHOT_PATH, `${JSON.stringify(reasoningSnapshot, null, 2)}\n`);
+  console.log(`Wrote ${REASONING_SNAPSHOT_PATH}`);
+}
+
+if (import.meta.main) {
+  main().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+}

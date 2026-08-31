@@ -1,0 +1,248 @@
+import type { IncomingMessage, ServerResponse } from "node:http";
+import { z } from "zod";
+import {
+  cleanupAgentSessions,
+  cleanupStaleSessions,
+  deleteActiveSession,
+  deleteActiveSessionById,
+  getActiveSessions,
+  heartbeatActiveSession,
+  insertActiveSession,
+  resetOrphanedInProgressTasksForAgent,
+  updateActiveSessionProviderSessionId,
+} from "../be/db";
+import { ActiveSessionSchema, AgentTaskSchema } from "../types";
+import { isMultiRuntimeEnabled } from "../utils/multi-runtime";
+import { route } from "./route-def";
+import { jsonError } from "./utils";
+
+// ─── Route Definitions ───────────────────────────────────────────────────────
+
+const listActiveSessions = route({
+  method: "get",
+  path: "/api/active-sessions",
+  pattern: ["api", "active-sessions"],
+  summary: "List active sessions",
+  tags: ["Active Sessions"],
+  query: z.object({
+    agentId: z.string().optional(),
+  }),
+  responses: {
+    200: {
+      description: "Active session list",
+      schema: z.object({ sessions: z.array(ActiveSessionSchema) }),
+    },
+  },
+});
+
+const createActiveSession = route({
+  method: "post",
+  path: "/api/active-sessions",
+  pattern: ["api", "active-sessions"],
+  summary: "Create a new active session",
+  tags: ["Active Sessions"],
+  body: z.object({
+    agentId: z.string().min(1),
+    taskId: z.string().optional(),
+    triggerType: z.string().min(1),
+    inboxMessageId: z.string().optional(),
+    taskDescription: z.string().optional(),
+    runnerSessionId: z.string().optional(),
+    runtimeInstanceId: z.string().optional(),
+  }),
+  responses: {
+    201: { description: "Session created", schema: z.object({ session: ActiveSessionSchema }) },
+    400: { description: "Validation error" },
+  },
+});
+
+const deleteSessionByTask = route({
+  method: "delete",
+  path: "/api/active-sessions/by-task/{taskId}",
+  pattern: ["api", "active-sessions", "by-task", null],
+  summary: "Delete active session by task ID",
+  tags: ["Active Sessions"],
+  params: z.object({ taskId: z.string() }),
+  responses: {
+    200: { description: "Session deleted", schema: z.object({ deleted: z.boolean() }) },
+  },
+});
+
+const deleteSessionById = route({
+  method: "delete",
+  path: "/api/active-sessions/{id}",
+  pattern: ["api", "active-sessions", null],
+  summary: "Delete active session by ID",
+  tags: ["Active Sessions"],
+  params: z.object({ id: z.string() }),
+  responses: {
+    200: { description: "Session deleted", schema: z.object({ deleted: z.boolean() }) },
+  },
+});
+
+const heartbeatSession = route({
+  method: "put",
+  path: "/api/active-sessions/heartbeat/{taskId}",
+  pattern: ["api", "active-sessions", "heartbeat", null],
+  summary: "Update heartbeat for an active session",
+  tags: ["Active Sessions"],
+  params: z.object({ taskId: z.string() }),
+  responses: {
+    200: { description: "Heartbeat updated", schema: z.object({ updated: z.boolean() }) },
+  },
+});
+
+const updateProviderSession = route({
+  method: "put",
+  path: "/api/active-sessions/provider-session/{taskId}",
+  pattern: ["api", "active-sessions", "provider-session", null],
+  summary: "Update provider session ID on an active session",
+  tags: ["Active Sessions"],
+  params: z.object({ taskId: z.string() }),
+  body: z.object({ providerSessionId: z.string().min(1) }),
+  responses: {
+    200: { description: "Provider session ID updated", schema: z.object({ updated: z.boolean() }) },
+  },
+});
+
+const cleanupSessions = route({
+  method: "post",
+  path: "/api/active-sessions/cleanup",
+  pattern: ["api", "active-sessions", "cleanup"],
+  summary: "Clean up stale sessions",
+  tags: ["Active Sessions"],
+  body: z
+    .object({
+      agentId: z.string().optional(),
+      maxAgeMinutes: z.number().int().optional(),
+    })
+    .optional(),
+  responses: {
+    200: { description: "Cleanup result", schema: z.object({ cleaned: z.number().int() }) },
+  },
+});
+
+const recoverOrphanedTasks = route({
+  method: "post",
+  path: "/api/active-sessions/recover-orphaned-tasks",
+  pattern: ["api", "active-sessions", "recover-orphaned-tasks"],
+  summary: "Recover orphaned in-progress tasks for an agent",
+  tags: ["Active Sessions"],
+  body: z.object({
+    agentId: z.string().min(1),
+    minAgeSeconds: z.number().int().positive().optional(),
+  }),
+  responses: {
+    200: {
+      description: "Recovery result",
+      schema: z.object({ recovered: z.number().int(), tasks: z.array(AgentTaskSchema) }),
+    },
+    403: { description: "Can only recover orphaned tasks for the calling agent" },
+  },
+});
+
+// ─── Handler ─────────────────────────────────────────────────────────────────
+
+export async function handleActiveSessions(
+  req: IncomingMessage,
+  res: ServerResponse,
+  pathSegments: string[],
+  queryParams: URLSearchParams,
+  myAgentId: string | undefined,
+): Promise<boolean> {
+  if (listActiveSessions.match(req.method, pathSegments)) {
+    const parsed = await listActiveSessions.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+    const sessions = await getActiveSessions(parsed.query.agentId || undefined);
+    listActiveSessions.respond(res, 200, { sessions });
+    return true;
+  }
+
+  if (createActiveSession.match(req.method, pathSegments)) {
+    const parsed = await createActiveSession.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+    const session = await insertActiveSession({
+      agentId: parsed.body.agentId,
+      taskId: parsed.body.taskId,
+      triggerType: parsed.body.triggerType,
+      inboxMessageId: parsed.body.inboxMessageId,
+      taskDescription: parsed.body.taskDescription,
+      runnerSessionId: parsed.body.runnerSessionId,
+      runtimeInstanceId: parsed.body.runtimeInstanceId,
+    });
+    createActiveSession.respond(res, 201, { session });
+    return true;
+  }
+
+  if (deleteSessionByTask.match(req.method, pathSegments)) {
+    const parsed = await deleteSessionByTask.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+    const deleted = await deleteActiveSession(parsed.params.taskId);
+    deleteSessionByTask.respond(res, 200, { deleted });
+    return true;
+  }
+
+  if (deleteSessionById.match(req.method, pathSegments)) {
+    const parsed = await deleteSessionById.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+    const deleted = await deleteActiveSessionById(parsed.params.id);
+    deleteSessionById.respond(res, 200, { deleted });
+    return true;
+  }
+
+  if (heartbeatSession.match(req.method, pathSegments)) {
+    const parsed = await heartbeatSession.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+    const updated = await heartbeatActiveSession(parsed.params.taskId);
+    heartbeatSession.respond(res, 200, { updated });
+    return true;
+  }
+
+  if (updateProviderSession.match(req.method, pathSegments)) {
+    const parsed = await updateProviderSession.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+    const updated = await updateActiveSessionProviderSessionId(
+      parsed.params.taskId,
+      parsed.body.providerSessionId,
+    );
+    updateProviderSession.respond(res, 200, { updated });
+    return true;
+  }
+
+  if (cleanupSessions.match(req.method, pathSegments)) {
+    const parsed = await cleanupSessions.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+    let cleaned = 0;
+    if (parsed.body?.agentId) {
+      // Multi-runtime: several processes share this agent id, and a booting
+      // worker has no evidence distinguishing a crashed predecessor's session
+      // from a live-but-quiet sibling's — sessions heartbeat on tool activity
+      // only, and during the activation window a live worker's runtime may
+      // have no row at all. Reclamation stays with the heartbeat's
+      // stalled-task classifier (stale session AND stale task), backstopped
+      // by the sweep's stale-session cleanup; boot cleanup deletes nothing.
+      cleaned = isMultiRuntimeEnabled() ? 0 : await cleanupAgentSessions(parsed.body.agentId);
+    } else {
+      cleaned = await cleanupStaleSessions(parsed.body?.maxAgeMinutes ?? 30);
+    }
+    cleanupSessions.respond(res, 200, { cleaned });
+    return true;
+  }
+
+  if (recoverOrphanedTasks.match(req.method, pathSegments)) {
+    const parsed = await recoverOrphanedTasks.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+    if (!myAgentId || parsed.body.agentId !== myAgentId) {
+      jsonError(res, "Can only recover orphaned tasks for the calling agent", 403);
+      return true;
+    }
+    const tasks = await resetOrphanedInProgressTasksForAgent(
+      parsed.body.agentId,
+      parsed.body.minAgeSeconds ?? 60,
+    );
+    recoverOrphanedTasks.respond(res, 200, { recovered: tasks.length, tasks });
+    return true;
+  }
+
+  return false;
+}

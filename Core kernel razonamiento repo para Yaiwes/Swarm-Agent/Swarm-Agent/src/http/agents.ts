@@ -1,0 +1,1064 @@
+import type { IncomingMessage, ServerResponse } from "node:http";
+import { ensure } from "@desplega.ai/business-use";
+import { z } from "zod";
+import {
+  computeContentHash,
+  createAgent,
+  deleteSwarmConfigByKey,
+  getAgentById,
+  getAgentWithTasks,
+  getAllAgents,
+  getAllAgentsWithTasks,
+  getDbClient,
+  getSwarmConfigs,
+  resetEmptyPollCount,
+  setAgentHarnessProvider,
+  updateAgentActivity,
+  updateAgentCredentialMissing,
+  updateAgentCredentialState,
+  updateAgentCredStatus,
+  updateAgentMaxTasks,
+  updateAgentName,
+  updateAgentProfile,
+  updateAgentProvider,
+  updateAgentStatus,
+  upsertSwarmConfig,
+} from "../be/db";
+import { createEvent } from "../be/events";
+import {
+  getRuntimeInstanceById,
+  listRuntimeInstancesForAgent,
+  reconcileAgentMaxTasksPolicy,
+  reconcileAgentStatusFromRuntimes,
+  runtimeStaleThresholdMinutes,
+  setRuntimeCredentialReady,
+  upsertRuntimeInstance,
+} from "../be/multi-runtime";
+import { reasoningCapability } from "../providers/reasoning-effort";
+import { ALL_CAPABILITIES, getEnabledCapabilities } from "../server";
+import { telemetry } from "../telemetry";
+import {
+  type Agent,
+  AgentAvatarSchema,
+  AgentCredStatusSchema,
+  AgentLatestModelSchema,
+  AgentSchema,
+  AgentStatusSchema,
+  AgentWithTasksSchema,
+  type ProviderName,
+  ProviderNameSchema,
+  ReasoningEffortSchema,
+  RuntimeInstanceSchema,
+} from "../types";
+import { MAX_PROFILE_FILE_LENGTH } from "../utils/constants";
+import {
+  type BudgetedIdentityField,
+  IDENTITY_FIELD_BUDGETS,
+  IdentityFieldBudgetError,
+} from "../utils/identity-field-budget";
+import { isMultiRuntimeEnabled } from "../utils/multi-runtime";
+import { scrubSecrets } from "../utils/secret-scrubber";
+import { route, runtimeInstanceHeader } from "./route-def";
+import { agentWithCapacity, json, jsonError } from "./utils";
+
+function singleHeaderValue(req: IncomingMessage, name: string): string | undefined {
+  const raw = req.headers[name];
+  return Array.isArray(raw) ? raw[0] : raw;
+}
+
+// ─── Route Definitions ───────────────────────────────────────────────────────
+
+/** Mirrors `CAPABILITIES_T` (src/server.ts) — the server's registered MCP tool-group flags. */
+const CapabilitySchema = z.enum(ALL_CAPABILITIES);
+
+const AgentCapacitySchema = z.object({
+  current: z.number().int(),
+  max: z.number().int(),
+  available: z.number().int(),
+});
+
+/** Shape sent by `agentWithCapacity()` (src/http/utils.ts) for a plain Agent row. */
+const AgentWithCapacitySchema = AgentSchema.extend({
+  capacity: AgentCapacitySchema,
+});
+
+/**
+ * Same as `AgentWithCapacitySchema`, plus the `tasks` array added by
+ * `getAgentWithTasks`/`getAllAgentsWithTasks` when `?include=tasks` is used.
+ * Reuses the canonical `AgentWithTasksSchema` (src/types.ts) rather than
+ * re-declaring the `tasks` field inline.
+ */
+const AgentWithCapacityAndTasksSchema = AgentWithTasksSchema.extend({
+  capacity: AgentCapacitySchema,
+});
+
+/** POST /api/agents response: the agent row plus the server's capability flags. */
+const RegisterAgentResponseSchema = AgentSchema.extend({
+  enabledCapabilities: z.array(CapabilitySchema),
+});
+
+/** Shape shared by the single- and bulk- credential-status endpoints. */
+const AgentCredentialStatusEntrySchema = z.object({
+  agentId: z.string(),
+  name: z.string(),
+  status: AgentStatusSchema,
+  missing: z.array(z.string()),
+  provider: ProviderNameSchema.nullable(),
+  harnessProvider: ProviderNameSchema.nullable(),
+  credStatus: AgentCredStatusSchema.nullable(),
+  lastCheckedAt: z.string(),
+});
+
+const registerAgent = route({
+  method: "post",
+  path: "/api/agents",
+  pattern: ["api", "agents"],
+  summary: "Register or re-register an agent",
+  tags: ["Agents"],
+  body: z.object({
+    name: z.string().min(1),
+    isLead: z.boolean().optional(),
+    description: z.string().optional(),
+    role: z.string().optional(),
+    capabilities: z.array(z.string()).optional(),
+    maxTasks: z.number().int().optional(),
+    provider: ProviderNameSchema.optional(),
+    /**
+     * Phase 1.5 (cloud-personalization): worker-pushed canonical harness
+     * provider. Persists to `agents.harness_provider`. Validated against
+     * the canonical list — unknown values reject the request with 400.
+     */
+    harness_provider: ProviderNameSchema.optional(),
+    /**
+     * Per-process runtime identity; `X-Agent-ID` remains the logical agent.
+     * Ignored when MULTI_RUNTIME_ENABLED is off, required when it is on —
+     * schema-optional so older workers still parse, with the handler
+     * enforcing the mode-dependent requirement.
+     */
+    runtimeInstanceId: z.string().min(1).optional(),
+  }),
+  responses: {
+    200: {
+      description:
+        "Agent re-registered (already existed). Response includes `enabledCapabilities` — the server's capability flags (registered MCP tool groups), not the agent's declared skill tags.",
+      schema: RegisterAgentResponseSchema,
+    },
+    201: {
+      description: "Agent created. Response includes `enabledCapabilities` (see 200).",
+      schema: RegisterAgentResponseSchema,
+    },
+    400: { description: "Validation error" },
+  },
+});
+
+const setAgentHarnessProviderRoute = route({
+  method: "patch",
+  path: "/api/agents/{id}/harness-provider",
+  pattern: ["api", "agents", null, "harness-provider"],
+  summary: "Re-assign an agent's harness_provider (live)",
+  description:
+    "Updates `agents.harness_provider` and upserts `swarm_config` (scope=agent, key=HARNESS_PROVIDER) so the worker's poll-loop reconciliation picks up the new provider within ~10s. No restart required. The swarm_config row is what actually drives the worker; the column mirrors the latest set value for dashboards.",
+  tags: ["Agents"],
+  params: z.object({ id: z.string() }),
+  body: z.object({
+    harness_provider: ProviderNameSchema,
+  }),
+  responses: {
+    200: { description: "Updated agent row", schema: AgentWithCapacitySchema },
+    400: { description: "Validation error (unknown provider)" },
+    404: { description: "Agent not found" },
+  },
+});
+
+const LocalHarnessProviderSchema = z.enum(["claude", "codex", "pi", "opencode"]);
+
+const updateAgentRuntimeRoute = route({
+  method: "patch",
+  path: "/api/agents/{id}/runtime",
+  pattern: ["api", "agents", null, "runtime"],
+  summary: "Update an agent's runtime harness and default model",
+  description:
+    "Updates `agents.harness_provider` and upserts agent-scoped `swarm_config` rows for HARNESS_PROVIDER, MODEL_OVERRIDE, and REASONING_EFFORT_OVERRIDE. The settings apply to future provider sessions. For `model` and `reasoning_effort`: omit the field to leave it unchanged, send `null` to clear the corresponding override, or send a value to set it.",
+  tags: ["Agents"],
+  params: z.object({ id: z.string() }),
+  body: z.object({
+    harness_provider: LocalHarnessProviderSchema,
+    model: z.string().trim().min(1).nullable().optional(),
+    allow_custom_model: z.boolean().optional().default(false),
+    reasoning_effort: ReasoningEffortSchema.nullable().optional(),
+  }),
+  responses: {
+    200: { description: "Updated agent row", schema: AgentWithCapacitySchema },
+    400: { description: "Validation error" },
+    404: { description: "Agent not found" },
+  },
+});
+
+const listAgents = route({
+  method: "get",
+  path: "/api/agents",
+  pattern: ["api", "agents"],
+  summary: "List all agents",
+  description:
+    "Returns agents WITHOUT the six identity-markdown blobs (`claudeMd`/`soulMd`/`identityMd`/`toolsMd`/`heartbeatMd`/`setupScript`) by default — they bloat the list by ~16 KB/agent and the overview never renders them. Pass `fields=full` to restore them, or fetch a single agent via `GET /api/agents/{id}`.",
+  tags: ["Agents"],
+  query: z.object({
+    include: z.enum(["tasks"]).optional(),
+    /** `full` restores the legacy shape (includes identity markdown); default is slim. */
+    fields: z.enum(["full", "slim"]).optional(),
+  }),
+  responses: {
+    200: {
+      description: "Agent list with capacity info",
+      schema: z.object({ agents: z.array(AgentWithCapacityAndTasksSchema) }),
+    },
+  },
+});
+
+const updateAgentNameRoute = route({
+  method: "put",
+  path: "/api/agents/{id}/name",
+  pattern: ["api", "agents", null, "name"],
+  summary: "Update agent name",
+  tags: ["Agents"],
+  params: z.object({ id: z.string() }),
+  body: z.object({ name: z.string().min(1) }),
+  responses: {
+    200: { description: "Agent updated", schema: AgentWithCapacitySchema },
+    404: { description: "Agent not found" },
+    409: { description: "Name conflict" },
+  },
+});
+
+const getAgentSetupScript = route({
+  method: "get",
+  path: "/api/agents/{id}/setup-script",
+  pattern: ["api", "agents", null, "setup-script"],
+  summary: "Fetch agent + global setup scripts for Docker entrypoint",
+  tags: ["Agents"],
+  params: z.object({ id: z.string() }),
+  responses: {
+    200: {
+      description: "Setup scripts",
+      schema: z.object({
+        setupScript: z.string().nullable(),
+        globalSetupScript: z.string().nullable(),
+      }),
+    },
+    404: { description: "Agent not found" },
+  },
+});
+
+/** Operator view of a runtime instance: internal `metadata` omitted, server-derived `isLive` added. */
+const AgentRuntimeInstanceSchema = RuntimeInstanceSchema.omit({ metadata: true }).extend({
+  isLive: z.boolean(),
+});
+
+const listAgentRuntimeInstances = route({
+  method: "get",
+  path: "/api/agents/{id}/runtime-instances",
+  pattern: ["api", "agents", null, "runtime-instances"],
+  summary: "List runtime instances serving an agent",
+  description:
+    "Read-only view of the worker processes currently registered for a logical agent. Rows exist only for multi-runtime registrations (MULTI_RUNTIME_ENABLED), so the list is empty in the default configuration. `isLive` combines `status` with `lastSeenAt` freshness against the server's staleness cutoff (`staleThresholdMinutes`); `reportedSlots` is each process's self-reported capacity, distinct from the agent's logical `maxTasks` policy.",
+  tags: ["Agents"],
+  params: z.object({ id: z.string() }),
+  responses: {
+    200: {
+      description: "Runtime instances for the agent (empty when none are registered)",
+      schema: z.object({
+        runtimeInstances: z.array(AgentRuntimeInstanceSchema),
+        staleThresholdMinutes: z.number().int(),
+      }),
+    },
+    404: { description: "Agent not found" },
+  },
+});
+
+const ProfileSyncRejectionSchema = z.object({
+  field: z.enum(["soulMd", "identityMd", "claudeMd", "toolsMd"]),
+  diskSize: z.number().int(),
+  dbSize: z.number().int(),
+  budget: z.number().int(),
+  delta: z.number().int(),
+  reason: z.string(),
+});
+
+const updateAgentProfileRoute = route({
+  method: "put",
+  path: "/api/agents/{id}/profile",
+  pattern: ["api", "agents", null, "profile"],
+  summary: "Update agent profile (role, description, capabilities, etc.)",
+  tags: ["Agents"],
+  params: z.object({ id: z.string() }),
+  body: z.object({
+    role: z.string().max(100).optional(),
+    description: z.string().optional(),
+    capabilities: z.array(z.string()).optional(),
+    claudeMd: z.string().optional(),
+    soulMd: z.string().optional(),
+    identityMd: z.string().optional(),
+    setupScript: z.string().max(MAX_PROFILE_FILE_LENGTH).optional(),
+    toolsMd: z.string().optional(),
+    heartbeatMd: z.string().max(MAX_PROFILE_FILE_LENGTH).optional(),
+    /** `null` resets to the deterministic fallback; omit the key to leave untouched. */
+    avatar: AgentAvatarSchema.nullable().optional(),
+    changeSource: z.string().optional(),
+    changedByAgentId: z.string().optional(),
+    changeReason: z.string().optional(),
+  }),
+  responses: {
+    200: { description: "Profile updated", schema: AgentWithCapacitySchema },
+    400: {
+      description: "Validation or identity-field budget error",
+      schema: z.object({
+        error: z.string(),
+        profileSyncRejection: ProfileSyncRejectionSchema.optional(),
+      }),
+    },
+    404: { description: "Agent not found" },
+  },
+});
+
+const updateAgentActivityRoute = route({
+  method: "put",
+  path: "/api/agents/{id}/activity",
+  pattern: ["api", "agents", null, "activity"],
+  summary: "Update agent last activity timestamp",
+  tags: ["Agents"],
+  params: z.object({ id: z.string() }),
+  responses: {
+    204: { description: "Activity updated" },
+  },
+});
+
+const getAgent = route({
+  method: "get",
+  path: "/api/agents/{id}",
+  pattern: ["api", "agents", null],
+  summary: "Get a single agent",
+  tags: ["Agents"],
+  params: z.object({ id: z.string() }),
+  query: z.object({
+    include: z.enum(["tasks"]).optional(),
+  }),
+  responses: {
+    200: { description: "Agent with capacity info", schema: AgentWithCapacityAndTasksSchema },
+    404: { description: "Agent not found" },
+  },
+});
+
+// ─── Credential-status (Phase 3 + 4 of the credential safe-loop plan) ───────
+
+const credentialStatusBody = z.object({
+  ready: z.boolean().optional(),
+  /** Env-var names (or absolute file paths) the worker is blocked on. Empty/null when ready. */
+  missing: z.array(z.string()).optional().nullable(),
+  /**
+   * Migration 055: full credential snapshot (presence + live test). Optional
+   * for backward compat — older workers may only POST `{ready, missing}`.
+   * When present, written to `agents.cred_status` as JSON; the dashboard
+   * reads the row instead of running its own check.
+   */
+  cred_status: AgentCredStatusSchema.optional().nullable(),
+  /**
+   * Worker-reported latest model telemetry. Optional and merge-only: when sent
+   * without `cred_status`, the API preserves existing readiness/live-test data.
+   */
+  latest_model: AgentLatestModelSchema.optional(),
+});
+
+const updateAgentCredentialStatusRoute = route({
+  method: "put",
+  path: "/api/agents/{id}/credential-status",
+  pattern: ["api", "agents", null, "credential-status"],
+  summary: "Worker self-report of credential readiness (Phase 3 boot loop)",
+  tags: ["Agents"],
+  params: z.object({ id: z.string() }),
+  headers: runtimeInstanceHeader("report credential readiness"),
+  body: credentialStatusBody,
+  responses: {
+    200: {
+      description: "State updated; returns the agent row.",
+      schema: AgentWithCapacitySchema,
+    },
+    400: { description: "Missing X-Runtime-Instance-ID in multi-runtime mode" },
+    404: { description: "Agent not found" },
+  },
+});
+
+const getAgentCredentialStatusRoute = route({
+  method: "get",
+  path: "/api/agents/{id}/credential-status",
+  pattern: ["api", "agents", null, "credential-status"],
+  summary: "Single-agent credential-status snapshot for the dashboard",
+  tags: ["Agents"],
+  params: z.object({ id: z.string() }),
+  responses: {
+    200: { description: "Credential status payload", schema: AgentCredentialStatusEntrySchema },
+    404: { description: "Agent not found" },
+  },
+});
+
+const listCredentialStatusRoute = route({
+  method: "get",
+  path: "/api/agents/credential-status",
+  pattern: ["api", "agents", "credential-status"],
+  summary: "Bulk credential-status across all agents (powers the dashboard)",
+  tags: ["Agents"],
+  query: z.object({
+    status: z.enum(["idle", "busy", "offline", "waiting_for_credentials"]).optional(),
+  }),
+  responses: {
+    200: {
+      description: "List of {agentId, status, missing[], lastCheckedAt}",
+      schema: z.object({ agents: z.array(AgentCredentialStatusEntrySchema) }),
+    },
+  },
+});
+
+// ─── Handlers ────────────────────────────────────────────────────────────────
+
+export async function handleAgentRegister(
+  req: IncomingMessage,
+  res: ServerResponse,
+  pathSegments: string[],
+  myAgentId: string | undefined,
+): Promise<boolean> {
+  if (registerAgent.match(req.method, pathSegments)) {
+    const parsed = await registerAgent.parse(req, res, pathSegments, new URLSearchParams());
+    if (!parsed) return true;
+
+    const agentId = myAgentId || crypto.randomUUID();
+    // Read once so one mode applies consistently even if a config reload
+    // flips the flag mid-request.
+    const multiRuntime = isMultiRuntimeEnabled();
+
+    if (multiRuntime && parsed.body.runtimeInstanceId) {
+      // Runtime ownership is permanent: a runtime id already serving another
+      // agent must not be moved. `upsertRuntimeInstance` enforces this in SQL
+      // too; rejecting here keeps the failure legible and pre-mutation.
+      const existingRuntime = await getRuntimeInstanceById(parsed.body.runtimeInstanceId);
+      if (existingRuntime && existingRuntime.agentId !== agentId) {
+        jsonError(res, "runtimeInstanceId is already registered to another agent", 400);
+        return true;
+      }
+    } else if (multiRuntime) {
+      // Enforced here rather than in the schema so the field stays optional
+      // for workers running against a server with the flag off.
+      jsonError(res, "runtimeInstanceId is required when multi-runtime mode is enabled", 400);
+      return true;
+    }
+
+    const result = await getDbClient().transaction(async () => {
+      const existingAgent = await getAgentById(agentId);
+      if (existingAgent) {
+        if (existingAgent.status === "offline") {
+          await updateAgentStatus(existingAgent.id, "idle");
+        }
+        if (multiRuntime) {
+          // body.maxTasks is this runtime's own capacity, recorded below; it
+          // must not redefine the logical policy, or two runtimes serving one
+          // agent would race to overwrite it.
+          await reconcileAgentMaxTasksPolicy(existingAgent.id);
+        } else if (
+          parsed.body.maxTasks !== undefined &&
+          parsed.body.maxTasks !== existingAgent.maxTasks
+        ) {
+          await updateAgentMaxTasks(existingAgent.id, parsed.body.maxTasks);
+        }
+        if (parsed.body.provider && parsed.body.provider !== existingAgent.provider) {
+          await updateAgentProvider(existingAgent.id, parsed.body.provider);
+        }
+        // Phase 1.5: worker-pushed harness_provider always wins on
+        // re-registration. Env-driven, by design (per-agent live override
+        // belongs to DES-359). NULL => leave existing column untouched
+        // so PATCH /harness-provider doesn't get clobbered by re-register
+        // payloads from older workers.
+        if (
+          parsed.body.harness_provider &&
+          parsed.body.harness_provider !== existingAgent.harnessProvider
+        ) {
+          await setAgentHarnessProvider(existingAgent.id, parsed.body.harness_provider);
+        }
+        await resetEmptyPollCount(existingAgent.id);
+        if (multiRuntime && parsed.body.runtimeInstanceId) {
+          await upsertRuntimeInstance({
+            id: parsed.body.runtimeInstanceId,
+            agentId: existingAgent.id,
+            reportedSlots: parsed.body.maxTasks ?? 1,
+          });
+          // A new live runtime can lift the agent out of waiting without
+          // forcing idle over work another runtime is already doing.
+          await reconcileAgentStatusFromRuntimes(existingAgent.id);
+        }
+        return { agent: await getAgentById(agentId), created: false };
+      }
+
+      const agent = await createAgent({
+        id: agentId,
+        name: parsed.body.name,
+        isLead: parsed.body.isLead ?? false,
+        status: "idle",
+        description: parsed.body.description,
+        role: parsed.body.role,
+        capabilities: parsed.body.capabilities ?? [],
+        // The first registration establishes the logical policy — including
+        // role defaults such as a lead's two concurrent tasks. Later
+        // registrations cannot change it; reconcile below only seeds.
+        maxTasks: parsed.body.maxTasks ?? 1,
+        provider: parsed.body.provider,
+        harnessProvider: parsed.body.harness_provider ?? null,
+      });
+
+      if (multiRuntime) {
+        // Re-fetch below: this may adopt a policy row an operator wrote
+        // before the agent existed.
+        await reconcileAgentMaxTasksPolicy(agent.id);
+        if (parsed.body.runtimeInstanceId) {
+          await upsertRuntimeInstance({
+            id: parsed.body.runtimeInstanceId,
+            agentId: agent.id,
+            reportedSlots: parsed.body.maxTasks ?? 1,
+          });
+          await reconcileAgentStatusFromRuntimes(agent.id);
+        }
+        return { agent: await getAgentById(agent.id), created: true };
+      }
+
+      return { agent, created: true };
+    });
+
+    telemetry.agent("registered", {
+      role: parsed.body.role,
+      capabilities: parsed.body.capabilities ?? [],
+      isReconnect: !result.created,
+    });
+
+    if (result.created) {
+      ensure({
+        id: "registered",
+        flow: "agent",
+        runId: agentId,
+        data: {
+          agentId,
+          name: parsed.body.name,
+          isLead: parsed.body.isLead ?? false,
+        },
+      });
+    } else {
+      ensure({
+        id: "reconnected",
+        flow: "agent",
+        runId: agentId,
+        depIds: ["registered"],
+        data: {
+          agentId,
+          name: parsed.body.name,
+        },
+        validator: (_data, ctx) => {
+          // Validates that registered happened before reconnected
+          return ctx.deps.length > 0;
+        },
+        // biome-ignore lint/correctness/noEmptyPattern: data unused, ctx needed
+        filter: ({}, ctx) => ctx.deps.length > 0,
+        conditions: [{ timeout_ms: 86_400_000 }], // 1 day: agents may be offline for extended periods
+      });
+    }
+
+    // `enabledCapabilities` = the server's capability flags (which MCP tool
+    // groups are registered), NOT the agent's declared skill tags. Workers use
+    // it to drop prompt sections that instruct unregistered tools.
+    // Non-null assertion: `result.agent` is only `| null` in the TS union
+    // because the re-registration branch re-fetches by id inside the same
+    // transaction right after confirming the row exists — it cannot actually
+    // be null here. (Same value as before; this only affects the compile-time
+    // type used to check the response schema.)
+    registerAgent.respond(res, result.created ? 201 : 200, {
+      ...result.agent!,
+      enabledCapabilities: getEnabledCapabilities(),
+    });
+    return true;
+  }
+
+  return false;
+}
+
+export async function handleAgentsRest(
+  req: IncomingMessage,
+  res: ServerResponse,
+  pathSegments: string[],
+  queryParams: URLSearchParams,
+  _myAgentId: string | undefined,
+): Promise<boolean> {
+  if (listAgents.match(req.method, pathSegments)) {
+    const parsed = await listAgents.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+    const includeTasks = parsed.query.include === "tasks";
+    // List responses default to slim (no identity markdown); `?fields=full` restores it.
+    const slim = parsed.query.fields !== "full";
+    const agents = includeTasks
+      ? await getAllAgentsWithTasks({ slim })
+      : await getAllAgents({ slim });
+    const agentsWithCapacity = await Promise.all(agents.map(agentWithCapacity));
+    listAgents.respond(res, 200, { agents: agentsWithCapacity });
+    return true;
+  }
+
+  if (updateAgentNameRoute.match(req.method, pathSegments)) {
+    const parsed = await updateAgentNameRoute.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+
+    try {
+      const agent = await updateAgentName(parsed.params.id, parsed.body.name.trim());
+      if (!agent) {
+        jsonError(res, "Agent not found", 404);
+        return true;
+      }
+      updateAgentNameRoute.respond(res, 200, await agentWithCapacity(agent));
+    } catch (error) {
+      jsonError(res, (error as Error).message, 409);
+    }
+    return true;
+  }
+
+  if (getAgentSetupScript.match(req.method, pathSegments)) {
+    const parsed = await getAgentSetupScript.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+    const agent = await getAgentById(parsed.params.id);
+    if (!agent) {
+      jsonError(res, "Agent not found", 404);
+      return true;
+    }
+    const globalConfigs = await getSwarmConfigs({ scope: "global", key: "SETUP_SCRIPT" });
+    const globalSetupScript = globalConfigs[0]?.value ?? null;
+    getAgentSetupScript.respond(res, 200, {
+      setupScript: agent.setupScript ?? null,
+      globalSetupScript,
+    });
+    return true;
+  }
+
+  if (listAgentRuntimeInstances.match(req.method, pathSegments)) {
+    const parsed = await listAgentRuntimeInstances.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+    if (!(await getAgentById(parsed.params.id))) {
+      jsonError(res, "Agent not found", 404);
+      return true;
+    }
+    listAgentRuntimeInstances.respond(res, 200, {
+      runtimeInstances: (await listRuntimeInstancesForAgent(parsed.params.id)).map(
+        ({ metadata: _metadata, ...instance }) => instance,
+      ),
+      staleThresholdMinutes: runtimeStaleThresholdMinutes(),
+    });
+    return true;
+  }
+
+  if (updateAgentProfileRoute.match(req.method, pathSegments)) {
+    const parsed = await updateAgentProfileRoute.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+    const body = parsed.body;
+
+    // At least one profile field must be provided
+    if (
+      body.role === undefined &&
+      body.description === undefined &&
+      body.capabilities === undefined &&
+      body.claudeMd === undefined &&
+      body.soulMd === undefined &&
+      body.identityMd === undefined &&
+      body.setupScript === undefined &&
+      body.toolsMd === undefined &&
+      body.heartbeatMd === undefined &&
+      body.avatar === undefined
+    ) {
+      jsonError(
+        res,
+        "At least one field (role, description, capabilities, claudeMd, soulMd, identityMd, setupScript, toolsMd, heartbeatMd, or avatar) must be provided",
+        400,
+      );
+      return true;
+    }
+
+    // Build version metadata if provided
+    const validChangeSources = ["self_edit", "lead_coaching", "api", "system", "session_sync"];
+    const versionMeta =
+      body.changeSource || body.changedByAgentId || body.changeReason
+        ? {
+            changeSource: validChangeSources.includes(body.changeSource ?? "")
+              ? (body.changeSource as import("../types").ChangeSource)
+              : undefined,
+            changedByAgentId: body.changedByAgentId ?? null,
+            changeReason: body.changeReason ?? null,
+          }
+        : undefined;
+
+    let agent: Agent | null;
+    try {
+      agent = await updateAgentProfile(
+        parsed.params.id,
+        {
+          role: body.role,
+          description: body.description,
+          capabilities: body.capabilities,
+          claudeMd: body.claudeMd,
+          soulMd: body.soulMd,
+          identityMd: body.identityMd,
+          setupScript: body.setupScript,
+          toolsMd: body.toolsMd,
+          heartbeatMd: body.heartbeatMd,
+          // Only include the key when the client sent it, so `null` (reset)
+          // is distinguishable from "not provided" (leave untouched).
+          ...(body.avatar !== undefined ? { avatar: body.avatar } : {}),
+        },
+        versionMeta,
+      );
+    } catch (error) {
+      if (error instanceof IdentityFieldBudgetError) {
+        if (
+          versionMeta?.changeSource === "self_edit" ||
+          versionMeta?.changeSource === "session_sync"
+        ) {
+          try {
+            await createEvent({
+              category: "system",
+              event: "system.profile_sync_rejected",
+              status: "error",
+              source: "api",
+              agentId: parsed.params.id,
+              data: {
+                ...error.rejection,
+                dbHash: error.dbHash,
+                diskHash: error.diskHash,
+                changeSource: versionMeta.changeSource,
+              },
+            });
+          } catch (eventError) {
+            const message = eventError instanceof Error ? eventError.message : String(eventError);
+            console.error(
+              scrubSecrets(`[profile-sync] Failed to persist budget rejection event: ${message}`),
+            );
+          }
+        }
+        updateAgentProfileRoute.respond(res, 400, {
+          error: error.message,
+          profileSyncRejection: error.rejection,
+        });
+        return true;
+      }
+      throw error;
+    }
+
+    if (!agent) {
+      jsonError(res, "Agent not found", 404);
+      return true;
+    }
+
+    if (versionMeta?.changeSource === "self_edit" || versionMeta?.changeSource === "session_sync") {
+      try {
+        for (const field of Object.keys(IDENTITY_FIELD_BUDGETS) as BudgetedIdentityField[]) {
+          if (body[field] === undefined) continue;
+          await createEvent({
+            category: "system",
+            event: "system.profile_sync_reconciled",
+            status: "ok",
+            source: "api",
+            agentId: parsed.params.id,
+            data: {
+              field,
+              dbHash: computeContentHash(agent[field] ?? ""),
+              changeSource: versionMeta.changeSource,
+            },
+          });
+        }
+      } catch (eventError) {
+        const message = eventError instanceof Error ? eventError.message : String(eventError);
+        console.error(
+          scrubSecrets(`[profile-sync] Failed to persist reconciliation event: ${message}`),
+        );
+      }
+    }
+
+    updateAgentProfileRoute.respond(res, 200, await agentWithCapacity(agent));
+    return true;
+  }
+
+  if (updateAgentActivityRoute.match(req.method, pathSegments)) {
+    const parsed = await updateAgentActivityRoute.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+    await updateAgentActivity(parsed.params.id);
+    res.writeHead(204);
+    res.end();
+    return true;
+  }
+
+  if (setAgentHarnessProviderRoute.match(req.method, pathSegments)) {
+    const parsed = await setAgentHarnessProviderRoute.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+    const agent = await setAgentHarnessProvider(parsed.params.id, parsed.body.harness_provider);
+    if (!agent) {
+      jsonError(res, "Agent not found", 404);
+      return true;
+    }
+    // Mirror to swarm_config (scope=agent) so the worker's reconciliation
+    // loop actually reads the new value. The column above is for dashboard
+    // visibility; this row is the live override.
+    await upsertSwarmConfig({
+      scope: "agent",
+      scopeId: parsed.params.id,
+      key: "HARNESS_PROVIDER",
+      value: parsed.body.harness_provider,
+      description: "Set via PATCH /api/agents/{id}/harness-provider",
+    });
+    setAgentHarnessProviderRoute.respond(res, 200, await agentWithCapacity(agent));
+    return true;
+  }
+
+  if (updateAgentRuntimeRoute.match(req.method, pathSegments)) {
+    const parsed = await updateAgentRuntimeRoute.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+    const { harness_provider, model, allow_custom_model, reasoning_effort } = parsed.body;
+
+    // Validate the requested level against the hybrid capability lookup
+    // before touching the DB. `model` may be omitted (leave MODEL_OVERRIDE
+    // unchanged) — in that case validate against the currently persisted
+    // MODEL_OVERRIDE for this agent, not an empty string, so a
+    // reasoning_effort-only PATCH doesn't spuriously 400 against a model the
+    // agent is already running.
+    if (reasoning_effort) {
+      const modelForValidation =
+        model !== undefined
+          ? model
+          : ((
+              await getSwarmConfigs({
+                scope: "agent",
+                scopeId: parsed.params.id,
+                key: "MODEL_OVERRIDE",
+              })
+            )[0]?.value ?? "");
+      const capability = reasoningCapability(harness_provider, modelForValidation ?? "");
+      if (!capability.levels.includes(reasoning_effort)) {
+        json(
+          res,
+          {
+            error: "Unsupported reasoning_effort for this harness/model",
+            harness: harness_provider,
+            model: modelForValidation || null,
+            level: reasoning_effort,
+            allowed: capability.levels,
+          },
+          400,
+        );
+        return true;
+      }
+    }
+
+    const agent = await getDbClient().transaction(async () => {
+      const updated = await setAgentHarnessProvider(
+        parsed.params.id,
+        harness_provider as ProviderName,
+      );
+      if (!updated) return null;
+
+      await upsertSwarmConfig({
+        scope: "agent",
+        scopeId: parsed.params.id,
+        key: "HARNESS_PROVIDER",
+        value: harness_provider,
+        description: "Set via PATCH /api/agents/{id}/runtime",
+      });
+
+      // `model === null` clears MODEL_OVERRIDE; `undefined` leaves it
+      // untouched; a string sets/updates it. Symmetric with reasoning_effort
+      // below — this closes a pre-existing gap (there was previously no way
+      // to clear MODEL_OVERRIDE via the API).
+      if (model === null) {
+        await deleteSwarmConfigByKey("agent", parsed.params.id, "MODEL_OVERRIDE");
+      } else if (model !== undefined) {
+        await upsertSwarmConfig({
+          scope: "agent",
+          scopeId: parsed.params.id,
+          key: "MODEL_OVERRIDE",
+          value: model,
+          description: allow_custom_model
+            ? "Custom model set via PATCH /api/agents/{id}/runtime"
+            : "Set via PATCH /api/agents/{id}/runtime",
+        });
+      }
+
+      // Same tri-state contract for REASONING_EFFORT_OVERRIDE. Note: until
+      // the runner reads this key (Phase 3), setting it is a no-op on the
+      // worker side — this phase only wires storage + validation.
+      if (reasoning_effort === null) {
+        await deleteSwarmConfigByKey("agent", parsed.params.id, "REASONING_EFFORT_OVERRIDE");
+      } else if (reasoning_effort !== undefined) {
+        await upsertSwarmConfig({
+          scope: "agent",
+          scopeId: parsed.params.id,
+          key: "REASONING_EFFORT_OVERRIDE",
+          value: reasoning_effort,
+          description: "Set via PATCH /api/agents/{id}/runtime",
+        });
+      }
+
+      return updated;
+    });
+
+    if (!agent) {
+      jsonError(res, "Agent not found", 404);
+      return true;
+    }
+    updateAgentRuntimeRoute.respond(res, 200, await agentWithCapacity(agent));
+    return true;
+  }
+
+  // Bulk credential-status MUST be matched BEFORE single-agent routes — the
+  // path "api/agents/credential-status" otherwise looks like an agent id.
+  if (listCredentialStatusRoute.match(req.method, pathSegments)) {
+    const parsed = await listCredentialStatusRoute.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+    const filter = parsed.query.status;
+    const agents = (await getAllAgents())
+      .filter((a) => (filter ? a.status === filter : true))
+      .map((a) => ({
+        agentId: a.id,
+        name: a.name,
+        status: a.status,
+        missing: a.credentialMissing ?? [],
+        provider: a.provider ?? null,
+        harnessProvider: a.harnessProvider ?? null,
+        credStatus: a.credStatus ?? null,
+        lastCheckedAt: a.lastUpdatedAt,
+      }));
+    listCredentialStatusRoute.respond(res, 200, { agents });
+    return true;
+  }
+
+  if (updateAgentCredentialStatusRoute.match(req.method, pathSegments)) {
+    const parsed = await updateAgentCredentialStatusRoute.parse(
+      req,
+      res,
+      pathSegments,
+      queryParams,
+    );
+    if (!parsed) return true;
+    const existing = await getAgentById(parsed.params.id);
+    if (!existing) {
+      jsonError(res, "Agent not found", 404);
+      return true;
+    }
+    // Credential readiness is process-local. With several runtimes serving one
+    // agent, writing it straight onto the shared row lets the last reporter win
+    // — so the report is stored on its own runtime and the logical state is
+    // recomputed from all live runtimes.
+    const runtimeInstanceId = singleHeaderValue(req, "x-runtime-instance-id");
+    const multiRuntime = isMultiRuntimeEnabled();
+    // Only the readiness write is process-scoped; model/status metadata on this
+    // same endpoint stays agent-level and needs no runtime identity.
+    if (multiRuntime && parsed.body.ready !== undefined && !runtimeInstanceId) {
+      jsonError(res, "X-Runtime-Instance-ID is required when multi-runtime mode is enabled", 400);
+      return true;
+    }
+
+    let agent = existing;
+    if (parsed.body.ready !== undefined) {
+      if (multiRuntime && runtimeInstanceId) {
+        if (
+          await setRuntimeCredentialReady(runtimeInstanceId, parsed.params.id, parsed.body.ready)
+        ) {
+          await updateAgentCredentialMissing(parsed.params.id, parsed.body.missing ?? null);
+          await reconcileAgentStatusFromRuntimes(parsed.params.id);
+        }
+        agent = (await getAgentById(parsed.params.id)) ?? existing;
+      } else {
+        agent =
+          (await updateAgentCredentialState(
+            parsed.params.id,
+            parsed.body.ready,
+            parsed.body.missing ?? null,
+          )) ?? existing;
+      }
+    }
+    if (!agent) {
+      jsonError(res, "Agent not found", 404);
+      return true;
+    }
+    // Phase 055: persist the richer worker-reported snapshot when sent.
+    // We accept `null` to explicitly clear (e.g. on harness change), and
+    // `undefined` to leave the existing row value untouched.
+    let finalAgent = agent;
+    if (parsed.body.cred_status !== undefined) {
+      const nextStatus = parsed.body.cred_status
+        ? {
+            ...parsed.body.cred_status,
+            latestModel:
+              parsed.body.latest_model ??
+              parsed.body.cred_status.latestModel ??
+              agent.credStatus?.latestModel ??
+              null,
+          }
+        : null;
+      finalAgent = (await updateAgentCredStatus(parsed.params.id, nextStatus)) ?? agent;
+    } else if (parsed.body.latest_model) {
+      const current = agent.credStatus ?? {
+        ready: parsed.body.ready ?? true,
+        missing: parsed.body.missing ?? [],
+        satisfiedBy: null,
+        hint: null,
+        liveTest: null,
+        latestModel: null,
+        reportedAt: parsed.body.latest_model.reportedAt,
+        reportKind: "post_task" as const,
+        bedrock: null,
+      };
+      finalAgent =
+        (await updateAgentCredStatus(parsed.params.id, {
+          ...current,
+          latestModel: parsed.body.latest_model,
+        })) ?? agent;
+    }
+    updateAgentCredentialStatusRoute.respond(res, 200, await agentWithCapacity(finalAgent));
+    return true;
+  }
+
+  if (getAgentCredentialStatusRoute.match(req.method, pathSegments)) {
+    const parsed = await getAgentCredentialStatusRoute.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+    const agent = await getAgentById(parsed.params.id);
+    if (!agent) {
+      jsonError(res, "Agent not found", 404);
+      return true;
+    }
+    getAgentCredentialStatusRoute.respond(res, 200, {
+      agentId: agent.id,
+      name: agent.name,
+      status: agent.status,
+      missing: agent.credentialMissing ?? [],
+      provider: agent.provider ?? null,
+      harnessProvider: agent.harnessProvider ?? null,
+      credStatus: agent.credStatus ?? null,
+      lastCheckedAt: agent.lastUpdatedAt,
+    });
+    return true;
+  }
+
+  if (getAgent.match(req.method, pathSegments)) {
+    const parsed = await getAgent.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+    const includeTasks = parsed.query.include === "tasks";
+    const agent = includeTasks
+      ? await getAgentWithTasks(parsed.params.id)
+      : await getAgentById(parsed.params.id);
+
+    if (!agent) {
+      jsonError(res, "Agent not found", 404);
+      return true;
+    }
+
+    getAgent.respond(res, 200, await agentWithCapacity(agent));
+    return true;
+  }
+
+  return false;
+}

@@ -1,0 +1,626 @@
+import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import * as z from "zod";
+import { AssetKeyAuthorizationError, authorizeAssetKeyWrite } from "@/be/asset-key-auth";
+import { resolveTaskAuditUserId } from "@/be/audit-user";
+import { canClaim } from "@/be/budget-admission";
+import {
+  type BudgetRefusalContext,
+  emitBudgetRefusalSideEffects,
+} from "@/be/budget-refusal-notify";
+import {
+  acceptTask,
+  checkDependencies,
+  claimTask,
+  createTaskExtended,
+  getActiveSessions,
+  getActiveTaskCount,
+  getAgentById,
+  getDbClient,
+  getTaskById,
+  hasCapacity,
+  isAgentEligibleForTask,
+  moveTaskFromBacklog,
+  moveTaskToBacklog,
+  reassociateSessionLogs,
+  recordBudgetRefusalNotification,
+  rejectTask,
+  releaseTask,
+  updateTaskClaudeSessionId,
+} from "@/be/db";
+import { touchRuntimeInstance } from "@/be/multi-runtime";
+import { assertOwnsTask, ownerCtx, type ToolCtx } from "@/tools/task-tool-ctx";
+import {
+  createToolRegistrar,
+  type SwarmToolResult,
+  swarmToolOutputSchema,
+  toolErr,
+  toolOk,
+} from "@/tools/utils";
+import {
+  AssetKeySchema,
+  BudgetRefusalCauseSchema,
+  ModelTierSchema,
+  ReasoningEffortSchema,
+  splitLegacyModelAlias,
+} from "@/types";
+import { isMultiRuntimeEnabled } from "@/utils/multi-runtime";
+import { looseAgentTaskOutputSchema } from "./get-task-details";
+
+export const TaskActionSchema = z.enum([
+  "create",
+  "claim",
+  "release",
+  "accept",
+  "reject",
+  "to_backlog",
+  "from_backlog",
+]);
+
+export const taskActionInputSchema = z.object({
+  action: TaskActionSchema.describe(
+    "The action to perform: 'create' creates an unassigned task, 'claim' takes a task from pool, 'release' returns task to pool, 'accept' accepts offered task, 'reject' declines offered task, 'to_backlog' moves task to backlog, 'from_backlog' moves task from backlog to pool.",
+  ),
+  // For 'create' action:
+  task: z.string().min(1).optional().describe("Task description (required for 'create')."),
+  key: AssetKeySchema.optional().describe(
+    "Logical namespace for a created task. Defaults to a shared/task:<id>/ resource key.",
+  ),
+  taskType: z.string().max(50).optional().describe("Task type (e.g., 'bug', 'feature')."),
+  tags: z
+    .array(z.string())
+    .optional()
+    .describe("Tags for filtering (e.g., ['urgent', 'frontend'])."),
+  priority: z.number().int().min(0).max(100).optional().describe("Priority 0-100, default 50."),
+  dependsOn: z.array(z.uuid()).optional().describe("Task IDs this task depends on."),
+  // For claim/release/accept/reject actions:
+  taskId: z.uuid().optional().describe("Task ID (required for claim/release/accept/reject)."),
+  // For 'reject' action:
+  reason: z.string().optional().describe("Reason for rejection (optional for 'reject')."),
+  // For 'create' action:
+  dir: z
+    .string()
+    .min(1)
+    .startsWith("/")
+    .optional()
+    .describe(
+      "Working directory (absolute path) for the agent to start in. Only used with 'create' action.",
+    ),
+  model: z
+    .string()
+    .trim()
+    .min(1)
+    .optional()
+    .describe(
+      "Concrete model override for the created task, interpreted by the claiming worker's harness/provider. This does not switch providers. Only used with 'create' action.",
+    ),
+  modelTier: ModelTierSchema.optional().describe(
+    "Portable model tier for the created task: 'smol', 'regular', 'smart', or 'ultra'. Resolved when a worker claims/runs the task. Only used with 'create' action.",
+  ),
+  effort: ReasoningEffortSchema.optional().describe(
+    "Reasoning effort for the created task: 'off', 'low', 'medium', 'high', 'xhigh', or 'max'. Only used with 'create' action.",
+  ),
+  requiredCapabilities: z
+    .array(z.string())
+    .optional()
+    .describe(
+      "Capabilities a claiming agent must have (declared via join-swarm/update-profile) to be pool-eligible for this task. Written into the created task's routingAffinity (role is left unset). Only used with 'create' action.",
+    ),
+});
+
+export const taskActionOutputSchema = swarmToolOutputSchema({
+  yourAgentId: z.string().optional(),
+  task: looseAgentTaskOutputSchema.optional(),
+  // Phase 3: budget-admission refusal fields. Populated only on
+  // `accept` action when the per-agent or global daily budget is blown.
+  refusalCause: BudgetRefusalCauseSchema.optional(),
+  agentSpend: z.number().optional(),
+  agentBudget: z.number().optional(),
+  globalSpend: z.number().optional(),
+  globalBudget: z.number().optional(),
+  userSpend: z.number().optional(),
+  userBudget: z.number().optional(),
+  resetAt: z.string().optional(),
+});
+
+type TaskActionArgs = z.infer<typeof taskActionInputSchema>;
+type TaskActionResult = {
+  success: boolean;
+  message: string;
+  task?: unknown;
+  refusalCause?: unknown;
+  agentSpend?: number;
+  agentBudget?: number;
+  globalSpend?: number;
+  globalBudget?: number;
+  userSpend?: number;
+  userBudget?: number;
+  resetAt?: string;
+  refusalSideEffects?: unknown;
+};
+
+function agentOnlyActionResult(): SwarmToolResult {
+  return toolErr("This action is only available to worker agents.");
+}
+
+/**
+ * Work-acquisition gate shared by claim and accept — the same dispatch gate
+ * as HTTP poll and poll-task: a process whose runtime is gone must not take
+ * work beside its replacement. Identity travels as request context, never as
+ * a tool argument; touch refreshes liveness and cannot revive a retired
+ * runtime. Returns null when acquisition may proceed.
+ */
+async function staleRuntimeResult(ctx: ToolCtx, agentId: string): Promise<TaskActionResult | null> {
+  if (!isMultiRuntimeEnabled()) return null;
+  if (
+    ctx.kind === "owner" &&
+    ctx.runtimeInstanceId &&
+    (await touchRuntimeInstance(ctx.runtimeInstanceId, agentId))
+  ) {
+    return null;
+  }
+  return {
+    success: false,
+    message: "This runtime is no longer registered. Re-register before taking work.",
+  };
+}
+
+function taskActionResult(result: TaskActionResult, agentId?: string): SwarmToolResult {
+  const { refusalSideEffects: _omit, success, message, ...rest } = result;
+  const data = {
+    yourAgentId: agentId,
+    ...rest,
+  };
+  // Most harnesses only show the model the text channel — render the payload
+  // (task object, refusalCause, ...) there too, not just in structuredContent.
+  const details = Object.keys(rest).length > 0 ? JSON.stringify(rest, null, 2) : undefined;
+  return success ? toolOk(message, { data, details }) : toolErr(message, { data, details });
+}
+
+export async function taskActionHandler(
+  ctx: ToolCtx,
+  input: TaskActionArgs,
+): Promise<SwarmToolResult> {
+  const {
+    action,
+    task,
+    key,
+    taskType,
+    tags,
+    priority,
+    dependsOn,
+    taskId,
+    reason,
+    dir,
+    model,
+    requiredCapabilities,
+  } = input;
+  const normalizedModel = splitLegacyModelAlias({ model, modelTier: input.modelTier });
+
+  if (ctx.kind === "user") {
+    if (action !== "to_backlog" && action !== "from_backlog") {
+      return agentOnlyActionResult();
+    }
+
+    const result = await getDbClient().transaction(
+      async (): Promise<TaskActionResult | SwarmToolResult> => {
+        if (!taskId) {
+          return { success: false, message: `Task ID is required for '${action}' action.` };
+        }
+
+        const existingTask = await getTaskById(taskId);
+        if (!existingTask) {
+          return { success: false, message: `Task "${taskId}" not found.` };
+        }
+
+        const ownershipError = assertOwnsTask(ctx, existingTask, "task.action.own");
+        if (ownershipError) return ownershipError;
+
+        if (action === "to_backlog") {
+          if (existingTask.status !== "unassigned") {
+            return {
+              success: false,
+              message: `Task "${taskId}" is not unassigned (status: ${existingTask.status}). Only unassigned tasks can be moved to backlog.`,
+            };
+          }
+          const backlogTask = await moveTaskToBacklog(taskId);
+          if (!backlogTask) {
+            return { success: false, message: `Failed to move task "${taskId}" to backlog.` };
+          }
+          return {
+            success: true,
+            message: `Moved task "${taskId}" to backlog.`,
+            task: backlogTask,
+          };
+        }
+
+        if (existingTask.status !== "backlog") {
+          return {
+            success: false,
+            message: `Task "${taskId}" is not in backlog (status: ${existingTask.status}).`,
+          };
+        }
+        const unassignedTask = await moveTaskFromBacklog(taskId);
+        if (!unassignedTask) {
+          return { success: false, message: `Failed to move task "${taskId}" from backlog.` };
+        }
+        return {
+          success: true,
+          message: `Moved task "${taskId}" from backlog to pool.`,
+          task: unassignedTask,
+        };
+      },
+    );
+
+    return "ok" in result ? result : taskActionResult(result);
+  }
+
+  if (!ctx.agentId) {
+    return toolErr('Agent ID not found. Set the "X-Agent-ID" header.');
+  }
+
+  const agentId = ctx.agentId;
+  let assetKey: string | undefined;
+  if (action === "create") {
+    try {
+      assetKey = key
+        ? await authorizeAssetKeyWrite(key, await resolveTaskAuditUserId(ctx.sourceTaskId, agentId))
+        : undefined;
+    } catch (error) {
+      const message =
+        error instanceof AssetKeyAuthorizationError
+          ? error.message
+          : error instanceof Error
+            ? error.message
+            : String(error);
+      return taskActionResult({ success: false, message }, agentId);
+    }
+  }
+
+  const result = await getDbClient().transaction(async (): Promise<TaskActionResult> => {
+    switch (action) {
+      case "create": {
+        if (!task) {
+          return {
+            success: false,
+            message: "Task description is required for 'create' action.",
+          };
+        }
+        const newTask = await createTaskExtended(task, {
+          key: assetKey,
+          creatorAgentId: agentId,
+          taskType,
+          tags,
+          priority,
+          dependsOn,
+          dir,
+          model: normalizedModel.model,
+          modelTier: normalizedModel.modelTier,
+          effort: input.effort,
+          routingAffinity: requiredCapabilities?.length
+            ? { capabilities: requiredCapabilities }
+            : undefined,
+        });
+        return {
+          success: true,
+          message: `Created unassigned task "${newTask.id}".`,
+          task: newTask,
+        };
+      }
+
+      case "claim": {
+        if (!taskId) {
+          return { success: false, message: "Task ID is required for 'claim' action." };
+        }
+        const staleClaimRuntime = await staleRuntimeResult(ctx, agentId);
+        if (staleClaimRuntime) return staleClaimRuntime;
+        // Check capacity before claiming
+        if (!(await hasCapacity(agentId))) {
+          const activeCount = await getActiveTaskCount(agentId);
+          const agent = await getAgentById(agentId);
+          return {
+            success: false,
+            message: `You have no capacity (${activeCount}/${agent?.maxTasks ?? 1} tasks). Complete a task first.`,
+          };
+        }
+        // Pre-checks for informative error messages (the atomic UPDATE in
+        // claimTask is the real guard against race conditions)
+        const existingTask = await getTaskById(taskId);
+        if (!existingTask) {
+          return { success: false, message: `Task "${taskId}" not found.` };
+        }
+        if (existingTask.status !== "unassigned") {
+          return {
+            success: false,
+            message: `Task "${taskId}" is not unassigned (status: ${existingTask.status}). It may have been claimed by another agent.`,
+          };
+        }
+        // Check if task dependencies are met
+        const { ready, blockedBy } = await checkDependencies(taskId);
+        if (!ready) {
+          return {
+            success: false,
+            message: `Task "${taskId}" has unmet dependencies: ${blockedBy.join(", ")}. Cannot claim until dependencies are completed.`,
+          };
+        }
+        // Routing-affinity pre-check for an informative rejection (the gate
+        // inside claimTask below is the real guard — this just lets the
+        // agent self-correct instead of retry-looping on a silent null).
+        const claimingAgent = await getAgentById(agentId);
+        if (claimingAgent && !isAgentEligibleForTask(claimingAgent, existingTask)) {
+          return {
+            success: false,
+            message: `Task "${taskId}" requires role "${existingTask.routingAffinity?.role ?? "(unspecified)"}"; yours is "${claimingAgent.role ?? "(unspecified)"}". Cannot claim.`,
+          };
+        }
+        // Atomic claim — only one agent can win this race
+        const claimedTask = await claimTask(taskId, agentId);
+        if (!claimedTask) {
+          return {
+            success: false,
+            message: `Task "${taskId}" was already claimed by another agent. Try a different task.`,
+          };
+        }
+
+        // Reassociate session logs from pool trigger's random UUID to real task ID
+        const sessions = await getActiveSessions(agentId);
+        const activeSession = sessions.find((s) => s.runnerSessionId);
+        if (activeSession?.runnerSessionId) {
+          const count = await reassociateSessionLogs(activeSession.runnerSessionId, taskId);
+          if (count > 0) {
+            console.log(
+              `[task-action] Reassociated ${count} session logs for claimed task ${taskId.slice(0, 8)}`,
+            );
+          }
+          // Propagate provider session ID (e.g. claudeSessionId) to the task
+          if (activeSession.providerSessionId) {
+            await updateTaskClaudeSessionId(taskId, activeSession.providerSessionId);
+          }
+        }
+
+        return {
+          success: true,
+          message: `Claimed task "${taskId}".`,
+          task: claimedTask,
+        };
+      }
+
+      case "release": {
+        if (!taskId) {
+          return { success: false, message: "Task ID is required for 'release' action." };
+        }
+        const existingTask = await getTaskById(taskId);
+        if (!existingTask) {
+          return { success: false, message: `Task "${taskId}" not found.` };
+        }
+        if (existingTask.agentId !== agentId) {
+          return { success: false, message: `Task "${taskId}" is not assigned to you.` };
+        }
+        if (existingTask.status !== "pending" && existingTask.status !== "in_progress") {
+          return {
+            success: false,
+            message: `Cannot release task in status "${existingTask.status}". Only 'pending' or 'in_progress' tasks can be released.`,
+          };
+        }
+        const releasedTask = await releaseTask(taskId);
+        if (!releasedTask) {
+          return { success: false, message: `Failed to release task "${taskId}".` };
+        }
+        return {
+          success: true,
+          message: `Released task "${taskId}" back to pool.`,
+          task: releasedTask,
+        };
+      }
+
+      case "accept": {
+        if (!taskId) {
+          return { success: false, message: "Task ID is required for 'accept' action." };
+        }
+        // Accept is a work-acquisition transition too — gate it before the
+        // budget admission below so a retired process cannot take the offer.
+        const staleAcceptRuntime = await staleRuntimeResult(ctx, agentId);
+        if (staleAcceptRuntime) return staleAcceptRuntime;
+        const existingTask = await getTaskById(taskId);
+        if (!existingTask) {
+          return { success: false, message: `Task "${taskId}" not found.` };
+        }
+        if (existingTask.status !== "offered") {
+          return { success: false, message: `Task "${taskId}" is not offered.` };
+        }
+        if (existingTask.offeredTo !== agentId) {
+          return { success: false, message: `Task "${taskId}" was not offered to you.` };
+        }
+        // Check if task dependencies are met
+        const { ready, blockedBy } = await checkDependencies(taskId);
+        if (!ready) {
+          return {
+            success: false,
+            message: `Task "${taskId}" has unmet dependencies: ${blockedBy.join(", ")}. Cannot accept until dependencies are completed.`,
+          };
+        }
+        // Budget admission gate (Phase 3). Same in-transaction placement
+        // as the /api/poll gates so capacity AND budget share atomicity.
+        // Phase 5: record dedup row + capture side-effect context for the
+        // after-commit lead follow-up + workflow event-bus emit.
+        const admission = await canClaim(agentId, new Date(), existingTask.requestedByUserId);
+        if (!admission.allowed) {
+          const causeMsg =
+            admission.cause === "agent"
+              ? "agent daily budget exceeded"
+              : admission.cause === "user"
+                ? "user daily budget exceeded"
+                : "global daily budget exceeded";
+          const utcDate = new Date().toISOString().slice(0, 10);
+          const dedup = await recordBudgetRefusalNotification({
+            taskId,
+            date: utcDate,
+            agentId,
+            cause: admission.cause,
+            agentSpendUsd: admission.agentSpend,
+            agentBudgetUsd: admission.agentBudget,
+            globalSpendUsd: admission.globalSpend,
+            globalBudgetUsd: admission.globalBudget,
+            userSpendUsd: admission.userSpend,
+            userBudgetUsd: admission.userBudget,
+          });
+          return {
+            success: false,
+            message: `Refused: ${causeMsg}. Resets at ${admission.resetAt}.`,
+            refusalCause: admission.cause,
+            ...(admission.agentSpend !== undefined && { agentSpend: admission.agentSpend }),
+            ...(admission.agentBudget !== undefined && { agentBudget: admission.agentBudget }),
+            ...(admission.globalSpend !== undefined && { globalSpend: admission.globalSpend }),
+            ...(admission.globalBudget !== undefined && {
+              globalBudget: admission.globalBudget,
+            }),
+            ...(admission.userSpend !== undefined && { userSpend: admission.userSpend }),
+            ...(admission.userBudget !== undefined && { userBudget: admission.userBudget }),
+            resetAt: admission.resetAt,
+            refusalSideEffects: {
+              context: {
+                task: {
+                  id: existingTask.id,
+                  task: existingTask.task,
+                  requestedByUserId: existingTask.requestedByUserId,
+                  slackChannelId: existingTask.slackChannelId,
+                  slackThreadTs: existingTask.slackThreadTs,
+                  slackUserId: existingTask.slackUserId,
+                },
+                agentId,
+                date: utcDate,
+                cause: admission.cause,
+                agentSpendUsd: admission.agentSpend,
+                agentBudgetUsd: admission.agentBudget,
+                globalSpendUsd: admission.globalSpend,
+                globalBudgetUsd: admission.globalBudget,
+                userSpendUsd: admission.userSpend,
+                userBudgetUsd: admission.userBudget,
+                resetAt: admission.resetAt,
+              } satisfies BudgetRefusalContext,
+              inserted: dedup.inserted,
+            },
+          };
+        }
+        const acceptedTask = await acceptTask(taskId, agentId);
+        if (!acceptedTask) {
+          return { success: false, message: `Failed to accept task "${taskId}".` };
+        }
+        return {
+          success: true,
+          message: `Accepted task "${taskId}".`,
+          task: acceptedTask,
+        };
+      }
+
+      case "reject": {
+        if (!taskId) {
+          return { success: false, message: "Task ID is required for 'reject' action." };
+        }
+        const existingTask = await getTaskById(taskId);
+        if (!existingTask) {
+          return { success: false, message: `Task "${taskId}" not found.` };
+        }
+        if (existingTask.status !== "offered") {
+          return { success: false, message: `Task "${taskId}" is not offered.` };
+        }
+        if (existingTask.offeredTo !== agentId) {
+          return { success: false, message: `Task "${taskId}" was not offered to you.` };
+        }
+        const rejectedTask = await rejectTask(taskId, agentId, reason);
+        if (!rejectedTask) {
+          return { success: false, message: `Failed to reject task "${taskId}".` };
+        }
+        return {
+          success: true,
+          message: `Rejected task "${taskId}". Task returned to pool.`,
+          task: rejectedTask,
+        };
+      }
+
+      case "to_backlog": {
+        if (!taskId) {
+          return { success: false, message: "Task ID is required for 'to_backlog' action." };
+        }
+        const existingTask = await getTaskById(taskId);
+        if (!existingTask) {
+          return { success: false, message: `Task "${taskId}" not found.` };
+        }
+        if (existingTask.status !== "unassigned") {
+          return {
+            success: false,
+            message: `Task "${taskId}" is not unassigned (status: ${existingTask.status}). Only unassigned tasks can be moved to backlog.`,
+          };
+        }
+        const backlogTask = await moveTaskToBacklog(taskId);
+        if (!backlogTask) {
+          return { success: false, message: `Failed to move task "${taskId}" to backlog.` };
+        }
+        return {
+          success: true,
+          message: `Moved task "${taskId}" to backlog.`,
+          task: backlogTask,
+        };
+      }
+
+      case "from_backlog": {
+        if (!taskId) {
+          return { success: false, message: "Task ID is required for 'from_backlog' action." };
+        }
+        const existingTask = await getTaskById(taskId);
+        if (!existingTask) {
+          return { success: false, message: `Task "${taskId}" not found.` };
+        }
+        if (existingTask.status !== "backlog") {
+          return {
+            success: false,
+            message: `Task "${taskId}" is not in backlog (status: ${existingTask.status}).`,
+          };
+        }
+        const unassignedTask = await moveTaskFromBacklog(taskId);
+        if (!unassignedTask) {
+          return { success: false, message: `Failed to move task "${taskId}" from backlog.` };
+        }
+        return {
+          success: true,
+          message: `Moved task "${taskId}" from backlog to pool.`,
+          task: unassignedTask,
+        };
+      }
+
+      default:
+        return { success: false, message: `Unknown action: ${action}` };
+    }
+  });
+
+  // Phase 5: when the accept gate refused, run after-commit side
+  // effects (lead follow-up + workflow bus). The dedup row was recorded
+  // inside the txn; this just consumes the captured context.
+  if (
+    "refusalSideEffects" in result &&
+    result.refusalSideEffects &&
+    typeof result.refusalSideEffects === "object"
+  ) {
+    const sideEffects = result.refusalSideEffects as {
+      context: BudgetRefusalContext;
+      inserted: boolean;
+    };
+    await emitBudgetRefusalSideEffects(sideEffects.context, sideEffects.inserted);
+  }
+
+  return taskActionResult(result, agentId);
+}
+
+export const registerTaskActionTool = (server: McpServer) => {
+  createToolRegistrar(server)(
+    "task-action",
+    {
+      title: "Task Pool Actions",
+      annotations: { destructiveHint: false },
+      description:
+        "Perform task pool operations: create unassigned tasks, claim/release tasks from pool, accept/reject offered tasks.",
+      inputSchema: taskActionInputSchema,
+      outputSchema: taskActionOutputSchema,
+    },
+    async (args, info, _meta) => taskActionHandler(ownerCtx(info), args),
+  );
+};

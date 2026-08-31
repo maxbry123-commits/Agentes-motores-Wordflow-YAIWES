@@ -1,0 +1,20 @@
+{
+  "kind": "skill",
+  "name": "pages",
+  "displayName": "Pages",
+  "slug": "pages",
+  "title": "Pages",
+  "description": "Publish human-readable task outputs as DB-backed shareable pages (HTML or JSON) via `create_page` — no server, no tunnel. Covers auth modes, share URLs, versioning, the injected browser SDK, the `<swarm-diff>` primitive, print/PDF export, limits, and the minimalist taste baseline plus report-density layer every page should follow.",
+  "version": "2.0.0",
+  "category": "skills",
+  "placeholders": [],
+  "runAllSeedersCandidate": true,
+  "systemDefault": true,
+  "tags": [
+    "pages",
+    "reporting",
+    "artifacts",
+    "taste-skill"
+  ],
+  "must": true
+}

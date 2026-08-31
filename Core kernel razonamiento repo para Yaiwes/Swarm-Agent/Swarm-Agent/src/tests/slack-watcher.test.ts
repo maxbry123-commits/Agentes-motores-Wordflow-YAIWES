@@ -1,0 +1,1082 @@
+import { afterAll, beforeAll, describe, expect, mock, test } from "bun:test";
+import { unlinkSync } from "node:fs";
+import {
+  cancelTask,
+  closeDb,
+  completeTask,
+  createAgent,
+  createLogEntry,
+  createTaskExtended,
+  failTask,
+  getChildTasks,
+  getCompletedSlackTasks,
+  getInProgressSlackTasks,
+  getTaskById,
+  initDb,
+  insertTaskAttachment,
+  setSlackMessageTracking,
+  startTask,
+  updateTaskProgress,
+} from "../be/db";
+import { getAgentDisplayName, getAgentEmoji } from "../slack/responses";
+import {
+  _getLastRenderedTree,
+  _getTaskMessages,
+  _getTaskToTree,
+  _getTreeLastUpdateTime,
+  _getTreeMessages,
+  _isDMChannel,
+  _postInitialDMTreeMessage,
+  buildTreeNodes,
+  processTreeMessages,
+  registerTreeMessage,
+  startTaskWatcher,
+  stopTaskWatcher,
+} from "../slack/watcher";
+
+process.env.SLACK_RENDER_V2 = "false";
+
+const TEST_DB_PATH = "./test-slack-watcher.sqlite";
+
+beforeAll(() => {
+  initDb(TEST_DB_PATH);
+});
+
+afterAll(() => {
+  stopTaskWatcher();
+  closeDb();
+  try {
+    unlinkSync(TEST_DB_PATH);
+    unlinkSync(`${TEST_DB_PATH}-wal`);
+    unlinkSync(`${TEST_DB_PATH}-shm`);
+  } catch {
+    // ignore if files don't exist
+  }
+});
+
+describe("startTaskWatcher / stopTaskWatcher", () => {
+  test("starts and stops without error", async () => {
+    await startTaskWatcher(60000); // Long interval so it doesn't fire during test
+    stopTaskWatcher();
+  });
+
+  test("is idempotent — starting twice does not error", async () => {
+    await startTaskWatcher(60000);
+    await startTaskWatcher(60000); // Should log "already running", not throw
+    stopTaskWatcher();
+  });
+
+  test("stopping when not running does not error", async () => {
+    stopTaskWatcher();
+    stopTaskWatcher();
+  });
+});
+
+describe("watcher DB queries", () => {
+  test("getInProgressSlackTasks excludes pending tasks (only in_progress)", async () => {
+    // createTaskExtended creates tasks as 'pending', not 'in_progress'
+    const agent = await createAgent({ name: "WatcherTestAgent", isLead: false, status: "idle" });
+    const task = await createTaskExtended("watcher pending test", {
+      agentId: agent.id,
+      source: "slack",
+      slackChannelId: "C_WATCHER",
+      slackThreadTs: "1111111111.000001",
+      slackUserId: "U_WATCHER",
+    });
+
+    const inProgress = await getInProgressSlackTasks();
+    const found = inProgress.find((t) => t.id === task.id);
+    // Task is 'pending', not 'in_progress', so it should NOT appear
+    expect(found).toBeUndefined();
+  });
+
+  test("getInProgressSlackTasks returns array", async () => {
+    const inProgress = await getInProgressSlackTasks();
+    expect(Array.isArray(inProgress)).toBe(true);
+  });
+
+  test("getCompletedSlackTasks excludes cancelled tasks (only completed/failed)", async () => {
+    const agent = await createAgent({ name: "WatcherCompAgent", isLead: false, status: "idle" });
+    const task = await createTaskExtended("watcher cancel test", {
+      agentId: agent.id,
+      source: "slack",
+      slackChannelId: "C_WATCHER2",
+      slackThreadTs: "2222222222.000001",
+      slackUserId: "U_WATCHER2",
+    });
+
+    await cancelTask(task.id, "test cancel");
+
+    const completed = await getCompletedSlackTasks();
+    const found = completed.find((t) => t.id === task.id);
+    // Cancelled tasks are NOT included in getCompletedSlackTasks (only completed/failed)
+    expect(found).toBeUndefined();
+  });
+
+  test("getCompletedSlackTasks returns array", async () => {
+    const completed = await getCompletedSlackTasks();
+    expect(Array.isArray(completed)).toBe(true);
+  });
+
+  test("initializes notifiedCompletions on start to skip existing completed tasks", async () => {
+    // Starting the watcher with existing data should not crash
+    await startTaskWatcher(60000);
+    stopTaskWatcher();
+  });
+
+  test("rehydrates tree message tracking from in-progress tasks after restart", async () => {
+    const agent = await createAgent({
+      name: "WatcherHydrateTreeAgent",
+      isLead: false,
+      status: "idle",
+    });
+    const task = await createTaskExtended("watcher hydrate tree test", {
+      agentId: agent.id,
+      source: "slack",
+      slackChannelId: "C_HYDRATE_TREE",
+      slackThreadTs: "1919191919.000001",
+      slackUserId: "U_HYDRATE_TREE",
+    });
+    await startTask(task.id);
+
+    const messageTs = "1919191919.000002";
+    await registerTreeMessage(task.id, "C_HYDRATE_TREE", "1919191919.000001", messageTs);
+
+    expect((await getTaskById(task.id))!.slackTreeRootMessageTs).toBe(messageTs);
+
+    _getTreeMessages().clear();
+    _getTaskToTree().clear();
+    _getTaskMessages().clear();
+
+    await startTaskWatcher(60000);
+    stopTaskWatcher();
+
+    const tree = _getTreeMessages().get(messageTs);
+    expect(tree).toBeDefined();
+    expect(tree!.channelId).toBe("C_HYDRATE_TREE");
+    expect(tree!.threadTs).toBe("1919191919.000001");
+    expect(tree!.rootTaskIds.has(task.id)).toBe(true);
+    expect(_getTaskToTree().get(task.id)).toBe(messageTs);
+    expect(_getTaskMessages().get(task.id)?.messageTs).toBe(messageTs);
+  });
+
+  test("rehydrates flat progress message tracking from in-progress tasks after restart", async () => {
+    const agent = await createAgent({
+      name: "WatcherHydrateFlatAgent",
+      isLead: false,
+      status: "idle",
+    });
+    const task = await createTaskExtended("watcher hydrate flat test", {
+      agentId: agent.id,
+      source: "slack",
+      slackChannelId: "C_HYDRATE_FLAT",
+      slackThreadTs: "2020202020.000001",
+      slackUserId: "U_HYDRATE_FLAT",
+    });
+    await updateTaskProgress(task.id, "Halfway there");
+
+    const messageTs = "2020202020.000002";
+    await setSlackMessageTracking(task.id, { slackProgressMessageTs: messageTs });
+
+    _getTreeMessages().clear();
+    _getTaskToTree().clear();
+    _getTaskMessages().clear();
+
+    await startTaskWatcher(60000);
+    stopTaskWatcher();
+
+    expect(_getTreeMessages().has(messageTs)).toBe(false);
+    expect(_getTaskToTree().has(task.id)).toBe(false);
+    expect(_getTaskMessages().get(task.id)).toEqual({
+      channelId: "C_HYDRATE_FLAT",
+      threadTs: "2020202020.000001",
+      messageTs,
+    });
+  });
+});
+
+describe("getChildTasks", () => {
+  test("returns empty array when no children exist", async () => {
+    const agent = await createAgent({ name: "ParentAgent", isLead: true, status: "idle" });
+    const parent = await createTaskExtended("parent task", {
+      agentId: agent.id,
+      source: "slack",
+      slackChannelId: "C_TREE1",
+      slackThreadTs: "3333333333.000001",
+      slackUserId: "U_TREE1",
+    });
+
+    const children = await getChildTasks(parent.id);
+    expect(children).toEqual([]);
+  });
+
+  test("returns child tasks ordered by createdAt", async () => {
+    const lead = await createAgent({ name: "LeadAgent", isLead: true, status: "idle" });
+    const worker = await createAgent({ name: "WorkerAgent", isLead: false, status: "idle" });
+
+    const parent = await createTaskExtended("parent task for children", {
+      agentId: lead.id,
+      source: "slack",
+      slackChannelId: "C_TREE2",
+      slackThreadTs: "4444444444.000001",
+      slackUserId: "U_TREE2",
+    });
+
+    const child1 = await createTaskExtended("child task 1", {
+      agentId: worker.id,
+      source: "slack",
+      parentTaskId: parent.id,
+    });
+
+    const child2 = await createTaskExtended("child task 2", {
+      agentId: worker.id,
+      source: "slack",
+      parentTaskId: parent.id,
+    });
+
+    const children = await getChildTasks(parent.id);
+    expect(children.length).toBe(2);
+    expect(children[0].id).toBe(child1.id);
+    expect(children[1].id).toBe(child2.id);
+    expect(children[0].parentTaskId).toBe(parent.id);
+    expect(children[1].parentTaskId).toBe(parent.id);
+  });
+});
+
+describe("registerTreeMessage", () => {
+  test("registers a single task in a new tree", async () => {
+    const taskId = "aaaa0001-0000-0000-0000-000000000000";
+    const channelId = "C_REG1";
+    const threadTs = "5555555555.000001";
+    const messageTs = "5555555555.000002";
+
+    await registerTreeMessage(taskId, channelId, threadTs, messageTs);
+
+    const treeMessages = _getTreeMessages();
+    const taskToTree = _getTaskToTree();
+
+    const tree = treeMessages.get(messageTs);
+    expect(tree).toBeDefined();
+    expect(tree!.channelId).toBe(channelId);
+    expect(tree!.threadTs).toBe(threadTs);
+    expect(tree!.messageTs).toBe(messageTs);
+    expect(tree!.rootTaskIds.has(taskId)).toBe(true);
+    expect(tree!.rootTaskIds.size).toBe(1);
+
+    // Reverse lookup
+    expect(taskToTree.get(taskId)).toBe(messageTs);
+  });
+
+  test("registers multiple tasks to the same tree message", async () => {
+    const taskId1 = "bbbb0001-0000-0000-0000-000000000000";
+    const taskId2 = "bbbb0002-0000-0000-0000-000000000000";
+    const channelId = "C_REG2";
+    const threadTs = "6666666666.000001";
+    const messageTs = "6666666666.000002";
+
+    await registerTreeMessage(taskId1, channelId, threadTs, messageTs);
+    await registerTreeMessage(taskId2, channelId, threadTs, messageTs);
+
+    const treeMessages = _getTreeMessages();
+    const taskToTree = _getTaskToTree();
+
+    const tree = treeMessages.get(messageTs);
+    expect(tree).toBeDefined();
+    expect(tree!.rootTaskIds.size).toBe(2);
+    expect(tree!.rootTaskIds.has(taskId1)).toBe(true);
+    expect(tree!.rootTaskIds.has(taskId2)).toBe(true);
+
+    // Both tasks point to the same messageTs
+    expect(taskToTree.get(taskId1)).toBe(messageTs);
+    expect(taskToTree.get(taskId2)).toBe(messageTs);
+  });
+
+  test("different messages create separate trees", async () => {
+    const taskId1 = "cccc0001-0000-0000-0000-000000000000";
+    const taskId2 = "cccc0002-0000-0000-0000-000000000000";
+    const channelId = "C_REG3";
+    const threadTs = "7777777777.000001";
+    const messageTs1 = "7777777777.000002";
+    const messageTs2 = "7777777777.000003";
+
+    await registerTreeMessage(taskId1, channelId, threadTs, messageTs1);
+    await registerTreeMessage(taskId2, channelId, threadTs, messageTs2);
+
+    const treeMessages = _getTreeMessages();
+
+    expect(treeMessages.has(messageTs1)).toBe(true);
+    expect(treeMessages.has(messageTs2)).toBe(true);
+    expect(treeMessages.get(messageTs1)!.rootTaskIds.has(taskId1)).toBe(true);
+    expect(treeMessages.get(messageTs2)!.rootTaskIds.has(taskId2)).toBe(true);
+  });
+});
+
+describe("buildTreeNodes", () => {
+  test("returns nodes for root-only tasks", async () => {
+    const agent = await createAgent({ name: "TreeBuildLead", isLead: true, status: "idle" });
+    const task = await createTaskExtended("root only tree test", {
+      agentId: agent.id,
+      source: "slack",
+      slackChannelId: "C_TREE_BUILD1",
+      slackThreadTs: "8888888888.000001",
+      slackUserId: "U_TREE_BUILD1",
+    });
+
+    const messageTs = "8888888888.000002";
+    await registerTreeMessage(task.id, "C_TREE_BUILD1", "8888888888.000001", messageTs);
+
+    const tree = _getTreeMessages().get(messageTs)!;
+    const nodes = await buildTreeNodes(tree);
+
+    expect(nodes.length).toBe(1);
+    expect(nodes[0].taskId).toBe(task.id);
+    expect(nodes[0].agentName).toBe("TreeBuildLead");
+    expect(nodes[0].status).toBe("pending");
+    expect(nodes[0].children).toEqual([]);
+  });
+
+  test("returns nodes with children and registers children in taskToTree", async () => {
+    const lead = await createAgent({ name: "TreeBuildLead2", isLead: true, status: "idle" });
+    const worker = await createAgent({ name: "TreeBuildWorker", isLead: false, status: "idle" });
+
+    const parent = await createTaskExtended("parent for tree nodes", {
+      agentId: lead.id,
+      source: "slack",
+      slackChannelId: "C_TREE_BUILD2",
+      slackThreadTs: "9999999999.000001",
+      slackUserId: "U_TREE_BUILD2",
+    });
+
+    const child = await createTaskExtended("child for tree nodes", {
+      agentId: worker.id,
+      source: "slack",
+      parentTaskId: parent.id,
+    });
+
+    const messageTs = "9999999999.000002";
+    await registerTreeMessage(parent.id, "C_TREE_BUILD2", "9999999999.000001", messageTs);
+
+    const tree = _getTreeMessages().get(messageTs)!;
+    const nodes = await buildTreeNodes(tree);
+
+    expect(nodes.length).toBe(1);
+    expect(nodes[0].taskId).toBe(parent.id);
+    expect(nodes[0].agentName).toBe("TreeBuildLead2");
+    expect(nodes[0].children.length).toBe(1);
+    expect(nodes[0].children[0].taskId).toBe(child.id);
+    expect(nodes[0].children[0].agentName).toBe("TreeBuildWorker");
+
+    // Child should now be registered in taskToTree
+    const taskToTree = _getTaskToTree();
+    expect(taskToTree.get(child.id)).toBe(messageTs);
+  });
+
+  test("handles multiple root tasks in one tree", async () => {
+    const agent1 = await createAgent({ name: "MultiRoot1", isLead: false, status: "idle" });
+    const agent2 = await createAgent({ name: "MultiRoot2", isLead: false, status: "idle" });
+
+    const task1 = await createTaskExtended("multi root task 1", {
+      agentId: agent1.id,
+      source: "slack",
+      slackChannelId: "C_MULTI",
+      slackThreadTs: "1010101010.000001",
+      slackUserId: "U_MULTI",
+    });
+
+    const task2 = await createTaskExtended("multi root task 2", {
+      agentId: agent2.id,
+      source: "slack",
+      slackChannelId: "C_MULTI",
+      slackThreadTs: "1010101010.000001",
+      slackUserId: "U_MULTI",
+    });
+
+    const messageTs = "1010101010.000002";
+    await registerTreeMessage(task1.id, "C_MULTI", "1010101010.000001", messageTs);
+    await registerTreeMessage(task2.id, "C_MULTI", "1010101010.000001", messageTs);
+
+    const tree = _getTreeMessages().get(messageTs)!;
+    const nodes = await buildTreeNodes(tree);
+
+    expect(nodes.length).toBe(2);
+    const taskIds = nodes.map((n) => n.taskId);
+    expect(taskIds).toContain(task1.id);
+    expect(taskIds).toContain(task2.id);
+  });
+
+  test("skips missing root tasks gracefully", async () => {
+    const messageTs = "1111111111.999999";
+    const fakeTaskId = "zzzzzzzz-0000-0000-0000-000000000000";
+    await registerTreeMessage(fakeTaskId, "C_MISSING", "1111111111.000001", messageTs);
+
+    const tree = _getTreeMessages().get(messageTs)!;
+    const nodes = await buildTreeNodes(tree);
+
+    // Missing task should be skipped, not crash
+    expect(nodes.length).toBe(0);
+  });
+
+  test("populates attachments for completed nodes (root + child)", async () => {
+    const lead = await createAgent({ name: "AttachLead", isLead: true, status: "idle" });
+    const worker = await createAgent({ name: "AttachWorker", isLead: false, status: "idle" });
+
+    const parent = await createTaskExtended("parent with attachments", {
+      agentId: lead.id,
+      source: "slack",
+      slackChannelId: "C_ATTACH",
+      slackThreadTs: "2020202020.000001",
+      slackUserId: "U_ATTACH",
+    });
+    const child = await createTaskExtended("child with attachments", {
+      agentId: worker.id,
+      source: "slack",
+      parentTaskId: parent.id,
+    });
+    // Mark both completed so the watcher pulls their attachments.
+    await completeTask(parent.id, "done");
+    await completeTask(child.id, "done");
+
+    await insertTaskAttachment({
+      taskId: parent.id,
+      agentId: lead.id,
+      name: "parent-report.pdf",
+      kind: "url",
+      url: "https://example.com/parent.pdf",
+    });
+    await insertTaskAttachment({
+      taskId: child.id,
+      agentId: worker.id,
+      name: "child-log.txt",
+      kind: "agent-fs",
+      path: "/logs/child.txt",
+      orgId: "org-1",
+      driveId: "drive-1",
+    });
+
+    const messageTs = "2020202020.000002";
+    await registerTreeMessage(parent.id, "C_ATTACH", "2020202020.000001", messageTs);
+
+    const tree = _getTreeMessages().get(messageTs)!;
+    const nodes = await buildTreeNodes(tree);
+
+    expect(nodes.length).toBe(1);
+    expect(nodes[0].attachments?.length).toBe(1);
+    expect(nodes[0].attachments?.[0].name).toBe("parent-report.pdf");
+    expect(nodes[0].children.length).toBe(1);
+    expect(nodes[0].children[0].attachments?.length).toBe(1);
+    expect(nodes[0].children[0].attachments?.[0].orgId).toBe("org-1");
+    expect(nodes[0].children[0].attachments?.[0].driveId).toBe("drive-1");
+  });
+
+  test("does NOT fetch attachments for non-completed nodes (pending parent)", async () => {
+    const agent = await createAgent({ name: "NoFetchAgent", isLead: true, status: "idle" });
+    const task = await createTaskExtended("pending no fetch", {
+      agentId: agent.id,
+      source: "slack",
+      slackChannelId: "C_NOFETCH",
+      slackThreadTs: "3030303030.000001",
+      slackUserId: "U_NOFETCH",
+    });
+    // Pre-populate an attachment even though the task is still pending.
+    await insertTaskAttachment({
+      taskId: task.id,
+      agentId: agent.id,
+      name: "should-not-render.pdf",
+      kind: "url",
+      url: "https://example.com/notyet.pdf",
+    });
+
+    const messageTs = "3030303030.000002";
+    await registerTreeMessage(task.id, "C_NOFETCH", "3030303030.000001", messageTs);
+
+    const tree = _getTreeMessages().get(messageTs)!;
+    const nodes = await buildTreeNodes(tree);
+
+    expect(nodes.length).toBe(1);
+    // Pending tasks should not have attachments populated — the renderer
+    // never shows them in that state, so the query is skipped.
+    expect(nodes[0].attachments).toBeUndefined();
+  });
+});
+
+// --- Phase 5: processTreeMessages tests ---
+
+// Mock Slack API methods for tree message updates, DM posting, and assistant status
+const mockChatUpdate = mock(() => Promise.resolve({ ok: true }));
+const mockChatPostMessage = mock(() => Promise.resolve({ ok: true, ts: "mock.dm.tree.000001" }));
+const mockSetStatus = mock(() => Promise.resolve({ ok: true }));
+const mockReactionAdd = mock(() => Promise.resolve({ ok: true }));
+const mockReactionRemove = mock(() => Promise.resolve({ ok: true }));
+
+mock.module("../slack/app", () => ({
+  getSlackApp: () => ({
+    client: {
+      chat: {
+        update: mockChatUpdate,
+        postMessage: mockChatPostMessage,
+      },
+      assistant: {
+        threads: {
+          setStatus: mockSetStatus,
+        },
+      },
+      reactions: {
+        add: mockReactionAdd,
+        remove: mockReactionRemove,
+      },
+    },
+  }),
+}));
+
+describe("processTreeMessages", () => {
+  test("renders tree and updates Slack message for active tree", async () => {
+    const agent = await createAgent({ name: "TreeRenderAgent", isLead: true, status: "idle" });
+    const task = await createTaskExtended("tree render test", {
+      agentId: agent.id,
+      source: "slack",
+      slackChannelId: "C_RENDER1",
+      slackThreadTs: "2020202020.000001",
+      slackUserId: "U_RENDER1",
+    });
+
+    // Start the task so it's in_progress
+    await startTask(task.id);
+
+    const messageTs = "2020202020.000002";
+    await registerTreeMessage(task.id, "C_RENDER1", "2020202020.000001", messageTs);
+
+    // Clear any rate limit state
+    _getTreeLastUpdateTime().delete(messageTs);
+    _getLastRenderedTree().delete(messageTs);
+
+    await processTreeMessages();
+
+    // Should have recorded the rendered state
+    const lastRendered = _getLastRenderedTree().get(messageTs);
+    expect(lastRendered).toBeDefined();
+    expect(lastRendered!.length).toBeGreaterThan(0);
+
+    // Should have recorded the update time
+    const lastUpdateTime = _getTreeLastUpdateTime().get(messageTs);
+    expect(lastUpdateTime).toBeDefined();
+    expect(lastUpdateTime).toBeGreaterThan(0);
+  });
+
+  test("skips update when tree state unchanged (no-op)", async () => {
+    const agent = await createAgent({ name: "NoOpAgent", isLead: true, status: "idle" });
+    const task = await createTaskExtended("noop tree test", {
+      agentId: agent.id,
+      source: "slack",
+      slackChannelId: "C_NOOP1",
+      slackThreadTs: "3030303030.000001",
+      slackUserId: "U_NOOP1",
+    });
+
+    await startTask(task.id);
+
+    const messageTs = "3030303030.000002";
+    await registerTreeMessage(task.id, "C_NOOP1", "3030303030.000001", messageTs);
+
+    // Clear rate limit state
+    _getTreeLastUpdateTime().delete(messageTs);
+    _getLastRenderedTree().delete(messageTs);
+
+    // First call — renders
+    await processTreeMessages();
+    const firstRendered = _getLastRenderedTree().get(messageTs);
+    const firstUpdateTime = _getTreeLastUpdateTime().get(messageTs);
+    expect(firstRendered).toBeDefined();
+    expect(firstUpdateTime).toBeDefined();
+
+    // Clear rate limit to allow second call
+    _getTreeLastUpdateTime().delete(messageTs);
+
+    // Second call — same state, should be a no-op (lastRenderedTree unchanged)
+    await processTreeMessages();
+
+    // Update time should NOT have been re-set (no-op skipped the update)
+    const secondUpdateTime = _getTreeLastUpdateTime().get(messageTs);
+    expect(secondUpdateTime).toBeUndefined();
+  });
+
+  test("cleans up tree and settles persisted steering reactions", async () => {
+    const agent = await createAgent({ name: "TerminalAgent", isLead: true, status: "idle" });
+    const task = await createTaskExtended("terminal tree test", {
+      agentId: agent.id,
+      source: "slack",
+      slackChannelId: "C_TERM1",
+      slackThreadTs: "4040404040.000001",
+      slackTriggerMessageTs: "4040404040.000003",
+      slackUserId: "U_TERM1",
+    });
+
+    await startTask(task.id);
+    await createLogEntry({
+      eventType: "task_steering",
+      taskId: task.id,
+      newValue: "slack_reaction",
+      metadata: { slackChannelId: "C_TERM1", slackMessageTs: "4040404040.000004" },
+    });
+    await completeTask(task.id, "All done");
+
+    const messageTs = "4040404040.000002";
+    await registerTreeMessage(task.id, "C_TERM1", "4040404040.000001", messageTs);
+
+    // Clear rate limit state
+    _getTreeLastUpdateTime().delete(messageTs);
+    _getLastRenderedTree().delete(messageTs);
+    mockReactionAdd.mockClear();
+    mockReactionRemove.mockClear();
+
+    await processTreeMessages();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    // Tree should be cleaned up since it's fully terminal
+    expect(_getTreeMessages().has(messageTs)).toBe(false);
+    expect(_getTaskToTree().has(task.id)).toBe(false);
+    expect(_getLastRenderedTree().has(messageTs)).toBe(false);
+    expect(_getTreeLastUpdateTime().has(messageTs)).toBe(false);
+    expect(mockReactionRemove).toHaveBeenCalledTimes(8);
+    expect(mockReactionAdd).toHaveBeenCalledWith({
+      channel: "C_TERM1",
+      name: "white_check_mark",
+      timestamp: "4040404040.000003",
+    });
+    expect(mockReactionAdd).toHaveBeenCalledWith({
+      channel: "C_TERM1",
+      name: "white_check_mark",
+      timestamp: "4040404040.000004",
+    });
+  });
+
+  test("posts truncated terminal output in full before cleaning up the tree", async () => {
+    const agent = await createAgent({ name: "FullOutputAgent", isLead: true, status: "idle" });
+    const task = await createTaskExtended("terminal full output test", {
+      agentId: agent.id,
+      source: "slack",
+      slackChannelId: "C_FULL_OUTPUT",
+      slackThreadTs: "4141414141.000001",
+      slackUserId: "U_FULL_OUTPUT",
+    });
+    const finalMarker = "FINAL-OUTPUT-MARKER";
+    const output = `### Findings\n\n${"Detailed result line. ".repeat(350)}${finalMarker}`;
+
+    await startTask(task.id);
+    await completeTask(task.id, output);
+
+    const messageTs = "4141414141.000002";
+    await registerTreeMessage(task.id, "C_FULL_OUTPUT", "4141414141.000001", messageTs);
+    _getTreeLastUpdateTime().delete(messageTs);
+    _getLastRenderedTree().delete(messageTs);
+    mockChatPostMessage.mockClear();
+    mockChatUpdate.mockClear();
+
+    await processTreeMessages();
+
+    expect(mockChatPostMessage).toHaveBeenCalledTimes(1);
+    const reply = mockChatPostMessage.mock.calls[0]![0] as any;
+    expect(reply.thread_ts).toBe("4141414141.000001");
+    expect(reply.blocks.length).toBeGreaterThan(1);
+    expect(
+      reply.blocks.every((block: { text: { text: string } }) => block.text.text.length <= 2900),
+    ).toBe(true);
+    expect(
+      reply.blocks.map((block: { text: { text: string } }) => block.text.text).join(""),
+    ).toContain(finalMarker);
+    expect((await getTaskById(task.id))!.slackReplySent).toBe(true);
+
+    const treeUpdate = mockChatUpdate.mock.calls[0]![0] as any;
+    expect(JSON.stringify(treeUpdate.blocks)).not.toContain("open task for full output");
+    expect(JSON.stringify(treeUpdate.blocks)).not.toContain(finalMarker);
+    expect(_getTreeMessages().has(messageTs)).toBe(false);
+  });
+
+  test("uses x when any task for the trigger failed", async () => {
+    const lead = await createAgent({ name: "TermLead", isLead: true, status: "idle" });
+    const worker = await createAgent({ name: "TermWorker", isLead: false, status: "idle" });
+
+    const parent = await createTaskExtended("terminal parent", {
+      agentId: lead.id,
+      source: "slack",
+      slackChannelId: "C_TERM2",
+      slackThreadTs: "5050505050.000001",
+      slackTriggerMessageTs: "5050505050.000003",
+      slackUserId: "U_TERM2",
+    });
+
+    const child = await createTaskExtended("terminal child", {
+      agentId: worker.id,
+      source: "slack",
+      parentTaskId: parent.id,
+      slackChannelId: "C_TERM2",
+      slackThreadTs: "5050505050.000001",
+      slackTriggerMessageTs: "5050505050.000003",
+    });
+
+    await startTask(parent.id);
+    await startTask(child.id);
+    await failTask(child.id, "Child failed");
+    await completeTask(parent.id, "Parent done");
+
+    const messageTs = "5050505050.000002";
+    await registerTreeMessage(parent.id, "C_TERM2", "5050505050.000001", messageTs);
+
+    _getTreeLastUpdateTime().delete(messageTs);
+    _getLastRenderedTree().delete(messageTs);
+    mockReactionAdd.mockClear();
+
+    await processTreeMessages();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    // Both parent and child should be cleaned up
+    expect(_getTreeMessages().has(messageTs)).toBe(false);
+    expect(_getTaskToTree().has(parent.id)).toBe(false);
+    expect(_getTaskToTree().has(child.id)).toBe(false);
+    expect(mockReactionAdd).toHaveBeenCalledWith({
+      channel: "C_TERM2",
+      name: "x",
+      timestamp: "5050505050.000003",
+    });
+  });
+
+  test("does NOT clean up tree when some tasks still active", async () => {
+    const lead = await createAgent({ name: "ActiveLead", isLead: true, status: "idle" });
+    const worker = await createAgent({ name: "ActiveWorker", isLead: false, status: "idle" });
+
+    const parent = await createTaskExtended("active parent", {
+      agentId: lead.id,
+      source: "slack",
+      slackChannelId: "C_ACTIVE1",
+      slackThreadTs: "6060606060.000001",
+      slackUserId: "U_ACTIVE1",
+    });
+
+    const child = await createTaskExtended("active child", {
+      agentId: worker.id,
+      source: "slack",
+      parentTaskId: parent.id,
+    });
+
+    await startTask(parent.id);
+    await startTask(child.id);
+    // Child completes but parent still in_progress
+    await completeTask(child.id, "Child done");
+
+    const messageTs = "6060606060.000002";
+    await registerTreeMessage(parent.id, "C_ACTIVE1", "6060606060.000001", messageTs);
+
+    _getTreeLastUpdateTime().delete(messageTs);
+    _getLastRenderedTree().delete(messageTs);
+
+    await processTreeMessages();
+
+    // Tree should still be tracked (parent still active)
+    expect(_getTreeMessages().has(messageTs)).toBe(true);
+    expect(_getTaskToTree().has(parent.id)).toBe(true);
+  });
+
+  test("respects rate limiting", async () => {
+    const agent = await createAgent({ name: "RateLimitAgent", isLead: true, status: "idle" });
+    const task = await createTaskExtended("rate limit test", {
+      agentId: agent.id,
+      source: "slack",
+      slackChannelId: "C_RATE1",
+      slackThreadTs: "7070707070.000001",
+      slackUserId: "U_RATE1",
+    });
+
+    await startTask(task.id);
+
+    const messageTs = "7070707070.000002";
+    await registerTreeMessage(task.id, "C_RATE1", "7070707070.000001", messageTs);
+
+    // Clear state
+    _getTreeLastUpdateTime().delete(messageTs);
+    _getLastRenderedTree().delete(messageTs);
+
+    // First call renders
+    await processTreeMessages();
+    const firstUpdateTime = _getTreeLastUpdateTime().get(messageTs);
+    expect(firstUpdateTime).toBeDefined();
+
+    // Second call immediately — should be rate limited (update time is very recent)
+    // Force lastRenderedTree to be different so it's not a no-op for content reasons
+    _getLastRenderedTree().delete(messageTs);
+
+    await processTreeMessages();
+
+    // Update time should not have changed (rate limited)
+    const secondUpdateTime = _getTreeLastUpdateTime().get(messageTs);
+    expect(secondUpdateTime).toBe(firstUpdateTime);
+  });
+});
+
+describe("tree-tracked tasks skip flat processing", () => {
+  test("taskToTree check prevents double-processing of in-progress tasks", async () => {
+    // This is a structural test: verify taskToTree.has() is used in the watcher
+    // by checking that a task registered in taskToTree is tracked
+    const taskId = "dddd0001-0000-0000-0000-000000000000";
+    const messageTs = "8080808080.000002";
+    await registerTreeMessage(taskId, "C_SKIP1", "8080808080.000001", messageTs);
+
+    const taskToTree = _getTaskToTree();
+    expect(taskToTree.has(taskId)).toBe(true);
+
+    // The watcher loop checks taskToTree.has(task.id) to skip tree-tracked tasks.
+    // We verify the data structure is correctly populated — the actual skip logic
+    // is in the interval callback which we test via the full integration above.
+  });
+
+  test("child tasks discovered by buildTreeNodes are added to taskToTree", async () => {
+    const lead = await createAgent({ name: "SkipLead", isLead: true, status: "idle" });
+    const worker = await createAgent({ name: "SkipWorker", isLead: false, status: "idle" });
+
+    const parent = await createTaskExtended("skip parent", {
+      agentId: lead.id,
+      source: "slack",
+      slackChannelId: "C_SKIP2",
+      slackThreadTs: "9090909090.000001",
+      slackUserId: "U_SKIP2",
+    });
+
+    const child = await createTaskExtended("skip child", {
+      agentId: worker.id,
+      source: "slack",
+      parentTaskId: parent.id,
+    });
+
+    const messageTs = "9090909090.000002";
+    await registerTreeMessage(parent.id, "C_SKIP2", "9090909090.000001", messageTs);
+
+    // Before buildTreeNodes, child is NOT in taskToTree
+    const taskToTree = _getTaskToTree();
+    expect(taskToTree.has(child.id)).toBe(false);
+
+    // After buildTreeNodes, child IS in taskToTree
+    const tree = _getTreeMessages().get(messageTs)!;
+    await buildTreeNodes(tree);
+
+    expect(taskToTree.has(child.id)).toBe(true);
+    expect(taskToTree.get(child.id)).toBe(messageTs);
+  });
+});
+
+// --- Phase 6: DM Unification tests ---
+
+describe("isDMChannel", () => {
+  test("returns true for DM channels (starting with D)", async () => {
+    expect(_isDMChannel("D12345678")).toBe(true);
+    expect(_isDMChannel("DABCDEFGH")).toBe(true);
+  });
+
+  test("returns false for regular channels", async () => {
+    expect(_isDMChannel("C12345678")).toBe(false);
+    expect(_isDMChannel("G12345678")).toBe(false);
+  });
+});
+
+describe("DM unification — postInitialDMTreeMessage", () => {
+  test("posts a tree message for a DM task and returns messageTs", async () => {
+    const agent = await createAgent({ name: "DMTreeAgent", isLead: false, status: "idle" });
+    const task = await createTaskExtended("dm tree test", {
+      agentId: agent.id,
+      source: "slack",
+      slackChannelId: "D_DM_TREE1",
+      slackThreadTs: "1212121212.000001",
+      slackUserId: "U_DM1",
+    });
+
+    await startTask(task.id);
+
+    // Re-fetch the task to get in_progress status
+    const { getTaskById } = await import("../be/db");
+    const freshTask = (await getTaskById(task.id))!;
+
+    const messageTs = await _postInitialDMTreeMessage(freshTask);
+    expect(messageTs).toBe("mock.dm.tree.000001");
+
+    // Verify chat.postMessage was called with the DM channel
+    expect(mockChatPostMessage).toHaveBeenCalled();
+    const lastCall = mockChatPostMessage.mock.calls[mockChatPostMessage.mock.calls.length - 1];
+    expect((lastCall[0] as any).channel).toBe("D_DM_TREE1");
+    expect((lastCall[0] as any).thread_ts).toBe("1212121212.000001");
+    expect((lastCall[0] as any).blocks).toBeDefined();
+    expect(lastCall[0]).toMatchObject({
+      username: getAgentDisplayName(agent),
+      icon_emoji: getAgentEmoji(agent),
+    });
+  });
+
+  test("returns undefined when task has no agentId", async () => {
+    const task = await createTaskExtended("dm no agent test", {
+      source: "slack",
+      slackChannelId: "D_DM_TREE2",
+      slackThreadTs: "1313131313.000001",
+      slackUserId: "U_DM2",
+    });
+
+    const { getTaskById } = await import("../be/db");
+    const freshTask = (await getTaskById(task.id))!;
+
+    const messageTs = await _postInitialDMTreeMessage(freshTask);
+    expect(messageTs).toBeUndefined();
+  });
+});
+
+describe("DM unification — tree messages in DMs", () => {
+  test("DM tasks get tree messages registered via registerTreeMessage", async () => {
+    const agent = await createAgent({ name: "DMRegAgent", isLead: false, status: "idle" });
+    const task = await createTaskExtended("dm register test", {
+      agentId: agent.id,
+      source: "slack",
+      slackChannelId: "D_DM_REG1",
+      slackThreadTs: "1414141414.000001",
+      slackUserId: "U_DM_REG1",
+    });
+
+    const messageTs = "1414141414.000002";
+    // DM channel ID starts with "D" — this is the same registerTreeMessage used for channels
+    await registerTreeMessage(task.id, "D_DM_REG1", "1414141414.000001", messageTs);
+
+    const treeMessages = _getTreeMessages();
+    const tree = treeMessages.get(messageTs);
+    expect(tree).toBeDefined();
+    expect(tree!.channelId).toBe("D_DM_REG1");
+    expect(tree!.rootTaskIds.has(task.id)).toBe(true);
+
+    // Task is tracked in taskToTree
+    const taskToTree = _getTaskToTree();
+    expect(taskToTree.get(task.id)).toBe(messageTs);
+  });
+
+  test("DM tree updates work via processTreeMessages (chat.update)", async () => {
+    const agent = await createAgent({ name: "DMUpdateAgent", isLead: true, status: "idle" });
+    const task = await createTaskExtended("dm tree update test", {
+      agentId: agent.id,
+      source: "slack",
+      slackChannelId: "D_DM_UPD1",
+      slackThreadTs: "1515151515.000001",
+      slackUserId: "U_DM_UPD1",
+    });
+
+    await startTask(task.id);
+
+    const messageTs = "1515151515.000002";
+    await registerTreeMessage(task.id, "D_DM_UPD1", "1515151515.000001", messageTs);
+
+    // Clear rate limit and rendered state
+    _getTreeLastUpdateTime().delete(messageTs);
+    _getLastRenderedTree().delete(messageTs);
+
+    // Reset mock call counts
+    mockChatUpdate.mockClear();
+    mockSetStatus.mockClear();
+
+    await processTreeMessages();
+
+    // chat.update should have been called (tree rendering)
+    expect(mockChatUpdate).toHaveBeenCalled();
+
+    // Rendered state should be recorded
+    const lastRendered = _getLastRenderedTree().get(messageTs);
+    expect(lastRendered).toBeDefined();
+    expect(lastRendered!.length).toBeGreaterThan(0);
+  });
+
+  test("assistant status is set in parallel for DM tree messages", async () => {
+    const agent = await createAgent({ name: "DMStatusAgent", isLead: true, status: "idle" });
+    const task = await createTaskExtended("dm status test", {
+      agentId: agent.id,
+      source: "slack",
+      slackChannelId: "D_DM_STATUS1",
+      slackThreadTs: "1616161616.000001",
+      slackUserId: "U_DM_STATUS1",
+    });
+
+    await startTask(task.id);
+
+    const messageTs = "1616161616.000002";
+    await registerTreeMessage(task.id, "D_DM_STATUS1", "1616161616.000001", messageTs);
+
+    // Clear rate limit and rendered state
+    _getTreeLastUpdateTime().delete(messageTs);
+    _getLastRenderedTree().delete(messageTs);
+
+    mockSetStatus.mockClear();
+
+    await processTreeMessages();
+
+    // Wait a tick for the fire-and-forget setAssistantStatus to complete
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    // setAssistantStatus should have been called for the DM channel
+    expect(mockSetStatus).toHaveBeenCalled();
+    const statusCall = mockSetStatus.mock.calls[mockSetStatus.mock.calls.length - 1];
+    expect((statusCall[0] as any).channel_id).toBe("D_DM_STATUS1");
+    expect((statusCall[0] as any).thread_ts).toBe("1616161616.000001");
+    // Status text should be set (not empty — task is still in progress)
+    expect((statusCall[0] as any).status).toBeTruthy();
+  });
+
+  test("assistant status is cleared when DM tree is fully terminal", async () => {
+    const agent = await createAgent({ name: "DMTermAgent", isLead: true, status: "idle" });
+    const task = await createTaskExtended("dm terminal test", {
+      agentId: agent.id,
+      source: "slack",
+      slackChannelId: "D_DM_TERM1",
+      slackThreadTs: "1717171717.000001",
+      slackUserId: "U_DM_TERM1",
+    });
+
+    await startTask(task.id);
+    await completeTask(task.id, "Done in DM");
+
+    const messageTs = "1717171717.000002";
+    await registerTreeMessage(task.id, "D_DM_TERM1", "1717171717.000001", messageTs);
+
+    _getTreeLastUpdateTime().delete(messageTs);
+    _getLastRenderedTree().delete(messageTs);
+
+    mockSetStatus.mockClear();
+
+    await processTreeMessages();
+
+    // Wait a tick for the fire-and-forget setAssistantStatus to complete
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    // setAssistantStatus should have been called with empty status (clearing indicator)
+    expect(mockSetStatus).toHaveBeenCalled();
+    const statusCall = mockSetStatus.mock.calls[mockSetStatus.mock.calls.length - 1];
+    expect((statusCall[0] as any).channel_id).toBe("D_DM_TERM1");
+    expect((statusCall[0] as any).status).toBe("");
+  });
+
+  test("non-DM channel trees do NOT trigger assistant status", async () => {
+    const agent = await createAgent({ name: "NonDMAgent", isLead: true, status: "idle" });
+    const task = await createTaskExtended("non dm test", {
+      agentId: agent.id,
+      source: "slack",
+      slackChannelId: "C_NON_DM1",
+      slackThreadTs: "1818181818.000001",
+      slackUserId: "U_NON_DM1",
+    });
+
+    await startTask(task.id);
+
+    const messageTs = "1818181818.000002";
+    await registerTreeMessage(task.id, "C_NON_DM1", "1818181818.000001", messageTs);
+
+    _getTreeLastUpdateTime().delete(messageTs);
+    _getLastRenderedTree().delete(messageTs);
+
+    mockSetStatus.mockClear();
+
+    await processTreeMessages();
+
+    // Wait a tick
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    // setAssistantStatus should NOT have been called for a non-DM channel
+    expect(mockSetStatus).not.toHaveBeenCalled();
+  });
+});
