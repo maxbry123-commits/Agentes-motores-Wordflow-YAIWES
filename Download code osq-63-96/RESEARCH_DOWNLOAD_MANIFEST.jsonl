@@ -6,3 +6,6 @@
 {"number": 68, "parts": 4, "slug": "excalidraw", "source": "https://github.com/excalidraw/excalidraw.git", "source_commit": "e1bb9ff8f8931e783c11d104abb8967ac6605c9a", "status": "COMPLETE"}
 {"number": 69, "parts": 1, "slug": "argos-translate", "source": "https://github.com/argosopentech/argos-translate.git", "source_commit": "17ed1a9b055c5ba1b51d76b683bbb0c64e2a4a88", "status": "COMPLETE"}
 {"number": 70, "parts": 1, "slug": "LibreTranslate", "source": "https://github.com/LibreTranslate/LibreTranslate.git", "source_commit": "4ef133381ed7728afbab53ffc97ff5d5dd28a941", "status": "COMPLETE"}
+{"number": 71, "parts": 7, "slug": "hermes-agent", "source": "https://github.com/NousResearch/hermes-agent.git", "source_commit": "b20cc5f787ea816ea8645603b7b2ac8234dcb8b4", "status": "COMPLETE"}
+{"number": 72, "parts": 3, "slug": "plandex", "source": "https://github.com/plandex-ai/plandex.git", "source_commit": "e2d772072efadbe41d2946d97d79be55532dbab5", "status": "COMPLETE"}
+{"number": 73, "parts": 1, "slug": "repomix", "source": "https://github.com/yamadashy/repomix.git", "source_commit": "b79ca3b5abcaea81d681d9436fd34d6b9a51eb6c", "status": "COMPLETE"}
