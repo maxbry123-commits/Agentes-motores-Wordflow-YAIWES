@@ -1,0 +1,1114 @@
+"""Pydantic request / response schemas for the Bernstein task server.
+
+All BaseModel subclasses used by route handlers live here.
+The parent ``server`` module re-exports every name for backward compatibility.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Literal
+
+from pydantic import AliasChoices, BaseModel, Field, ValidationInfo, field_validator, model_validator
+
+from bernstein.core.communication.bulletin import MessageType  # noqa: TC001 - Pydantic needs at runtime
+from bernstein.core.tasks.task_store import ProgressEntry
+
+# ---------------------------------------------------------------------------
+# Pydantic request / response schemas
+# ---------------------------------------------------------------------------
+
+_SIGNAL_TYPE = Literal["path_exists", "glob_exists", "test_passes", "file_contains", "llm_review", "llm_judge"]
+
+
+class CompletionSignalSchema(BaseModel):
+    """Pydantic schema for a single completion signal in API requests."""
+
+    type: _SIGNAL_TYPE
+    value: str
+
+
+# input-size caps for TaskCreate (prevents OOM via 200MB descriptions).
+# Titles are short human-readable summaries; descriptions can carry a plan but must
+# stay below the per-request body cap (1MB) enforced by ContentLengthMiddleware.
+_MAX_TITLE_LEN = 500  # Raised from 200 - real backlog/audit tickets use
+# long descriptive titles (-… runs to 206 chars). 500 still caps
+# abusive multi-MB titles but stops ingest_backlog batch POSTs 422-ing every
+# 20 s whenever the backlog carries any title > 200.
+_MAX_DESCRIPTION_LEN = 100_000
+_MAX_SHORT_STR_LEN = 1_000  # role, scope, complexity, etc. - enum-like fields
+_MAX_PATH_LEN = 4_096  # owned_files / parent_task_id / depends_on entries
+_MAX_LIST_LEN = 100
+_MAX_DICT_SERIALIZED_LEN = 50_000  # cap serialized size of dict[str, Any] fields
+_MAX_META_MESSAGE_LEN = 10_000  # retry meta_messages - operational hints
+_MAX_REASON_LEN = 10_000  # fail/reopen/cancel/block reason - human-readable note
+
+
+def _enforce_dict_size(value: dict[str, Any] | None, *, field_name: str) -> dict[str, Any] | None:
+    """Validate that a dict-of-any does not serialize beyond ``_MAX_DICT_SERIALIZED_LEN``.
+
+    Raises ``ValueError`` (surfaced by pydantic as 422) when the JSON form would
+    exceed the cap.  Protects slack_context / metadata / upgrade_details from
+    unbounded memory usage without forcing callers onto a rigid TypedDict.
+    """
+    if value is None:
+        return value
+    import json as _json
+
+    try:
+        serialized = _json.dumps(value, default=str)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be JSON-serialisable") from exc
+    if len(serialized) > _MAX_DICT_SERIALIZED_LEN:
+        raise ValueError(
+            f"{field_name} exceeds {_MAX_DICT_SERIALIZED_LEN} serialized chars",
+        )
+    return value
+
+
+def _sanitize_reason(value: str, field_name: str) -> str:
+    """Strip CR/LF from a free-text reason and cap its length at the API boundary.
+
+    Reason fields flow into ``logger.*`` calls in the task routes. Stripping
+    carriage returns and newlines here is a root-cause defense against log
+    injection: a caller cannot forge log lines even before the value reaches a
+    log sink. The sink-side ``sanitize_log`` wrapping is kept as well, so the
+    two layers are independent. Length is capped to block multi-MB reasons from
+    bloating the log stream.
+    """
+    if not isinstance(value, str):
+        return value
+    if len(value) > _MAX_REASON_LEN:
+        raise ValueError(f"{field_name} exceeds {_MAX_REASON_LEN} chars")
+    return value.replace("\r", " ").replace("\n", " ")
+
+
+def _ensure_task_enum(value: str, field_name: str) -> str:
+    """Reject task enum values outside their valid set at the API boundary.
+
+    These fields stay typed as ``str`` for backward compatibility, so without
+    this check an out-of-range value (e.g. ``""``) passes pydantic and then
+    raises ``ValueError`` deep in the task store when the corresponding enum is
+    constructed, surfacing as an unhandled 500.
+    Raising here turns that into a 422.
+    """
+    from bernstein.core.tasks.models import Complexity, Scope, TaskType
+
+    if field_name == "complexity":
+        enum_cls = Complexity
+    elif field_name == "scope":
+        enum_cls = Scope
+    elif field_name == "task_type":
+        enum_cls = TaskType
+    else:
+        raise ValueError(f"unsupported enum field: {field_name}")
+    try:
+        enum_cls(value)
+    except ValueError:
+        valid = ", ".join(m.value for m in enum_cls)
+        raise ValueError(f"{field_name} must be one of: {valid}") from None
+    return value
+
+
+def _ensure_relative_owned_files(value: list[str]) -> list[str]:
+    """Reject ``owned_files`` entries that do not name a path under a workdir.
+
+    Every consumer of ``owned_files`` joins the entry onto a working
+    directory before reading or writing it, and ``Path.__truediv__`` neither
+    collapses ``..`` nor keeps the left side when the right side is absolute.
+    Checking the shape as the row is created keeps such an entry out of the
+    store in the first place; the consumers assert containment again on the
+    path they actually open, so a row that predates this rule or arrives by
+    another route is still handled there.
+    """
+    from bernstein.core.security.path_containment import PathContainmentError, validate_relative_path
+
+    for entry in value:
+        try:
+            validate_relative_path(entry, label="owned_files entry")
+        except PathContainmentError as exc:
+            raise ValueError(str(exc)) from None
+    return value
+
+
+class TaskCreate(BaseModel):
+    """Body for POST /tasks."""
+
+    # bounded string lengths prevent trivial memory exhaustion.
+    id: str | None = Field(default=None, max_length=_MAX_SHORT_STR_LEN)
+    title: str = Field(max_length=_MAX_TITLE_LEN)
+    description: str = Field(max_length=_MAX_DESCRIPTION_LEN)
+    role: str = Field(default="auto", max_length=_MAX_SHORT_STR_LEN)
+    tenant_id: str = Field(default="default", max_length=_MAX_SHORT_STR_LEN)
+    priority: int = 2
+    scope: str = Field(default="medium", max_length=_MAX_SHORT_STR_LEN)
+    complexity: str = Field(default="medium", max_length=_MAX_SHORT_STR_LEN)
+    eu_ai_act_risk: str = Field(default="minimal", max_length=_MAX_SHORT_STR_LEN)
+    approval_required: bool = False
+    risk_level: str = Field(default="low", max_length=_MAX_SHORT_STR_LEN)
+    estimated_minutes: int | None = None
+    # ``needs`` is the declaration-style alias for the same dependency list
+    # (#2357); both spellings populate ``depends_on`` and the claim API only
+    # offers tasks whose dependencies are complete.
+    depends_on: list[str] = Field(
+        default_factory=list,
+        max_length=_MAX_LIST_LEN,
+        validation_alias=AliasChoices("depends_on", "needs"),
+    )
+    parent_task_id: str | None = Field(default=None, max_length=_MAX_SHORT_STR_LEN)
+    depends_on_repo: str | None = Field(default=None, max_length=_MAX_PATH_LEN)
+    owned_files: list[str] = Field(default_factory=list, max_length=_MAX_LIST_LEN)
+    cell_id: str | None = Field(default=None, max_length=_MAX_SHORT_STR_LEN)
+    repo: str | None = Field(default=None, max_length=_MAX_PATH_LEN)
+    task_type: str = Field(default="standard", max_length=_MAX_SHORT_STR_LEN)
+    upgrade_details: dict[str, Any] | None = None
+    model: str | None = Field(default=None, max_length=_MAX_SHORT_STR_LEN)  # "opus", "sonnet", "haiku"
+    effort: str | None = Field(default=None, max_length=_MAX_SHORT_STR_LEN)  # "max", "high", "medium", "low"
+    cli: str | None = Field(default=None, max_length=_MAX_SHORT_STR_LEN)  # adapter override: "claude", "opencode", …
+    batch_eligible: bool = False  # Non-urgent: eligible for provider batch APIs at ~50% cost
+    completion_signals: list[CompletionSignalSchema] = Field(
+        default_factory=lambda: list[CompletionSignalSchema](),
+        max_length=_MAX_LIST_LEN,
+    )
+    slack_context: dict[str, Any] | None = None  # Slack slash command metadata
+    metadata: dict[str, Any] = Field(default_factory=dict)  # Trigger-source metadata (e.g. issue_number)
+    deadline: float | None = None  # Epoch timestamp when task must be complete
+    parent_session_id: str | None = Field(default=None, max_length=_MAX_SHORT_STR_LEN)
+    parent_context: str | None = Field(default=None, max_length=_MAX_DESCRIPTION_LEN)
+    # Retry bookkeeping: retry_count is the single source of truth.
+    # When a retry task is created, the orchestrator sets retry_count=previous+1.
+    retry_count: int | None = None  # Current retry attempt number (0 = first attempt)
+    max_retries: int | None = None  # Per-task override of default retry limit
+    retry_delay_s: float | None = None  # Delay between retries (exponential backoff base)
+    terminal_reason: str | None = Field(default=None, max_length=_MAX_DESCRIPTION_LEN)
+    max_output_tokens: int | None = None  # Per-task output-token cap (escalated on retry)
+    meta_messages: list[str] | None = Field(default=None, max_length=_MAX_LIST_LEN)
+    # Explicit override for compute_max_turns()'s complexity-based auto-computation.
+    # When set, callers get exact control over how many turns a Claude agent spawn
+    # gets, bypassing scope/complexity math entirely (see claude_max_turns.py).
+    # Bounded because the value reaches the CLI --max-turns flag verbatim: 0 or a
+    # negative would break the spawn (ge=1 also gives a clean 422 instead of a
+    # confusing CLI-level failure downstream), and an unbounded value defeats
+    # turn budgeting.
+    max_turns: int | None = Field(default=None, ge=1, le=10_000)
+    # Issue #3110: the declared artifact contract (see
+    # ``bernstein.core.tasks.artifacts.ArtifactSpec``). Validated by the one
+    # strict parser every declaration surface shares; a malformed block is a
+    # 422 naming the offending field, never a silent downgrade to code_diff.
+    # ``None`` = no declaration: the task keeps the default coding contract.
+    artifact_spec: dict[str, Any] | None = None
+
+    @field_validator("scope", "complexity", "task_type")
+    @classmethod
+    def _validate_task_enums(cls, value: str, info: ValidationInfo) -> str:
+        return _ensure_task_enum(value, info.field_name or "")
+
+    @field_validator("owned_files")
+    @classmethod
+    def _validate_owned_files(cls, value: list[str]) -> list[str]:
+        return _ensure_relative_owned_files(value)
+
+    @field_validator("artifact_spec")
+    @classmethod
+    def _validate_artifact_spec(cls, value: dict[str, Any] | None) -> dict[str, Any] | None:
+        """Fail closed on a malformed artifact declaration (issue #3110)."""
+        if value is None:
+            return None
+        from bernstein.core.tasks.artifacts import ArtifactSpecError, parse_artifact_spec
+
+        try:
+            return parse_artifact_spec(value).to_dict()
+        except ArtifactSpecError as exc:
+            raise ValueError(str(exc)) from None
+
+    # cap serialized size of dict-of-any fields to block deeply-nested
+    # or very wide payloads from wedging the server at pydantic-validation time.
+    def model_post_init(self, _context: Any) -> None:
+        """Enforce serialized-size caps on dict fields and meta_messages entries."""
+        if self.artifact_spec is not None and any(s.type == "llm_judge" for s in self.completion_signals):
+            raise ValueError("Task cannot declare both an artifact_spec and an llm_judge completion signal")
+        _enforce_dict_size(self.slack_context, field_name="slack_context")
+        _enforce_dict_size(self.metadata, field_name="metadata")
+        _enforce_dict_size(self.upgrade_details, field_name="upgrade_details")
+        # Cap individual meta_messages strings so a 100-item list can't each be 1MB.
+        if self.meta_messages is not None:
+            for msg in self.meta_messages:
+                if len(msg) > _MAX_META_MESSAGE_LEN:
+                    raise ValueError(
+                        f"meta_messages entry exceeds {_MAX_META_MESSAGE_LEN} chars",
+                    )
+
+
+class TaskSelfCreate(BaseModel):
+    """Body for POST /tasks/self-create - agent-initiated subtask creation.
+
+    Agents use this to decompose work into subtasks during execution.
+    The parent_task_id is required and links the new subtask to the calling
+    agent's current task.
+    """
+
+    parent_task_id: str
+    title: str
+    description: str
+    role: str = "auto"
+    priority: int = 2
+    scope: str = "medium"
+    complexity: str = "medium"
+    estimated_minutes: int | None = None
+    depends_on: list[str] = Field(default_factory=list)
+    owned_files: list[str] = Field(default_factory=list)
+
+    @field_validator("scope", "complexity")
+    @classmethod
+    def _validate_scope_complexity(cls, value: str, info: ValidationInfo) -> str:
+        return _ensure_task_enum(value, info.field_name or "")
+
+    @field_validator("owned_files")
+    @classmethod
+    def _validate_owned_files(cls, value: list[str]) -> list[str]:
+        return _ensure_relative_owned_files(value)
+
+
+class WebhookTaskCreate(TaskCreate):
+    """Body for POST /webhook."""
+
+    role: str = "backend"
+
+
+class TaskResponse(BaseModel):
+    """Serialised task returned by every task endpoint."""
+
+    id: str
+    title: str
+    description: str
+    role: str
+    tenant_id: str
+    priority: int
+    scope: str
+    complexity: str
+    eu_ai_act_risk: str
+    approval_required: bool
+    risk_level: str
+    estimated_minutes: int | None
+    status: str
+    depends_on: list[str]
+    parent_task_id: str | None
+    depends_on_repo: str | None
+    owned_files: list[str]
+    assigned_agent: str | None
+    result_summary: str | None
+    cell_id: str | None
+    repo: str | None
+    task_type: str
+    upgrade_details: dict[str, Any] | None
+    model: str | None
+    effort: str | None
+    cli: str | None = None
+    batch_eligible: bool = False
+    completion_signals: list[dict[str, str]] = Field(default_factory=lambda: list[dict[str, str]]())
+    slack_context: dict[str, Any] | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    created_at: float
+    claimed_at: float | None = None
+    completed_at: float | None = None
+    closed_at: float | None = None
+    deadline: float | None = None
+    progress_log: list[ProgressEntry] = Field(default_factory=lambda: list[ProgressEntry]())
+    version: int = 1
+    parent_session_id: str | None = None  # Coordinator session that owns this task
+    # Retry bookkeeping: typed fields are the single source of truth.
+    retry_count: int = 0
+    max_retries: int = 3
+    retry_delay_s: float = 0.0
+    terminal_reason: str | None = None
+    max_output_tokens: int | None = None
+    meta_messages: list[str] = Field(default_factory=list)
+    max_turns: int | None = None
+    # Issue #3110: the task's artifact contract as ``ArtifactSpec.to_dict()``.
+    # Always present on responses built by ``task_to_response`` (the default
+    # contract serialises as kind=code_diff), so a declared contract survives
+    # the wire round-trip instead of being dropped at the response boundary.
+    artifact_spec: dict[str, Any] | None = None
+
+
+class WebhookTaskResponse(BaseModel):
+    """Serialized task returned by POST /webhook.
+
+    ``receipt`` carries the signed, chain-anchored trigger receipt for the
+    admitted trigger (#2512) so the calling automation platform stores a proof
+    of what it asked for, not just a task reference. It is optional: an install
+    whose bridge state is unavailable still creates the task and returns
+    ``None`` rather than failing the caller.
+    """
+
+    task: TaskResponse
+    receipt: dict[str, Any] | None = None
+
+
+class TaskCompleteRequest(BaseModel):
+    """Body for POST /tasks/{task_id}/complete.
+
+    ``result_summary`` is the legacy free-form summary and stays accepted
+    unchanged. ``payload`` carries a structured terminal payload under the
+    worker completion contract (#2244) - either a completion or a typed
+    refusal - and is schema-validated at the API boundary; an invalid
+    payload is a typed ``contract_violation`` failure, never a silent
+    accept. When ``payload`` is provided, ``result_summary`` is ignored.
+    """
+
+    result_summary: str = ""
+    payload: dict[str, Any] | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _require_summary_or_payload(cls, data: Any) -> Any:
+        """Reject bodies that carry neither field.
+
+        A body with an explicitly empty ``result_summary`` still validates -
+        the store maps that to the empty-summary auto-fail path - but a body
+        with neither key is a malformed request, not a worker outcome.
+        """
+        if isinstance(data, dict) and "result_summary" not in data and "payload" not in data:
+            raise ValueError("either result_summary or payload is required")
+        return data
+
+
+class TaskFailRequest(BaseModel):
+    """Body for POST /tasks/{task_id}/fail."""
+
+    reason: str = ""
+
+    @field_validator("reason")
+    @classmethod
+    def _sanitize_reason(cls, value: str, info: ValidationInfo) -> str:
+        return _sanitize_reason(value, info.field_name or "reason")
+
+
+class TaskReopenRequest(BaseModel):
+    """Body for POST /tasks/{task_id}/reopen."""
+
+    reason: str = ""
+
+    @field_validator("reason")
+    @classmethod
+    def _sanitize_reason(cls, value: str, info: ValidationInfo) -> str:
+        return _sanitize_reason(value, info.field_name or "reason")
+
+
+class TaskReleaseRequest(BaseModel):
+    """Body for POST /tasks/{task_id}/release."""
+
+    reason: str = ""
+
+    @field_validator("reason")
+    @classmethod
+    def _sanitize_reason(cls, value: str, info: ValidationInfo) -> str:
+        return _sanitize_reason(value, info.field_name or "reason")
+
+
+class TaskCancelRequest(BaseModel):
+    """Body for POST /tasks/{task_id}/cancel."""
+
+    reason: str = ""
+
+    @field_validator("reason")
+    @classmethod
+    def _sanitize_reason(cls, value: str, info: ValidationInfo) -> str:
+        return _sanitize_reason(value, info.field_name or "reason")
+
+
+class TaskBlockRequest(BaseModel):
+    """Body for POST /tasks/{task_id}/block."""
+
+    reason: str = ""
+
+    @field_validator("reason")
+    @classmethod
+    def _sanitize_reason(cls, value: str, info: ValidationInfo) -> str:
+        return _sanitize_reason(value, info.field_name or "reason")
+
+
+class TaskPatchRequest(BaseModel):
+    """Body for PATCH /tasks/{task_id} - manager corrections."""
+
+    role: str | None = None
+    priority: int | None = None
+    model: str | None = None
+
+
+class TaskProgressRequest(BaseModel):
+    """Body for POST /tasks/{task_id}/progress."""
+
+    message: str = ""
+    percent: int = 0
+    # Structured snapshot fields for stall detection (optional)
+    files_changed: int | None = None
+    lines_changed: int | None = None
+    tests_passing: int | None = None
+    errors: int | None = None
+    last_file: str = ""
+    # Last shell command executed by the agent - used for real-time anomaly detection.
+    # Agents report this so the orchestrator can detect dangerous commands (exfiltration,
+    # reverse shells, privilege escalation) before the task completes.
+    last_command: str = ""
+
+
+class PartialMergeRequest(BaseModel):
+    """Body for POST /tasks/{task_id}/partial-merge.
+
+    Requests an incremental merge of specific files from the agent's branch
+    into the main branch before the task finishes.  Only files already
+    committed in the agent's worktree branch are processed.
+    """
+
+    files: list[str]
+    """Repo-relative file paths to merge (must be committed in the agent branch)."""
+
+    message: str = ""
+    """Optional commit message.  Auto-generated from session/file list if empty."""
+
+
+class PartialMergeResponse(BaseModel):
+    """Response for POST /tasks/{task_id}/partial-merge."""
+
+    success: bool
+    merged_files: list[str]
+    skipped_already_merged: list[str]
+    uncommitted_files: list[str]
+    conflicting_files: list[str]
+    commit_sha: str
+    error: str
+
+
+class TaskWaitForSubtasksRequest(BaseModel):
+    """Body for POST /tasks/{task_id}/wait-for-subtasks."""
+
+    subtask_count: int = 0
+
+
+class BatchClaimRequest(BaseModel):
+    """Body for POST /tasks/claim-batch."""
+
+    task_ids: list[str]
+    agent_id: str
+    claimed_by_session: str | None = None
+
+
+class BatchClaimResponse(BaseModel):
+    """Response for POST /tasks/claim-batch."""
+
+    claimed: list[str]
+    failed: list[str]
+
+
+class ClaimReceiptRequest(BaseModel):
+    """Body for POST /tasks/claim-receipt (#2555).
+
+    Drives the dependency-gated claim path over MCP and returns a signed,
+    content-addressed :class:`ClaimReceipt` instead of a mutable task
+    projection. The eligibility predicates mirror
+    :class:`bernstein.core.tasks.claim.ClaimFilter`: a task is offered only
+    when its ``depends_on`` are all present in ``completed_ids`` (the
+    dependency gate), and a filter that matches no eligible row still returns
+    a signed refusal receipt (never a silent skip).
+    """
+
+    claimer_id: str = Field(min_length=1, max_length=_MAX_SHORT_STR_LEN)
+    claimer_card_fingerprint: str | None = Field(default=None, max_length=_MAX_SHORT_STR_LEN)
+    role: str | None = Field(default=None, max_length=64)
+    project: str | None = Field(default=None, max_length=_MAX_SHORT_STR_LEN)
+    capability: str | None = Field(default=None, max_length=_MAX_SHORT_STR_LEN)
+    completed_ids: list[str] = Field(default_factory=list)
+    max_attempts: int | None = Field(default=None, ge=0)
+
+
+class TaskMessagePost(BaseModel):
+    """Body for POST /tasks/{task_id}/messages (#2357).
+
+    Typed, size-capped worker mailbox payload. ``kind`` must be one of the
+    closed vocabulary (``finding`` / ``artefact_ref`` / ``question``).
+    The message body is capped by the mailbox chain to 4096 UTF-8 bytes
+    (see ``task_mailbox.MAX_MESSAGE_BODY_BYTES``); the API model mirrors
+    this limit so oversized bodies fail validation up front instead of
+    being rejected downstream. The byte-strict cap remains authoritative
+    in the mailbox for multibyte payloads.
+    """
+
+    sender: str = Field(min_length=1, max_length=_MAX_SHORT_STR_LEN)
+    kind: str = Field(min_length=1, max_length=64)
+    body: str = Field(min_length=1, max_length=4096)
+    sender_card_fingerprint: str | None = Field(default=None, max_length=_MAX_SHORT_STR_LEN)
+
+
+class TaskMessageResponse(BaseModel):
+    """One delivered mailbox message (chain order = delivery order)."""
+
+    seq: int
+    task_id: str
+    sender: str
+    sender_card_fingerprint: str
+    kind: str
+    body: str
+    body_hash: str
+    redaction_count: int
+    timestamp: float
+    prev_entry_hash: str
+    entry_hash: str
+    signature: str
+    signer_public_key_pem: str
+
+
+class TaskArtifactPost(BaseModel):
+    """Body for POST /tasks/{task_id}/artifacts (#2553).
+
+    An agent-posted, journal-anchored artifact. ``artifact_type`` selects the
+    payload shape: ``report`` uses ``body`` (markdown); ``table`` uses
+    ``columns`` and ``rows``; ``link`` uses ``url`` and ``link_kind``
+    (``preview`` / ``dashboard`` / ``document``). ``poster`` is the claim
+    identity: a caller may only post against a task whose claim it holds.
+
+    There is deliberately no progress field. Progress is a chain-computed
+    projection of journaled work, never postable.
+    """
+
+    key: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.\-]{0,127}$")
+    artifact_type: str = Field(pattern="^(report|table|link|finding)$")
+    poster: str = Field(min_length=1, max_length=_MAX_SHORT_STR_LEN)
+    body: str = Field(default="", max_length=1_048_576)
+    columns: list[str] = Field(default_factory=list[str])
+    rows: list[list[str]] = Field(default_factory=list[list[str]])
+    url: str = Field(default="", max_length=_MAX_PATH_LEN)
+    link_kind: str = Field(default="", max_length=64)
+    sarif_result: dict[str, Any] = Field(default_factory=dict)
+    tool: str = Field(default="", max_length=_MAX_SHORT_STR_LEN)
+    tool_version: str = Field(default="", max_length=128)
+    pinned_ruleset_or_feed_digest: str = Field(default="", max_length=256)
+    invocation_argv_hash: str = Field(default="", max_length=256)
+    target: str = Field(default="", max_length=_MAX_PATH_LEN)
+
+
+class TaskArtifactResponse(BaseModel):
+    """One posted artifact version, with its chain anchors and verify state."""
+
+    task_id: str
+    key: str
+    artifact_type: str
+    content_hash: str
+    version: int
+    prev_version_hash: str
+    spine_entry_hash: str
+    journal_index: int
+    journal_event_hash: str
+    link_kind: str = ""
+    size: int = 0
+    verified: bool = True
+    verify_reason: str = ""
+
+
+class TaskArtifactContentResponse(TaskArtifactResponse):
+    """A posted artifact version plus its decoded content (for rendering).
+
+    ``content`` carries the type-specific fields (``body`` for a report,
+    ``columns``/``rows`` for a table, ``url``/``kind`` for a link). When the
+    stored blob fails its hash check ``verified`` is False and ``content`` is
+    omitted -- the surface must render *tampered*, never the bytes.
+    """
+
+    content: dict[str, Any] | None = None
+
+
+class TaskProgressResponse(BaseModel):
+    """The chain-computed progress vector for a task (#2553).
+
+    A pure projection of journaled work: checkpoints, diffs, gates, evidence
+    producers, and ledger transitions. ``vector_hash`` is the stable hash of the
+    canonical vector; two projections of the same run agree byte-for-byte.
+    """
+
+    task_id: str
+    schema_version: int
+    checkpoints: int
+    diffs_captured: int
+    gate_attempts: int
+    evidence_declared: int
+    evidence_passed: int
+    ledger_phase: str
+    ledger_attempts: int
+    terminal: bool
+    earned_steps: int
+    phase_ordinal: int
+    vector_hash: str
+
+
+class TaskSteerPost(BaseModel):
+    """Body for POST /tasks/{task_id}/steer (#2508).
+
+    An operator steering command: pause, resume, guidance, redirect, or
+    abort. Free-text fields are capped so the mailbox delivery envelope
+    always fits the mailbox body cap. ``displayed_payload_hash`` is the hash
+    the confirmation UI computed over what it showed the operator; when
+    supplied the server rejects the action if it differs from the executed
+    command, so the receipt binds exactly the confirmed payload.
+    """
+
+    kind: str = Field(min_length=1, max_length=64)
+    principal: str = Field(default="", max_length=_MAX_SHORT_STR_LEN)
+    guidance: str = Field(default="", max_length=2048)
+    redirect_target: str = Field(default="", max_length=2048)
+    reason: str = Field(default="", max_length=2048)
+    session_id: str = Field(default="", max_length=_MAX_SHORT_STR_LEN)
+    adapter: str = Field(default="", max_length=_MAX_SHORT_STR_LEN)
+    worktree: str = Field(default="", max_length=_MAX_PATH_LEN)
+    displayed_payload_hash: str | None = Field(default=None, max_length=_MAX_SHORT_STR_LEN)
+
+
+class TaskSteerResponse(BaseModel):
+    """The receipt a steering action produced (#2508).
+
+    The response IS the receipt: the chain-anchored ``receipt_hash`` the
+    delivered effect references, the ``payload_hash`` it binds, and the
+    mailbox journal position the effect was delivered at.
+    """
+
+    kind: str
+    task_id: str
+    principal: str
+    scope: str
+    payload_hash: str
+    receipt_hash: str
+    timestamp: float
+    mailbox_seq: int
+    mailbox_entry_hash: str
+    checkpoint_event_hash: str = ""
+    abort_signal_written: bool = False
+
+
+class BatchCreateRequest(BaseModel):
+    """Body for POST /tasks/batch."""
+
+    tasks: list[TaskCreate]
+
+
+class BatchCreateResponse(BaseModel):
+    """Response for POST /tasks/batch."""
+
+    created: list[TaskResponse]
+    skipped_titles: list[str]
+
+
+class RoleCounts(BaseModel):
+    """Per-role open task counts."""
+
+    role: str
+    open: int
+    claimed: int
+    done: int
+    failed: int
+    cost_usd: float = 0.0
+
+
+class StatusResponse(BaseModel):
+    """Body for GET /status."""
+
+    total: int
+    open: int
+    claimed: int
+    done: int
+    failed: int
+    per_role: list[RoleCounts]
+    total_cost_usd: float = 0.0
+
+
+class HeartbeatRequest(BaseModel):
+    """Body for POST /agents/{agent_id}/heartbeat."""
+
+    role: str = ""
+    status: Literal["starting", "working", "idle", "dead"] = "working"
+
+
+class HeartbeatResponse(BaseModel):
+    """Response for heartbeat."""
+
+    agent_id: str
+    acknowledged: bool
+    server_ts: float
+
+
+class ComponentStatus(BaseModel):
+    """Status of an individual system component."""
+
+    status: Literal["ok", "degraded", "down", "unknown"]
+    detail: str = ""
+
+
+class HealthResponse(BaseModel):
+    """Response for GET /health."""
+
+    status: str
+    uptime_s: float
+    task_count: int
+    agent_count: int
+    task_queue_depth: int = 0
+    memory_mb: float = 0.0
+    restart_count: int = 0
+    is_readonly: bool = False
+    components: dict[str, dict[str, Any]] = Field(default_factory=dict)
+
+
+class BulletinPostRequest(BaseModel):
+    """Body for POST /bulletin."""
+
+    agent_id: str
+    type: MessageType = "status"
+    content: str
+    cell_id: str | None = None
+
+
+# -- Cluster schemas -------------------------------------------------------
+
+
+class NodeCapacitySchema(BaseModel):
+    """Advertised capacity of a cluster node."""
+
+    max_agents: int = 6
+    available_slots: int = 6
+    active_agents: int = 0
+    gpu_available: bool = False
+    supported_models: list[str] = Field(default_factory=lambda: ["sonnet", "opus", "haiku"])
+
+
+class NodeRegisterRequest(BaseModel):
+    """Body for POST /cluster/nodes."""
+
+    name: str = ""
+    url: str = ""
+    capacity: NodeCapacitySchema = Field(default_factory=NodeCapacitySchema)
+    labels: dict[str, str] = Field(default_factory=dict)
+    cell_ids: list[str] = Field(default_factory=list)
+
+
+class NodeHeartbeatRequest(BaseModel):
+    """Body for POST /cluster/nodes/{node_id}/heartbeat."""
+
+    capacity: NodeCapacitySchema | None = None
+
+
+class NodeResponse(BaseModel):
+    """Serialised node in API responses."""
+
+    id: str
+    name: str
+    url: str
+    status: str
+    capacity: NodeCapacitySchema
+    last_heartbeat: float
+    registered_at: float
+    labels: dict[str, str]
+    cell_ids: list[str]
+
+
+class ClusterStatusResponse(BaseModel):
+    """Response for GET /cluster/status."""
+
+    topology: str
+    total_nodes: int
+    online_nodes: int
+    offline_nodes: int
+    total_capacity: int
+    available_slots: int
+    active_agents: int
+    nodes: list[NodeResponse]
+
+
+class ClaimGossipRequest(BaseModel):
+    """Body for POST /cluster/claims/gossip - push signed claim receipts to a peer.
+
+    ``receipts`` are the raw :class:`ClaimReceipt` wire dicts in journal order.
+    ``head`` is the sender's journal head, echoed back so the sender can tell
+    convergence from divergence without a second round trip.
+    """
+
+    receipts: list[dict[str, Any]]
+    head: str | None = None
+    node_id: str | None = None
+
+
+class ClaimGossipResult(BaseModel):
+    """Per-receipt outcome of a gossip push."""
+
+    entry_hash: str
+    status: str
+    reason: str | None = None
+    divergence_index: int | None = None
+
+
+class ClaimGossipResponse(BaseModel):
+    """Response for POST /cluster/claims/gossip.
+
+    ``forked`` is surfaced at the top level because a fork is the one outcome
+    that must not be lost in a per-receipt list an integrator might ignore.
+    """
+
+    head: str
+    accepted: int
+    results: list[ClaimGossipResult]
+    forked: bool = False
+
+
+class TaskStealRequest(BaseModel):
+    """Body for POST /cluster/steal - report queue depths and request rebalancing."""
+
+    queue_depths: dict[str, int] = Field(default_factory=dict)
+
+
+class TaskStealAction(BaseModel):
+    """A single steal action: move tasks from donor to receiver."""
+
+    donor_node_id: str
+    receiver_node_id: str
+    task_ids: list[str]
+
+
+class TaskStealResponse(BaseModel):
+    """Response for POST /cluster/steal."""
+
+    actions: list[TaskStealAction]
+    total_stolen: int
+
+
+class TaskCountsResponse(BaseModel):
+    """Lightweight status counts - no task bodies.
+
+    Every value in :class:`bernstein.core.tasks.models.TaskStatus` is exposed
+    as a field so the GUI's status-chip badges can render real numbers
+    instead of ``-``.  Adding fields here is non-breaking - existing clients
+    that consume only ``open``/``claimed``/``done`` continue to work and the
+    new fields default to ``0``.
+    """
+
+    open: int = 0
+    claimed: int = 0
+    in_progress: int = 0
+    done: int = 0
+    closed: int = 0
+    failed: int = 0
+    blocked: int = 0
+    cancelled: int = 0
+    planned: int = 0
+    pending_approval: int = 0
+    waiting_for_subtasks: int = 0
+    orphaned: int = 0
+    abandoned: int = 0
+    blocked_by_abandon: int = 0
+    blocked_by_failed_dep: int = 0
+    refused: int = 0
+    suspended: int = 0
+    total: int = 0
+
+
+class PaginatedTasksResponse(BaseModel):
+    """Paginated list of tasks with total count for cursor math."""
+
+    tasks: list[TaskResponse]
+    total: int
+    limit: int
+    offset: int
+
+
+class BulletinMessageResponse(BaseModel):
+    """Single bulletin message in responses."""
+
+    agent_id: str
+    type: str
+    content: str
+    timestamp: float
+    cell_id: str | None
+
+
+class AgentLogsResponse(BaseModel):
+    """Response for GET /agents/{session_id}/logs."""
+
+    session_id: str
+    content: str
+    size: int
+
+
+class AgentKillResponse(BaseModel):
+    """Response for POST /agents/{session_id}/kill."""
+
+    session_id: str
+    kill_requested: bool
+
+
+# -- Delegation schemas ----------------------------------------------------
+
+
+class DelegationPostRequest(BaseModel):
+    """Body for POST /delegations."""
+
+    origin_agent: str
+    target_role: str
+    description: str
+    deadline: float = 0.0
+    cell_id: str | None = None
+
+
+class DelegationClaimRequest(BaseModel):
+    """Body for POST /delegations/{id}/claim."""
+
+    agent_id: str
+
+
+class DelegationResultRequest(BaseModel):
+    """Body for POST /delegations/{id}/result."""
+
+    agent_id: str
+    result: str
+
+
+class DelegationResponse(BaseModel):
+    """Single delegation in API responses."""
+
+    id: str
+    origin_agent: str
+    target_role: str
+    description: str
+    deadline: float
+    status: str
+    claimed_by: str | None
+    result: str | None
+    created_at: float
+    cell_id: str | None
+
+
+# -- Direct channel schemas ------------------------------------------------
+
+
+class ChannelQueryRequest(BaseModel):
+    """Body for POST /channel/query."""
+
+    sender_agent: str
+    topic: str
+    content: str
+    target_agent: str | None = None
+    target_role: str | None = None
+    ttl_seconds: float = 300
+
+
+class ChannelResponseRequest(BaseModel):
+    """Body for POST /channel/{query_id}/respond."""
+
+    responder_agent: str
+    content: str
+
+
+class ChannelQueryResponse(BaseModel):
+    """Single channel query in API responses."""
+
+    id: str
+    sender_agent: str
+    topic: str
+    content: str
+    target_agent: str | None
+    target_role: str | None
+    timestamp: float
+    expires_at: float
+    resolved: bool
+
+
+class ChannelResponseResponse(BaseModel):
+    """Single channel response in API responses."""
+
+    id: str
+    query_id: str
+    responder_agent: str
+    content: str
+    timestamp: float
+
+
+# -- A2A protocol schemas --------------------------------------------------
+
+
+class A2ATaskSendRequest(BaseModel):
+    """Body for POST /a2a/tasks/send - receive a task from an external A2A agent."""
+
+    sender: str
+    message: str
+    role: str = "backend"
+
+
+class A2AArtifactRequest(BaseModel):
+    """Body for POST /a2a/tasks/{id}/artifacts - attach an artifact."""
+
+    name: str
+    data: str = ""
+    content_type: str = "text/plain"
+
+
+class A2AArtifactResponse(BaseModel):
+    """Single artifact in responses."""
+
+    name: str
+    content_type: str
+    data: str
+    created_at: float
+
+
+class A2AMessageRequest(BaseModel):
+    """Body for POST /a2a/message."""
+
+    sender: str
+    recipient: str
+    content: str
+    task_id: str
+
+
+class A2AMessageResponse(BaseModel):
+    """Serialized A2A message returned by Bernstein endpoints."""
+
+    id: str
+    sender: str
+    recipient: str
+    content: str
+    task_id: str
+    direction: str
+    delivered: bool
+    external_endpoint: str | None
+    created_at: float
+
+
+class A2ATaskResponse(BaseModel):
+    """Serialised A2A task in responses.
+
+    ``receipt`` carries the lineage receipt for an inbound task (#2609): the
+    execution evidence a caller verifies offline with ``bernstein a2a verify
+    --receipt``. It is ``None`` on read paths, and on write paths when the
+    node could not provision receipt key material - an absent receipt means
+    "unattested", which a caller should treat as unverified rather than
+    trusted.
+    """
+
+    id: str
+    bernstein_task_id: str | None
+    sender: str
+    message: str
+    status: str
+    artifacts: list[A2AArtifactResponse]
+    created_at: float
+    updated_at: float
+    receipt: dict[str, Any] | None = None
+
+
+class A2AAgentCardResponse(BaseModel):
+    """Agent Card response for the ``/a2a/agent-card`` discovery endpoint.
+
+    The A2A v1.0 card served at ``/.well-known/agent.json`` is built and
+    signed in :mod:`bernstein.core.routes.well_known` and does not use this
+    model.
+    """
+
+    name: str
+    description: str
+    capabilities: list[str]
+    protocol_version: str
+    endpoint: str
+    provider: str

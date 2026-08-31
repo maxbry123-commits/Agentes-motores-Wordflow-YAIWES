@@ -1,0 +1,249 @@
+name: Major/Minor Release
+
+# Manual trigger for significant releases (x.0.0 or x.y.0)
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Version bump type"
+        required: true
+        type: choice
+        options:
+          - minor
+          - major
+      changelog:
+        description: "Release highlights (markdown)"
+        required: true
+        type: string
+      dry_run:
+        description: "Dry run (don't publish)"
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: release-major-minor-${{ github.ref }}
+  cancel-in-progress: false
+
+# Default-deny at workflow scope; the release job re-asserts the writes
+# it actually needs (Scorecard token-permissions).
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: "${{ inputs.bump }} release"
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Harden runner (audit mode)
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          enable-cache: false
+
+      # Read and bump version
+      - name: Bump version
+        id: bump
+        run: |
+          VERSION=$(grep '^version = ' pyproject.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          IFS='.' read -r MAJOR MINOR _PATCH <<< "$VERSION"
+
+          if [ "${{ inputs.bump }}" = "major" ]; then
+            NEW="$((MAJOR + 1)).0.0"
+          else
+            NEW="${MAJOR}.$((MINOR + 1)).0"
+          fi
+
+          {
+            echo "old=$VERSION"
+            echo "new=$NEW"
+          } >> "$GITHUB_OUTPUT"
+          echo "Bumping $VERSION → $NEW (${{ inputs.bump }})"
+
+      # Verify CI passed on current commit.
+      #
+      # Read check runs, not the combined status API. Every lane in this repo
+      # reports as a check run and nothing posts a commit status, so
+      # /commits/{sha}/status answers `pending` with an empty `statuses` array
+      # on every commit that has ever existed here -- including green tags.
+      # This step used to read that field and would have refused every release.
+      #
+      # `CI gate` is the sole required context (docs/operations/merge-queue.md),
+      # so it is what decides. The other lanes are advisory: a cancelled one is
+      # routine (queue-branch runs get cancelled to free runners), but a lane
+      # that ran to completion and failed still means main is broken, so those
+      # are refused too.
+      - name: Verify CI green
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          RUNS=$(gh api "repos/${{ github.repository }}/commits/${SHA}/check-runs" \
+            --paginate --jq '.check_runs[] | "\(.name)\t\(.status)\t\(.conclusion // "")"')
+
+          if [ -z "$RUNS" ]; then
+            echo "::error::No check runs on ${SHA}. CI has not reported; refusing to release."
+            exit 1
+          fi
+
+          GATE=$(printf '%s\n' "$RUNS" | awk -F'\t' '$1 == "CI gate" {print $3}' | tail -1)
+          if [ "$GATE" != "success" ]; then
+            echo "::error::CI gate is '${GATE:-missing}' on ${SHA}. Fix CI before releasing."
+            printf '%s\n' "$RUNS"
+            exit 1
+          fi
+
+          FAILED=$(printf '%s\n' "$RUNS" \
+            | awk -F'\t' '$2 == "completed" && $3 != "success" && $3 != "skipped" && $3 != "neutral" && $3 != "cancelled" {print $1 " (" $3 ")"}')
+          if [ -n "$FAILED" ]; then
+            echo "::error::Completed check runs failed on ${SHA}:"
+            printf '%s\n' "$FAILED"
+            exit 1
+          fi
+
+      # No test run here. The step that used to sit at this point re-ran the
+      # whole suite unsharded on this one runner, against the exact tree the
+      # `Verify CI green` step above has just proved green -- and it did not
+      # fit: at 49 minutes it was still going when the job's 60-minute timeout
+      # cancelled it, taking the release with it. A cancelled step is not a
+      # safety net, it is a release that cannot be cut.
+      #
+      # The tree is already tested twice without it. `Test` runs the full
+      # OS/Python shard matrix on `main`, and `Verify CI green` refuses to
+      # continue unless every one of those check runs reported success on this
+      # exact SHA. Then the bump PR goes through the merge queue, which runs
+      # the same required matrix again before anything lands. A third,
+      # slower, less parallel copy of the same suite adds no signal.
+
+      # Apply version bump. scripts/bump_version.py is the single supported
+      # bump path: it rewrites pyproject.toml, refreshes uv.lock, and
+      # regenerates the distribution manifests (server.json,
+      # .plugin/plugin.json) together, so the bump PR can never desync them
+      # the way a bare `sed` on pyproject.toml alone would.
+      - name: Bump version files
+        if: inputs.dry_run == false
+        env:
+          NEW_VERSION: ${{ steps.bump.outputs.new }}
+        run: uv run python scripts/bump_version.py "${NEW_VERSION}"
+
+      # Generate changelog section for the PR body
+      - name: Generate changelog
+        id: changelog
+        run: |
+          PREV_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          if [ -n "$PREV_TAG" ]; then
+            COMMITS=$(git log --oneline "$PREV_TAG"..HEAD | head -30)
+          else
+            COMMITS=$(git log --oneline -20)
+          fi
+          {
+            echo "commits<<EOF"
+            echo "$COMMITS"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      # Land the bump the same way a patch release does: a PR through the
+      # merge queue, never a direct push to main. The branch ruleset has no
+      # bypass actors, so a bare `git push` to main is rejected outright --
+      # this used to be this job's next step, and it made every major/minor
+      # release attempted from this workflow fail here.
+      #
+      # BERNSTEIN_AUTOSYNC_TOKEN (a PAT) is preferred over GITHUB_TOKEN: PRs
+      # opened with GITHUB_TOKEN do not trigger pull_request workflows, so
+      # their required checks never report and auto-merge never fires. The
+      # GITHUB_TOKEN fallback still opens the PR, but an operator then has to
+      # merge it by hand.
+      - name: Open bump PR
+        if: inputs.dry_run == false
+        id: bump_pr
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
+        with:
+          token: ${{ secrets.BERNSTEIN_AUTOSYNC_TOKEN || secrets.GITHUB_TOKEN }}
+          branch: auto/bump-v${{ steps.bump.outputs.new }}
+          # Every file `scripts/bump_version.py` touches, or the bump PR opens
+          # with some of them a release behind (#4053). The generated set is
+          # GENERATED_MANIFESTS in scripts/gen_distribution_manifests.py, and
+          # tests/unit/test_release_bump_add_paths.py fails if the two drift.
+          add-paths: |
+            pyproject.toml
+            uv.lock
+            server.json
+            .plugin/plugin.json
+            plugin.json
+            mcp.json
+            CITATION.cff
+          commit-message: "release: v${{ steps.bump.outputs.new }}"
+          committer: "bernstein[bot] <bernstein-bot@users.noreply.github.com>"
+          author: "bernstein[bot] <bernstein-bot@users.noreply.github.com>"
+          title: "release: v${{ steps.bump.outputs.new }}"
+          body: |
+            ${{ inputs.changelog }}
+
+            ### Changes since v${{ steps.bump.outputs.old }}
+
+            ${{ steps.changelog.outputs.commits }}
+
+            ---
+            Version bump via `scripts/bump_version.py`. Merging this PR through
+            the merge queue hands off to `auto-release.yml`, which tags the
+            merge commit once CI is green on `main`, and `publish.yml`, which
+            builds, publishes, and creates the GitHub Release from that tag --
+            the same chain every patch release goes through.
+
+      # Same enqueue call the merge queue expects everywhere else in this
+      # repo (docs/operations/merge-gate.md configures the queue's merge
+      # method), so this PR merges the same way ci-topology-heal.yml
+      # lands its own bot-authored PRs.
+      - name: Enable auto-merge
+        if: >-
+          inputs.dry_run == false &&
+          (steps.bump_pr.outputs.pull-request-operation == 'created' ||
+           steps.bump_pr.outputs.pull-request-operation == 'updated')
+        env:
+          GH_TOKEN: ${{ secrets.BERNSTEIN_AUTOSYNC_TOKEN || secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ steps.bump_pr.outputs.pull-request-url }}
+          HAS_PAT: ${{ secrets.BERNSTEIN_AUTOSYNC_TOKEN != '' }}
+        run: |
+          set -euo pipefail
+          # No merge-strategy flag: the queue applies its own configured
+          # method, and passing one here conflicts with it.
+          gh pr merge --auto "$PR_URL"
+          if [ "${HAS_PAT}" != "true" ]; then
+            echo "::warning title=Bump PR needs a manual merge::BERNSTEIN_AUTOSYNC_TOKEN is unset, so ${PR_URL} was opened with GITHUB_TOKEN. Its pull_request workflows never start, so the required contexts never report and auto-merge cannot fire. Close and reopen the PR under a user account to start CI."
+            echo "- Bump PR **${PR_URL}** was opened with GITHUB_TOKEN: its required checks will never run. Close and reopen it under a user account." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Dry run summary
+        if: inputs.dry_run == true
+        env:
+          BUMP_TYPE: ${{ inputs.bump }}
+          OLD_VERSION: ${{ steps.bump.outputs.old }}
+          NEW_VERSION: ${{ steps.bump.outputs.new }}
+          CHANGELOG: ${{ inputs.changelog }}
+          COMMITS: ${{ steps.changelog.outputs.commits }}
+        run: |
+          {
+            echo "## Dry Run Summary"
+            echo "- **Bump**: $BUMP_TYPE"
+            echo "- **Version**: $OLD_VERSION → $NEW_VERSION"
+            echo "- **Changelog**: $CHANGELOG"
+            echo "- **Commits since last tag**:"
+            echo '```'
+            echo "$COMMITS"
+            echo '```'
+            echo ""
+            echo "No PR opened (dry run). A real run opens \`auto/bump-v${NEW_VERSION}\` against main with auto-merge armed; auto-release.yml and publish.yml take it from there."
+          } >> "$GITHUB_STEP_SUMMARY"

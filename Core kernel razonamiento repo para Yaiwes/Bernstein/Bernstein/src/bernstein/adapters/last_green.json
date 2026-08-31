@@ -1,0 +1,65 @@
+{
+  "adapters": {
+    "agy": {
+      "binary": "agy",
+      "receipt_sha256": "006fb946868db1d68aee03a2530b21981aec240fbf6e1ae663c272eb63e66a53",
+      "recorded_at": "2026-07-11T05:57:23Z",
+      "version": "1.0.0"
+    },
+    "aider": {
+      "binary": "aider",
+      "receipt_sha256": "7cf04d2c7f122e6f83704f6467768a1b6ab716d3f65e74153bcbc3a799f6bad9",
+      "recorded_at": "2026-08-29T11:23:38Z",
+      "version": "0.86.2"
+    },
+    "claude": {
+      "binary": "claude",
+      "receipt_sha256": "620ddf212dbf2e9db2ac8a06039c07f60df806c7bac611f588531415388894f1",
+      "recorded_at": "2026-08-29T11:23:38Z",
+      "version": "2.1.251"
+    },
+    "codex": {
+      "binary": "codex",
+      "receipt_sha256": "764d072cf4007aab9b4079833ec9aa9f85d6c228317716662cb4bd5b570f9a25",
+      "recorded_at": "2026-08-29T11:23:38Z",
+      "version": "0.151.0"
+    },
+    "copilot": {
+      "binary": "copilot",
+      "receipt_sha256": "4a817ded148aa728bbf86b7531333483e4470952cc89c33883e1edeb534dd339",
+      "recorded_at": "2026-08-29T11:23:38Z",
+      "version": "1.0.81"
+    },
+    "gemini": {
+      "binary": "gemini",
+      "receipt_sha256": "e56fcb0657a4b3307d62466610c47e295422c4a26f3bc3f991bb935a2d5314a7",
+      "recorded_at": "2026-08-29T11:23:38Z",
+      "version": "0.57.0"
+    },
+    "kimi": {
+      "binary": "kimi",
+      "receipt_sha256": "88bc11837712cf3c2eac70d4caee140d5835bbb0c3b38633702c168ab099cbb3",
+      "recorded_at": "2026-08-29T11:23:38Z",
+      "version": "1.49.0"
+    },
+    "opencode": {
+      "binary": "opencode",
+      "receipt_sha256": "ba3c967c0c15121546bf059d9d532a1d69dfddbdd1fadbd2b8e7597c85ec0b41",
+      "recorded_at": "2026-08-29T11:23:38Z",
+      "version": "1.18.25"
+    },
+    "pydantic_ai": {
+      "binary": "clai",
+      "receipt_sha256": "57f498ddd28884fbcb332fbb6a39d935bcdbf6e2a0e6dd192cf8b309beb1cb6e",
+      "recorded_at": "2026-08-29T11:23:38Z",
+      "version": "2.36.0"
+    },
+    "qwen": {
+      "binary": "qwen",
+      "receipt_sha256": "362afcdb722e6c1220904d5a45cec7f7cc14f04d4887bbd3ca4c88efe3350e64",
+      "recorded_at": "2026-08-29T11:23:38Z",
+      "version": "0.22.3"
+    }
+  },
+  "schema_version": 1
+}

@@ -1,0 +1,335 @@
+"""Unit tests for graceful drain coordinator."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from pathlib import Path
+from unittest.mock import AsyncMock, patch
+
+import httpx
+import pytest
+from bernstein.core.drain import DrainConfig, DrainCoordinator, DrainPhase, DrainReport
+
+
+def test_drain_config_defaults() -> None:
+    cfg = DrainConfig()
+    assert cfg.wait_timeout_s == 120
+    assert cfg.merge_timeout_s == 120
+    assert cfg.auto_commit is True
+    assert cfg.auto_merge is True
+
+
+def test_drain_phase_lifecycle_fields() -> None:
+    phase = DrainPhase(number=1, name="freeze", status="pending", detail="")
+    phase.status = "running"
+    phase.detail = "working"
+    phase.finished_at = 1.0
+
+    assert phase.name == "freeze"
+    assert phase.status == "running"
+    assert phase.detail == "working"
+    assert phase.finished_at == pytest.approx(1.0)
+
+
+def test_drain_report_defaults() -> None:
+    report = DrainReport()
+    assert report.tasks_done == 0
+    assert report.tasks_partial == 0
+    assert report.tasks_failed == 0
+    assert report.merges == []
+
+
+def test_build_phases_has_expected_order(tmp_path: Path) -> None:
+    coordinator = DrainCoordinator(tmp_path)
+    phases = DrainCoordinator._build_phases()  # pyright: ignore[reportPrivateUsage]
+
+    assert [phase.name for phase in phases] == ["freeze", "signal", "wait", "commit", "merge", "cleanup"]
+    assert [phase.number for phase in phases] == [1, 2, 3, 4, 5, 6]
+    assert coordinator.cancellable is True
+
+
+@pytest.mark.asyncio
+async def test_cancel_phase_one_cleans_flags(tmp_path: Path) -> None:
+    coordinator = DrainCoordinator(tmp_path)
+    coordinator._current_phase = 1  # pyright: ignore[reportPrivateUsage]
+
+    shutdown_file = tmp_path / ".sdd" / "runtime" / "signals" / "S-1" / "SHUTDOWN"
+    shutdown_file.parent.mkdir(parents=True, exist_ok=True)
+    shutdown_file.write_text("1", encoding="utf-8")
+    draining_flag = tmp_path / ".sdd" / "runtime" / "draining"
+    draining_flag.parent.mkdir(parents=True, exist_ok=True)
+    draining_flag.write_text("draining", encoding="utf-8")
+
+    class _Client:
+        async def __aenter__(self) -> _Client:
+            return self
+
+        async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
+            return None
+
+        async def post(self, url: str) -> object:
+            await asyncio.sleep(0)  # Async interface requirement
+            return object()
+
+    from bernstein.core import drain as drain_module
+
+    original_async_client = drain_module.httpx.AsyncClient
+    drain_module.httpx.AsyncClient = lambda timeout=5: _Client()  # type: ignore[assignment]
+    try:
+        await coordinator.cancel()
+    finally:
+        drain_module.httpx.AsyncClient = original_async_client
+
+    assert draining_flag.exists() is False
+    assert shutdown_file.exists() is False
+
+
+@pytest.mark.asyncio
+async def test_phase_freeze_falls_back_to_flag_on_http_error(tmp_path: Path) -> None:
+    coordinator = DrainCoordinator(tmp_path)
+    phase_freeze = coordinator._phase_freeze  # pyright: ignore[reportPrivateUsage]
+
+    class _Response:
+        def raise_for_status(self) -> None:
+            raise httpx.HTTPError("offline")
+
+    class _Client:
+        async def __aenter__(self) -> _Client:
+            return self
+
+        async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
+            return None
+
+        async def post(self, url: str) -> _Response:
+            await asyncio.sleep(0)  # Async interface requirement
+            return _Response()
+
+    from bernstein.core import drain as drain_module
+
+    original_async_client = drain_module.httpx.AsyncClient
+    drain_module.httpx.AsyncClient = lambda timeout=5: _Client()  # type: ignore[assignment]
+    try:
+        await phase_freeze()
+    finally:
+        drain_module.httpx.AsyncClient = original_async_client
+
+    draining_flag = tmp_path / ".sdd" / "runtime" / "draining"
+    assert draining_flag.exists()
+    assert draining_flag.read_text(encoding="utf-8") == "draining"
+
+
+@pytest.mark.asyncio
+async def test_stop_infrastructure_uses_pid_files_and_supervisor_state(tmp_path: Path) -> None:
+    coordinator = DrainCoordinator(tmp_path)
+    runtime_dir = tmp_path / ".sdd" / "runtime"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    (runtime_dir / "watchdog.pid").write_text("101", encoding="utf-8")
+    (runtime_dir / "spawner.pid").write_text("202", encoding="utf-8")
+    (runtime_dir / "supervisor_state.json").write_text(
+        json.dumps(
+            {
+                "started_at": 1.0,
+                "restart_count": 0,
+                "current_pid": 303,
+                "last_restart_at": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    calls: list[tuple[int | None, str]] = []
+
+    async def _record(pid: int | None, label: str) -> None:
+        await asyncio.sleep(0)  # Async interface requirement
+        calls.append((pid, label))
+
+    with patch.object(coordinator, "_terminate_process", side_effect=_record):
+        await coordinator._stop_infrastructure()  # pyright: ignore[reportPrivateUsage]
+
+    assert calls == [(101, "watchdog"), (202, "spawner"), (303, "task server")]
+
+
+@pytest.mark.asyncio
+async def test_phase_cleanup_stops_infrastructure_and_removes_draining_flag(tmp_path: Path) -> None:
+    coordinator = DrainCoordinator(tmp_path)
+    runtime_dir = tmp_path / ".sdd" / "runtime"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    draining_flag = runtime_dir / "draining"
+    draining_flag.write_text("draining", encoding="utf-8")
+
+    with patch.object(coordinator, "_stop_infrastructure", new=AsyncMock()) as mock_stop:
+        await coordinator._phase_cleanup()  # pyright: ignore[reportPrivateUsage]
+
+    mock_stop.assert_called_once()
+    assert draining_flag.exists() is False
+
+
+def _write_agents_json(tmp_path: Path, pid: int) -> None:
+    runtime_dir = tmp_path / ".sdd" / "runtime"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    (runtime_dir / "agents.json").write_text(
+        json.dumps([{"session_id": "s-1", "role": "backend", "pid": pid, "worktree_path": ""}]),
+        encoding="utf-8",
+    )
+
+
+def test_discover_agents_from_agents_json_skips_dead_pid(tmp_path: Path) -> None:
+    coordinator = DrainCoordinator(tmp_path)
+    _write_agents_json(tmp_path, pid=999999)
+
+    from bernstein.core import drain as drain_module
+
+    with patch.object(drain_module, "_is_process_alive", return_value=False):
+        coordinator._discover_agents_from_agents_json()  # pyright: ignore[reportPrivateUsage]
+
+    assert coordinator._agents == []  # pyright: ignore[reportPrivateUsage]
+
+
+def test_discover_agents_from_agents_json_admits_live_pid(tmp_path: Path) -> None:
+    coordinator = DrainCoordinator(tmp_path)
+    _write_agents_json(tmp_path, pid=123)
+
+    from bernstein.core import drain as drain_module
+
+    with patch.object(drain_module, "_is_process_alive", return_value=True):
+        coordinator._discover_agents_from_agents_json()  # pyright: ignore[reportPrivateUsage]
+
+    assert [a.session_id for a in coordinator._agents] == ["s-1"]  # pyright: ignore[reportPrivateUsage]
+
+
+def _git(repo: Path, *args: str) -> str:
+    import subprocess
+
+    res = subprocess.run(
+        ["git", *args],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return res.stdout.strip()
+
+
+def test_drain_rescues_unmerged_agent_branch(tmp_path: Path) -> None:
+    """Drain on a repo with an unmerged agent branch leaves a rescue ref at its tip and no branch (#4677)."""
+    # 1. Initialize real git repository
+    _git(tmp_path, "-c", "init.defaultBranch=main", "init", "--quiet")
+    _git(tmp_path, "config", "user.name", "Test User")
+    _git(tmp_path, "config", "user.email", "test@example.com")
+    (tmp_path / "README.md").write_text("# Test Repo\n", encoding="utf-8")
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-m", "initial commit", "--quiet")
+
+    # 2. Create unmerged agent branch
+    _git(tmp_path, "checkout", "-b", "agent/sess-unmerged", "--quiet")
+    (tmp_path / "work.txt").write_text("unmerged work\n", encoding="utf-8")
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-m", "unmerged agent work", "--quiet")
+    unmerged_sha = _git(tmp_path, "rev-parse", "HEAD")
+
+    # 3. Switch back to main and run drain cleanup of agent branches
+    _git(tmp_path, "checkout", "main", "--quiet")
+    coordinator = DrainCoordinator(tmp_path)
+    coordinator._run_id = "test-run-123"  # pyright: ignore[reportPrivateUsage]
+
+    deleted = coordinator._delete_agent_branches()  # pyright: ignore[reportPrivateUsage]
+    assert deleted == 1
+
+    # 4. Assert branch is deleted
+    branches = _git(tmp_path, "branch", "--list", "agent/sess-unmerged")
+    assert branches == ""
+
+    # 5. Assert rescue ref exists and points to the unmerged commit tip
+    rescue_ref = "refs/rescue/test-run-123/agent/sess-unmerged"
+    rescued_sha = _git(tmp_path, "rev-parse", rescue_ref)
+    assert rescued_sha == unmerged_sha
+
+
+def test_drain_does_not_tag_merged_agent_branch(tmp_path: Path) -> None:
+    """Drain on a merged agent branch deletes the branch without creating a rescue ref (#4677)."""
+    # 1. Initialize real git repository
+    _git(tmp_path, "-c", "init.defaultBranch=main", "init", "--quiet")
+    _git(tmp_path, "config", "user.name", "Test User")
+    _git(tmp_path, "config", "user.email", "test@example.com")
+    (tmp_path / "README.md").write_text("# Test Repo\n", encoding="utf-8")
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-m", "initial commit", "--quiet")
+
+    # 2. Create agent branch and merge into main
+    _git(tmp_path, "checkout", "-b", "agent/sess-merged", "--quiet")
+    (tmp_path / "merged.txt").write_text("merged work\n", encoding="utf-8")
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-m", "merged agent work", "--quiet")
+    _git(tmp_path, "checkout", "main", "--quiet")
+    _git(tmp_path, "merge", "agent/sess-merged", "--quiet")
+
+    # 3. Run drain
+    coordinator = DrainCoordinator(tmp_path)
+    coordinator._run_id = "test-run-456"  # pyright: ignore[reportPrivateUsage]
+
+    deleted = coordinator._delete_agent_branches()  # pyright: ignore[reportPrivateUsage]
+    assert deleted == 1
+
+    # 4. Assert branch is deleted and no rescue ref was created
+    branches = _git(tmp_path, "branch", "--list", "agent/sess-merged")
+    assert branches == ""
+
+    rescue_refs = _git(tmp_path, "for-each-ref", "refs/rescue/**")
+    assert rescue_refs == ""
+
+
+def test_safe_force_delete_is_only_branch_D_callsite_in_drain_and_hygiene() -> None:
+    """The safe_force_delete_branch helper is the only branch -D call site in drain.py and git_hygiene.py (#4677)."""
+    repo_root = Path(__file__).resolve().parents[2]
+    drain_py = repo_root / "src" / "bernstein" / "core" / "orchestration" / "drain.py"
+    hygiene_py = repo_root / "src" / "bernstein" / "core" / "git" / "git_hygiene.py"
+
+    drain_text = drain_py.read_text(encoding="utf-8")
+    hygiene_text = hygiene_py.read_text(encoding="utf-8")
+
+    # drain.py must not contain direct branch -D
+    assert '"branch", "-D"' not in drain_text
+    assert "'branch', '-D'" not in drain_text
+
+    # git_hygiene.py must contain exactly one branch -D, inside safe_force_delete_branch
+    assert hygiene_text.count('"branch", "-D"') == 1
+
+
+def test_drain_refuses_deletion_if_rescue_fails(tmp_path: Path) -> None:
+    """If rescue ref creation fails, safe_force_delete_branch returns (False, None) and preserves the branch (#4677)."""
+    from bernstein.core.git.git_hygiene import safe_force_delete_branch
+
+    # 1. Initialize real git repository
+    _git(tmp_path, "-c", "init.defaultBranch=main", "init", "--quiet")
+    _git(tmp_path, "config", "user.name", "Test User")
+    _git(tmp_path, "config", "user.email", "test@example.com")
+    (tmp_path / "README.md").write_text("# Test Repo\n", encoding="utf-8")
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-m", "initial commit", "--quiet")
+
+    # 2. Create unmerged agent branch
+    _git(tmp_path, "checkout", "-b", "agent/sess-preserve", "--quiet")
+    (tmp_path / "work.txt").write_text("unmerged work\n", encoding="utf-8")
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-m", "unmerged agent work", "--quiet")
+    _git(tmp_path, "checkout", "main", "--quiet")
+
+    # 3. Create a conflicting ref that blocks refs/rescue/blocked-run/agent/sess-preserve
+    # (creating refs/rescue/blocked-run as a direct ref causes directory/file conflict)
+    _git(tmp_path, "update-ref", "refs/rescue/blocked-run", "HEAD")
+
+    # 4. Attempt deletion under the blocked run-id
+    deleted, rescue_ref = safe_force_delete_branch(
+        tmp_path,
+        "agent/sess-preserve",
+        run_id="blocked-run",
+    )
+
+    # Must refuse to delete and return (False, None)
+    assert deleted is False
+    assert rescue_ref is None
+
+    # Branch must still exist intact
+    branches = _git(tmp_path, "branch", "--list", "agent/sess-preserve")
+    assert "agent/sess-preserve" in branches

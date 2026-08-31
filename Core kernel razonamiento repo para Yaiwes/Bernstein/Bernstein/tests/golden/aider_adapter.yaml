@@ -1,0 +1,28 @@
+name: aider_adapter_spawn
+adapter_class: bernstein.adapters.aider.AiderAdapter
+steps:
+  - prompt: "fix the bug in main.py"
+    model: "sonnet"
+    expected_pid: 3456
+    inner_argv:
+      - "aider"
+      - "--model"
+      - "anthropic/claude-sonnet-4-6"
+      - "--message"
+      - "fix the bug in main.py"
+      - "--yes-always"
+      - "--auto-commits"
+      - "--map-tokens"
+      - "2048"
+      - "--no-auto-lint"
+      - "--analytics-log"
+      # Per-session path under the worktree, so it is not reproducible
+      # across runs. Named below so the comparison strips the argument
+      # and asserts only that the flag is still emitted.
+      - "<per-session path>"
+    required_json_flags:
+      - "--analytics-log"
+    env_extra_keys:
+      - "ANTHROPIC_API_KEY"
+      - "OPENAI_API_KEY"
+      - "AZURE_OPENAI_API_KEY"

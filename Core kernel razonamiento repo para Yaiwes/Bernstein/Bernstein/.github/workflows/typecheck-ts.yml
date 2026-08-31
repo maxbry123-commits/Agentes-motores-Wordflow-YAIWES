@@ -1,0 +1,160 @@
+name: TypeScript typecheck
+
+# tsc --noEmit gate for every TypeScript package in the tree.
+#
+# Problem
+# -------
+# Before this workflow existed, no CI job ran ``tsc --noEmit`` on the
+# TypeScript packages outside ``packages/vscode`` (publish-extension.yml
+# already covers that one). PRs that broke types in ``sdk/typescript``,
+# ``web``, or ``templates/cloudflare-mcp-server`` were merged green
+# because:
+#
+#  1. ``ci.yml`` paths-ignores ``sdk/typescript/**`` and
+#     ``packages/vscode/**`` -- it never sees those diffs.
+#  2. ``ci-gate-stub.yml`` fires on those paths but emits a synthetic
+#     ``CI gate`` success without running any TS tooling.
+#
+# A regression coverage gap surfaced this when the Renovate ``typescript
+# v5 -> v6`` PR slipped through with 45 typecheck errors no required
+# check would catch.
+#
+# The same gap reappeared one level down. The Workers template named in
+# this comment was listed in neither the trigger nor the matrix, so an
+# ``agents ^0.19 -> ^0.20`` bump to its manifest merged with no
+# TypeScript job having run at all. Declared coverage and actual
+# coverage are now asserted against the tree by
+# ``tests/unit/test_typecheck_ts_workflow_yaml.py`` rather than kept in
+# agreement by hand.
+#
+# Fix
+# ---
+# This workflow runs ``tsc --noEmit`` (or ``tsc -b`` for composite
+# projects) on every TypeScript package on PRs that touch TS sources,
+# tsconfigs, or package manifests. It does NOT emit a check named
+# ``CI gate`` -- the canary in ``tests/unit/test_required_check_canary
+# _workflow_yaml.py`` allow-lists exactly two emitters of that string
+# (ci.yml + ci-gate-stub.yml) and rejects a third.
+#
+# Merge queue
+# -----------
+# #4073. ``ci.yml`` paths-ignores ``sdk/typescript/**`` and
+# ``packages/vscode/**``, and ``CI gate`` is the only required context,
+# so nothing required has an opinion about the TypeScript trees: a type
+# error under ``web/`` merges green. That is #4010's shape one directory
+# over, and the fix is the same two steps in the same order. This lane
+# now reports on a queued ref, so branch protection *can* require it. It
+# is not required yet -- that is a repository-settings change, and the
+# ordering matters in one direction only. A required context that cannot
+# report on a queued ref wedges the queue: every entry waits forever for
+# a check that never arrives (docs/operations/merge-queue.md,
+# troubleshooting row 1). Trigger first, requirement second, never the
+# reverse.
+#
+# The paragraph this replaced said "do NOT promote this workflow's job
+# names to required branch-protection contexts while it has no
+# ``merge_group`` trigger". The ban is lifted; the caution it was made
+# of is not, and it is now in the runbook where the person throwing the
+# switch will be looking.
+#
+# What promoting it means here is **four** contexts, not one. The job
+# name is ``typecheck (${{ matrix.package }})`` and the matrix has a
+# cell per TypeScript package, so the lane publishes one check per cell
+# and every one of them has to be listed. Worse, the matrix is not a
+# constant: ``test_every_typescript_package_is_in_the_matrix`` derives
+# it from the tree, so adding a package silently adds an unrequired
+# context and removing one silently strips a required context of its
+# emitter -- a hole and a wedge respectively. The four names are
+# enumerated in the runbook and
+# ``test_queue_reporting_lane_contexts_are_named_in_the_runbook`` fails
+# if the matrix and that list stop agreeing.
+#
+# The ``merge_group`` trigger carries no ``paths`` filter, deliberately.
+# GitHub evaluates ``paths`` / ``paths-ignore`` for ``push``,
+# ``pull_request`` and ``pull_request_target`` only, so copying the
+# filter down from the ``pull_request`` trigger would not filter
+# anything -- it would read as a restriction while being ignored. It
+# would also be the wrong intent: a queue batch stacks several pull
+# requests, so the batch can carry a TypeScript change the entry being
+# tested does not, and a context that reports on only some entries
+# cannot be required at all.
+#
+# Each matrix cell carries its own install command because ``npm ci``
+# aborts rather than resolving a manifest when the package has no
+# lockfile. The template is scaffolding that consumers copy and install
+# themselves, so it stays lock-free and its cell resolves the declared
+# ranges -- which is the tree a dependency bump to that manifest
+# actually produces. Resolving ranges also means the packages whose
+# lifecycle scripts would run are not visible in the pull request diff
+# the way a lockfile change is, so that cell installs with
+# ``--ignore-scripts``; type declarations land on disk either way.
+
+on:
+  merge_group: {}
+  pull_request:
+    paths:
+      - "sdk/typescript/**"
+      - "packages/vscode/**"
+      - "web/**"
+      - "templates/cloudflare-mcp-server/**"
+      - ".github/workflows/typecheck-ts.yml"
+  push:
+    branches: [main]
+    paths:
+      - "sdk/typescript/**"
+      - "packages/vscode/**"
+      - "web/**"
+      - "templates/cloudflare-mcp-server/**"
+      - ".github/workflows/typecheck-ts.yml"
+
+concurrency:
+  group: typecheck-ts-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  typecheck:
+    name: typecheck (${{ matrix.package }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package: sdk/typescript
+            install: npm ci
+            command: npx tsc --noEmit
+          - package: packages/vscode
+            install: npm ci
+            command: npx tsc --noEmit
+          - package: web
+            install: npm ci
+            command: npx tsc -b
+          - package: templates/cloudflare-mcp-server
+            install: npm install --no-audit --no-fund --ignore-scripts
+            command: npx tsc --noEmit
+    steps:
+      - name: Harden runner (audit mode)
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7 # zizmor: ignore[cache-poisoning]
+        with:
+          node-version: '24'
+
+      - name: Install dependencies
+        working-directory: ${{ matrix.package }}
+        run: ${{ matrix.install }}
+
+      - name: Type check
+        working-directory: ${{ matrix.package }}
+        run: ${{ matrix.command }}

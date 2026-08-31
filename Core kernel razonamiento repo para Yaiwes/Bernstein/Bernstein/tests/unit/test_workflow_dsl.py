@@ -1,0 +1,1397 @@
+"""Tests for the workflow DSL module."""
+
+from __future__ import annotations
+
+import textwrap
+from typing import TYPE_CHECKING
+
+import pytest
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+from bernstein.core.models import Task, TaskStatus
+from bernstein.core.workflow import WorkflowDefinition, WorkflowPhase
+from bernstein.core.workflow_dsl import (
+    BLOCKING_CAUSE_METADATA_KEY,
+    BLOCKING_NODE_METADATA_KEY,
+    SKIPPED_EDGES_METADATA_KEY,
+    ConditionError,
+    ConditionExpr,
+    DAGEdge,
+    DAGExecutor,
+    DAGNode,
+    DSLError,
+    EdgeResolution,
+    RetryPolicy,
+    WorkflowDAG,
+    build_condition_context,
+    parse_workflow_yaml,
+    validate_dag,
+)
+
+from bernstein.core.knowledge.task_graph import EdgeType
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _task(
+    task_id: str,
+    role: str = "backend",
+    status: TaskStatus = TaskStatus.OPEN,
+    result_summary: str | None = None,
+) -> Task:
+    """Create a minimal task for testing."""
+    return Task(
+        id=task_id,
+        title=f"Task {task_id}",
+        description="test",
+        role=role,
+        status=status,
+        result_summary=result_summary,
+    )
+
+
+def _simple_definition() -> WorkflowDefinition:
+    """Create a simple 3-phase workflow definition."""
+    return WorkflowDefinition(
+        name="test",
+        phases=(
+            WorkflowPhase(name="plan"),
+            WorkflowPhase(name="implement"),
+            WorkflowPhase(name="verify"),
+        ),
+    )
+
+
+def _simple_dag() -> WorkflowDAG:
+    """Create a simple DAG: A -> B -> C across three phases."""
+    return WorkflowDAG(
+        definition=_simple_definition(),
+        nodes=(
+            DAGNode(id="a", phase="plan", role="manager"),
+            DAGNode(id="b", phase="implement", role="backend"),
+            DAGNode(id="c", phase="verify", role="qa"),
+        ),
+        edges=(
+            DAGEdge(source="a", target="b"),
+            DAGEdge(source="b", target="c"),
+        ),
+    )
+
+
+def _write_yaml(tmp_path: Path, content: str) -> Path:
+    """Write YAML content to a temp file and return the path."""
+    p = tmp_path / "workflow.yaml"
+    p.write_text(textwrap.dedent(content))
+    return p
+
+
+# ===========================================================================
+# ConditionExpr tests
+# ===========================================================================
+
+
+class TestConditionExpr:
+    def test_simple_equality(self) -> None:
+        expr = ConditionExpr(raw="status == 'done'")
+        assert expr.evaluate({"status": "done"})
+        assert not expr.evaluate({"status": "failed"})
+
+    def test_not_equal(self) -> None:
+        expr = ConditionExpr(raw="status != 'failed'")
+        assert expr.evaluate({"status": "done"})
+        assert not expr.evaluate({"status": "failed"})
+
+    def test_numeric_comparison(self) -> None:
+        expr = ConditionExpr(raw="output.count > 5")
+        assert expr.evaluate({"output": {"count": 10}})
+        assert not expr.evaluate({"output": {"count": 3}})
+
+    def test_and_operator(self) -> None:
+        expr = ConditionExpr(raw="status == 'done' and output.passed == true")
+        assert expr.evaluate({"status": "done", "output": {"passed": True}})
+        assert not expr.evaluate({"status": "done", "output": {"passed": False}})
+
+    def test_or_operator(self) -> None:
+        expr = ConditionExpr(raw="status == 'done' or status == 'cancelled'")
+        assert expr.evaluate({"status": "done"})
+        assert expr.evaluate({"status": "cancelled"})
+        assert not expr.evaluate({"status": "failed"})
+
+    def test_not_operator(self) -> None:
+        expr = ConditionExpr(raw="not status == 'failed'")
+        assert expr.evaluate({"status": "done"})
+        assert not expr.evaluate({"status": "failed"})
+
+    def test_nested_attribute(self) -> None:
+        expr = ConditionExpr(raw="output.test.result == 'passed'")
+        assert expr.evaluate({"output": {"test": {"result": "passed"}}})
+
+    def test_in_operator(self) -> None:
+        expr = ConditionExpr(raw="status in ['done', 'cancelled']")
+        assert expr.evaluate({"status": "done"})
+        assert not expr.evaluate({"status": "failed"})
+
+    def test_invalid_syntax(self) -> None:
+        with pytest.raises(ConditionError, match="Invalid condition syntax"):
+            ConditionExpr(raw="status ==== 'done'")
+
+    def test_unsafe_node_rejected(self) -> None:
+        with pytest.raises(ConditionError, match="Unsafe expression node"):
+            ConditionExpr(raw="__import__('os').system('ls')")
+
+    def test_unknown_variable(self) -> None:
+        expr = ConditionExpr(raw="unknown_var == 'x'")
+        with pytest.raises(ConditionError, match="Unknown variable"):
+            expr.evaluate({})
+
+    def test_missing_attribute_returns_none(self) -> None:
+        expr = ConditionExpr(raw="output.missing == null")
+        assert expr.evaluate({"output": {}})
+
+    def test_subscript_dict(self) -> None:
+        expr = ConditionExpr(raw="output['key'] == 'val'")
+        assert expr.evaluate({"output": {"key": "val"}})
+
+    def test_subscript_missing_key(self) -> None:
+        expr = ConditionExpr(raw="output['missing'] == null")
+        assert expr.evaluate({"output": {}})
+
+    def test_boolean_literals(self) -> None:
+        expr = ConditionExpr(raw="output.flag == true")
+        assert expr.evaluate({"output": {"flag": True}})
+        assert not expr.evaluate({"output": {"flag": False}})
+
+
+class TestBuildConditionContext:
+    def test_basic_context(self) -> None:
+        task = _task("t1", status=TaskStatus.DONE, result_summary="hello")
+        ctx = build_condition_context(task)
+        assert ctx["status"] == "done"
+        assert ctx["result"] == "hello"
+        assert ctx["output"] == {}
+
+    def test_json_result_summary(self) -> None:
+        task = _task("t1", status=TaskStatus.DONE, result_summary='{"tests_passed": true, "count": 42}')
+        ctx = build_condition_context(task)
+        assert ctx["output"]["tests_passed"] is True
+        assert ctx["output"]["count"] == 42
+
+    def test_none_result(self) -> None:
+        task = _task("t1", status=TaskStatus.OPEN)
+        ctx = build_condition_context(task)
+        assert ctx["result"] == ""
+        assert ctx["output"] == {}
+
+
+# ===========================================================================
+# YAML parser tests
+# ===========================================================================
+
+
+class TestParseWorkflowYaml:
+    def test_minimal_workflow(self, tmp_path: Path) -> None:
+        path = _write_yaml(
+            tmp_path,
+            """\
+            name: test-wf
+            version: "1.0.0"
+            phases:
+              - plan
+              - implement
+            nodes:
+              task-a:
+                phase: plan
+                role: manager
+              task-b:
+                phase: implement
+                role: backend
+                depends_on:
+                  - task-a
+            """,
+        )
+        dag = parse_workflow_yaml(path)
+        assert dag.definition.name == "test-wf"
+        assert dag.definition.version == "1.0.0"
+        assert len(dag.nodes) == 2
+        assert len(dag.edges) == 1
+        assert dag.edges[0].source == "task-a"
+        assert dag.edges[0].target == "task-b"
+
+    def test_phase_with_options(self, tmp_path: Path) -> None:
+        path = _write_yaml(
+            tmp_path,
+            """\
+            name: test
+            phases:
+              - name: plan
+                allowed_roles: [manager]
+              - name: impl
+                requires_approval: true
+            nodes:
+              a:
+                phase: plan
+                role: manager
+              b:
+                phase: impl
+                role: backend
+                depends_on: [a]
+            """,
+        )
+        dag = parse_workflow_yaml(path)
+        assert dag.definition.phases[0].allowed_roles == frozenset({"manager"})
+        assert dag.definition.phases[1].requires_approval is True
+
+    def test_conditional_edge(self, tmp_path: Path) -> None:
+        path = _write_yaml(
+            tmp_path,
+            """\
+            name: test
+            phases:
+              - plan
+              - impl
+            nodes:
+              a:
+                phase: plan
+                role: manager
+              b:
+                phase: impl
+                role: backend
+                depends_on:
+                  - source: a
+                    condition: "status == 'done'"
+            """,
+        )
+        dag = parse_workflow_yaml(path)
+        assert dag.edges[0].condition is not None
+        assert dag.edges[0].condition.raw == "status == 'done'"
+
+    def test_typed_edge(self, tmp_path: Path) -> None:
+        path = _write_yaml(
+            tmp_path,
+            """\
+            name: test
+            phases:
+              - plan
+              - verify
+            nodes:
+              a:
+                phase: plan
+                role: manager
+              b:
+                phase: verify
+                role: qa
+                depends_on:
+                  - source: a
+                    edge_type: validates
+            """,
+        )
+        dag = parse_workflow_yaml(path)
+        assert dag.edges[0].edge_type == EdgeType.VALIDATES
+
+    def test_retry_policy(self, tmp_path: Path) -> None:
+        path = _write_yaml(
+            tmp_path,
+            """\
+            name: test
+            phases:
+              - plan
+              - impl
+            nodes:
+              a:
+                phase: plan
+                role: manager
+              b:
+                phase: impl
+                role: backend
+                depends_on:
+                  - source: a
+                    condition: "status == 'failed'"
+                retry:
+                  max_attempts: 3
+                  until: "status == 'done'"
+            """,
+        )
+        dag = parse_workflow_yaml(path)
+        node_b = dag.node_map["b"]
+        assert node_b.retry is not None
+        assert node_b.retry.max_attempts == 3
+        assert node_b.retry.until is not None
+
+    def test_fan_out_fan_in(self, tmp_path: Path) -> None:
+        path = _write_yaml(
+            tmp_path,
+            """\
+            name: fanout
+            phases:
+              - plan
+              - impl
+              - verify
+            nodes:
+              root:
+                phase: plan
+                role: manager
+              work-a:
+                phase: impl
+                role: backend
+                depends_on: [root]
+              work-b:
+                phase: impl
+                role: frontend
+                depends_on: [root]
+              merge:
+                phase: verify
+                role: qa
+                depends_on:
+                  - work-a
+                  - work-b
+            """,
+        )
+        dag = parse_workflow_yaml(path)
+        # Fan-out: root -> work-a, root -> work-b
+        root_edges = [e for e in dag.edges if e.source == "root"]
+        assert len(root_edges) == 2
+        # Fan-in: work-a -> merge, work-b -> merge
+        merge_edges = [e for e in dag.edges if e.target == "merge"]
+        assert len(merge_edges) == 2
+
+    def test_missing_name_raises(self, tmp_path: Path) -> None:
+        path = _write_yaml(
+            tmp_path,
+            """\
+            phases:
+              - plan
+            nodes:
+              a:
+                phase: plan
+                role: manager
+            """,
+        )
+        with pytest.raises(DSLError, match="'name' must be"):
+            parse_workflow_yaml(path)
+
+    def test_missing_phases_raises(self, tmp_path: Path) -> None:
+        path = _write_yaml(
+            tmp_path,
+            """\
+            name: test
+            nodes:
+              a:
+                phase: plan
+                role: manager
+            """,
+        )
+        with pytest.raises(DSLError, match="'phases' must be"):
+            parse_workflow_yaml(path)
+
+    def test_missing_nodes_raises(self, tmp_path: Path) -> None:
+        path = _write_yaml(
+            tmp_path,
+            """\
+            name: test
+            phases:
+              - plan
+            """,
+        )
+        with pytest.raises(DSLError, match="'nodes' must be"):
+            parse_workflow_yaml(path)
+
+    def test_invalid_yaml_raises(self, tmp_path: Path) -> None:
+        path = tmp_path / "bad.yaml"
+        path.write_text("key: [unterminated")
+        with pytest.raises(DSLError, match="Invalid YAML"):
+            parse_workflow_yaml(path)
+
+    def test_unknown_phase_in_node_raises(self, tmp_path: Path) -> None:
+        path = _write_yaml(
+            tmp_path,
+            """\
+            name: test
+            phases:
+              - plan
+            nodes:
+              a:
+                phase: nonexistent
+                role: manager
+            """,
+        )
+        with pytest.raises(DSLError, match="unknown phase"):
+            parse_workflow_yaml(path)
+
+    def test_unknown_edge_source_raises(self, tmp_path: Path) -> None:
+        path = _write_yaml(
+            tmp_path,
+            """\
+            name: test
+            phases:
+              - plan
+            nodes:
+              a:
+                phase: plan
+                role: manager
+                depends_on:
+                  - nonexistent
+            """,
+        )
+        with pytest.raises(DSLError, match="not found in nodes"):
+            parse_workflow_yaml(path)
+
+    def test_invalid_condition_raises(self, tmp_path: Path) -> None:
+        path = _write_yaml(
+            tmp_path,
+            """\
+            name: test
+            phases:
+              - plan
+              - impl
+            nodes:
+              a:
+                phase: plan
+                role: manager
+              b:
+                phase: impl
+                role: backend
+                depends_on:
+                  - source: a
+                    condition: "def foo():"
+            """,
+        )
+        with pytest.raises(DSLError, match="condition"):
+            parse_workflow_yaml(path)
+
+
+# ===========================================================================
+# DAG validation tests
+# ===========================================================================
+
+
+class TestValidateDAG:
+    def test_valid_linear_dag(self) -> None:
+        dag = _simple_dag()
+        result = validate_dag(dag)
+        assert result.is_valid
+        assert result.errors == []
+
+    def test_cycle_detected(self) -> None:
+        dag = WorkflowDAG(
+            definition=_simple_definition(),
+            nodes=(
+                DAGNode(id="a", phase="plan", role="manager"),
+                DAGNode(id="b", phase="implement", role="backend"),
+            ),
+            edges=(
+                DAGEdge(source="a", target="b"),
+                DAGEdge(source="b", target="a"),  # cycle
+            ),
+        )
+        result = validate_dag(dag)
+        assert not result.is_valid
+        assert any("Cycle" in e or "backward" in e.lower() for e in result.errors)
+
+    def test_unreachable_node(self) -> None:
+        dag = WorkflowDAG(
+            definition=_simple_definition(),
+            nodes=(
+                DAGNode(id="a", phase="plan", role="manager"),
+                DAGNode(id="b", phase="implement", role="backend"),
+                DAGNode(id="c", phase="verify", role="qa"),
+            ),
+            edges=(
+                DAGEdge(source="a", target="b"),
+                # c has no incoming edges from roots, but is not a root itself
+                # Actually c IS a root (no incoming edges), so it's reachable.
+            ),
+        )
+        result = validate_dag(dag)
+        # c is a root node, so it's reachable.
+        assert result.is_valid
+
+    def test_truly_unreachable_node(self) -> None:
+        dag = WorkflowDAG(
+            definition=_simple_definition(),
+            nodes=(
+                DAGNode(id="a", phase="plan", role="manager"),
+                DAGNode(id="b", phase="implement", role="backend"),
+                DAGNode(id="c", phase="verify", role="qa"),
+                DAGNode(id="d", phase="verify", role="qa"),
+            ),
+            edges=(
+                DAGEdge(source="a", target="b"),
+                # c -> d forms a disconnected subgraph
+                DAGEdge(source="c", target="d"),
+            ),
+        )
+        result = validate_dag(dag)
+        # c and d are reachable (c is a root, d is reachable from c)
+        assert result.is_valid
+
+    def test_backward_unconditional_edge(self) -> None:
+        dag = WorkflowDAG(
+            definition=_simple_definition(),
+            nodes=(
+                DAGNode(id="a", phase="plan", role="manager"),
+                DAGNode(id="b", phase="verify", role="qa"),
+            ),
+            edges=(
+                DAGEdge(source="b", target="a"),  # verify -> plan = backward
+            ),
+        )
+        result = validate_dag(dag)
+        assert not result.is_valid
+        assert any("backward" in e.lower() for e in result.errors)
+
+    def test_backward_conditional_edge_warning(self) -> None:
+        dag = WorkflowDAG(
+            definition=_simple_definition(),
+            nodes=(
+                DAGNode(id="a", phase="plan", role="manager"),
+                DAGNode(id="b", phase="implement", role="backend"),
+                DAGNode(id="c", phase="verify", role="qa"),
+            ),
+            edges=(
+                DAGEdge(source="a", target="b"),
+                DAGEdge(source="b", target="c"),
+                DAGEdge(
+                    source="c",
+                    target="b",
+                    condition=ConditionExpr(raw="status == 'failed'"),
+                ),
+            ),
+        )
+        result = validate_dag(dag)
+        assert result.is_valid  # conditional backward is OK
+        assert any("loop pattern" in w.lower() for w in result.warnings)
+
+    def test_unknown_edge_source(self) -> None:
+        dag = WorkflowDAG(
+            definition=_simple_definition(),
+            nodes=(DAGNode(id="a", phase="plan", role="manager"),),
+            edges=(DAGEdge(source="nonexistent", target="a"),),
+        )
+        result = validate_dag(dag)
+        assert not result.is_valid
+        assert any("not found" in e for e in result.errors)
+
+    def test_unknown_node_phase(self) -> None:
+        dag = WorkflowDAG(
+            definition=_simple_definition(),
+            nodes=(DAGNode(id="a", phase="nonexistent", role="manager"),),
+            edges=(),
+        )
+        result = validate_dag(dag)
+        assert not result.is_valid
+        assert any("unknown phase" in e for e in result.errors)
+
+
+# ===========================================================================
+# DAG executor tests
+# ===========================================================================
+
+
+class TestEdgeResolution:
+    def test_unconditional_done_is_satisfied(self) -> None:
+        dag = _simple_dag()
+        executor = DAGExecutor(dag)
+        edge = dag.edges[0]  # a -> b, unconditional
+        tasks = {"a": _task("a", status=TaskStatus.DONE)}
+        assert executor.resolve_edge(edge, tasks) == EdgeResolution.SATISFIED
+
+    def test_unconditional_pending(self) -> None:
+        dag = _simple_dag()
+        executor = DAGExecutor(dag)
+        edge = dag.edges[0]
+        tasks = {"a": _task("a", status=TaskStatus.IN_PROGRESS)}
+        assert executor.resolve_edge(edge, tasks) == EdgeResolution.PENDING
+
+    def test_unconditional_failed_is_skipped(self) -> None:
+        dag = _simple_dag()
+        executor = DAGExecutor(dag)
+        edge = dag.edges[0]
+        tasks = {"a": _task("a", status=TaskStatus.FAILED)}
+        assert executor.resolve_edge(edge, tasks) == EdgeResolution.SKIPPED
+
+    def test_unconditional_missing_task_is_pending(self) -> None:
+        dag = _simple_dag()
+        executor = DAGExecutor(dag)
+        edge = dag.edges[0]
+        assert executor.resolve_edge(edge, {}) == EdgeResolution.PENDING
+
+    def test_conditional_satisfied(self) -> None:
+        dag = WorkflowDAG(
+            definition=_simple_definition(),
+            nodes=(
+                DAGNode(id="a", phase="plan", role="manager"),
+                DAGNode(id="b", phase="implement", role="backend"),
+            ),
+            edges=(
+                DAGEdge(
+                    source="a",
+                    target="b",
+                    condition=ConditionExpr(raw="status == 'done'"),
+                ),
+            ),
+        )
+        executor = DAGExecutor(dag)
+        edge = dag.edges[0]
+        tasks = {"a": _task("a", status=TaskStatus.DONE)}
+        assert executor.resolve_edge(edge, tasks) == EdgeResolution.SATISFIED
+
+    def test_conditional_skipped(self) -> None:
+        dag = WorkflowDAG(
+            definition=_simple_definition(),
+            nodes=(
+                DAGNode(id="a", phase="plan", role="manager"),
+                DAGNode(id="b", phase="implement", role="backend"),
+            ),
+            edges=(
+                DAGEdge(
+                    source="a",
+                    target="b",
+                    condition=ConditionExpr(raw="status == 'done'"),
+                ),
+            ),
+        )
+        executor = DAGExecutor(dag)
+        edge = dag.edges[0]
+        tasks = {"a": _task("a", status=TaskStatus.FAILED)}
+        assert executor.resolve_edge(edge, tasks) == EdgeResolution.SKIPPED
+
+    def test_conditional_with_output_metadata(self) -> None:
+        dag = WorkflowDAG(
+            definition=_simple_definition(),
+            nodes=(
+                DAGNode(id="a", phase="plan", role="manager"),
+                DAGNode(id="b", phase="implement", role="backend"),
+            ),
+            edges=(
+                DAGEdge(
+                    source="a",
+                    target="b",
+                    condition=ConditionExpr(raw="output.tests_passed == true"),
+                ),
+            ),
+        )
+        executor = DAGExecutor(dag)
+        edge = dag.edges[0]
+        tasks = {
+            "a": _task("a", status=TaskStatus.DONE, result_summary='{"tests_passed": true}'),
+        }
+        assert executor.resolve_edge(edge, tasks) == EdgeResolution.SATISFIED
+
+
+class TestReadyNodes:
+    def test_root_nodes_ready(self) -> None:
+        dag = _simple_dag()
+        executor = DAGExecutor(dag)
+        ready = executor.ready_nodes({})
+        assert "a" in ready
+        assert "b" not in ready
+        assert "c" not in ready
+
+    def test_linear_progression(self) -> None:
+        dag = _simple_dag()
+        executor = DAGExecutor(dag)
+        tasks = {"a": _task("a", status=TaskStatus.DONE)}
+        ready = executor.ready_nodes(tasks)
+        assert "b" in ready
+        assert "c" not in ready
+
+    def test_fan_out(self) -> None:
+        dag = WorkflowDAG(
+            definition=_simple_definition(),
+            nodes=(
+                DAGNode(id="root", phase="plan", role="manager"),
+                DAGNode(id="w1", phase="implement", role="backend"),
+                DAGNode(id="w2", phase="implement", role="frontend"),
+            ),
+            edges=(
+                DAGEdge(source="root", target="w1"),
+                DAGEdge(source="root", target="w2"),
+            ),
+        )
+        executor = DAGExecutor(dag)
+        tasks = {"root": _task("root", status=TaskStatus.DONE)}
+        ready = executor.ready_nodes(tasks)
+        # Both w1 and w2 should be ready (fan-out).
+        assert sorted(ready) == ["w1", "w2"]
+
+    def test_fan_in(self) -> None:
+        dag = WorkflowDAG(
+            definition=_simple_definition(),
+            nodes=(
+                DAGNode(id="w1", phase="implement", role="backend"),
+                DAGNode(id="w2", phase="implement", role="frontend"),
+                DAGNode(id="merge", phase="verify", role="qa"),
+            ),
+            edges=(
+                DAGEdge(source="w1", target="merge"),
+                DAGEdge(source="w2", target="merge"),
+            ),
+        )
+        executor = DAGExecutor(dag)
+
+        # Only w1 done -> merge not ready.
+        tasks: dict[str, Task] = {
+            "w1": _task("w1", status=TaskStatus.DONE),
+        }
+        assert "merge" not in executor.ready_nodes(tasks)
+
+        # Both done -> merge ready.
+        tasks["w2"] = _task("w2", status=TaskStatus.DONE)
+        assert "merge" in executor.ready_nodes(tasks)
+
+    def test_conditional_edge_gating(self) -> None:
+        dag = WorkflowDAG(
+            definition=_simple_definition(),
+            nodes=(
+                DAGNode(id="test", phase="verify", role="qa"),
+                DAGNode(id="fix", phase="implement", role="backend"),
+            ),
+            edges=(
+                DAGEdge(
+                    source="test",
+                    target="fix",
+                    condition=ConditionExpr(raw="status == 'failed'"),
+                ),
+            ),
+        )
+        executor = DAGExecutor(dag)
+
+        # Test passed (done) -> fix should NOT be ready (condition not met).
+        tasks = {"test": _task("test", status=TaskStatus.DONE)}
+        assert "fix" not in executor.ready_nodes(tasks)
+
+        # Test failed -> fix should be ready (condition met).
+        tasks = {"test": _task("test", status=TaskStatus.FAILED)}
+        assert "fix" in executor.ready_nodes(tasks)
+
+    def test_already_active_task_not_ready(self) -> None:
+        dag = _simple_dag()
+        executor = DAGExecutor(dag)
+        tasks = {"a": _task("a", status=TaskStatus.IN_PROGRESS)}
+        ready = executor.ready_nodes(tasks)
+        assert "a" not in ready
+
+
+class TestRetryPolicy:
+    def test_should_retry_with_policy(self) -> None:
+        dag = WorkflowDAG(
+            definition=_simple_definition(),
+            nodes=(
+                DAGNode(
+                    id="a",
+                    phase="plan",
+                    role="manager",
+                    retry=RetryPolicy(max_attempts=3),
+                ),
+            ),
+            edges=(),
+        )
+        executor = DAGExecutor(dag)
+        task = _task("a", status=TaskStatus.FAILED)
+        assert executor.should_retry("a", task)
+
+    def test_should_not_retry_without_policy(self) -> None:
+        dag = _simple_dag()
+        executor = DAGExecutor(dag)
+        task = _task("a", status=TaskStatus.FAILED)
+        assert not executor.should_retry("a", task)
+
+    def test_max_attempts_exhausted(self) -> None:
+        dag = WorkflowDAG(
+            definition=_simple_definition(),
+            nodes=(
+                DAGNode(
+                    id="a",
+                    phase="plan",
+                    role="manager",
+                    retry=RetryPolicy(max_attempts=2),
+                ),
+            ),
+            edges=(),
+        )
+        executor = DAGExecutor(dag)
+        task = _task("a", status=TaskStatus.FAILED)
+
+        executor.record_retry("a")
+        assert executor.should_retry("a", task)
+
+        executor.record_retry("a")
+        assert not executor.should_retry("a", task)
+
+    def test_until_condition_stops_retry(self) -> None:
+        dag = WorkflowDAG(
+            definition=_simple_definition(),
+            nodes=(
+                DAGNode(
+                    id="a",
+                    phase="plan",
+                    role="manager",
+                    retry=RetryPolicy(
+                        max_attempts=5,
+                        until=ConditionExpr(raw="status == 'done'"),
+                    ),
+                ),
+            ),
+            edges=(),
+        )
+        executor = DAGExecutor(dag)
+
+        # Failed task -> should retry.
+        failed = _task("a", status=TaskStatus.FAILED)
+        assert executor.should_retry("a", failed)
+
+        # Done task -> until condition met, no retry.
+        done = _task("a", status=TaskStatus.DONE)
+        assert not executor.should_retry("a", done)
+
+    def test_retry_in_ready_nodes(self) -> None:
+        dag = WorkflowDAG(
+            definition=_simple_definition(),
+            nodes=(
+                DAGNode(
+                    id="a",
+                    phase="plan",
+                    role="manager",
+                    retry=RetryPolicy(max_attempts=3),
+                ),
+            ),
+            edges=(),
+        )
+        executor = DAGExecutor(dag)
+        tasks = {"a": _task("a", status=TaskStatus.FAILED)}
+        ready = executor.ready_nodes(tasks)
+        assert "a" in ready
+
+
+class TestCreateTask:
+    def test_create_task_from_node(self) -> None:
+        dag = _simple_dag()
+        executor = DAGExecutor(dag)
+        task = executor.create_task("a")
+        assert task.role == "manager"
+        assert task.status == TaskStatus.OPEN
+        assert task.id.startswith("a-")
+
+    def test_created_task_has_dependencies(self) -> None:
+        dag = _simple_dag()
+        executor = DAGExecutor(dag)
+        task = executor.create_task("b")
+        assert "a" in task.depends_on
+
+    def test_create_unknown_node_raises(self) -> None:
+        dag = _simple_dag()
+        executor = DAGExecutor(dag)
+        with pytest.raises(KeyError):
+            executor.create_task("nonexistent")
+
+
+# ===========================================================================
+# on_fail recovery receipts (issue #2557)
+# ===========================================================================
+
+
+def _recovery_dag() -> WorkflowDAG:
+    """DAG whose ``fix-bugs`` recovery node depends on failing ``run-tests``."""
+    return WorkflowDAG(
+        definition=WorkflowDefinition(
+            name="ci",
+            phases=(
+                WorkflowPhase(name="verify"),
+                WorkflowPhase(name="implement"),
+            ),
+        ),
+        nodes=(
+            DAGNode(id="run-tests", phase="verify", role="qa"),
+            DAGNode(id="fix-bugs", phase="implement", role="backend", description="Fix the failing tests"),
+        ),
+        edges=(
+            DAGEdge(
+                source="run-tests",
+                target="fix-bugs",
+                condition=ConditionExpr(raw="status == 'failed'"),
+            ),
+        ),
+    )
+
+
+class TestRecoveryReceiptCreateTask:
+    def test_source_none_is_byte_identical_to_legacy(self) -> None:
+        """AC5: ``create_task(node_id)`` without a source task is unchanged."""
+        executor = DAGExecutor(_recovery_dag())
+        plain = executor.create_task("fix-bugs")
+        explicit = executor.create_task("fix-bugs", source_task=None)
+
+        # Metadata is untouched (default empty dict) on the no-source path.
+        assert plain.metadata == {}
+        assert explicit.metadata == {}
+
+        # Every field except the per-call uuid id and wall-clock created_at.
+        import dataclasses
+
+        norm_a = dataclasses.replace(plain, id="X", created_at=0.0)
+        norm_b = dataclasses.replace(explicit, id="X", created_at=0.0)
+        assert norm_a == norm_b
+
+    def test_recovery_task_prompt_has_failure_context(self, tmp_path: Path) -> None:
+        """AC1: the recovery task's injected prompt carries status, gates, tail."""
+        from bernstein.core.lineage.spine import LineageSpine
+        from bernstein.core.quality.quality_gates import QualityGateCheckResult, QualityGatesResult
+        from bernstein.core.replay.journal import EventJournal
+
+        executor = DAGExecutor(_recovery_dag())
+        source = _task("run-tests-fixed", role="qa", status=TaskStatus.FAILED, result_summary='{"status": "failed"}')
+        edge = executor.dag.edges[0]
+        journal = EventJournal(run_id="run-1", sdd_dir=tmp_path / ".sdd")
+        journal.record("task_failed", task_id="run-tests-fixed", reason="tests")
+        gate_report = QualityGatesResult(
+            task_id="run-tests-fixed",
+            passed=False,
+            gate_results=[QualityGateCheckResult(gate="tests", passed=False, blocked=True, detail="3 failing")],
+        )
+        spine = LineageSpine(tmp_path / ".sdd" / "lineage", run_id="run-1", hmac_key=b"k" * 32)
+        recovery_store: dict[str, str] = {}
+
+        task = executor.create_task(
+            "fix-bugs",
+            source_task=source,
+            source_edge=edge,
+            spine=spine,
+            journal=journal,
+            gate_report=gate_report,
+            recovery_store=recovery_store,
+            timestamp=0,
+        )
+
+        assert task.id in recovery_store
+        preamble = recovery_store[task.id]
+        assert "failed" in preamble  # failing status
+        assert "tests" in preamble  # gate finding
+        assert "task_failed" in preamble  # journal tail
+        # The spine entry hash is stamped on metadata and injected into the prompt.
+        entry_hash = task.metadata["recovery_receipt_hash"]
+        assert entry_hash in preamble
+        assert task.metadata["recovery_failing_node"] == "run-tests"
+
+    def test_recovery_receipt_hash_resolves_on_spine(self, tmp_path: Path) -> None:
+        """AC2: the stamped entry hash resolves to a valid spine entry."""
+        from bernstein.core.lineage.spine import LineageSpine
+        from bernstein.core.planning.recovery_receipt import resolve_receipt_on_spine
+
+        executor = DAGExecutor(_recovery_dag())
+        source = _task("run-tests-fixed", role="qa", status=TaskStatus.FAILED, result_summary='{"status": "failed"}')
+        spine = LineageSpine(tmp_path / ".sdd" / "lineage", run_id="run-1", hmac_key=b"k" * 32)
+
+        task = executor.create_task(
+            "fix-bugs",
+            source_task=source,
+            source_edge=executor.dag.edges[0],
+            spine=spine,
+            timestamp=0,
+        )
+        entry_hash = task.metadata["recovery_receipt_hash"]
+        resolution = resolve_receipt_on_spine(spine, entry_hash=entry_hash)
+        assert resolution.ok
+
+    def test_receipt_built_without_spine_still_stamps_content_hash(self) -> None:
+        """No spine: the content hash is stamped, no entry hash, no crash."""
+        executor = DAGExecutor(_recovery_dag())
+        source = _task("run-tests-fixed", role="qa", status=TaskStatus.FAILED, result_summary='{"status": "failed"}')
+        recovery_store: dict[str, str] = {}
+        task = executor.create_task(
+            "fix-bugs",
+            source_task=source,
+            source_edge=executor.dag.edges[0],
+            recovery_store=recovery_store,
+        )
+        assert task.metadata["recovery_receipt_content_hash"].startswith("sha256:")
+        assert "recovery_receipt_hash" not in task.metadata
+        assert task.id in recovery_store
+
+    def test_guard_routing_unchanged(self) -> None:
+        """The receipt path does not alter edge resolution or readiness."""
+        executor = DAGExecutor(_recovery_dag())
+        failed = {"run-tests": _task("run-tests-x", status=TaskStatus.FAILED, result_summary='{"status": "failed"}')}
+        assert "fix-bugs" in executor.ready_nodes(failed)
+
+        done = {"run-tests": _task("run-tests-x", status=TaskStatus.DONE, result_summary='{"status": "done"}')}
+        assert "fix-bugs" not in executor.ready_nodes(done)
+
+
+# ===========================================================================
+# WorkflowDAG tests
+# ===========================================================================
+
+
+class TestWorkflowDAG:
+    def test_node_map(self) -> None:
+        dag = _simple_dag()
+        assert "a" in dag.node_map
+        assert "b" in dag.node_map
+        assert "c" in dag.node_map
+
+    def test_definition_hash_deterministic(self) -> None:
+        dag = _simple_dag()
+        h1 = dag.definition_hash()
+        h2 = dag.definition_hash()
+        assert h1 == h2
+        assert len(h1) == 64  # SHA-256 hex
+
+    def test_definition_hash_changes_with_structure(self) -> None:
+        dag1 = _simple_dag()
+        dag2 = WorkflowDAG(
+            definition=_simple_definition(),
+            nodes=(DAGNode(id="x", phase="plan", role="manager"),),
+            edges=(),
+        )
+        assert dag1.definition_hash() != dag2.definition_hash()
+
+
+# ===========================================================================
+# End-to-end YAML file test
+# ===========================================================================
+
+
+class TestEndToEnd:
+    def test_ci_pipeline_yaml(self, tmp_path: Path) -> None:
+        """Parse the example ci-pipeline and execute a simulated run."""
+        path = _write_yaml(
+            tmp_path,
+            """\
+            name: e2e-test
+            version: "1.0.0"
+
+            phases:
+              - name: plan
+                allowed_roles: [manager]
+              - name: implement
+              - name: verify
+                allowed_roles: [qa]
+              - name: merge
+                allowed_roles: [manager]
+
+            nodes:
+              decompose:
+                phase: plan
+                role: manager
+                description: "Break down the goal"
+                estimated_minutes: 10
+
+              build-api:
+                phase: implement
+                role: backend
+                depends_on: [decompose]
+
+              build-ui:
+                phase: implement
+                role: frontend
+                depends_on: [decompose]
+
+              run-tests:
+                phase: verify
+                role: qa
+                depends_on:
+                  - build-api
+                  - build-ui
+
+              deploy:
+                phase: merge
+                role: manager
+                depends_on:
+                  - source: run-tests
+                    condition: "status == 'done'"
+            """,
+        )
+        dag = parse_workflow_yaml(path)
+        executor = DAGExecutor(dag)
+
+        # Step 1: Only root (decompose) is ready.
+        tasks: dict[str, Task] = {}
+        ready = executor.ready_nodes(tasks)
+        assert ready == ["decompose"]
+
+        # Step 2: decompose done -> fan-out: build-api, build-ui.
+        tasks["decompose"] = _task("decompose", role="manager", status=TaskStatus.DONE)
+        ready = executor.ready_nodes(tasks)
+        assert sorted(ready) == ["build-api", "build-ui"]
+
+        # Step 3: both builds done -> fan-in: run-tests.
+        tasks["build-api"] = _task("build-api", role="backend", status=TaskStatus.DONE)
+        tasks["build-ui"] = _task("build-ui", role="frontend", status=TaskStatus.DONE)
+        ready = executor.ready_nodes(tasks)
+        assert ready == ["run-tests"]
+
+        # Step 4a: tests pass -> deploy is ready.
+        tasks["run-tests"] = _task("run-tests", role="qa", status=TaskStatus.DONE)
+        ready = executor.ready_nodes(tasks)
+        assert ready == ["deploy"]
+
+    def test_conditional_branch_skipped(self, tmp_path: Path) -> None:
+        """When all conditional edges skip, the node is not scheduled."""
+        path = _write_yaml(
+            tmp_path,
+            """\
+            name: cond-test
+            phases:
+              - plan
+              - verify
+              - merge
+            nodes:
+              test:
+                phase: plan
+                role: qa
+              deploy:
+                phase: merge
+                role: manager
+                depends_on:
+                  - source: test
+                    condition: "status == 'done'"
+            """,
+        )
+        dag = parse_workflow_yaml(path)
+        executor = DAGExecutor(dag)
+
+        # Test failed -> deploy should NOT be scheduled.
+        tasks = {"test": _task("test", role="qa", status=TaskStatus.FAILED)}
+        ready = executor.ready_nodes(tasks)
+        assert "deploy" not in ready
+
+    def test_retry_loop(self, tmp_path: Path) -> None:
+        """Retry/loop pattern: node retries on failure."""
+        path = _write_yaml(
+            tmp_path,
+            """\
+            name: retry-test
+            phases:
+              - plan
+              - impl
+            nodes:
+              build:
+                phase: plan
+                role: backend
+              fix:
+                phase: impl
+                role: backend
+                depends_on:
+                  - source: build
+                    condition: "status == 'failed'"
+                retry:
+                  max_attempts: 2
+                  until: "status == 'done'"
+            """,
+        )
+        dag = parse_workflow_yaml(path)
+        executor = DAGExecutor(dag)
+
+        # Build failed -> fix is ready.
+        tasks = {"build": _task("build", status=TaskStatus.FAILED)}
+        assert "fix" in executor.ready_nodes(tasks)
+
+        # Fix failed -> retry check.
+        tasks["fix"] = _task("fix", status=TaskStatus.FAILED)
+        assert executor.should_retry("fix", tasks["fix"])
+        executor.record_retry("fix")
+        assert executor.should_retry("fix", tasks["fix"])
+        executor.record_retry("fix")
+        assert not executor.should_retry("fix", tasks["fix"])
+
+
+class TestUnreachableNodes:
+    """A node whose every path in was skipped is recorded, not dropped (#3622)."""
+
+    @staticmethod
+    def _fan_in_dag() -> WorkflowDAG:
+        """Two workers feeding one merge node over unconditional edges."""
+        return WorkflowDAG(
+            definition=_simple_definition(),
+            nodes=(
+                DAGNode(id="w1", phase="implement", role="backend"),
+                DAGNode(id="w2", phase="implement", role="frontend"),
+                DAGNode(id="merge", phase="verify", role="qa"),
+            ),
+            edges=(
+                DAGEdge(source="w1", target="merge"),
+                DAGEdge(source="w2", target="merge"),
+            ),
+        )
+
+    @staticmethod
+    def _guarded_dag(guard: str) -> WorkflowDAG:
+        """One node reachable only through a single guarded edge."""
+        return WorkflowDAG(
+            definition=_simple_definition(),
+            nodes=(
+                DAGNode(id="test", phase="plan", role="qa"),
+                DAGNode(id="deploy", phase="verify", role="manager"),
+            ),
+            edges=(DAGEdge(source="test", target="deploy", condition=ConditionExpr(raw=guard)),),
+        )
+
+    def test_sole_inbound_edge_skipped_materializes_the_node(self) -> None:
+        executor = DAGExecutor(self._guarded_dag("status == 'done'"))
+        tasks = {"test": _task("test", role="qa", status=TaskStatus.FAILED)}
+
+        # The guard is false against a failed source, so deploy is not ready.
+        assert "deploy" not in executor.ready_nodes(tasks)
+
+        assert executor.materialize_unreachable(tasks) == ["deploy"]
+
+        blocked = tasks["deploy"]
+        assert blocked.status == TaskStatus.BLOCKED_BY_FAILED_DEP
+        assert blocked.metadata[BLOCKING_NODE_METADATA_KEY] == "test"
+        assert blocked.metadata[SKIPPED_EDGES_METADATA_KEY] == ["test -> deploy"]
+        assert blocked.terminal_reason == "blocked_by_failed_dependency"
+
+        # Derivable from the record alone, and the node stays off the ready list.
+        assert executor.unreachable_nodes(tasks) == [("deploy", "test")]
+        assert "deploy" not in executor.ready_nodes(tasks)
+
+    def test_stranding_cause_distinguishes_retry_exhaustion_from_plain_failure(self) -> None:
+        """A dependent must record WHY its blocker blocked, not just which node.
+
+        Both cases strand the dependent identically; the operator response
+        differs. A node that failed once with no retry policy may just need
+        one, while a node that burned every attempt is saying the failure is
+        not transient.
+        """
+        dag = WorkflowDAG(
+            definition=_simple_definition(),
+            nodes=(
+                DAGNode(id="test", phase="plan", role="qa", retry=RetryPolicy(max_attempts=2)),
+                DAGNode(id="deploy", phase="verify", role="manager"),
+            ),
+            edges=(DAGEdge(source="test", target="deploy", condition=ConditionExpr(raw="status == 'done'")),),
+        )
+
+        # Failed once, one attempt still available: not exhausted.
+        executor = DAGExecutor(dag)
+        tasks = {"test": _task("test", role="qa", status=TaskStatus.FAILED)}
+        executor.record_retry("test")
+        assert executor.should_retry("test", tasks["test"]) is True
+
+        assert executor.materialize_unreachable(tasks) == ["deploy"]
+        assert tasks["deploy"].metadata[BLOCKING_CAUSE_METADATA_KEY] == "dependency_failed"
+
+        # Same graph, same failure, but every attempt used up.
+        exhausted = DAGExecutor(dag)
+        tasks = {"test": _task("test", role="qa", status=TaskStatus.FAILED)}
+        exhausted.record_retry("test")
+        exhausted.record_retry("test")
+        assert exhausted.should_retry("test", tasks["test"]) is False
+
+        assert exhausted.materialize_unreachable(tasks) == ["deploy"]
+        assert tasks["deploy"].metadata[BLOCKING_CAUSE_METADATA_KEY] == "retry_exhausted"
+
+        # The existing key is untouched by the addition.
+        assert tasks["deploy"].metadata[BLOCKING_NODE_METADATA_KEY] == "test"
+
+    def test_node_without_retry_policy_is_never_retry_exhausted(self) -> None:
+        executor = DAGExecutor(self._guarded_dag("status == 'done'"))
+        tasks = {"test": _task("test", role="qa", status=TaskStatus.FAILED)}
+
+        assert executor.materialize_unreachable(tasks) == ["deploy"]
+        assert tasks["deploy"].metadata[BLOCKING_CAUSE_METADATA_KEY] == "dependency_failed"
+
+    def test_all_of_several_inbound_edges_skipped(self) -> None:
+        executor = DAGExecutor(self._fan_in_dag())
+        tasks = {
+            "w1": _task("w1", status=TaskStatus.FAILED),
+            "w2": _task("w2", status=TaskStatus.CANCELLED),
+        }
+
+        assert executor.materialize_unreachable(tasks) == ["merge"]
+
+        blocked = tasks["merge"]
+        assert blocked.status == TaskStatus.BLOCKED_BY_FAILED_DEP
+        assert blocked.metadata[SKIPPED_EDGES_METADATA_KEY] == ["w1 -> merge", "w2 -> merge"]
+        # Both sources strand the node; the lowest id is the recorded cause.
+        assert blocked.metadata[BLOCKING_NODE_METADATA_KEY] == "w1"
+        assert executor.unreachable_nodes(tasks) == [("merge", "w1")]
+
+    def test_one_satisfied_edge_leaves_the_node_schedulable(self) -> None:
+        executor = DAGExecutor(self._fan_in_dag())
+        tasks = {
+            "w1": _task("w1", status=TaskStatus.DONE),
+            "w2": _task("w2", status=TaskStatus.FAILED),
+        }
+
+        assert "merge" in executor.ready_nodes(tasks)
+        assert executor.materialize_unreachable(tasks) == []
+        assert "merge" not in tasks
+        assert executor.unreachable_nodes(tasks) == []
+
+    def test_dependents_of_an_unreachable_node_are_unreachable_too(self) -> None:
+        # a -> b -> c, with a failed: b is stranded by a, c by b.
+        executor = DAGExecutor(_simple_dag())
+        tasks = {"a": _task("a", status=TaskStatus.FAILED)}
+
+        assert executor.materialize_unreachable(tasks) == ["b", "c"]
+        # Each stranded node names its nearest cause, not the original failure.
+        assert tasks["b"].metadata[BLOCKING_NODE_METADATA_KEY] == "a"
+        assert tasks["c"].metadata[BLOCKING_NODE_METADATA_KEY] == "b"
+        assert executor.unreachable_nodes(tasks) == [("b", "a"), ("c", "b")]
+
+    def test_a_branch_not_taken_is_not_unreachable(self) -> None:
+        # The source completed; the guard simply chose the other branch. The
+        # node did not run, but nothing stranded it.
+        executor = DAGExecutor(self._guarded_dag("status == 'failed'"))
+        tasks = {"test": _task("test", role="qa", status=TaskStatus.DONE)}
+
+        assert "deploy" not in executor.ready_nodes(tasks)
+        assert executor.materialize_unreachable(tasks) == []
+        assert "deploy" not in tasks
+        assert executor.unreachable_nodes(tasks) == []
+
+    def test_a_retrying_node_keeps_its_escape(self) -> None:
+        dag = WorkflowDAG(
+            definition=_simple_definition(),
+            nodes=(
+                DAGNode(
+                    id="a",
+                    phase="plan",
+                    role="manager",
+                    retry=RetryPolicy(max_attempts=3),
+                ),
+            ),
+            edges=(),
+        )
+        executor = DAGExecutor(dag)
+        tasks = {"a": _task("a", status=TaskStatus.FAILED)}
+
+        assert "a" in executor.ready_nodes(tasks)
+        assert executor.materialize_unreachable(tasks) == []
+        assert executor.unreachable_nodes(tasks) == []
+        assert "a" in executor.ready_nodes(tasks)
+
+    def test_unreachable_set_is_identical_across_derivations(self) -> None:
+        def derive() -> list[tuple[str, str]]:
+            dag = WorkflowDAG(
+                definition=_simple_definition(),
+                nodes=(
+                    DAGNode(id="root", phase="plan", role="manager"),
+                    DAGNode(id="w2", phase="implement", role="backend"),
+                    DAGNode(id="w1", phase="implement", role="frontend"),
+                    DAGNode(id="tail", phase="verify", role="qa"),
+                ),
+                edges=(
+                    DAGEdge(source="root", target="w2"),
+                    DAGEdge(source="root", target="w1"),
+                    DAGEdge(source="w2", target="tail"),
+                    DAGEdge(source="w1", target="tail"),
+                ),
+            )
+            executor = DAGExecutor(dag)
+            tasks = {"root": _task("root", status=TaskStatus.FAILED)}
+            executor.materialize_unreachable(tasks)
+            return executor.unreachable_nodes(tasks)
+
+        first = derive()
+        second = derive()
+
+        assert first == [("tail", "w1"), ("w1", "root"), ("w2", "root")]
+        assert len(first) == len(second)
+        for left, right in zip(first, second, strict=True):
+            assert left == right

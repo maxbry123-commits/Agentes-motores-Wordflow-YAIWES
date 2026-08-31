@@ -1,0 +1,279 @@
+name: Post-CI dispatcher
+
+# ---------------------------------------------------------------------------
+# DO NOT PRUNE THIS WORKFLOW FOR RUNNER CAPACITY.
+#
+# `.github/workflows/auto-release.yml` declares `on: workflow_call:` and
+# nothing else, and so do auto-heal.yml, bernstein-ci-fix.yml and
+# bisect-on-red.yml. This dispatcher is their ONLY invocation path. A
+# dispatcher run that is cancelled, disabled or filtered away takes the
+# release automation with it, and nothing anywhere reports a failing check
+# when that happens - the release simply does not occur.
+#
+# Any change to the routing below has to keep `conclusion == 'success'` on
+# `main` reaching the auto-release job.
+# ---------------------------------------------------------------------------
+#
+# Single workflow_run: CI completed listener that consolidates the fanout
+# previously paid out across sibling workflows (auto-release, auto-heal,
+# bernstein-ci-fix, bisect-on-red). Each child is now a reusable workflow
+# (on: workflow_call:) and runs only when the dispatcher's routing logic
+# selects it.
+#
+# Routing summary:
+#   - auto-release       -> fires on the main branch only.
+#   - auto-heal          -> fires on failure on main, gated on canonical repo
+#                            and recursion guards.
+#   - bernstein-ci-fix   -> fires on failure on main only when auto-heal did
+#                            NOT open a heal PR. Prevents the parallel race
+#                            that previously caused both heals to fight over
+#                            the same SHA.
+#   - bisect-on-red      -> fires on failure on main.
+#
+# Each child reusable workflow re-checks its own preconditions, so the
+# dispatcher gates are best-effort routing rather than security boundaries.
+#
+# Safety note (zizmor dangerous-triggers): the workflow_run trigger is
+# intentional and only reads metadata fields (conclusion, sha, branch,
+# repository) into the dispatcher's job-level if: conditions. No
+# attacker-controlled value reaches a run: script in this file. The child
+# reusable workflows enforce their own canonical-repo and recursion guards.
+on:  # zizmor: ignore[dangerous-triggers]
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+
+concurrency:
+  group: post-ci-dispatcher-${{ github.event.workflow_run.head_sha }}
+  cancel-in-progress: false
+
+# Workflow-level permissions stay minimal. Each reusable child below
+# declares its own per-job `permissions:` block scoped to the union of
+# the scopes that the called workflow's jobs request. A reusable
+# workflow inherits the *calling job's* GITHUB_TOKEN permissions, and
+# the GitHub Actions validator rejects the call at workflow_run boot
+# (zero check_runs, conclusion: startup_failure) when the caller grants
+# less than any callee job requests. The repo default for GITHUB_TOKEN
+# is `read` only, so an empty `permissions: {}` at this level grants
+# nothing and every callee with a `contents: write` /
+# `pull-requests: write` / `issues: write` / `attestations: write` /
+# `id-token: write` job failed the call before any job was scheduled.
+# That was the cause of the silent startup_failure on every dispatcher
+# run since the consolidation merged.
+permissions: {}
+
+jobs:
+  # Surface the upstream CI run metadata once so each child reusable
+  # workflow can receive it via workflow_call inputs. Computing this in
+  # a single boot is the entire reason this dispatcher exists.
+  meta:
+    name: Resolve upstream metadata
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    # Do not boot a runner for an upstream conclusion no route can act on.
+    #
+    # Every job in auto-release.yml gates on `inputs.conclusion == 'success'`
+    # except its stale-trigger alert, which gates on the explicit list
+    # ["failure", "timed_out", "action_required"] and documents `cancelled`
+    # as deliberately excluded. auto-heal, bernstein-ci-fix and bisect-on-red
+    # each require exactly `failure`. So `cancelled` and `skipped` route
+    # nothing: today they boot this job, resolve metadata, and every child
+    # then skips.
+    #
+    # That is not a rare case. ci.yml keys push-to-main runs per SHA and
+    # never cancels them, so a merge wave leaves a long tail of main CI runs
+    # that an operator mass-cancels to reclaim the pool; `workflow_run` fires
+    # on `completed`, which includes `cancelled`, and each one paid a runner
+    # slot here for no routing decision.
+    #
+    # `success` is admitted unconditionally, so the release path is
+    # untouched. tests/unit/test_post_ci_dispatcher_workflow_yaml.py pins
+    # that: the inert set may not intersect any conclusion a child acts on.
+    if: >-
+      github.event.workflow_run.conclusion != 'cancelled' &&
+      github.event.workflow_run.conclusion != 'skipped'
+    permissions:
+      contents: read
+    outputs:
+      head_sha: ${{ steps.out.outputs.head_sha }}
+      short_sha: ${{ steps.out.outputs.short_sha }}
+      head_branch: ${{ steps.out.outputs.head_branch }}
+      head_repo: ${{ steps.out.outputs.head_repo }}
+      conclusion: ${{ steps.out.outputs.conclusion }}
+      run_id: ${{ steps.out.outputs.run_id }}
+      run_name: ${{ steps.out.outputs.run_name }}
+      html_url: ${{ steps.out.outputs.html_url }}
+      display_title: ${{ steps.out.outputs.display_title }}
+      actor_login: ${{ steps.out.outputs.actor_login }}
+      event: ${{ steps.out.outputs.event }}
+    steps:
+      - name: Harden runner (audit mode)
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+      - name: Capture event metadata
+        id: out
+        env:
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
+          CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_NAME: ${{ github.event.workflow_run.name }}
+          HTML_URL: ${{ github.event.workflow_run.html_url }}
+          DISPLAY_TITLE: ${{ github.event.workflow_run.display_title }}
+          ACTOR_LOGIN: ${{ github.event.workflow_run.actor.login }}
+          EVENT: ${{ github.event.workflow_run.event }}
+        run: |
+          set -euo pipefail
+          {
+            echo "head_sha=${HEAD_SHA}"
+            echo "short_sha=${HEAD_SHA:0:12}"
+            echo "head_branch=${HEAD_BRANCH}"
+            echo "head_repo=${HEAD_REPO}"
+            echo "conclusion=${CONCLUSION}"
+            echo "run_id=${RUN_ID}"
+            echo "run_name=${RUN_NAME}"
+            echo "html_url=${HTML_URL}"
+            echo "display_title=${DISPLAY_TITLE}"
+            echo "actor_login=${ACTOR_LOGIN}"
+            echo "event=${EVENT}"
+          } >> "$GITHUB_OUTPUT"
+
+  auto-release:
+    name: Auto-release
+    needs: meta
+    if: needs.meta.outputs.head_branch == 'main'
+    # Union of permissions the called workflow's jobs request: it tags
+    # the release commit (contents:write), opens / closes the
+    # auto-release-skipped issue (issues:write), and dispatches the
+    # publish chain (actions:write). Granting less than any callee job
+    # requests rejects the call at boot: the whole dispatcher run ends
+    # as conclusion: startup_failure with zero check_runs.
+    permissions:
+      contents: write
+      issues: write
+      actions: write
+    uses: ./.github/workflows/auto-release.yml
+    # GITHUB_TOKEN is provided automatically to reusable workflows.
+    with:
+      conclusion: ${{ needs.meta.outputs.conclusion }}
+      head_branch: ${{ needs.meta.outputs.head_branch }}
+      head_sha: ${{ needs.meta.outputs.head_sha }}
+      run_id: ${{ needs.meta.outputs.run_id }}
+      html_url: ${{ needs.meta.outputs.html_url }}
+
+  auto-heal:
+    name: Auto-heal v2
+    needs: meta
+    if: >-
+      needs.meta.outputs.conclusion == 'failure' &&
+      needs.meta.outputs.head_branch == 'main' &&
+      needs.meta.outputs.head_repo == github.repository &&
+      !startsWith(needs.meta.outputs.display_title, 'fix(ci-heal-v2):') &&
+      !startsWith(needs.meta.outputs.display_title, 'fix(ci-heal):') &&
+      needs.meta.outputs.actor_login != 'github-actions[bot]'
+    # Union of permissions the called workflow's jobs request: it pushes
+    # heal branches and opens heal PRs (contents:write,
+    # pull-requests:write), attests provenance on the heal commit
+    # (attestations:write, id-token:write), and reads upstream CI run
+    # metadata (actions:read).
+    permissions:
+      contents: write
+      pull-requests: write
+      attestations: write
+      id-token: write
+      actions: read
+    uses: ./.github/workflows/auto-heal.yml
+    # GITHUB_TOKEN is auto-provided to the reusable workflow. Nothing else
+    # is: a reusable workflow sees only the secrets passed here, so the
+    # token the heal lane uses to open its pull request has to be forwarded
+    # explicitly or the reference reads as empty and the lane degrades to
+    # the Actions token, whose pull requests never trigger workflows. The
+    # callee declares it `required: false`, so an environment without the
+    # secret still boots.
+    secrets:
+      BERNSTEIN_AUTOSYNC_TOKEN: ${{ secrets.BERNSTEIN_AUTOSYNC_TOKEN }}
+    with:
+      head_sha: ${{ needs.meta.outputs.head_sha }}
+      run_id: ${{ needs.meta.outputs.run_id }}
+      display_title: ${{ needs.meta.outputs.display_title }}
+
+  bernstein-ci-fix:
+    name: Bernstein CI fix
+    needs: [meta, auto-heal]
+    # Run only on real CI failures on main from the canonical repo, and only
+    # when auto-heal did NOT open a heal PR. This serialises the two fixers
+    # so they no longer race on the same failing SHA (ticket acceptance:
+    # auto-heal and bernstein-ci-fix call each other via dispatcher when
+    # one fails instead of both firing in parallel).
+    if: >-
+      always() &&
+      needs.meta.outputs.conclusion == 'failure' &&
+      needs.meta.outputs.head_branch == 'main' &&
+      needs.meta.outputs.head_repo == github.repository &&
+      !startsWith(needs.meta.outputs.display_title, 'auto-heal:') &&
+      needs.meta.outputs.actor_login != 'bernstein[bot]' &&
+      needs.meta.outputs.actor_login != 'bernstein-orchestrator[bot]' &&
+      needs.meta.outputs.actor_login != 'github-actions[bot]' &&
+      (needs.auto-heal.result == 'skipped' ||
+        needs.auto-heal.outputs.heal_outcome == '' ||
+        needs.auto-heal.outputs.heal_outcome == 'skipped_no_jobs' ||
+        needs.auto-heal.outputs.heal_outcome == 'failed_validation')
+    # Union of permissions the called workflow's jobs request: it pushes
+    # auto-heal branches and opens auto-heal PRs (contents:write,
+    # pull-requests:write), opens fallback ci-fix issues (issues:write),
+    # and reads upstream CI run + PR metadata (actions:read).
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      actions: read
+    uses: ./.github/workflows/bernstein-ci-fix.yml
+    # bernstein-ci-fix uses GEMINI_API_KEY for the LLM triage agent.
+    # GITHUB_TOKEN is auto-provided. GEMINI_API_KEY is declared
+    # `required: false` on the called workflow so jobs that need it gate
+    # on a non-empty value rather than failing the whole reusable call.
+    secrets:
+      # See the auto-heal call above: a reusable workflow sees only what it
+      # is passed, so the pull-request token has to be forwarded explicitly.
+      BERNSTEIN_AUTOSYNC_TOKEN: ${{ secrets.BERNSTEIN_AUTOSYNC_TOKEN }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      # OPENROUTER_API_KEY_FREE: ${{ secrets.OPENROUTER_API_KEY_FREE }}
+      # Re-enable the pass once OPENROUTER_API_KEY_FREE is defined on
+      # the repo. The Tier-3 shadow-mode job (#1715) gates on
+      # vars.BERNSTEIN_CI_SELF_DRIVE == 'tier3' (default off) so leaving
+      # the pass commented while the operator has not defined the secret
+      # is the documented graceful-degrade posture: Tier-3 records a
+      # flag_off / skipped outcome and the rest of the dispatcher chain
+      # continues to run.
+    with:
+      head_sha: ${{ needs.meta.outputs.head_sha }}
+      head_branch: ${{ needs.meta.outputs.head_branch }}
+      run_id: ${{ needs.meta.outputs.run_id }}
+      display_title: ${{ needs.meta.outputs.display_title }}
+      actor_login: ${{ needs.meta.outputs.actor_login }}
+
+  bisect-on-red:
+    name: Bisect on red
+    needs: meta
+    if: >-
+      needs.meta.outputs.conclusion == 'failure' &&
+      needs.meta.outputs.head_branch == 'main'
+    # Union of permissions the called workflow's jobs request: it reads
+    # the failing commit's git history (contents:read) and posts the
+    # culprit comment on the suspected PR plus opens a bisect-on-red
+    # issue (pull-requests:write, issues:write).
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    uses: ./.github/workflows/bisect-on-red.yml
+    # bisect-on-red reads only inputs and GITHUB_TOKEN (auto-provided).
+    # No repository secrets are forwarded, replacing the prior
+    # `secrets: inherit` blanket pass.
+    with:
+      head_sha: ${{ needs.meta.outputs.head_sha }}
+      run_id: ${{ needs.meta.outputs.run_id }}
+      html_url: ${{ needs.meta.outputs.html_url }}

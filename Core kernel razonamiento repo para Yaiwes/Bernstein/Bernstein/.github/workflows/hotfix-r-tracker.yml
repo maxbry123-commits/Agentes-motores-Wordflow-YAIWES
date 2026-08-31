@@ -1,0 +1,240 @@
+name: Hotfix R-counter
+
+# Track if a hotfix commit produces further hotfix commits within a
+# short window. When R > 1 (a hotfix begets another hotfix on the same
+# parent chain) the root cause was not actually fixed; surface that on
+# the original feature PR for human attention.
+#
+# The counter is the number of consecutive hotfixes on the same parent
+# chain: a feature merge may need one hotfix, but that hotfix should
+# produce zero further hotfixes. If it does, the original feature PR is
+# the right place to investigate, not the latest patch.
+#
+# State is persisted under .sdd/runtime/ which is gitignored; the
+# workflow only uses the GitHub API for cross-run state.
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: hotfix-r-tracker-${{ github.sha }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  track:
+    name: Detect hotfix-begets-hotfix
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Only run on commits that look like CI hotfixes. Conventional
+    # commit prefix `fix(ci):` matches the established pattern used by
+    # bernstein-ci-fix and auto-heal.
+    if: contains(github.event.head_commit.message, 'fix(ci):')
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Harden runner (audit mode)
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout repo for benign-drift classifier
+        # EDGE-4: the classifier script lives in the repo; checkout
+        # shallow (depth=1) so the workflow can read it without paying
+        # for full history.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Check parent commit for prior hotfix
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.sha }}
+          HEAD_MSG: ${{ github.event.head_commit.message }}
+        run: |
+          set -euo pipefail
+
+          # Walk back up to 6 parents looking for prior hotfix commits
+          # within a 24h window. 6 is enough to span a typical
+          # main-red --> bisect --> patch --> merge cycle without
+          # collapsing into noise on a calm day.
+          MAX_DEPTH=6
+          WINDOW_HOURS=24
+          NOW_EPOCH=$(date -u +%s)
+
+          CHAIN_LEN=1
+          CHAIN_DETAILS=""
+          ROOT_SHA=""
+          ROOT_MSG=""
+
+          # One batched API call returns the head commit followed by
+          # up to per_page-1 ancestors along the first-parent chain,
+          # replacing the previous N sequential .parents[0].sha walks.
+          # per_page is set to MAX_DEPTH+4 so we still have a few extra
+          # entries in case the window-age check trims the tail.
+          PER_PAGE=$((MAX_DEPTH + 4))
+          COMMITS_JSON=$(gh api \
+            "/repos/${REPO}/commits?sha=${HEAD_SHA}&per_page=${PER_PAGE}" \
+            2>/dev/null || echo '[]')
+
+          # Slice off the head commit itself (.[1:]) so we iterate only
+          # ancestors; everything we need for each ancestor (sha, first
+          # message line, author date) is already in the payload.
+          ANCESTORS=$(echo "${COMMITS_JSON}" \
+            | jq -c '.[1:][] | {sha: .sha, msg: (.commit.message | split("\n")[0]), date: .commit.author.date}' \
+            2>/dev/null || echo "")
+
+          if [ -z "${ANCESTORS}" ]; then
+            echo "No ancestor commits returned; skipping walk."
+          fi
+
+          DEPTH=0
+          while IFS= read -r ENTRY; do
+            [ -z "${ENTRY}" ] && continue
+            DEPTH=$((DEPTH + 1))
+            if [ "${DEPTH}" -gt "${MAX_DEPTH}" ]; then
+              break
+            fi
+
+            PARENT=$(echo "${ENTRY}" | jq -r '.sha // ""')
+            PARENT_MSG=$(echo "${ENTRY}" | jq -r '.msg // ""')
+            PARENT_DATE=$(echo "${ENTRY}" | jq -r '.date // ""')
+
+            if [ -z "${PARENT}" ] || [ -z "${PARENT_DATE}" ]; then
+              break
+            fi
+
+            PARENT_EPOCH=$(date -u -d "${PARENT_DATE}" +%s 2>/dev/null \
+              || date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "${PARENT_DATE}" +%s 2>/dev/null \
+              || echo "0")
+            AGE_HOURS=$(( (NOW_EPOCH - PARENT_EPOCH) / 3600 ))
+
+            if [ "${AGE_HOURS}" -gt "${WINDOW_HOURS}" ]; then
+              echo "Walk stopped: parent ${PARENT:0:7} is ${AGE_HOURS}h old (window ${WINDOW_HOURS}h)."
+              break
+            fi
+
+            case "${PARENT_MSG}" in
+              "fix(ci):"*|*"fix(ci):"*)
+                CHAIN_LEN=$((CHAIN_LEN + 1))
+                CHAIN_DETAILS="${CHAIN_DETAILS}- \`${PARENT:0:7}\`: ${PARENT_MSG}"$'\n'
+                ROOT_SHA="${PARENT}"
+                continue
+                ;;
+              *)
+                # First non-hotfix parent within window: that is the
+                # feature merge to blame. Capture it as the root cause
+                # signal.
+                ROOT_SHA="${PARENT}"
+                ROOT_MSG="${PARENT_MSG}"
+                break
+                ;;
+            esac
+          done <<< "${ANCESTORS}"
+
+          echo "Hotfix chain length R = ${CHAIN_LEN}"
+
+          if [ "${CHAIN_LEN}" -le 1 ]; then
+            echo "R = 1 (single hotfix). No action needed."
+            exit 0
+          fi
+
+          # EDGE-4 hardening: classify the chain against the benign-drift
+          # allow-list before deciding to comment. The agents-md regen +
+          # ruff-format drift sequence is mechanical post-feature cleanup,
+          # not a regression; alerting on it trains operators to ignore
+          # the signal entirely.
+          #
+          # Collect every chain subject including HEAD into a single
+          # buffer and pipe to the classifier.
+          CHAIN_SUBJECTS_FILE=$(mktemp)
+          printf '%s\n' "${HEAD_MSG}" | head -1 > "${CHAIN_SUBJECTS_FILE}"
+          # Append each parent's subject (first line). CHAIN_DETAILS lines
+          # look like "- `sha7`: subject", strip the prefix back to subject.
+          printf '%s' "${CHAIN_DETAILS}" \
+            | sed -E 's/^- `[0-9a-f]+`: //' \
+            >> "${CHAIN_SUBJECTS_FILE}"
+
+          # ubuntu-latest ships python3 by default; we do not need an
+          # explicit setup-python step for this stdlib-only script. If
+          # the classifier exits 2 (missing allow-list, malformed regex)
+          # we fall open to "investigate" so the legacy alert path runs.
+          VERDICT=$(python3 scripts/r_counter_classify.py \
+            < "${CHAIN_SUBJECTS_FILE}" 2>/dev/null || echo "investigate")
+
+          if [ "${VERDICT}" = "benign" ]; then
+            {
+              echo "## R-counter (benign drift, no PR comment)"
+              echo ""
+              echo "Chain length R=${CHAIN_LEN}, but every commit matches"
+              echo ".github/r-counter-allowlist.txt patterns. This is the"
+              echo "standard agents-md+ruff drift mop-up sequence after a"
+              echo "feature merge, not a regression. Suppressing PR comment."
+              echo ""
+              echo "### Chain (newest first)"
+              echo ""
+              printf -- '- `%s`: %s\n' "${HEAD_SHA:0:7}" "${HEAD_MSG}"
+              printf '%s' "${CHAIN_DETAILS}"
+            } >> "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+
+          echo "::warning::R-counter triggered: chain length ${CHAIN_LEN}"
+
+          # Identify the feature PR (if any) that introduced the root.
+          # The merge-commit message conventionally ends with `(#NNNN)`.
+          PR_NUMBER=""
+          if [ -n "${ROOT_SHA:-}" ]; then
+            ROOT_FULL_MSG=$(gh api "repos/${REPO}/commits/${ROOT_SHA}" \
+              --jq '.commit.message' 2>/dev/null || echo "")
+            PR_NUMBER=$(printf '%s' "${ROOT_FULL_MSG}" \
+              | grep -oE '#[0-9]+' \
+              | head -1 \
+              | tr -d '#' \
+              || true)
+          fi
+
+          BODY_FILE=$(mktemp)
+          {
+            printf '## R-counter triggered (hotfix begets hotfix)\n\n'
+            printf 'The CI hotfix on `%s` is the **%sth** consecutive `fix(ci):` commit on main within the last 24h. R = %s > 1 indicates the previous hotfix did not actually contain the regression.\n\n' \
+              "${HEAD_SHA:0:7}" "${CHAIN_LEN}" "${CHAIN_LEN}"
+            printf '### Chain (newest first)\n\n'
+            printf -- '- `%s`: %s\n' "${HEAD_SHA:0:7}" "${HEAD_MSG}"
+            printf '%s' "${CHAIN_DETAILS}"
+            printf '\n### Suggested next step\n\n'
+            printf 'Investigate the change that introduced the regression rather than landing another patch on top: when the chain count is above one, fix the original source instead of patching each follow-on failure separately.\n\n'
+            printf '_Posted automatically by `hotfix-r-tracker.yml`._\n'
+          } > "${BODY_FILE}"
+
+          if [ -n "${PR_NUMBER}" ]; then
+            echo "Commenting on root feature PR #${PR_NUMBER}"
+            gh pr comment "${PR_NUMBER}" --repo "${REPO}" --body-file "${BODY_FILE}" \
+              || echo "::warning::failed to comment on PR #${PR_NUMBER}"
+          else
+            # No PR to attach to: open an issue so the signal still lands.
+            TITLE="R-counter: hotfix chain R=${CHAIN_LEN} on main"
+            EXISTING=$(gh issue list --repo "${REPO}" --state open \
+              --search "in:title \"${TITLE}\"" \
+              --json number,title \
+              --jq ".[] | select(.title == \"${TITLE}\") | .number" \
+              | head -1)
+            if [ -n "${EXISTING}" ]; then
+              gh issue comment "${EXISTING}" --repo "${REPO}" --body-file "${BODY_FILE}"
+            else
+              gh issue create --repo "${REPO}" \
+                --title "${TITLE}" \
+                --body-file "${BODY_FILE}" \
+                --label "ci,reliability" \
+                || gh issue create --repo "${REPO}" \
+                  --title "${TITLE}" \
+                  --body-file "${BODY_FILE}"
+            fi
+          fi

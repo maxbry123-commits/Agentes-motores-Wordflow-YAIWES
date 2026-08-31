@@ -1,0 +1,131 @@
+name: CI (macOS nightly)
+
+# Safety-net workflow for macOS coverage (closes #1468 alongside the
+# per-PR macOS gate in ci.yml). Per-PR macOS runs are skipped unless
+# the diff is macOS-sensitive or the PR carries `macos-needed`; this
+# workflow runs the full macOS matrix daily at 06:00 UTC so any drift
+# that slipped past the PR gate is caught within 24 hours.
+#
+# Also runs on push to main and on workflow_dispatch so the
+# release-train can demand an on-demand macOS check before cutting a
+# tag. The job mirrors the `test` matrix in ci.yml so the signal is
+# directly comparable.
+
+on:
+  schedule:
+    # 06:00 UTC daily. Off-peak for both US/EU contributors so the
+    # macOS hosted-runner pool is least contended.
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      # Trigger on the same set of macOS-sensitive paths the per-PR
+      # gate uses (kept in sync with the planner classifier in ci.yml
+      # determine-changes). Push-event filters do not benefit from the
+      # ci.yml planner job, so we list the paths inline here.
+      - "src/bernstein/core/tunnels/**"
+      - "src/bernstein/core/daemon/**"
+      - "src/bernstein/core/config/platform_compat.py"
+      - "src/bernstein/core/security/vault/**"
+      - "src/bernstein/core/security/resource_limits.py"
+      - "src/bernstein/core/persistence/runtime_state.py"
+      - "src/bernstein/core/communication/notifications.py"
+      - "src/bernstein/core/preview/**"
+      - "src/bernstein/tui/clipboard.py"
+      - "src/bernstein/cli/display/splash_screen.py"
+      - "src/bernstein/bridges/openclaw_gateway.py"
+      - "tests/integration/test_adapter_e2e.py"
+      - "scripts/run_tests.py"
+      - ".github/workflows/ci.yml"
+      - ".github/workflows/ci-macos-nightly.yml"
+
+# Concurrency: one run at a time per trigger kind. Cancel earlier runs if
+# two of the same kind overlap (the latest wins), but keep the event name
+# in the group so a push-to-main run and the scheduled nightly never share
+# a cancellation slot -- a merge touching ci.yml must not kill the
+# in-flight nightly, nor the other way round.
+concurrency:
+  group: ci-macos-nightly-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test-macos-nightly:
+    name: Test (macos-latest, Python ${{ matrix.python-version }})
+    runs-on: macos-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # Mirrors the (post-exclude) macOS cell from the ci.yml `test`
+        # matrix: Python 3.13 only. Add 3.12 here if/when the per-PR
+        # matrix is restored, but for now nightly tracks the supported
+        # cell.
+        python-version: ["3.13"]
+    steps:
+      - name: Harden runner (audit mode)
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/bootstrap
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Run isolated test suite
+        run: uv run python scripts/run_tests.py --parallel 4
+      - name: Run capability-matrix spawn-refusal integration tests
+        run: |
+          uv run pytest tests/integration/test_capability_matrix_spawn_refusal.py \
+            -x -q --tb=short --timeout=120
+      - name: Run fake-CLI adapter integration tests
+        run: uv run pytest tests/integration/test_adapter_e2e.py -x -q --timeout=60
+
+  open-failure-issue:
+    # If the nightly fails on a scheduled OR push-to-main run, open a
+    # single tracking issue (or comment on the existing one) so macOS
+    # drift never sits silent. Push-to-main failures are real regressions
+    # that previously failed silently (no issue was opened), so they are
+    # now included. Labelled `ci-macos-nightly` for easy filtering. Only
+    # workflow_dispatch is skipped, to avoid noise during operator-driven
+    # ad-hoc runs.
+    name: Open / update macOS nightly failure issue
+    needs: [test-macos-nightly]
+    if: failure() && github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Harden runner (audit mode)
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+      - name: Open or update issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          TITLE="macOS nightly CI failing"
+          BODY="The macOS safety-net workflow failed (trigger: ${EVENT_NAME}) on $(date -u +%Y-%m-%dT%H:%M:%SZ). Run: ${RUN_URL}. See #1468 for the gating policy."
+          # Find an existing open issue first so we do not create a new
+          # one every night while the underlying break persists.
+          EXISTING=$(gh issue list --label ci-macos-nightly --state open \
+            --json number --jq '.[0].number' 2>/dev/null || echo "")
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --body "$BODY" || true
+          else
+            gh issue create \
+              --title "$TITLE" \
+              --label ci-macos-nightly \
+              --body "$BODY" || true
+          fi

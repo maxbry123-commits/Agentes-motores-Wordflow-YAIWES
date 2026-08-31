@@ -1,0 +1,126 @@
+[default]
+extend-ignore-re = [
+    # Test files intentionally use truncated strings to simulate partial writes
+    "Truncat",
+    # Base64-encoded JWT tokens contain fragments that look like typos
+    "eyJ[A-Za-z0-9+/=._-]+",
+    # Prompt-injection test payloads embed a zero-width space (U+200B) inside
+    # tokens like "ig​nore" to bypass naive keyword filters. typos splits
+    # on the ZWSP and flags the trailing fragment ("nore") as a misspelling.
+    # Mask any alphanumeric run that contains an embedded ZWSP so fixtures
+    # stay intact without globally allowlisting the fragment.
+    "[A-Za-z]+​[A-Za-z]+",
+    # Receipt digests in generated projections (adapter conformance canary
+    # table, last_green.json). The canary regenerates these on every run, so
+    # any digest can land on a dictionary near-miss -- ``a18d3caf54fc`` reads
+    # as "caf" -> "calf", the same false positive already path-excluded for
+    # the lineage fixtures below. Mask hex runs of 12 characters or more (the
+    # short-digest width and up); no English word is twelve characters drawn
+    # only from [0-9a-f], so this cannot hide a real prose typo.
+    '\b[0-9a-f]{12,}\b',
+]
+
+[default.extend-words]
+# Variable names and abbreviations in code
+ba = "ba"            # ba_table = Budget & Approval table (manifest_cmd.py)
+nd = "nd"            # nd = number of diffs (benchmarks/run_benchmark.py)
+opps = "opps"        # opps = opportunities (test_evolution_e2e.py, test_evolution_loop.py)
+ded = "ded"          # injection_ded = injection deduction (memory_sanitizer.py)
+ehr = "ehr"          # Electronic Health Record (HIPAA compliance)
+rto = "rto"          # Recovery Time Objective (compliance/DR)
+RTO = "RTO"          # Recovery Time Objective (compliance/DR, acronym)
+mis = "mis"          # false positive on partial words
+hel = "hel"          # truncated stream-chunk fixture "hel"+"lo" (test_client_hardened.py)
+fo = "fo"            # fo = fan_out (test_complexity_correlation.py)
+thr = "thr"          # thr = threshold (scripts/mutmut_critical.py)
+strat = "strat"      # strat = strategy (adapter STRATEGY_MATRIX, test_adapter_wave_2521.py)
+doub = "doub"        # doub = SQLite "double" type-affinity prefix (datasources/engine.py)
+Aktive = "Aktive"    # correct German word for "Active" (i18n.py)
+abd = "abd"          # deterministic 3-byte hash fixture b"abd" (test_computer_use_lineage.py)
+continu = "continu"  # intentional substring match for "continue"/"continuity" in error text (test_capability_tokens.py)
+reprot = "reprot"    # intentionally malformed artifact-kind fixture (test_artifact_spec_declaration.py)
+critera = "critera"  # intentionally malformed artifact_spec key fixture (test_artifact_spec_declaration.py)
+
+# Technical terms used consistently in the codebase
+unparseable = "unparseable"
+Unparseable = "Unparseable"
+empted = "empted"    # `pre-empted` (past tense of pre-empt); typos splits on `-`
+noteable = "noteable" # GitLab webhook field name (`noteable_type`, `noteable_id`)
+Noteable = "Noteable" # GitLab webhook field name, capitalised form
+optin = "optin"      # compound abbreviation for "opt-in"; used in test filenames
+Optin = "Optin"      # capitalised form for class names / docs
+
+# Audit receipt envelope formats (RFC 9052 COSE_Sign1, in-toto/DSSE)
+cose = "cose"        # COSE_Sign1 signature format (audit receipt export)
+COSE = "COSE"        # COSE_Sign1 signature format, acronym form
+intoto = "intoto"    # in-toto v1 Statement / DSSE attestation format
+
+# Proper nouns and product names
+Hashi = "Hashi"      # HashiCorp
+certifi = "certifi"  # Python CA certificate package
+SIE = "SIE"          # appears as a fragment of "SIEM"/"SIEMs"
+SIEM = "SIEM"        # Security Information & Event Management (acronym)
+SIEMs = "SIEMs"      # plural of SIEM (compliance/audit docs)
+
+[default.extend-identifiers]
+# Truncated benchmark task names (generated data)
+architec = "architec"
+
+[files]
+extend-exclude = [
+    # Binary assets (typos cannot meaningfully check filenames of binaries)
+    "docs/assets/*.png",
+    # Generated benchmark results contain truncated task names
+    "benchmarks/results/*.json",
+    # Translated READMEs - typos has only an English dictionary, every
+    # non-English word would be a false positive.
+    "docs/i18n/**",
+    # Latin-script translated READMEs at the repo root - same false-positive
+    # profile; the English README.md does not match this glob and stays in scope.
+    "README.*.md",
+    # README demo evidence (issue #3426) - machine-generated recording bytes
+    # and cryptographic content (base64url JWK x / signature, hex hashes);
+    # the scanner reads base64 slices like "izRV" as words. The
+    # human-authored docs around the evidence stay in scope.
+    "docs/assets/demo-run/**",
+    # Operator-surface renders (issue #3427) - both are machine-generated from
+    # a captured run: the SVG carries Rich's own class namespace and the
+    # fixture carries task ids and hex session identifiers, which the scanner
+    # reads as words. Regenerating them is a command, not an edit, so a
+    # spelling fix here would be reverted by the next --update.
+    "docs/assets/tui-live.svg",
+    "tests/fixtures/tui_live_frame.json",
+    # Lineage demo fixtures are 100% deterministic hex content (sha256 hashes,
+    # JWS base64url, Ed25519 PEM). The scanner reads three-char hex slices like
+    # "abd"/"caf"/"dbe" as misspellings of and/calf/be. Path-exclude the entire
+    # fixtures tree; review still applies to the human-authored README/Makefile.
+    "examples/lineage/*/fixtures/**",
+    "examples/lineage/*/expected-pack.zip",
+    # Trust-record conformance vectors - same content profile as the lineage
+    # fixtures above: Ed25519 signatures and a did:key multibase subject, both
+    # base64/base58 runs the scanner reads as words ("iy" -> "it" inside a
+    # signature). The bytes are a real signature over the record, so a spelling
+    # fix here is not possible: editing one character invalidates the signature
+    # the offline verification test checks. Only the generated vectors are
+    # excluded; the human-authored builder script beside them stays in scope.
+    "tests/fixtures/trust-record-vectors/*.json",
+    "tests/fixtures/trust-record-vectors/*.pem",
+    # Vite-built SPA bundle - minified JS / sourcemaps mangle identifiers to
+    # 1–2 chars (``ue``, ``ot``, ``Iy``, ``Archtype``, etc.) that trigger
+    # thousands of false-positive typo errors and bury real findings. Human-
+    # authored React/TS sources under ``web/src/`` stay in scope.
+    "src/bernstein/gui/static/**",
+    # Packaged dashboard browser bundles - minified JS has the same
+    # identifier-mangling profile as the Vite-built SPA bundle above.
+    "src/bernstein/dashboard/static/**",
+    # Auto-heal typos helper -- intentionally contains a prose-typo
+    # denylist (`recieve`, `occured`, etc.) as data so it can reject
+    # those tokens at allowlist-time. The matching unit tests also
+    # carry the strings. Scanning these would create a circular
+    # contradiction (the scanner sees its own denylist as a typo).
+    "scripts/auto_heal_typos.py",
+    "tests/unit/test_auto_heal_typos.py",
+]
+
+[type.md]
+extend-words = { PN = "PN" }  # "PNGs" in markdown docs

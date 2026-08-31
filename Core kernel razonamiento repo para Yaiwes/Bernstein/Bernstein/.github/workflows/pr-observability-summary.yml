@@ -1,0 +1,131 @@
+name: PR observability summary
+
+on:
+  pull_request:
+    # `labeled` is in the list because the job is gated on the deep-review
+    # label, which is usually applied after the PR is already open; without
+    # it, adding the label does nothing until the next push.
+    types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: PR number to summarise (dispatch only)
+        required: true
+
+concurrency:
+  group: pr-observability-${{ github.event.pull_request.number || github.event.inputs.pr_number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  summary:
+    name: Sticky observability comment
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      checks: read
+      contents: read
+      pull-requests: write
+      security-events: read
+    # Opt-in on PRs: the observability fan-out only runs when the PR carries
+    # the 'deep-review' label, so ordinary PR pushes skip it. The manual
+    # workflow_dispatch path stays unconditional so an operator can summarise
+    # any PR on demand.
+    if: >
+      (github.event_name == 'pull_request' &&
+       contains(github.event.pull_request.labels.*.name, 'deep-review')) ||
+      github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c  # v2.21.0
+        with:
+          egress-policy: audit
+          disable-sudo: true
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up uv
+        uses: ./.github/actions/bootstrap
+        with:
+          python-version: '3.13'
+
+      - name: Install bernstein
+        run: |
+          uv sync --group dev
+
+      - name: Run doctor observe (JSON)
+        id: observe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p .ci/observability
+          uv run bernstein doctor observe --json --no-persist \
+            > .ci/observability/observe.json || true
+
+      - name: Report required-context presence on the PR head
+        # A head commit missing a required check context produces the same
+        # empty failure list as one whose checks all passed. This step names
+        # which of the two the PR is in. Advisory: `continue-on-error` keeps
+        # the report out of the gate - mergeability is still decided by the
+        # required contexts themselves.
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number || github.event.inputs.pr_number }}
+        run: |
+          set -uo pipefail
+          report="$(uv run python scripts/check_required_contexts.py --pr "$PR_NUMBER" 2>&1)" && rc=0 || rc=$?
+          {
+            echo "### Required-context presence"
+            echo ""
+            echo '```text'
+            echo "$report"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "$report"
+          exit "$rc"
+
+      - name: Build PR summary markdown
+        id: build
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number || github.event.inputs.pr_number }}
+          PR_BRANCH: ${{ github.event.pull_request.head.ref || '' }}
+        run: |
+          set -euo pipefail
+          uv run python scripts/observability/build_pr_summary.py \
+            --observe .ci/observability/observe.json \
+            --pr "$PR_NUMBER" \
+            --branch "$PR_BRANCH" \
+            --out .ci/observability/pr_summary.md
+          {
+            echo 'body<<OBSERVABILITY_EOF'
+            cat .ci/observability/pr_summary.md
+            echo 'OBSERVABILITY_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Append summary to job step summary
+        # Always surface the report in the job summary. Fork PRs run with a
+        # read-only GITHUB_TOKEN, so the sticky-comment step below 403s and
+        # is skipped; the step summary keeps the observability report
+        # visible regardless of who opened the PR.
+        run: cat .ci/observability/pr_summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Post sticky comment
+        # Skip on fork PRs: their GITHUB_TOKEN is read-only and the comment
+        # API returns 403. workflow_dispatch and same-repo PRs keep the
+        # sticky comment.
+        if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: marocchino/sticky-pull-request-comment@5770ad5eb8f42dd2c4f34da00c94c5381e49af88  # v3.0.5
+        with:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          number: ${{ github.event.pull_request.number || github.event.inputs.pr_number }}
+          header: bernstein-observability
+          message: ${{ steps.build.outputs.body }}

@@ -1,0 +1,105 @@
+name: cluster-tunnel-e2e
+
+# Bring up Bernstein central + a cloudflared sidecar via docker compose
+# and assert a worker can register / heartbeat through the public
+# tunnel hostname.
+#
+# This workflow makes real outbound calls to Cloudflare's edge and
+# requires:
+#   * secrets.CF_TUNNEL_TOKEN     - token for the test tunnel
+#   * secrets.CF_TUNNEL_HOSTNAME  - public hostname mapped to the tunnel
+#
+# Both are scoped to a throwaway tunnel used only for CI.
+#
+# It is opt-in:
+#   * Default: NOT triggered on regular PRs (the test guards itself
+#     with CI_TUNNEL_TEST=1 and skips when the secrets are missing).
+#   * Weekly: scheduled cron run (Sundays).
+#   * On-demand: workflow_dispatch.
+
+on:
+  schedule:
+    # 04:23 UTC weekly on Sunday. Offset from cluster-e2e (03:17) and
+    # other scheduled maintenance jobs so they don't compete for the
+    # same GitHub-hosted runner pool. Moved off a daily cadence because
+    # the lane has 0 failures in 81 runs and consumes the same 20-slot
+    # pool that PR verdicts queue behind.
+    - cron: "23 4 * * 0"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to test"
+        required: false
+        default: "main"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cluster-tunnel-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cluster-tunnel-e2e:
+    name: cluster-tunnel-e2e (linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    # Only run on the upstream repo so PRs from forks don't try to
+    # use the secrets (and silently skip).
+    if: github.repository == 'sipyourdrink-ltd/bernstein'
+    steps:
+      - name: Harden runner (audit mode)
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          enable-cache: true
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Sync dependencies
+        run: uv sync --frozen --all-extras --no-extra modal
+
+      - name: Verify docker compose available
+        run: docker compose version
+
+      - name: Run cluster tunnel smoke test
+        env:
+          CI_TUNNEL_TEST: "1"
+          CF_TUNNEL_TOKEN:    ${{ secrets.CF_TUNNEL_TOKEN }}
+          CF_TUNNEL_HOSTNAME: ${{ secrets.CF_TUNNEL_HOSTNAME }}
+          BERNSTEIN_RUN_CLUSTER_E2E: "1"
+        run: |
+          uv run pytest tests/integration/cluster/test_cluster_tunnel_smoke.py \
+            -m cluster_e2e -x -q --tb=short
+
+      - name: Collect docker compose logs
+        if: always()
+        run: |
+          docker ps -a > /tmp/docker-ps.txt 2>&1 || true
+          docker compose -f examples/cluster/cloudflared/docker-compose.yml \
+            logs --no-color > /tmp/compose-final.log 2>&1 || true
+          docker compose -f examples/cluster/cloudflared/docker-compose.yml \
+            down -v --remove-orphans > /tmp/compose-down.log 2>&1 || true
+
+      - name: Upload diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: cluster-tunnel-e2e-logs
+          path: |
+            /tmp/docker-ps.txt
+            /tmp/compose-final.log
+            /tmp/compose-down.log
+            /tmp/pytest-*/**/compose.log
+          if-no-files-found: ignore
+          retention-days: 7

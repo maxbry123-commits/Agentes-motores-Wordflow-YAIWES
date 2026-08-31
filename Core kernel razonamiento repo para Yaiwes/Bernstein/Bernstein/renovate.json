@@ -1,0 +1,70 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended"
+  ],
+  "minimumReleaseAge": "7 days",
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Track the trufflehog scanner image. The github-actions manager only reads 'uses:' lines, but that action is a wrapper that runs 'ghcr.io/trufflesecurity/trufflehog:${version}'; without this the pinned scanner would silently go stale.",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/trufflehog\\.yml$/"
+      ],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>[a-z-]+) depName=(?<depName>\\S+)\\s+version:\\s*(?<currentValue>[^\\s#]+)"
+      ]
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "trufflehog releases the action wrapper and the scanner image from one repository, and tests/unit/test_trufflehog_workflow_yaml.py requires the workflow to name the same release for both. Group them so a bump lands as one pull request rather than two that each fail that check.",
+      "groupName": "trufflehog",
+      "matchPackageNames": [
+        "trufflesecurity/trufflehog",
+        "ghcr.io/trufflesecurity/trufflehog"
+      ]
+    },
+    {
+      "description": "Pin python to 3.13 until aider-chat and other adapters confirm 3.14 compatibility.",
+      "matchManagers": [
+        "github-actions",
+        "docker-compose",
+        "dockerfile"
+      ],
+      "matchPackageNames": [
+        "python",
+        "/actions/python-versions/",
+        "/actions/setup-python/"
+      ],
+      "allowedVersions": "<=3.13"
+    },
+    {
+      "description": "Hold major updates back longer so a fast-follow patch can land before we bump.",
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "minimumReleaseAge": "14 days"
+    },
+    {
+      "description": "Hold TypeScript on 6.x for the npm packages: ts-jest's peer range is '>=4.3 <7', so a TypeScript 7 bump makes 'npm ci' fail with ERESOLVE. Renovate updates package.json and the lockfile together, so a bump within this range stays consistent. Lift this once ts-jest supports TypeScript 7.",
+      "matchManagers": [
+        "npm"
+      ],
+      "matchPackageNames": [
+        "typescript"
+      ],
+      "allowedVersions": "<7"
+    },
+    {
+      "description": "docs/requirements.txt is a compiled, hash-pinned resolution, so every package appears there as a bare '==' pin and the range that docs/requirements.in declares for it is invisible to the pip_requirements manager. mkdocs-redirects is capped below 1.2.3 in that .in file because 1.2.3 adds a runtime dependency on properdocs; bumping the compiled pin past the cap yields a hash-pinned file with that dependency missing, and 'pip install --require-hashes -r docs/requirements.txt' then fails to resolve it. No workflow installs that file, so the failure lands in the docs build rather than in CI. Lift this together with the cap in docs/requirements.in.",
+      "matchManagers": [
+        "pip_requirements"
+      ],
+      "matchPackageNames": [
+        "mkdocs-redirects"
+      ],
+      "allowedVersions": "<1.2.3"
+    }
+  ]
+}

@@ -1,0 +1,191 @@
+"""WEB-008: Data export endpoints for tasks and agents.
+
+GET /export/tasks?format=csv|json
+GET /export/agents?format=csv|json
+"""
+
+from __future__ import annotations
+
+import csv
+import io
+import json
+import time
+from typing import TYPE_CHECKING, Any, cast
+
+from fastapi import APIRouter, Request
+from fastapi.responses import Response
+
+if TYPE_CHECKING:
+    from bernstein.core.server import TaskStore
+
+router = APIRouter()
+
+_TASK_CSV_FIELDS = [
+    "id",
+    "title",
+    "description",
+    "role",
+    "priority",
+    "status",
+    "assigned_agent",
+    "created_at",
+    "completed_at",
+]
+
+_AGENT_CSV_FIELDS = [
+    "id",
+    "role",
+    "status",
+    "task_id",
+    "started_at",
+]
+
+
+def _get_store(request: Request) -> TaskStore:
+    return request.app.state.store  # type: ignore[no-any-return]
+
+
+def _task_to_export_dict(task: Any) -> dict[str, Any]:
+    """Convert a task object to an export-friendly dict."""
+    return {
+        "id": task.id,
+        "title": task.title,
+        "description": task.description,
+        "role": task.role,
+        "priority": task.priority,
+        "status": task.status.value if hasattr(task.status, "value") else str(task.status),
+        "assigned_agent": task.assigned_agent or "",
+        "created_at": task.created_at,
+        "completed_at": task.completed_at or "",
+    }
+
+
+def _agents_snapshot(request: Request) -> list[dict[str, Any]]:
+    """Read the current agents snapshot from disk, narrowed to the caller's scope.
+
+    The snapshot file carries no tenant field of its own: one orchestrator
+    process serves every tenant it is configured for and writes all their
+    sessions into a single ``agents.json``.  Rather than migrate the on-disk
+    format, the tenant is *derived* at read time from the task each record
+    names - which is what placed the session in the first place, since a
+    session exists to run one task.
+
+    A record naming no task has no tenant to derive and is kept: it describes
+    the process, not anybody's work.  So does a record whose task no longer
+    resolves - dropping it would be an existence check on the task table
+    rather than a scope narrowing, and would silently empty the export as
+    tasks age out of the store.
+    """
+    from pathlib import Path
+
+    from bernstein.core.routes.task_crud import task_ids_outside_tenant_scope
+
+    sdd_dir = getattr(request.app.state, "sdd_dir", None)
+    if not isinstance(sdd_dir, Path):
+        return []
+
+    path = sdd_dir / "runtime" / "agents.json"
+    if not path.exists():
+        return []
+
+    try:
+        payload: dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+
+    agents_raw: list[dict[str, Any]] = []
+    raw_list: list[Any] = payload.get("agents", [])
+    for raw_agent in raw_list:
+        if isinstance(raw_agent, dict):
+            agent_dict = cast("dict[str, Any]", raw_agent)
+            agents_raw.append(
+                {
+                    "id": str(agent_dict.get("id", "")),
+                    "role": str(agent_dict.get("role", "")),
+                    "status": str(agent_dict.get("status", "")),
+                    "task_id": str(agent_dict.get("task_id", "")),
+                    "started_at": agent_dict.get("started_at", ""),
+                }
+            )
+
+    out_of_scope = task_ids_outside_tenant_scope(request, [agent["task_id"] for agent in agents_raw])
+    return [agent for agent in agents_raw if agent["task_id"] not in out_of_scope]
+
+
+def _make_csv(rows: list[dict[str, Any]], fields: list[str]) -> str:
+    """Render a list of dicts as CSV text."""
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=fields, extrasaction="ignore")
+    writer.writeheader()
+    writer.writerows(rows)
+    return buf.getvalue()
+
+
+@router.get("/export/tasks")
+def export_tasks(
+    request: Request,
+    format: str = "json",
+    limit: int | None = None,
+    offset: int | None = None,
+) -> Response:
+    """Export tasks as CSV or JSON.
+
+    Query params:
+        format: ``csv`` or ``json`` (default ``json``).
+        limit: Optional max number of tasks to return. Pushed into
+            ``TaskStore.list_tasks`` so large stores no longer materialise
+            the whole table (issue #1728 finding 3).
+        offset: Optional number of tasks to skip before returning rows.
+
+    The export is a whole-store read, so it narrows to the caller's tenant
+    scope the same way the paginated task list does. The scope is pushed into
+    ``list_tasks`` rather than applied to the returned rows so that it is
+    ``limit``/``offset`` that page through the caller's own tasks: filtering
+    after the slice would page through every tenant's and return short pages.
+    """
+    from bernstein.core.routes.task_crud import _resolve_request_tenant_scope
+
+    all_tasks = _get_store(request).list_tasks(
+        limit=limit,
+        offset=offset,
+        tenant_id=_resolve_request_tenant_scope(request),
+    )
+    rows = [_task_to_export_dict(t) for t in all_tasks]
+
+    if format == "csv":
+        content = _make_csv(rows, _TASK_CSV_FIELDS)
+        return Response(
+            content=content,
+            media_type="text/csv",
+            headers={"Content-Disposition": f"attachment; filename=tasks_{int(time.time())}.csv"},
+        )
+
+    return Response(
+        content=json.dumps(rows, indent=2),
+        media_type="application/json",
+        headers={"Content-Disposition": f"attachment; filename=tasks_{int(time.time())}.json"},
+    )
+
+
+@router.get("/export/agents")
+def export_agents(request: Request, format: str = "json") -> Response:
+    """Export agent snapshots as CSV or JSON.
+
+    Query params:
+        format: ``csv`` or ``json`` (default ``json``).
+    """
+    agents = _agents_snapshot(request)
+
+    if format == "csv":
+        content = _make_csv(agents, _AGENT_CSV_FIELDS)
+        return Response(
+            content=content,
+            media_type="text/csv",
+            headers={"Content-Disposition": f"attachment; filename=agents_{int(time.time())}.csv"},
+        )
+
+    return Response(
+        content=json.dumps(agents, indent=2),
+        media_type="application/json",
+        headers={"Content-Disposition": f"attachment; filename=agents_{int(time.time())}.json"},
+    )

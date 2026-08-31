@@ -1,0 +1,87 @@
+name: CIFuzz (ClusterFuzzLite)
+
+# OSSF Scorecard's `Fuzzing` check recognizes ClusterFuzzLite when a
+# .clusterfuzzlite/ directory and a CIFuzz workflow are both present.
+# This workflow runs a short weekly batch fuzzing session so the check
+# fires without paying a per-PR-push cost; the Hypothesis property-test
+# suite in tests/ stays the primary fuzzing surface for real bug
+# discovery.
+#
+# Build and run live in a single job because ClusterFuzzLite expects
+# the build-out directory to exist on disk when run_fuzzers starts;
+# splitting into separate jobs would require an artifact round-trip
+# that the official actions do not support.
+#
+# Ref: https://google.github.io/clusterfuzzlite/running-clusterfuzzlite/github-actions/
+
+on:
+  # Weekly batch fuzz session (Monday 05:17 UTC). The previous per-PR
+  # code-change trigger is dropped to cut per-push CI load; a weekly run
+  # keeps a CIFuzz workflow present for OSSF Scorecard's Fuzzing check.
+  schedule:
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: cifuzz-weekly-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  cifuzz:
+    name: Build and run fuzzers
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Scorecard TokenPermissionsID: keep this job strictly read-only.
+    # The previous `security-events: write` was only needed to upload
+    # SARIF via run_fuzzers (output-sarif: true). Crash artefacts are
+    # surfaced through actions/upload-artifact below, which gives PR
+    # authors enough signal without the elevated token scope.
+    #
+    # `actions: read` lets run_fuzzers diff against the previous build's
+    # corpus artefact (avoids the 401 it otherwise logs when fetching it);
+    # it is a read scope, so it does not affect the Scorecard token score.
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build fuzzers (address sanitizer)
+        id: build
+        uses: google/clusterfuzzlite/actions/build_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1  # v1
+        with:
+          language: python
+          sanitizer: address
+
+      - name: Run fuzzers (address sanitizer, short session)
+        id: run
+        uses: google/clusterfuzzlite/actions/run_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1  # v1
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          fuzz-seconds: 120
+          # batch mode (not code-change): a scheduled / dispatch run has no
+          # PR diff to drive code-change mode, so run all fuzzers for the
+          # fixed session length instead.
+          mode: batch
+          sanitizer: address
+          # output-sarif disabled intentionally: enabling it would
+          # require `security-events: write` on this job (Scorecard
+          # TokenPermissionsID flags that as a score-0 risk). Crash
+          # artefacts are uploaded via actions/upload-artifact below
+          # which is enough signal for PR-time triage.
+          output-sarif: false
+
+      - name: Upload crash artifacts
+        if: failure() && steps.run.outcome == 'failure'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: cifuzz-artifacts-address
+          path: ./out/artifacts
+          if-no-files-found: ignore
+          retention-days: 7

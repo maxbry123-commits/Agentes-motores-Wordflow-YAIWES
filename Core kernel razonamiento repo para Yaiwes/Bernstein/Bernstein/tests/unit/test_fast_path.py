@@ -1,0 +1,593 @@
+"""Tests for fast-path task classification and deterministic executors."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import pytest
+from bernstein.core.fast_path import (
+    FastPathAction,
+    FastPathResult,
+    FastPathStats,
+    TaskLevel,
+    classify_task,
+    execute_fast_path,
+    get_l1_model_config,
+    try_fast_path_batch,
+)
+from bernstein.core.models import Complexity, ModelConfig, Scope, Task
+
+from bernstein.core import fast_path as fast_path_module
+from bernstein.core.agents.spawn_errors import ModelNotConfiguredError
+
+# --- Helpers ---
+
+
+def _make_task(
+    *,
+    title: str = "Implement feature",
+    description: str = "",
+    role: str = "backend",
+    complexity: Complexity = Complexity.MEDIUM,
+    scope: Scope = Scope.MEDIUM,
+    priority: int = 2,
+    model: str | None = None,
+    owned_files: list[str] | None = None,
+) -> Task:
+    return Task(
+        id="T-test",
+        title=title,
+        description=description,
+        role=role,
+        complexity=complexity,
+        scope=scope,
+        priority=priority,
+        model=model,
+        owned_files=owned_files or [],
+    )
+
+
+# --- Classification tests ---
+
+
+class TestClassifyTask:
+    """Tests for classify_task()."""
+
+    def test_high_complexity_always_l2(self) -> None:
+        task = _make_task(title="Format code", complexity=Complexity.HIGH)
+        result = classify_task(task)
+        assert result.level == TaskLevel.L2
+
+    def test_large_scope_always_l2(self) -> None:
+        task = _make_task(title="Format code", scope=Scope.LARGE)
+        result = classify_task(task)
+        assert result.level == TaskLevel.L2
+
+    def test_critical_priority_always_l2(self) -> None:
+        task = _make_task(title="Format code", priority=1)
+        result = classify_task(task)
+        assert result.level == TaskLevel.L2
+
+    def test_manager_role_always_l2(self) -> None:
+        task = _make_task(title="Format code", role="manager")
+        result = classify_task(task)
+        assert result.level == TaskLevel.L2
+
+    def test_architect_role_always_l2(self) -> None:
+        task = _make_task(title="Format code", role="architect")
+        result = classify_task(task)
+        assert result.level == TaskLevel.L2
+
+    def test_security_role_always_l2(self) -> None:
+        task = _make_task(title="Sort imports", role="security")
+        result = classify_task(task)
+        assert result.level == TaskLevel.L2
+
+    def test_opus_override_always_l2(self) -> None:
+        task = _make_task(title="Format code", model="opus")
+        result = classify_task(task)
+        assert result.level == TaskLevel.L2
+
+    def test_format_classified_l0(self) -> None:
+        task = _make_task(title="Format the codebase", complexity=Complexity.LOW, scope=Scope.SMALL)
+        result = classify_task(task)
+        assert result.level == TaskLevel.L0
+        assert result.action == FastPathAction.RUFF_FORMAT
+
+    def test_formatting_classified_l0(self) -> None:
+        task = _make_task(title="Apply formatting to utils.py", complexity=Complexity.LOW)
+        result = classify_task(task)
+        assert result.level == TaskLevel.L0
+        assert result.action == FastPathAction.RUFF_FORMAT
+
+    def test_lint_classified_l0(self) -> None:
+        task = _make_task(title="Fix lint errors in models.py", complexity=Complexity.LOW)
+        result = classify_task(task)
+        assert result.level == TaskLevel.L0
+        assert result.action == FastPathAction.RUFF_FIX
+
+    def test_autofix_classified_l0(self) -> None:
+        task = _make_task(title="Run autofix on codebase", complexity=Complexity.LOW)
+        result = classify_task(task)
+        assert result.level == TaskLevel.L0
+        assert result.action == FastPathAction.RUFF_FIX
+
+    def test_sort_imports_classified_l0(self) -> None:
+        task = _make_task(title="Sort imports across project", complexity=Complexity.LOW)
+        result = classify_task(task)
+        assert result.level == TaskLevel.L0
+        assert result.action == FastPathAction.SORT_IMPORTS
+
+    def test_isort_classified_l0(self) -> None:
+        task = _make_task(title="Run isort on all files", complexity=Complexity.LOW)
+        result = classify_task(task)
+        assert result.level == TaskLevel.L0
+        assert result.action == FastPathAction.SORT_IMPORTS
+
+    def test_rename_classified_l0(self) -> None:
+        task = _make_task(
+            title="Rename getCwd to get_current_dir",
+            complexity=Complexity.LOW,
+        )
+        result = classify_task(task)
+        assert result.level == TaskLevel.L0
+        assert result.action == FastPathAction.RENAME_SYMBOL
+
+    def test_rename_with_arrow_classified_l0(self) -> None:
+        task = _make_task(
+            title="Rename old_func -> new_func",
+            complexity=Complexity.LOW,
+        )
+        result = classify_task(task)
+        assert result.level == TaskLevel.L0
+        assert result.action == FastPathAction.RENAME_SYMBOL
+
+    def test_docstring_classified_l1(self) -> None:
+        task = _make_task(title="Add docstring to parse_config", complexity=Complexity.LOW)
+        result = classify_task(task)
+        assert result.level == TaskLevel.L1
+
+    def test_type_hint_classified_l1(self) -> None:
+        task = _make_task(title="Add type hint to all public methods", complexity=Complexity.LOW)
+        result = classify_task(task)
+        assert result.level == TaskLevel.L1
+
+    def test_typo_classified_l1(self) -> None:
+        task = _make_task(title="Fix typo in README", complexity=Complexity.LOW)
+        result = classify_task(task)
+        assert result.level == TaskLevel.L1
+
+    def test_low_complexity_small_scope_l1(self) -> None:
+        task = _make_task(
+            title="Update config value",
+            complexity=Complexity.LOW,
+            scope=Scope.SMALL,
+        )
+        result = classify_task(task)
+        assert result.level == TaskLevel.L1
+        assert result.confidence == pytest.approx(0.7)
+
+    def test_complex_feature_l2(self) -> None:
+        task = _make_task(title="Implement WebSocket support")
+        result = classify_task(task)
+        assert result.level == TaskLevel.L2
+
+    def test_classification_has_confidence(self) -> None:
+        task = _make_task(title="Fix lint issues", complexity=Complexity.LOW)
+        result = classify_task(task)
+        assert 0.0 < result.confidence <= 1.0
+
+    def test_classification_has_reason(self) -> None:
+        task = _make_task(title="Fix lint issues", complexity=Complexity.LOW)
+        result = classify_task(task)
+        assert result.reason != ""
+
+
+# --- Executor tests ---
+
+
+class TestExecuteFastPath:
+    """Tests for execute_fast_path() deterministic executors."""
+
+    @patch("bernstein.core.quality.fast_path.subprocess.run")
+    def test_ruff_format_success(self, mock_run: MagicMock) -> None:
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout="1 file reformatted",
+            stderr="",
+        )
+        result = execute_fast_path(
+            FastPathAction.RUFF_FORMAT,
+            Path("/tmp/project"),
+            ["src/main.py"],
+        )
+        assert result.success is True
+        assert result.action == FastPathAction.RUFF_FORMAT
+        assert result.duration_s >= 0
+
+    @patch("bernstein.core.quality.fast_path.subprocess.run")
+    def test_ruff_fix_success(self, mock_run: MagicMock) -> None:
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout="Fixed 3 errors",
+            stderr="",
+        )
+        result = execute_fast_path(
+            FastPathAction.RUFF_FIX,
+            Path("/tmp/project"),
+            [],
+        )
+        assert result.success is True
+        assert result.action == FastPathAction.RUFF_FIX
+
+    @patch("bernstein.core.quality.fast_path.subprocess.run")
+    def test_sort_imports_success(self, mock_run: MagicMock) -> None:
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout="",
+            stderr="",
+        )
+        result = execute_fast_path(
+            FastPathAction.SORT_IMPORTS,
+            Path("/tmp/project"),
+            ["src/utils.py"],
+        )
+        assert result.success is True
+        assert result.action == FastPathAction.SORT_IMPORTS
+
+    @patch("bernstein.core.quality.fast_path.subprocess.run")
+    def test_ruff_format_failure(self, mock_run: MagicMock) -> None:
+        mock_run.return_value = MagicMock(
+            returncode=2,
+            stdout="",
+            stderr="error: invalid syntax",
+        )
+        result = execute_fast_path(
+            FastPathAction.RUFF_FORMAT,
+            Path("/tmp/project"),
+            ["bad.py"],
+        )
+        assert result.success is False
+        assert result.error is not None
+
+    @patch("bernstein.core.quality.fast_path.subprocess.run")
+    def test_ruff_not_found(self, mock_run: MagicMock) -> None:
+        mock_run.side_effect = FileNotFoundError("ruff not found")
+        result = execute_fast_path(
+            FastPathAction.RUFF_FORMAT,
+            Path("/tmp/project"),
+            [],
+        )
+        assert result.success is False
+        assert "not found" in (result.error or "")
+
+    def test_rename_success(self, tmp_path: Path) -> None:
+        """Test rename executor modifies files correctly."""
+        src = tmp_path / "main.py"
+        src.write_text("def getCwd():\n    return getCwd()\n")
+        task = _make_task(
+            title="Rename getCwd to get_cwd",
+            complexity=Complexity.LOW,
+            owned_files=["main.py"],
+        )
+        result = execute_fast_path(
+            FastPathAction.RENAME_SYMBOL,
+            tmp_path,
+            ["main.py"],
+            task=task,
+        )
+        assert result.success is True
+        assert result.files_modified == 1
+        assert "get_cwd" in src.read_text()
+        assert "getCwd" not in src.read_text()
+
+    def test_rename_ignores_absolute_owned_file(self, tmp_path: Path) -> None:
+        """An absolute entry in owned_files never reaches a file outside workdir.
+
+        ``Path.__truediv__`` drops the left operand entirely when the right
+        operand is absolute, so ``workdir / "/x/y"`` is ``/x/y``.  The entry
+        is skipped and the outside file is left byte-for-byte unchanged.
+        """
+        workdir = tmp_path / "workdir"
+        workdir.mkdir()
+        outside = tmp_path / "outside.py"
+        outside.write_text("def getCwd():\n    return 1\n", encoding="utf-8")
+        original = outside.read_bytes()
+
+        task = _make_task(
+            title="Rename getCwd to get_cwd",
+            complexity=Complexity.LOW,
+            owned_files=[str(outside)],
+        )
+        result = execute_fast_path(
+            FastPathAction.RENAME_SYMBOL,
+            workdir,
+            [str(outside)],
+            task=task,
+        )
+
+        assert outside.read_bytes() == original
+        assert result.files_modified == 0
+
+    def test_rename_ignores_parent_traversal_owned_file(self, tmp_path: Path) -> None:
+        """A ``..`` entry in owned_files never reaches a file outside workdir."""
+        workdir = tmp_path / "workdir"
+        workdir.mkdir()
+        outside = tmp_path / "outside.py"
+        outside.write_text("def getCwd():\n    return 1\n", encoding="utf-8")
+        original = outside.read_bytes()
+
+        rel = "../outside.py"
+        task = _make_task(
+            title="Rename getCwd to get_cwd",
+            complexity=Complexity.LOW,
+            owned_files=[rel],
+        )
+        result = execute_fast_path(
+            FastPathAction.RENAME_SYMBOL,
+            workdir,
+            [rel],
+            task=task,
+        )
+
+        assert outside.read_bytes() == original
+        assert result.files_modified == 0
+
+    def test_rename_skips_bad_entry_but_still_renames_good_one(self, tmp_path: Path) -> None:
+        """A refused entry is skipped and logged; the run does not crash."""
+        workdir = tmp_path / "workdir"
+        workdir.mkdir()
+        good = workdir / "main.py"
+        good.write_text("def getCwd():\n    return getCwd()\n", encoding="utf-8")
+        outside = tmp_path / "outside.py"
+        outside.write_text("def getCwd():\n    return 1\n", encoding="utf-8")
+        original = outside.read_bytes()
+
+        targets = ["../outside.py", "main.py"]
+        task = _make_task(
+            title="Rename getCwd to get_cwd",
+            complexity=Complexity.LOW,
+            owned_files=targets,
+        )
+        result = execute_fast_path(
+            FastPathAction.RENAME_SYMBOL,
+            workdir,
+            targets,
+            task=task,
+        )
+
+        assert result.success is True
+        assert result.files_modified == 1
+        assert "get_cwd" in good.read_text(encoding="utf-8")
+        assert outside.read_bytes() == original
+
+    def test_rename_no_task_fails(self) -> None:
+        result = execute_fast_path(
+            FastPathAction.RENAME_SYMBOL,
+            Path("/tmp"),
+            ["some.py"],
+            task=None,
+        )
+        assert result.success is False
+
+    def test_rename_unparseable_pattern_fails(self) -> None:
+        task = _make_task(title="Do something weird", complexity=Complexity.LOW)
+        result = execute_fast_path(
+            FastPathAction.RENAME_SYMBOL,
+            Path("/tmp"),
+            ["some.py"],
+            task=task,
+        )
+        assert result.success is False
+
+    def test_rename_no_owned_files_fails(self) -> None:
+        task = _make_task(
+            title="Rename foo to bar",
+            complexity=Complexity.LOW,
+            owned_files=[],
+        )
+        result = execute_fast_path(
+            FastPathAction.RENAME_SYMBOL,
+            Path("/tmp"),
+            [],
+            task=task,
+        )
+        assert result.success is False
+
+    def test_unknown_action_fails(self) -> None:
+        # Reach the "no executor" branch by creating a mock action value
+        # We can't easily add a new enum, so test the execute_fast_path
+        # function handles missing executors gracefully by verifying
+        # the known actions all have executors
+        for action in FastPathAction:
+            result = execute_fast_path(
+                action,
+                Path("/tmp"),
+                [],
+                task=_make_task(title="Rename foo to bar", complexity=Complexity.LOW),
+            )
+            # Should not error out internally, even if the result is a failure
+            assert isinstance(result, FastPathResult)
+
+
+# --- Stats tests ---
+
+
+class TestFastPathStats:
+    """Tests for FastPathStats accumulation."""
+
+    def test_record_increments(self) -> None:
+        stats = FastPathStats()
+        result = FastPathResult(
+            success=True,
+            action=FastPathAction.RUFF_FORMAT,
+            duration_s=0.5,
+            files_modified=3,
+            summary="formatted 3 files",
+        )
+        stats.record(result)
+        assert stats.tasks_bypassed == 1
+        assert stats.estimated_cost_saved_usd == pytest.approx(0.15)
+        assert stats.total_time_saved_s > 0
+        assert stats.actions["ruff_format"] == 1
+
+    def test_record_multiple(self) -> None:
+        stats = FastPathStats()
+        for _ in range(5):
+            stats.record(
+                FastPathResult(
+                    success=True,
+                    action=FastPathAction.RUFF_FIX,
+                    duration_s=0.2,
+                    files_modified=1,
+                )
+            )
+        assert stats.tasks_bypassed == 5
+        assert stats.estimated_cost_saved_usd == pytest.approx(0.75)
+        assert stats.actions["ruff_fix"] == 5
+
+
+class TestLoadFastPathConfig:
+    """Tests for load_fast_path_config()."""
+
+    def setup_method(self) -> None:
+        self._orig_l0 = list(fast_path_module._l0_patterns)
+        self._orig_l1 = list(fast_path_module._l1_patterns)
+        self._orig_l1_model = fast_path_module._l1_model_config
+
+    def teardown_method(self) -> None:
+        fast_path_module._l0_patterns = self._orig_l0
+        fast_path_module._l1_patterns = self._orig_l1
+        fast_path_module._l1_model_config = self._orig_l1_model
+
+    def test_load_config_ignores_pending_upgrades(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        import logging
+
+        from bernstein.core.fast_path import load_fast_path_config
+
+        routing_yaml = tmp_path / "routing.yaml"
+        routing_yaml.write_text(
+            """
+fast_path:
+  enabled: true
+  l1_model: "claude-3-haiku"
+  l1_effort: "low"
+pending_upgrades:
+  - id: "legacy-pending"
+    title: "Old upgrade"
+    change: "Ignore me"
+""",
+            encoding="utf-8",
+        )
+
+        with caplog.at_level(logging.WARNING):
+            result = load_fast_path_config(routing_yaml)
+            assert result is True
+            assert any("pending_upgrades" in record.message for record in caplog.records)
+
+        assert fast_path_module._l1_model_config is not None
+        assert fast_path_module._l1_model_config.model == "claude-3-haiku"
+
+
+# --- L1 model config ---
+
+
+class TestL1ModelConfig:
+    """Tests for L1 cheapest model config.
+
+    L1 model config comes only from routing.yaml's fast_path.l1_model
+    (see load_fast_path_config) - Bernstein never hardcodes a fallback
+    model, so get_l1_model_config() must raise when unconfigured and
+    return exactly what was configured when it is.
+    """
+
+    def setup_method(self) -> None:
+        self._orig = fast_path_module._l1_model_config
+
+    def teardown_method(self) -> None:
+        fast_path_module._l1_model_config = self._orig
+
+    def test_raises_when_unconfigured(self) -> None:
+        fast_path_module._l1_model_config = None
+        with pytest.raises(ModelNotConfiguredError, match="No L1 model configured"):
+            get_l1_model_config()
+
+    def test_l1_model_returns_config_supplied_model(self) -> None:
+        fast_path_module._l1_model_config = ModelConfig(model="sonnet", effort="normal", max_tokens=50_000)
+        cfg = get_l1_model_config()
+        assert cfg.model == "sonnet"
+        assert cfg.effort == "normal"
+
+    def test_l1_model_has_reasonable_token_limit(self) -> None:
+        fast_path_module._l1_model_config = ModelConfig(model="sonnet", effort="normal", max_tokens=50_000)
+        cfg = get_l1_model_config()
+        assert cfg.max_tokens <= 100_000
+
+
+# --- Integration: try_fast_path_batch ---
+
+
+class TestTryFastPathBatch:
+    """Tests for the orchestrator integration function."""
+
+    def test_multi_task_batch_skipped(self) -> None:
+        """Batches with >1 task are never fast-pathed."""
+        tasks = [
+            _make_task(title="Format code", complexity=Complexity.LOW),
+            _make_task(title="Sort imports", complexity=Complexity.LOW),
+        ]
+        stats = FastPathStats()
+        result = try_fast_path_batch(
+            tasks,
+            Path("/tmp"),
+            MagicMock(),
+            "http://localhost:8052",
+            stats,
+        )
+        assert result is False
+
+    def test_l2_task_skipped(self) -> None:
+        """L2 tasks are not handled by fast-path."""
+        tasks = [_make_task(title="Implement WebSocket support")]
+        stats = FastPathStats()
+        result = try_fast_path_batch(
+            tasks,
+            Path("/tmp"),
+            MagicMock(),
+            "http://localhost:8052",
+            stats,
+        )
+        assert result is False
+
+    @patch("bernstein.core.quality.fast_path.execute_fast_path")
+    @patch("bernstein.core.quality.fast_path.get_collector")
+    def test_l0_task_handled(self, mock_collector: MagicMock, mock_exec: MagicMock) -> None:
+        """L0 formatting task is handled and marked complete."""
+        mock_exec.return_value = FastPathResult(
+            success=True,
+            action=FastPathAction.RUFF_FORMAT,
+            duration_s=0.3,
+            files_modified=2,
+            summary="formatted 2 files",
+        )
+        mock_client = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_client.post.return_value = mock_resp
+
+        task = _make_task(title="Format code", complexity=Complexity.LOW)
+        stats = FastPathStats()
+        result = try_fast_path_batch(
+            [task],
+            Path("/tmp"),
+            mock_client,
+            "http://localhost:8052",
+            stats,
+        )
+        assert result is True
+        assert stats.tasks_bypassed == 1
+        # Verify task was marked complete on server
+        mock_client.post.assert_called_once()
+        call_url = mock_client.post.call_args[0][0]
+        assert "/complete" in call_url

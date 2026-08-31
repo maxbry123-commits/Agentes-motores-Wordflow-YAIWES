@@ -1,0 +1,3644 @@
+"""Audit CLI -- HMAC-chain integrity, Merkle seal, and evidence export.
+
+Bernstein keeps a tamper-evident, append-only audit log under
+``.sdd/audit/YYYY-MM-DD.jsonl``. Every record is HMAC-SHA256-signed
+(RFC 2104) and chained to the previous record's HMAC, so any after-the-fact
+edit invalidates every following entry. The signing key sits outside the
+audit volume; daily files share one chain; ``bernstein audit verify``
+replays the chain and exits non-zero on any break.
+
+Commands:
+  bernstein audit show               Show recent audit log events.
+  bernstein audit seal               Compute and store a Merkle root.
+  bernstein audit seal --anchor-git  Also create a git tag.
+  bernstein audit ack-tear           Acknowledge recorded tear evidence.
+  bernstein audit verify             Verify HMAC chain, Merkle tree, checkpoint.
+  bernstein audit verify --hmac-only Verify HMAC chain only.
+  bernstein audit verify --merkle-only  Verify Merkle tree only.
+  bernstein audit verify --receipt   Verify one automation trigger receipt or
+                                     status callback offline.
+  bernstein audit verify-hmac        Verify HMAC chain across all audit files.
+  bernstein audit verify-gates       Verify clearance-gate integrity offline.
+  bernstein audit export             Export a signed Article 12 evidence pack.
+  bernstein audit pack               Build a SOC 2 evidence checklist.
+  bernstein audit capabilities       Print lethal-trifecta capability matrix.
+  bernstein audit slice              Write a deterministic subset.
+  bernstein audit query              Query audit log events with filters.
+  bernstein audit archive            Safely archive corrupt / pre-rotation jsonl files.
+  bernstein audit diagnose           Name the first faulty step of a run from
+                                     its signed per-step journal (#2928).
+  bernstein audit diagnose verify    Re-derive a diagnosis receipt offline.
+
+Operator guide: docs/security/audit-log.md.
+"""
+
+from __future__ import annotations
+
+import contextlib
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+import click
+from rich.panel import Panel
+from rich.table import Table
+
+from bernstein.cli.helpers import console
+
+if TYPE_CHECKING:
+    from datetime import date
+
+AUDIT_DIR = Path(".sdd/audit")
+MERKLE_DIR = AUDIT_DIR / "merkle"
+LINEAGE_DIR = Path(".sdd/lineage")
+
+
+@click.group("audit")
+def audit_group() -> None:
+    """Audit log integrity tools (RFC 2104 HMAC chain + Merkle seal).
+
+    See docs/security/audit-log.md for the operator runbook.
+    """
+
+
+@audit_group.command("show")
+@click.option("--limit", default=20, show_default=True, help="Maximum number of events to show.")
+def show_cmd(limit: int) -> None:
+    """Show recent audit log events from .sdd/audit/."""
+    import json as _json
+
+    if not AUDIT_DIR.is_dir():
+        console.print(
+            "[yellow]No audit log found.[/yellow]  Run [bold]bernstein run[/bold] first to generate audit events."
+        )
+        return
+
+    log_files = sorted(AUDIT_DIR.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not log_files:
+        console.print(
+            "[yellow]Audit directory exists but contains no log files.[/yellow]  "
+            "Run [bold]bernstein run[/bold] to generate audit events."
+        )
+        return
+
+    events: list[dict] = []
+    for lf in log_files:
+        with contextlib.suppress(OSError):
+            for line in lf.read_text().splitlines():
+                line = line.strip()
+                if line:
+                    with contextlib.suppress(_json.JSONDecodeError):
+                        events.append(_json.loads(line))
+        if len(events) >= limit:
+            break
+
+    events = events[:limit]
+
+    table = Table(show_header=True, header_style="bold magenta", show_lines=False)
+    table.add_column("Timestamp", style="dim", no_wrap=True)
+    table.add_column("Event", style="bold")
+    table.add_column("Actor")
+    table.add_column("Resource")
+
+    for ev in events:
+        ts = str(ev.get("timestamp", "-"))[:19]
+        event_type = str(ev.get("event_type", "-"))
+        actor = str(ev.get("actor", ""))
+        resource = f"{ev.get('resource_type', '')}/{ev.get('resource_id', '')}"
+        table.add_row(ts, event_type, actor, resource)
+
+    console.print()
+    console.print(table)
+    console.print(f"\n[dim]Showing {len(events)} event(s) from {AUDIT_DIR}[/dim]\n")
+
+
+@audit_group.command("seal")
+@click.option("--anchor-git", is_flag=True, default=False, help="Anchor root hash as a git tag.")
+@click.option(
+    "--allow-broken-chain",
+    is_flag=True,
+    default=False,
+    help="Seal even if the HMAC chain is broken (forensic capture of a corrupted log).",
+)
+def seal_cmd(anchor_git: bool, allow_broken_chain: bool) -> None:
+    """Compute a Merkle root across all audit log files and store the seal.
+
+    Two prechecks gate the seal. The chain must verify (a broken chain or
+    unacknowledged tear evidence aborts), and the tree must be a consistent
+    extension of the last signed checkpoint - so a history that shrank since
+    the last seal cannot obtain a fresh accepted seal, even when the
+    remaining chain is HMAC-intact. On success the checkpoint advances.
+
+    Pass --allow-broken-chain to seal a known-corrupted log on purpose
+    (forensic evidence capture during the recovery procedure); a forensic
+    seal skips both prechecks and never advances the checkpoint.
+    """
+    from bernstein.core.merkle import ChainBrokenError, anchor_to_git, compute_seal, save_seal
+    from bernstein.core.persistence.chain_checkpoint import (
+        CheckpointConsistencyError,
+        CheckpointFileError,
+        record_checkpoint,
+    )
+    from bernstein.core.security.audit import OutstandingTearError, load_or_create_audit_key
+
+    if not AUDIT_DIR.is_dir():
+        console.print(f"[red]Audit directory not found:[/red] {AUDIT_DIR}")
+        console.print("[dim]Ensure the audit log is active (bernstein must have written audit events).[/dim]")
+        raise SystemExit(1)
+
+    try:
+        _tree, seal = compute_seal(
+            AUDIT_DIR,
+            verify_chain=not allow_broken_chain,
+            checkpoint_gate=not allow_broken_chain,
+        )
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise SystemExit(1) from None
+    except ChainBrokenError as exc:
+        console.print(f"[red]Refusing to seal: the HMAC chain is broken.[/red]\n  {exc}")
+        console.print(
+            "[dim]Run 'bernstein audit verify --hmac-only' to locate the break. "
+            "To seal a known-corrupted log for forensics, re-run with --allow-broken-chain.[/dim]"
+        )
+        raise SystemExit(1) from None
+    except OutstandingTearError as exc:
+        console.print("[red]Refusing to seal: unacknowledged tear evidence is outstanding.[/red]")
+        for tear in exc.tears:
+            console.print(f"  [red]![/red] {tear.describe()}")
+            console.print(
+                f"  [dim]bernstein audit ack-tear --segment {tear.segment} "
+                f'--offset {tear.byte_offset} --reason "..."[/dim]'
+            )
+        raise SystemExit(1) from None
+    except CheckpointConsistencyError as exc:
+        _print_checkpoint_conflict(exc)
+        raise SystemExit(1) from None
+    except CheckpointFileError as exc:
+        console.print(f"[red]Refusing to seal: {exc}[/red]")
+        raise SystemExit(1) from None
+
+    seal_path = save_seal(seal, MERKLE_DIR)
+
+    # Generate content-addressed hash tiles for audit segments
+    from bernstein.core.persistence.tiles import generate_tiles
+
+    tile_paths = generate_tiles(AUDIT_DIR, seal)
+
+    checkpoint = None
+    if not allow_broken_chain:
+        try:
+            checkpoint = record_checkpoint(AUDIT_DIR, seal, key=load_or_create_audit_key())
+        except CheckpointConsistencyError as exc:
+            _print_checkpoint_conflict(exc)
+            raise SystemExit(1) from None
+        except (CheckpointFileError, OSError) as exc:
+            console.print(f"[red]Seal written but the checkpoint could not be recorded: {exc}[/red]")
+            raise SystemExit(1) from None
+
+    # Display result
+    console.print()
+    console.print(
+        Panel(
+            "[bold]Merkle Audit Seal[/bold]",
+            border_style="green",
+            expand=False,
+        )
+    )
+
+    table = Table(show_header=False, box=None, padding=(0, 2))
+    table.add_column("Key", style="dim", no_wrap=True, min_width=14)
+    table.add_column("Value")
+    table.add_row("Root hash", str(seal["root_hash"]))
+    table.add_row("Leaves", str(seal["leaf_count"]))
+    table.add_row("Algorithm", str(seal["algorithm"]))
+    table.add_row("Scheme", str(seal.get("scheme", 1)))
+    table.add_row("Entries", str(seal.get("entry_count", "-")))
+    table.add_row("Sealed at", str(seal["sealed_at_iso"]))
+    table.add_row("Seal file", str(seal_path))
+    table.add_row("Tiles", str(len(tile_paths)))
+    if checkpoint is not None:
+        extended = "extends previous" if checkpoint.get("extends_prev", True) else "acknowledged divergence"
+        table.add_row("Checkpoint", f"pinned at {checkpoint.get('entry_count', '-')} entries ({extended})")
+    if allow_broken_chain:
+        console.print(
+            "[yellow]Sealed WITHOUT chain verification (--allow-broken-chain); checkpoint not advanced.[/yellow]"
+        )
+    console.print(table)
+
+    if anchor_git:
+        root_hash = str(seal["root_hash"])
+        tag = anchor_to_git(root_hash, Path.cwd())
+        if tag:
+            console.print(f"\n  [green]Git tag created:[/green] {tag}")
+        else:
+            console.print("\n  [yellow]Git anchoring failed (not a git repo or tag exists).[/yellow]")
+
+    console.print()
+
+
+@audit_group.command("verify")
+@click.option("--merkle-only", is_flag=True, default=False, help="Only verify Merkle tree (skip HMAC chain).")
+@click.option("--hmac-only", is_flag=True, default=False, help="Only verify HMAC chain (skip Merkle tree).")
+@click.option(
+    "--receipt",
+    "receipt_path",
+    default=None,
+    type=click.Path(dir_okay=False, exists=True, resolve_path=True),
+    help="Verify a stored automation trigger receipt or status callback against the local chain.",
+)
+@click.option(
+    "--payload",
+    "payload_path",
+    default=None,
+    type=click.Path(dir_okay=False, exists=True, resolve_path=True),
+    help="Original trigger body to re-digest against a trigger receipt.",
+)
+def verify_cmd(merkle_only: bool, hmac_only: bool, receipt_path: str | None, payload_path: str | None) -> None:
+    """Verify audit log integrity (HMAC chain per RFC 2104 + Merkle tree).
+
+    \b
+      bernstein audit verify              Verify both HMAC chain and Merkle tree
+      bernstein audit verify --hmac-only  Verify HMAC chain only
+      bernstein audit verify --merkle-only  Verify Merkle tree only
+      bernstein audit verify --receipt r.json
+                                          Verify one automation receipt or
+                                          status callback exactly as the
+                                          automation platform stored it
+      bernstein audit verify --receipt r.json --payload body.json
+                                          Also re-digest the original trigger
+                                          body against the receipt
+
+    Exits non-zero on any chain break, missing record, or HMAC mismatch.
+    Run from cron and fail the run on non-zero exit (cite: docs/security/audit-log.md).
+
+    Reports lineage entry activity status: reads the lineage log (.sdd/lineage/log.jsonl),
+    computes active entries using active_set(), and displays total/active/inactive counts.
+    The ledger file is never mutated during verification.
+    """
+    if not AUDIT_DIR.is_dir():
+        console.print(f"[red]Audit directory not found:[/red] {AUDIT_DIR}")
+        raise SystemExit(1)
+
+    if receipt_path is not None:
+        _verify_automation_receipt(receipt_path, payload_path)
+        return
+    if payload_path is not None:
+        console.print("[red]--payload requires --receipt.[/red]")
+        raise SystemExit(2)
+
+    failed_pillars: list[str] = []
+
+    if not merkle_only and not _verify_hmac_chain():
+        failed_pillars.append("HMAC Chain")
+
+    if not hmac_only and not _verify_merkle_tree():
+        failed_pillars.append("Merkle Tree")
+
+    # Checkpoint extension is the pillar that makes a shrink sticky: a
+    # truncation that leaves the HMAC chain intact still conflicts with the
+    # last signed checkpoint, is reported here as tear evidence, and keeps
+    # failing until an operator acknowledges it. Like the evidence-bundle
+    # pillar, it runs regardless of --hmac-only / --merkle-only: a cron job
+    # invoking either narrow form must still go red when history shrinks.
+    if not _verify_checkpoints():
+        failed_pillars.append("Checkpoints")
+
+    # Evidence bundles are a third integrity pillar: a tampered evidence file
+    # must fail verify exactly like a tampered chain entry (#2362). This runs
+    # regardless of --hmac-only / --merkle-only because it is orthogonal to
+    # both the HMAC chain and the Merkle seal.
+    if not _verify_evidence_bundles():
+        failed_pillars.append("Evidence Bundles")
+
+    # Agent-posted artifacts are a further integrity pillar: a flipped byte in a
+    # stored artifact blob or its journal row must fail verify with the artifact
+    # named (#2553). Orthogonal to both the HMAC chain and the Merkle seal.
+    if not _verify_run_artifacts():
+        failed_pillars.append("Run Artifacts")
+
+    # Tournament selection receipts are a further integrity pillar: a tampered
+    # score or a hand-picked winner must fail verify exactly like a tampered
+    # chain entry (#2353). Orthogonal to both HMAC chain and Merkle seal.
+    if not _verify_tournament_receipts():
+        failed_pillars.append("Tournament Receipts")
+
+    # Clearance gates are a further integrity pillar: a dependent task claimed
+    # while its blocker gate was still open, or a tampered graph_delta_hash,
+    # must fail verify (#2556). Orthogonal to both HMAC chain and Merkle seal.
+    if not _verify_clearance_gates():
+        failed_pillars.append("Clearance Gates")
+
+    # Credential grant chains are a further integrity pillar: a mutated,
+    # deleted, or reordered grant / exchange / revocation record must fail
+    # verify exactly like a tampered chain entry (#2516). Orthogonal to both
+    # HMAC chain and Merkle seal.
+    if not _verify_grant_chains():
+        failed_pillars.append("Grant Chains")
+
+    # Approval cards are a further integrity pillar: a resolved approval must be
+    # re-checkable offline (#2511). A mutated stored envelope, a decision that
+    # echoed an unknown card_hash, or a decision made after expiry must fail
+    # verify. Orthogonal to both HMAC chain and Merkle seal.
+    if not _verify_approval_cards():
+        failed_pillars.append("Approval Cards")
+
+    # Fleet config-plane events are a further integrity pillar: a variable
+    # write spliced out of its per-name lineage, or a connection resolution
+    # naming a document that was never created, must fail verify beyond the
+    # HMAC check (#2550). Orthogonal to both HMAC chain and Merkle seal.
+    if not _verify_fleet_config():
+        failed_pillars.append("Fleet Config")
+
+    # Named sandbox pools are a further integrity pillar: a tampered pool body
+    # (its content-addressed hash no longer recomputes) or a forged placement
+    # receipt (a widened effective manifest, a swapped backend) must fail verify
+    # exactly like a tampered chain entry (#2547). Orthogonal to both the HMAC
+    # chain and the Merkle seal.
+    if not _verify_pool_receipts():
+        failed_pillars.append("Pool Receipts")
+
+    # Sovereign posture attestations + drift records are a further integrity
+    # pillar: a mutated effective-policy document, a forged posture signature,
+    # or a drift record whose hashes agree must fail verify exactly like a
+    # tampered chain entry (#2518). Orthogonal to both HMAC chain and Merkle seal.
+    if not _verify_sovereign_attestations():
+        failed_pillars.append("Sovereign Attestations")
+
+    # Benchmark-score trajectory receipts are a further integrity pillar: a
+    # tampered published score, a contaminated suite, a fabricated scalar, or a
+    # cherry-picked best-of-N candidate must fail verify with the offending task
+    # named (#2925). Absent receipts are a silent no-op; any present-and-tampered
+    # receipt hard-fails. Orthogonal to both HMAC chain and Merkle seal.
+    if not _verify_trajectory_receipts():
+        failed_pillars.append("Trajectory Receipts")
+
+    # Lineage entry activity status is a further integrity pillar: lineage entries
+    # that are invalidated by revocation seeds (or depend on invalidated entries)
+    # are correctly marked as inactive. This uses the active_set computation
+    # to verify the audit ledger's lineage activity status.
+    if not _verify_lineage_active_set():
+        failed_pillars.append("Lineage Activity")
+
+    console.print()
+    if not failed_pillars:
+        console.print(
+            Panel(
+                "[bold green]Audit Verification: PASSED[/bold green]\n"
+                "[dim]All audit log pillars passed verification.[/dim]",
+                border_style="green",
+                expand=False,
+            )
+        )
+        console.print()
+        raise SystemExit(0)
+
+    failing_list = "\n".join(f"  [red]![/red] {p}" for p in failed_pillars)
+    console.print(
+        Panel(
+            f"[bold red]Audit Verification: FAILED[/bold red]\n\n[bold]Failing pillar(s):[/bold]\n{failing_list}",
+            border_style="red",
+            expand=False,
+        )
+    )
+    console.print()
+    raise SystemExit(1)
+
+
+def _verify_key(pillar: str) -> bytes | None:
+    """Load the audit key for a verification pillar, never minting one.
+
+    Verification must not write to the store it inspects (#4210). Creating key
+    material here would leave stray key bytes behind and authenticate nothing:
+    a fresh key cannot validate a chain written under the real one, so it would
+    report a fabricated tamper alarm. A missing key is a named degradation -
+    the same limit the HMAC and checkpoint pillars carry - and the HMAC pillar
+    already fails the run when segments exist without a key.
+
+    Returns the key, or ``None`` when there is none to load.
+    """
+    from bernstein.core.security.audit import AuditKeyMissingError, load_audit_key
+
+    try:
+        return load_audit_key()
+    except AuditKeyMissingError:
+        console.print(f"[yellow]{pillar} verification skipped: no audit HMAC key available.[/yellow]")
+        return None
+
+
+def _verify_lineage_active_set() -> bool:
+    """Verify lineage entry activity status using active_set computation.
+
+    Reads all lineage entries from the lineage store and computes which entries
+    are active (not invalidated by seeds) versus inactive (seeded or dependent
+    on a seeded entry). Prints a summary of active/inactive counts.
+
+    Returns True when the lineage store exists and the computation completes
+    successfully (even if there are inactive entries). Returns False only if
+    the lineage store cannot be read.
+    """
+    from pathlib import Path
+
+    from bernstein.core.lineage.activity import active_set
+    from bernstein.core.lineage.entry import LineageEntry, entry_hash
+
+    lineage_path = Path(".sdd/lineage")
+    if not lineage_path.is_dir():
+        return True  # no lineage store, nothing to verify
+
+    # Read all lineage entries from the store
+    try:
+        from bernstein.core.lineage.store import LineageStore
+
+        store = LineageStore(lineage_path)
+        entries: list[LineageEntry] = []
+        for entry, _ in store.read_log():
+            entries.append(entry)
+    except OSError as exc:
+        console.print(
+            Panel(
+                f"[bold red]Lineage Store Read Failed[/bold red]\n\n{exc}",
+                border_style="red",
+                expand=False,
+            )
+        )
+        return False
+
+    if not entries:
+        # Print status even for empty lineage store
+        console.print()
+        console.print(
+            Panel(
+                "[bold]Lineage Activity Status[/bold]",
+                border_style="cyan",
+                expand=False,
+            )
+        )
+        table = Table(show_header=False, box=None, padding=(0, 2))
+        table.add_column("Key", style="dim", no_wrap=True, min_width=14)
+        table.add_column("Value")
+        table.add_row("Total entries", "0")
+        table.add_row("Active entries", "0")
+        table.add_row("Inactive entries", "0")
+        console.print(table)
+        return True
+
+    # Collect all invalidation seeds from revocation events in the audit chain
+    # Seeds are lineage entry hashes that have been revoked
+    from bernstein.core.security.audit_chain import AuditChainStore
+
+    audit_path = Path(".sdd/audit")
+    seeds: frozenset[str] = frozenset()
+
+    if audit_path.is_dir():
+        # Import the key loader locally to handle missing key gracefully
+        try:
+            from bernstein.core.security.audit import load_audit_key
+
+            key = load_audit_key()
+            chain = AuditChainStore(audit_path, key=key)
+
+            # Scan for revocation events that may contain lineage entry hashes as seeds
+            # We need to check if revocation events record lineage entry references
+            from bernstein.core.security.audit_chain import EVENT_EVAL_GATE_REVOCATION, EVENT_MANDATE_REVOCATION
+
+            for event in chain.query(event_type=EVENT_MANDATE_REVOCATION):
+                # Revocation events may reference lineage entries in their details
+                details = event.details.get("details", {})
+                if isinstance(details, dict):
+                    lineage_ref = details.get("lineage_entry_hash") or details.get("lineage_ref")
+                    if lineage_ref and isinstance(lineage_ref, str):
+                        seeds = seeds | {lineage_ref}
+
+            for event in chain.query(event_type=EVENT_EVAL_GATE_REVOCATION):
+                details = event.details.get("details", {})
+                if isinstance(details, dict):
+                    lineage_ref = details.get("lineage_entry_hash") or details.get("lineage_ref")
+                    if lineage_ref and isinstance(lineage_ref, str):
+                        seeds = seeds | {lineage_ref}
+
+        except Exception:
+            # If we can't load the audit key or read the chain, continue with empty seeds
+            pass
+
+    # Compute the active set
+    active_hashes = active_set(entries, seeds)
+
+    # Calculate counts
+    total = len(entries)
+    active_count = len(active_hashes)
+    inactive_count = total - active_count
+
+    # Identify inactive entry hashes with reasons
+    inactive_entries: list[tuple[str, str]] = []
+    for entry in entries:
+        eh = entry_hash(entry)
+        if eh not in active_hashes:
+            # Determine the reason for inactivity
+            # Check if this entry is directly seeded or depends on a seeded entry
+            reasons: list[str] = []
+            if eh in seeds:
+                reasons.append("seeded")
+            inactive_entries.append((eh, ",".join(reasons) if reasons else "dependent"))
+
+    console.print()
+    console.print(
+        Panel(
+            "[bold]Lineage Activity Status[/bold]",
+            border_style="cyan",
+            expand=False,
+        )
+    )
+
+    # Verification output format with required fields
+    console.print()
+    console.print("[bold]Lineage Entry Activity Report[/bold]")
+    console.print()
+
+    # Report counts
+    console.print(f"Total entries: {total}")
+    console.print(f"Active entries: {active_count}")
+    console.print(f"Inactive entries: {inactive_count}")
+    console.print()
+
+    # List inactive entry hashes with reasons
+    if inactive_entries:
+        console.print("[bold]Inactive entry hashes (with reasons):[/bold]")
+        for h, reason in inactive_entries:
+            console.print(f"  {h} ({reason})")
+    else:
+        console.print("[dim]No inactive entries found.[/dim]")
+
+    # Also show in table format for additional context
+    table = Table(show_header=False, box=None, padding=(0, 2))
+    table.add_column("Key", style="dim", no_wrap=True, min_width=14)
+    table.add_column("Value")
+    table.add_row("Total entries", str(total))
+    table.add_row("Active entries", str(active_count))
+    table.add_row("Inactive entries", str(inactive_count))
+    console.print(table)
+
+    if inactive_entries:
+        console.print()
+        console.print("[bold]Inactive entry hashes (up to 10 shown):[/bold]")
+        for h, reason in inactive_entries[:10]:
+            console.print(f"  [yellow]-[/yellow] {h} ({reason})")
+        if len(inactive_entries) > 10:
+            console.print(f"  [dim]... and {len(inactive_entries) - 10} more[/dim]")
+
+    return True
+
+
+def _verify_trajectory_receipts() -> bool:
+    """Verify every benchmark-score trajectory receipt and print results.
+
+    A tampered published score, a contaminated golden suite, a fabricated
+    scalar, or a cherry-picked best-of-N candidate makes ``bernstein audit
+    verify`` fail with the offending task named, exactly like a tampered chain
+    entry (#2925). When no trajectory receipts exist the check is a silent
+    no-op (returns True immediately).
+    """
+    from bernstein.eval.trajectory_receipt import verify_all_trajectory_receipts
+
+    # Derive workdir from cwd() for consistency with how the receipts were
+    # emitted (emit also starts from the project root), rather than from
+    # AUDIT_DIR which may be a relative path that resolves differently.
+    workdir = Path.cwd()
+
+    key = _verify_key("Trajectory receipt")
+    if key is None:
+        return True
+
+    results = verify_all_trajectory_receipts(workdir, hmac_key=key)
+    if not results:
+        return True  # no trajectory receipts recorded; nothing to verify
+
+    failures = [r for r in results if not r.ok]
+    console.print()
+    if not failures:
+        console.print(
+            Panel(
+                "[bold green]Trajectory Receipt Verification Passed[/bold green]",
+                border_style="green",
+                expand=False,
+            )
+        )
+        table = Table(show_header=False, box=None, padding=(0, 2))
+        table.add_column("Key", style="dim", no_wrap=True, min_width=14)
+        table.add_column("Value")
+        table.add_row("Receipts", str(len(results)))
+        console.print(table)
+        return True
+
+    console.print(
+        Panel(
+            "[bold red]Trajectory Receipt Verification FAILED[/bold red]",
+            border_style="red",
+            expand=False,
+        )
+    )
+    for result in failures:
+        # requested_hash is retained on every failure path, including the ones
+        # where the bytes were rejected before a receipt could be decoded, so
+        # the operator can always locate the offending file.
+        rh = result.requested_hash or (result.receipt.receipt_hash if result.receipt is not None else "unknown")
+        task_idx = result.failing_task_index
+        loc = f" (task [{task_idx}])" if task_idx >= 0 else ""
+        console.print(f"  [red]![/red] {rh[:32]}…{loc}: {result.reason}")
+    return False
+
+
+def _verify_automation_receipt(receipt_path: str, payload_path: str | None) -> None:
+    """Verify one automation receipt or status callback offline (#2512).
+
+    Takes the document exactly as the automation platform stored it -- a signed
+    trigger receipt, or a delivered status callback with its proof envelope --
+    and checks it against the local chain: the Ed25519 signature, the payload
+    digest, the chain anchor, and (for a status callback) that the status the
+    platform was told equals the status the chain recorded. Exits non-zero on
+    any failure so a workflow step can gate on it.
+    """
+    import json as _json
+
+    from bernstein.core.trigger_sources.receipt import verify_receipt_document
+
+    try:
+        document = _json.loads(Path(receipt_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        console.print(f"[red]Could not read receipt:[/red] {exc}")
+        raise SystemExit(2) from exc
+    if not isinstance(document, dict):
+        console.print("[red]Receipt must be a JSON object.[/red]")
+        raise SystemExit(2)
+
+    body: bytes | None = None
+    if payload_path is not None:
+        try:
+            body = Path(payload_path).read_bytes()
+        except OSError as exc:
+            console.print(f"[red]Could not read payload:[/red] {exc}")
+            raise SystemExit(2) from exc
+
+    # Load-only: answering "does this receipt check out?" must not leave key
+    # material behind in the store being inspected (#4210).
+    hmac_key = _verify_key("Receipt")
+    if hmac_key is None:
+        raise SystemExit(1)
+
+    result = verify_receipt_document(
+        document,
+        audit_dir=AUDIT_DIR,
+        hmac_key=hmac_key,
+        body=body,
+    )
+
+    console.print()
+    label = {"trigger": "Trigger Receipt", "status": "Status Proof"}.get(result.kind, "Receipt")
+    if result.ok:
+        lines = [f"[bold green]{label} Verified[/bold green]"]
+        if result.outcome:
+            lines.append(f"Outcome: {result.outcome}")
+        if result.chain_status:
+            lines.append(f"Chain-recorded status: {result.chain_status}")
+        for key, value in sorted(result.details.items()):
+            if value:
+                lines.append(f"{key}: {value}")
+        console.print(Panel("\n".join(lines), border_style="green", expand=False))
+        console.print()
+        raise SystemExit(0)
+
+    lines = [f"[bold red]{label} Verification Failed[/bold red]", result.reason]
+    if result.chain_status:
+        # The whole point of the negative path: the operator holding a doctored
+        # callback learns what the chain actually recorded for the run.
+        lines.append(f"Chain-recorded status: {result.chain_status}")
+    console.print(Panel("\n".join(lines), border_style="red", expand=False))
+    console.print()
+    raise SystemExit(1)
+
+
+def _verify_fleet_config() -> bool:
+    """Verify fleet config-plane semantic invariants. Returns True if valid.
+
+    Reconstructs the variable write lineage and connection references from the
+    chain and checks that write ordinals are contiguous, value hashes chain,
+    and every rotation/resolution names a created document (#2550). When no
+    fleet config events exist the check is a silent no-op.
+    """
+    from bernstein.core.fleet.config_audit import verify_fleet_config_events
+    from bernstein.core.security.audit_chain import (
+        EVENT_FLEET_VAR_SET,
+        AuditChainStore,
+    )
+
+    key = _verify_key("Fleet config")
+    if key is None:
+        return True
+    chain = AuditChainStore(AUDIT_DIR, key=key)
+
+    # Cheap presence probe: if no variable and no connection events exist,
+    # stay a silent no-op like the other pillars.
+    if not chain.query(event_type=EVENT_FLEET_VAR_SET) and not _has_any_connection_event(chain):
+        return True
+
+    ok, errors = verify_fleet_config_events(chain)
+    console.print()
+    if ok:
+        console.print(
+            Panel(
+                "[bold green]Fleet Config Verification Passed[/bold green]",
+                border_style="green",
+                expand=False,
+            )
+        )
+        return True
+    console.print(Panel("[bold red]Fleet Config Verification FAILED[/bold red]", border_style="red", expand=False))
+    for err in errors:
+        console.print(f"  [red]![/red] {err}")
+    return False
+
+
+def _verify_pool_receipts() -> bool:
+    """Verify active pool bodies and placement receipts. Returns True if valid.
+
+    Content-addressed pool bodies and sealed placement receipts recompute their
+    own hashes offline; a mutated body or a forged placement fails here with the
+    pool or placement named. When no pools are configured this is a silent
+    no-op (AC: regression -- nothing changes without pools).
+    """
+    from bernstein.cli.commands.pool_cmd import verify_pools
+
+    key = _verify_key("Pool")
+    if key is None:
+        return True
+    ok, errors = verify_pools(Path.cwd(), key=key)
+    console.print()
+    if ok:
+        console.print(Panel("[bold green]Pool Verification Passed[/bold green]", border_style="green", expand=False))
+        return True
+    console.print(Panel("[bold red]Pool Verification FAILED[/bold red]", border_style="red", expand=False))
+    for err in errors:
+        console.print(f"  [red]![/red] {err}")
+    return False
+
+
+def _has_any_connection_event(chain: object) -> bool:
+    from bernstein.core.security.audit_chain import (
+        EVENT_FLEET_CONN_CREATE,
+        EVENT_FLEET_CONN_REFUSE,
+        EVENT_FLEET_CONN_RESOLVE,
+        EVENT_FLEET_CONN_ROTATE,
+    )
+
+    query = chain.query  # type: ignore[attr-defined]
+    return any(
+        query(event_type=event_type)
+        for event_type in (
+            EVENT_FLEET_CONN_CREATE,
+            EVENT_FLEET_CONN_ROTATE,
+            EVENT_FLEET_CONN_RESOLVE,
+            EVENT_FLEET_CONN_REFUSE,
+        )
+    )
+
+
+def _verify_grant_chains() -> bool:
+    """Verify every per-run credential grant chain. Returns True if all valid.
+
+    Reconstructs each ``<audit>/grants/<run>.jsonl`` from genesis, recomputing
+    the HMAC linkage and the manager Ed25519 signature on every record. A
+    mutated field, a deleted record, or reordered records make ``bernstein
+    audit verify`` fail with the run and record named, exactly like a tampered
+    chain entry (#2516). When no grant chains exist the check is a silent no-op.
+    """
+    from bernstein.core.identity import grants
+
+    grants_dir = AUDIT_DIR / "grants"
+    if not grants_dir.is_dir():
+        return True  # no grant chains recorded; nothing to verify
+    run_files = sorted(grants_dir.glob("*.jsonl"))
+    if not run_files:
+        return True
+
+    key = _verify_key("Grant chain")
+    if key is None:
+        return True
+
+    failures: list[tuple[str, list[str]]] = []
+    for path in run_files:
+        run_id = path.stem
+        result = grants.verify_grant_chain(root=AUDIT_DIR, run_id=run_id, key=key)
+        if not result.valid:
+            failures.append((run_id, result.errors))
+
+    console.print()
+    if not failures:
+        console.print(
+            Panel("[bold green]Grant Chain Verification Passed[/bold green]", border_style="green", expand=False)
+        )
+        table = Table(show_header=False, box=None, padding=(0, 2))
+        table.add_column("Key", style="dim", no_wrap=True, min_width=14)
+        table.add_column("Value")
+        table.add_row("Runs", str(len(run_files)))
+        console.print(table)
+        return True
+
+    console.print(Panel("[bold red]Grant Chain Verification FAILED[/bold red]", border_style="red", expand=False))
+    for run_id, errors in failures:
+        for err in errors:
+            console.print(f"  [red]![/red] run {run_id}: {err}")
+    return False
+
+
+def _verify_hmac_chain() -> bool:
+    """Verify HMAC chain and print results. Returns True if valid.
+
+    Tear evidence is a verdict distinct from chain corruption: crash-shaped
+    damage at the chain tail (or its sealed remains) is reported with the byte
+    offset of the last verifiable record and an acknowledgement command, and
+    it keeps failing verification - on every run, indefinitely - until an
+    operator acknowledges it. In particular, re-sealing does not clear it.
+    """
+    from bernstein.core.audit import AuditLog
+    from bernstein.core.security.audit import AuditKeyMissingError, load_audit_key
+
+    console.print()
+
+    # Verification is read-only and must never mint key material: a freshly
+    # generated key cannot authenticate an existing chain, so it would report
+    # a fabricated tamper alarm and leave stray key bytes behind. An empty
+    # chain needs no key at all.
+    has_segments = any(AUDIT_DIR.glob("*.jsonl")) or any((AUDIT_DIR / "archive").glob("*.jsonl.gz"))
+    if not has_segments:
+        console.print(
+            Panel("[bold green]HMAC Chain Verification Passed[/bold green]", border_style="green", expand=False)
+        )
+        return True
+    try:
+        key = load_audit_key()
+    except AuditKeyMissingError as exc:
+        console.print(Panel("[bold red]HMAC Chain Verification FAILED[/bold red]", border_style="red", expand=False))
+        console.print(f"  [red]![/red] {exc}")
+        return False
+
+    report = AuditLog(AUDIT_DIR, key=key).verify_detailed()
+
+    if report.hard_errors:
+        console.print(Panel("[bold red]HMAC Chain Verification FAILED[/bold red]", border_style="red", expand=False))
+        for err in report.hard_errors:
+            console.print(f"  [red]![/red] {err}")
+    else:
+        console.print(
+            Panel("[bold green]HMAC Chain Verification Passed[/bold green]", border_style="green", expand=False)
+        )
+
+    outstanding = report.unacknowledged_tears
+    if outstanding:
+        console.print()
+        console.print(
+            Panel("[bold red]Chain Tear Evidence UNACKNOWLEDGED[/bold red]", border_style="red", expand=False)
+        )
+        for tear in outstanding:
+            console.print(f"  [red]![/red] {tear.describe()}")
+        console.print(
+            "  [dim]A crash (or a truncation) left a non-verifying tail. The evidence is durable\n"
+            "  and does not clear itself. Investigate, then acknowledge with:[/dim]\n"
+            f"  [dim]bernstein audit ack-tear --segment {outstanding[0].segment} "
+            f'--offset {outstanding[0].byte_offset} --reason "..."[/dim]'
+        )
+    acknowledged = [tear for tear in report.tears if tear.acknowledged]
+    if acknowledged:
+        console.print(f"  [dim]{len(acknowledged)} acknowledged tear(s) remain recorded in the chain.[/dim]")
+
+    return not report.hard_errors and not outstanding
+
+
+def _print_checkpoint_conflict(exc: object) -> None:
+    """Print a checkpoint-consistency conflict with its acknowledgement path."""
+    checkpoint = getattr(exc, "checkpoint", {}) or {}
+    conflicts = getattr(exc, "conflicts", []) or []
+    console.print(Panel("[bold red]Checkpoint Divergence (tear evidence)[/bold red]", border_style="red", expand=False))
+    console.print(
+        f"  [red]![/red] history conflicts with checkpoint root "
+        f"{str(checkpoint.get('root_hash', ''))[:16]}… "
+        f"(pinned {checkpoint.get('entry_count', '?')} entries)"
+    )
+    ackable = False
+    for conflict in conflicts:
+        console.print(f"  [red]![/red] {conflict.segment or conflict.kind}: {conflict.detail}")
+        if conflict.kind in type(conflict).ACKABLE_KINDS:
+            ackable = True
+    console.print(
+        "  [dim]The audit history shrank or was rewritten since the last accepted seal.\n"
+        "  A fresh seal will not be produced and this conflict will not clear itself.[/dim]"
+    )
+    if ackable:
+        first = next(c for c in conflicts if c.kind in type(c).ACKABLE_KINDS)
+        console.print(
+            f"  [dim]After investigating: bernstein audit ack-tear --segment {first.segment} "
+            f'--offset {first.offset} --reason "..."[/dim]'
+        )
+
+
+def _verify_checkpoints() -> bool:
+    """Verify the current tree against the last signed checkpoint.
+
+    Returns True when no checkpoint exists yet (nothing is pinned), when the
+    tree consistently extends the pin, or when a divergence has been
+    explicitly acknowledged; False otherwise. A divergence is reported as
+    tear evidence: the seal job refuses to advance over it and this check
+    keeps failing until an operator acknowledges.
+    """
+    from bernstein.core.persistence.chain_checkpoint import (
+        CheckpointConsistencyError,
+        CheckpointFileError,
+        authorize_divergence,
+        check_extension,
+        find_divergence_acks,
+        load_checkpoints,
+    )
+    from bernstein.core.security.audit import AuditKeyMissingError, load_audit_key
+
+    console.print()
+    try:
+        key = load_audit_key()
+    except AuditKeyMissingError:
+        # Checkpoints are HMAC-signed with the audit key. A verifier without
+        # the key cannot check them - the same limit the HMAC pillar has - so
+        # this is a named degradation, not a failure verdict.
+        console.print(
+            "[yellow]Checkpoint verification skipped: no audit HMAC key available "
+            "(checkpoints are signed with it).[/yellow]"
+        )
+        return True
+
+    try:
+        state = load_checkpoints(AUDIT_DIR, key)
+    except CheckpointFileError as exc:
+        console.print(Panel("[bold red]Checkpoint Verification FAILED[/bold red]", border_style="red", expand=False))
+        for err in exc.errors:
+            console.print(f"  [red]![/red] {err}")
+        return False
+
+    last = state.last
+    if last is None:
+        console.print("[dim]No chain checkpoint recorded yet. Run 'bernstein audit seal' to pin the history.[/dim]")
+        return True
+
+    conflicts = check_extension(AUDIT_DIR, last)
+    if not conflicts:
+        console.print(
+            Panel("[bold green]Checkpoint Verification Passed[/bold green]", border_style="green", expand=False)
+        )
+        table = Table(show_header=False, box=None, padding=(0, 2))
+        table.add_column("Key", style="dim", no_wrap=True, min_width=14)
+        table.add_column("Value")
+        table.add_row("Pinned root", str(last.get("root_hash", "")))
+        table.add_row("Pinned entries", str(last.get("entry_count", "-")))
+        if state.torn_tail:
+            table.add_row("Note", "checkpoints file ends in a torn append (previous pin in force)")
+        console.print(table)
+        return True
+
+    acks = find_divergence_acks(AUDIT_DIR, key, str(last.get("root_hash", "")))
+    if authorize_divergence(conflicts, acks) is not None:
+        console.print(
+            Panel("[bold yellow]Checkpoint Divergence acknowledged[/bold yellow]", border_style="yellow", expand=False)
+        )
+        console.print(
+            "  [dim]An operator acknowledged the divergence; the next 'bernstein audit seal' records a new pin.[/dim]"
+        )
+        return True
+
+    _print_checkpoint_conflict(CheckpointConsistencyError(last, conflicts))
+    return False
+
+
+def _os_user() -> str:
+    """Best-effort OS user name, for acknowledgement records."""
+    import getpass
+
+    try:
+        return getpass.getuser()
+    except (OSError, KeyError):  # pragma: no cover - no passwd entry
+        return "unknown"
+
+
+@audit_group.command("ack-tear")
+@click.option("--segment", required=True, help="Segment file name as verify printed it, e.g. 2026-07-25.jsonl.")
+@click.option("--offset", required=True, type=int, help="Byte offset as verify printed it.")
+@click.option("--reason", required=True, help="What was investigated and what was concluded.")
+@click.option("--actor", default=None, help="Who is acknowledging (defaults to the OS user).")
+def ack_tear_cmd(segment: str, offset: int, reason: str, actor: str | None) -> None:
+    """Acknowledge tear evidence so verification and sealing can proceed.
+
+    The acknowledgement is appended to the chain, not written beside it:
+    nothing about clearing the alert is editable after the fact, and the
+    reason travels with the record. Acknowledging repairs nothing - torn or
+    truncated records are still gone - it records that an operator looked.
+    When the tear is a checkpoint divergence (the history shrank relative to
+    the last accepted seal), the acknowledgement also names the conflicting
+    checkpoint root, which is what authorises the next seal to record a new
+    pin. The superseded checkpoint stays in the checkpoints file permanently.
+    """
+    from bernstein.core.persistence.chain_checkpoint import (
+        ACK_CHECKPOINT_ROOT_KEY,
+        CheckpointFileError,
+        check_extension,
+        load_checkpoints,
+    )
+    from bernstein.core.security.audit import (
+        EVENT_CHAIN_TEAR_ACKNOWLEDGED,
+        AuditLog,
+        load_or_create_audit_key,
+    )
+
+    if not AUDIT_DIR.is_dir():
+        raise click.ClickException(f"audit directory not found: {AUDIT_DIR}")
+
+    key = load_or_create_audit_key()
+    log = AuditLog(AUDIT_DIR, key=key)
+    with log.append_transaction():
+        # The target must be real: either recorded/live tear evidence at
+        # exactly this (segment, offset), or a checkpoint conflict for this
+        # segment. Refusing otherwise keeps acknowledgements bound to
+        # something verify actually printed.
+        details: dict[str, object] = {"segment": segment, "byte_offset": offset, "reason": reason}
+        report = log.verify_detailed()
+        matched = any(t.segment == segment and t.byte_offset == offset for t in report.tears)
+
+        # A tear at the tail and a checkpoint divergence commonly describe the
+        # same damage (a truncation is both, at the same offset). When the
+        # named (segment, offset) matches a checkpoint conflict exactly, the
+        # record carries the conflicting root, which is what authorises the
+        # next seal to record a new pin. The root is attached only on an
+        # exact match: an acknowledgement stays bound to precisely what
+        # verify printed, and a divergence whose conflict offset differs
+        # needs its own acknowledgement at that offset.
+        try:
+            state = load_checkpoints(AUDIT_DIR, key)
+        except CheckpointFileError as exc:
+            raise click.ClickException(str(exc)) from None
+        last = state.last
+        if last is not None:
+            for conflict in check_extension(AUDIT_DIR, last):
+                if conflict.segment != segment or conflict.offset != offset:
+                    continue
+                details[ACK_CHECKPOINT_ROOT_KEY] = str(last.get("root_hash", ""))
+                matched = True
+                break
+
+        if not matched:
+            raise click.ClickException(
+                f"no recorded tear or checkpoint conflict for segment {segment!r} at byte {offset}. "
+                "Use the segment and offset exactly as 'bernstein audit verify' printed them."
+            )
+
+        log.log(
+            EVENT_CHAIN_TEAR_ACKNOWLEDGED,
+            actor or _os_user(),
+            "audit_segment",
+            segment,
+            details,
+        )
+    console.print(f"[green]Acknowledged[/green] tear in {segment} at byte {offset}.")
+
+
+def _verify_merkle_tree() -> bool:
+    """Verify Merkle tree and print results. Returns True if valid.
+
+    The seal is pinned at finalization and the log keeps growing after it, so
+    the verdict separates the two facts an operator needs: the sealed prefix
+    recomputed to the pinned root, and how many rows arrived after the pin
+    (#4201). Only the first is an integrity claim.
+    """
+    from bernstein.core.merkle import verify_merkle
+
+    result = verify_merkle(AUDIT_DIR, MERKLE_DIR)
+
+    console.print()
+    if result.valid:
+        console.print(Panel("[bold green]Merkle Verification Passed[/bold green]", border_style="green", expand=False))
+        table = Table(show_header=False, box=None, padding=(0, 2))
+        table.add_column("Key", style="dim", no_wrap=True, min_width=14)
+        table.add_column("Value")
+        table.add_row("Root hash", result.root_hash)
+        if result.post_seal_rows:
+            table.add_row("Sealed prefix", "intact")
+            table.add_row("Post-seal rows", str(sum(result.post_seal_rows.values())))
+        if result.seal_path:
+            table.add_row("Seal file", str(result.seal_path))
+        console.print(table)
+        return True
+    console.print(Panel("[bold red]Merkle Verification FAILED[/bold red]", border_style="red", expand=False))
+    for err in result.errors:
+        console.print(f"  [red]![/red] {err}")
+    return False
+
+
+def _verify_evidence_bundles() -> bool:
+    """Verify every sealed evidence bundle and print results. Returns True if valid.
+
+    A tampered evidence file makes ``bernstein audit verify`` fail with the file
+    named, exactly like a tampered chain entry (#2362, AC2). When no bundles
+    exist the check is a silent no-op.
+    """
+    from bernstein.core.evidence.bundle import verify_all_evidence_bundles
+
+    # AUDIT_DIR is ``.sdd/audit``; the project root is two levels up. Bundles
+    # live under ``<root>/.sdd/evidence/bundles``.
+    workdir = AUDIT_DIR.parent.parent
+
+    key = _verify_key("Evidence bundle")
+    if key is None:
+        return True
+
+    results = verify_all_evidence_bundles(workdir, hmac_key=key)
+    if not results:
+        return True  # no evidence bundles recorded; nothing to verify
+
+    failures = [r for r in results if not r.ok]
+    console.print()
+    if not failures:
+        console.print(
+            Panel("[bold green]Evidence Bundle Verification Passed[/bold green]", border_style="green", expand=False)
+        )
+        table = Table(show_header=False, box=None, padding=(0, 2))
+        table.add_column("Key", style="dim", no_wrap=True, min_width=14)
+        table.add_column("Value")
+        table.add_row("Bundles", str(len(results)))
+        console.print(table)
+        return True
+
+    console.print(Panel("[bold red]Evidence Bundle Verification FAILED[/bold red]", border_style="red", expand=False))
+    for result in failures:
+        task = result.bundle.task_id if result.bundle is not None else "?"
+        console.print(f"  [red]![/red] task {task}: {result.reason}")
+    return False
+
+
+def _verify_run_artifacts() -> bool:
+    """Verify every agent-posted artifact and print results. Returns True if valid.
+
+    A flipped byte in a stored artifact blob, or in its journal row, makes
+    ``bernstein audit verify`` fail with the artifact key and its exact journal
+    position named -- exactly like a tampered chain entry (#2553). When no
+    artifacts exist the check is a silent no-op.
+    """
+    from bernstein.core.evidence.run_artifacts import verify_all_run_artifacts
+
+    # AUDIT_DIR is ``.sdd/audit``; the project root is two levels up. Artifacts
+    # live under ``<root>/.sdd/runs/*/journal.jsonl`` + ``<root>/.sdd/evidence``.
+    workdir = AUDIT_DIR.parent.parent
+
+    key = _verify_key("Run artifact")
+    if key is None:
+        return True
+
+    results = verify_all_run_artifacts(workdir, hmac_key=key)
+    if not results:
+        return True  # no artifacts recorded; nothing to verify
+
+    failures = [r for r in results if not r.ok]
+    console.print()
+    if not failures:
+        console.print(
+            Panel("[bold green]Run Artifact Verification Passed[/bold green]", border_style="green", expand=False)
+        )
+        table = Table(show_header=False, box=None, padding=(0, 2))
+        table.add_column("Key", style="dim", no_wrap=True, min_width=14)
+        table.add_column("Value")
+        table.add_row("Artifacts", str(len(results)))
+        console.print(table)
+        return True
+
+    console.print(Panel("[bold red]Run Artifact Verification FAILED[/bold red]", border_style="red", expand=False))
+    for result in failures:
+        console.print(f"  [red]![/red] task {result.task_id} key={result.key} v{result.version}: {result.reason}")
+    return False
+
+
+def _verify_tournament_receipts() -> bool:
+    """Verify every tournament selection receipt and print results.
+
+    A tampered score or a hand-picked winner makes ``bernstein audit verify``
+    fail with the task named, exactly like a tampered chain entry (#2353). When
+    no receipts exist the check is a silent no-op.
+    """
+    from bernstein.core.tournament.receipt import verify_all_tournament_receipts
+
+    # AUDIT_DIR is ``.sdd/audit``; receipts live under
+    # ``<root>/.sdd/tournaments/receipts``.
+    workdir = AUDIT_DIR.parent.parent
+
+    key = _verify_key("Tournament receipt")
+    if key is None:
+        return True
+
+    results = verify_all_tournament_receipts(workdir, hmac_key=key)
+    if not results:
+        return True  # no tournament receipts recorded; nothing to verify
+
+    failures = [r for r in results if not r.ok]
+    console.print()
+    if not failures:
+        console.print(
+            Panel("[bold green]Tournament Receipt Verification Passed[/bold green]", border_style="green", expand=False)
+        )
+        table = Table(show_header=False, box=None, padding=(0, 2))
+        table.add_column("Key", style="dim", no_wrap=True, min_width=14)
+        table.add_column("Value")
+        table.add_row("Receipts", str(len(results)))
+        console.print(table)
+        return True
+
+    console.print(
+        Panel("[bold red]Tournament Receipt Verification FAILED[/bold red]", border_style="red", expand=False)
+    )
+    for result in failures:
+        task = result.receipt.task_id if result.receipt is not None else "?"
+        console.print(f"  [red]![/red] task {task}: {result.reason}")
+    return False
+
+
+def _verify_approval_cards() -> bool:
+    """Verify resolved approval cards offline. Returns True if all valid.
+
+    Reconstructs, from the ``chat.approval_card.issued`` / ``resolved`` chain
+    entries alone, that every resolved card's stored envelope still hashes to
+    its recorded ``card_hash`` (no post-hoc mutation), that the decision echoed
+    an issued envelope, and that it landed before expiry (#2511). When no cards
+    were recorded the check is a silent no-op.
+    """
+    from bernstein.core.approval.card_verify import verify_approval_cards
+
+    key = _verify_key("Approval card")
+    if key is None:
+        return True
+    result = verify_approval_cards(AUDIT_DIR, key=key)
+    if result.issued_count == 0 == result.resolved_count:
+        return True  # no approval cards recorded; nothing to verify
+
+    console.print()
+    if result.ok:
+        console.print(
+            Panel("[bold green]Approval Card Verification Passed[/bold green]", border_style="green", expand=False)
+        )
+        table = Table(show_header=False, box=None, padding=(0, 2))
+        table.add_column("Key", style="dim", no_wrap=True, min_width=14)
+        table.add_column("Value")
+        table.add_row("Issued", str(result.issued_count))
+        table.add_row("Resolved", str(result.reconstructed_count))
+        console.print(table)
+        return True
+
+    console.print(Panel("[bold red]Approval Card Verification FAILED[/bold red]", border_style="red", expand=False))
+    for err in result.errors:
+        console.print(f"  [red]![/red] {err}")
+    # Internal faults are shown apart from record failures so an operator does
+    # not read a bug in this tool as evidence that their audit log was
+    # tampered with. Both still fail the pillar.
+    if result.verifier_errors:
+        console.print("  [yellow]The following records could not be evaluated by the verifier itself:[/yellow]")
+        for err in result.verifier_errors:
+            console.print(f"  [yellow]?[/yellow] {err}")
+    return False
+
+
+def _verify_sovereign_attestations() -> bool:
+    """Verify sovereign posture attestations + drift records. Returns True if valid.
+
+    Re-verifies, from the ``sovereign.posture_attestation`` /
+    ``sovereign.posture_drift`` chain entries alone, that every record's
+    embedded Ed25519 signature checks out against its embedded public key, that
+    the recorded posture hash recomputes byte-identically from the recorded
+    effective-policy document, and that each drift record names at least one
+    diverging key (#2518). When no records exist the check is a silent no-op.
+    """
+    from bernstein.core.security.deployment_profile import verify_sovereign_attestations
+
+    key = _verify_key("Sovereign posture")
+    if key is None:
+        return True
+    result = verify_sovereign_attestations(AUDIT_DIR, key=key)
+    if result.attestation_count == 0 == result.drift_count:
+        return True  # no sovereign records; nothing to verify
+
+    console.print()
+    if result.ok:
+        console.print(
+            Panel("[bold green]Sovereign Posture Verification Passed[/bold green]", border_style="green", expand=False)
+        )
+        table = Table(show_header=False, box=None, padding=(0, 2))
+        table.add_column("Key", style="dim", no_wrap=True, min_width=14)
+        table.add_column("Value")
+        table.add_row("Attestations", str(result.attestation_count))
+        table.add_row("Drift records", str(result.drift_count))
+        console.print(table)
+        return True
+
+    console.print(Panel("[bold red]Sovereign Posture Verification FAILED[/bold red]", border_style="red", expand=False))
+    for err in result.errors:
+        console.print(f"  [red]![/red] {err}")
+    return False
+
+
+def _verify_clearance_gates() -> bool:
+    """Verify clearance-gate integrity from the audit chain. Returns True if valid.
+
+    Reconstructs, from the ``signal.gate_projection`` chain entries alone, that
+    (a) every recorded ``graph_delta_hash`` recomputes byte-identically from the
+    projection's recorded inputs, and (b) no ``task.claim_receipt`` granted a
+    scoped dependent while its clearance gate was still open (#2556, AC4).
+
+    The HMAC chain is verified first: the semantic replay is only meaningful on
+    authenticated rows, so a tampered chain aborts the pass instead of feeding
+    forged details into the gate reconstruction (#2648). When no gates were
+    recorded and nothing failed, the check is a silent no-op.
+    """
+    from bernstein.core.communication.signal_actions import verify_clearance_gates
+    from bernstein.core.security.audit import AuditLog
+
+    key = _verify_key("Clearance gate")
+    if key is None:
+        return True
+    log = AuditLog(AUDIT_DIR, key=key)
+    chain_ok, chain_errors = log.verify()
+    if not chain_ok:
+        console.print()
+        console.print(
+            Panel("[bold red]Clearance Gate Verification FAILED[/bold red]", border_style="red", expand=False)
+        )
+        console.print("  [red]![/red] audit chain HMAC verification failed; gate replay not attempted")
+        for err in chain_errors:
+            console.print(f"  [red]![/red] {err}")
+        return False
+
+    # Read the same segments verify() authenticated. Without
+    # ``include_archived`` a query covers live files only, so after retention
+    # archiving it would hide archived gates and every claim of their
+    # dependents from the replay (#2648).
+    events = log.query(include_archived=True)
+    result = verify_clearance_gates(events)
+    if result.gate_count == 0 and result.ok:
+        return True  # no clearance gates recorded; nothing to verify
+
+    console.print()
+    if result.ok:
+        console.print(
+            Panel("[bold green]Clearance Gate Verification Passed[/bold green]", border_style="green", expand=False)
+        )
+        table = Table(show_header=False, box=None, padding=(0, 2))
+        table.add_column("Key", style="dim", no_wrap=True, min_width=14)
+        table.add_column("Value")
+        table.add_row("Gates", str(result.gate_count))
+        console.print(table)
+        return True
+
+    console.print(Panel("[bold red]Clearance Gate Verification FAILED[/bold red]", border_style="red", expand=False))
+    for task_id, claim_index in result.violations:
+        console.print(f"  [red]![/red] dependent {task_id} claimed at chain index {claim_index} during an open gate")
+    for err in result.errors:
+        console.print(f"  [red]![/red] {err}")
+    return False
+
+
+@audit_group.command("verify-gates")
+def verify_gates_cmd() -> None:
+    """Verify clearance-gate integrity offline from the audit chain (#2556).
+
+    \b
+    Replays every ``signal.gate_projection`` entry and proves, from the chain
+    alone, that:
+      * each recorded graph_delta_hash recomputes byte-identically, and
+      * no dependent task was claimed between a blocker post and its clearance.
+
+    Reports any violation with the offending task id and its claim chain
+    position. Exits non-zero on any violation or hash mismatch.
+    """
+    if not AUDIT_DIR.is_dir():
+        console.print(f"[red]Audit directory not found:[/red] {AUDIT_DIR}")
+        raise SystemExit(1)
+
+    passed = _verify_clearance_gates()
+    console.print()
+    raise SystemExit(0 if passed else 1)
+
+
+@audit_group.command("verify-suspension")
+@click.argument("task_id")
+@click.option("--workdir", default=".", help="Project root directory (parent of .sdd/).", type=click.Path())
+@click.option("--json", "as_json", is_flag=True, default=False, help="Print the continuity result as JSON.")
+def verify_suspension_cmd(task_id: str, workdir: str, as_json: bool) -> None:
+    """Prove a durable suspend/resume continuity offline (#2552).
+
+    \b
+    From a copied chain and the task journal alone, proves that a resumed task
+    continued from exactly the parked workspace hash -- or shows the recorded
+    fork/cold downgrade with its reason. Mutating the suspend row after the
+    fact fails journal verification at that exact chain position, and a
+    tampered receipt fails the HMAC chain. Exits non-zero on any break.
+    """
+    import json as _json
+
+    from bernstein.core.security.audit_chain import AuditChainStore
+    from bernstein.core.tasks.suspension import verify_suspension_continuity
+
+    sdd_dir = Path(workdir) / ".sdd"
+    chain = AuditChainStore(sdd_dir / "audit")
+    result = verify_suspension_continuity(sdd_dir=sdd_dir, task_id=task_id, chain=chain)
+
+    if as_json:
+        console.print_json(_json.dumps(result.to_dict()))
+        raise SystemExit(0 if result.ok else 1)
+
+    console.print()
+    if result.pending:
+        # A live park is an incomplete lifecycle, not a break. It exits 0, the
+        # same as before this distinction existed, so operator scripts that
+        # sweep parked fleets keep working.
+        console.print(
+            Panel(
+                f"[bold yellow]Suspension not settled yet[/bold yellow]\ntask [bold]{task_id}[/bold]: "
+                "parked, no resume recorded. Nothing to verify until it resumes.",
+                border_style="yellow",
+                expand=False,
+            )
+        )
+        raise SystemExit(0)
+    if result.ok:
+        detail = f"continued {result.effective_mode}"
+        if result.effective_mode == "warm":
+            detail += " from the parked workspace hash"
+        elif result.downgrade_reason:
+            detail += f" ({result.downgrade_reason})"
+        console.print(
+            Panel(
+                f"[bold green]Suspension continuity verified[/bold green]\ntask [bold]{task_id}[/bold]: {detail}",
+                border_style="green",
+                expand=False,
+            )
+        )
+        raise SystemExit(0)
+    console.print(
+        Panel(
+            f"[bold red]Suspension continuity FAILED[/bold red] for task [bold]{task_id}[/bold]",
+            border_style="red",
+            expand=False,
+        )
+    )
+    for err in result.errors:
+        console.print(f"  [red]![/red] {err}")
+    raise SystemExit(1)
+
+
+@audit_group.command("verify-hmac")
+def verify_hmac_cmd() -> None:
+    """Verify HMAC chain integrity across all audit log files."""
+    from bernstein.core.audit import AuditLog
+
+    if not AUDIT_DIR.is_dir():
+        console.print(f"[red]Audit directory not found:[/red] {AUDIT_DIR}")
+        raise SystemExit(1)
+
+    valid, errors = AuditLog(AUDIT_DIR).verify()
+
+    console.print()
+    if valid:
+        console.print(
+            Panel(
+                "[bold green]HMAC Chain Verification Passed[/bold green]",
+                border_style="green",
+                expand=False,
+            )
+        )
+    else:
+        console.print(
+            Panel(
+                "[bold red]HMAC Chain Verification FAILED[/bold red]",
+                border_style="red",
+                expand=False,
+            )
+        )
+        for err in errors:
+            console.print(f"  [red]![/red] {err}")
+
+    console.print()
+    raise SystemExit(0 if valid else 1)
+
+
+@audit_group.command("export")
+@click.option(
+    "--period",
+    default=None,
+    help="SOC 2 time period to export (e.g. Q1-2026, 2026-03, 2026).",
+)
+@click.option(
+    "--standard",
+    "standard",
+    default=None,
+    type=click.Choice(["ai-act", "owasp-asi", "owasp-skills"]),
+    help=(
+        "Emit a one-command compliance evidence pack mapped to the chosen "
+        "control catalogue, anchored on the operator's own HMAC-chained "
+        "audit events. 'ai-act' maps EU AI Act Article 12/13/15; "
+        "'owasp-asi' maps the OWASP Top 10 for Agentic Applications "
+        "(ASI01-ASI10); 'owasp-skills' maps the Agentic Skills Top 10 "
+        "(AST01-AST10). DORA and FINOS AIGF are tracked under #1316 and "
+        "will be added once their clause maps are validated."
+    ),
+)
+@click.option(
+    "--task",
+    "task",
+    default="all",
+    show_default=True,
+    help="Task id to scope the evidence pack to, or 'all' (--standard mode).",
+)
+@click.option(
+    "--out",
+    "out",
+    default=None,
+    type=click.Path(dir_okay=False, resolve_path=True),
+    help="Output zip path (--standard mode). Defaults to .sdd/evidence/.",
+)
+@click.option(
+    "--article-12",
+    "article_12",
+    is_flag=True,
+    default=False,
+    help="Emit an EU AI Act Article 12 evidence pack (uses --since/--until).",
+)
+@click.option(
+    "--tenant",
+    "tenant",
+    default=None,
+    help=(
+        "Emit a multi-tenant audit-chain export scoped to <tenant_id>. "
+        "Combine with --since/--until. Bundle conforms to "
+        "schemas/audit-multitenant-export-v2.json (back-compat with v1)."
+    ),
+)
+@click.option(
+    "--since",
+    default=None,
+    help="ISO-8601 inclusive lower bound (Article 12 / tenant mode).",
+)
+@click.option(
+    "--until",
+    default=None,
+    help="ISO-8601 exclusive upper bound (Article 12 / tenant mode).",
+)
+@click.option(
+    "--risk-class",
+    "risk_class",
+    default="limited",
+    type=click.Choice(["high", "limited", "minimal"]),
+    show_default=True,
+    help="EU AI Act risk class driving Article 12(3) retention horizon.",
+)
+@click.option(
+    "--format",
+    "fmt",
+    default="zip",
+    type=click.Choice(["zip", "dir"]),
+    show_default=True,
+    help="Output format (SOC 2 mode only; Article 12 always emits a zip).",
+)
+@click.option(
+    "--signature-kind",
+    "signature_kind",
+    default="hmac-chain-only",
+    type=click.Choice(
+        [
+            "hmac-chain-only",
+            "hmac-chain+rfc3161",
+            "hmac-chain+offline-anchor",
+            "hmac-chain+pubkey",
+            "hmac-chain+rfc3161+pubkey",
+        ],
+    ),
+    show_default=True,
+    help=(
+        "Tenant mode: which detached anchor to attach. "
+        "'hmac-chain-only' is the bare HMAC chain. "
+        "'hmac-chain+rfc3161' attaches a TSA timestamp token (--rfc3161-token). "
+        "'hmac-chain+offline-anchor' is an air-gap fallback (deterministic local anchor). "
+        "'hmac-chain+pubkey' (v2) signs head_sha256 with the lineage Ed25519 key "
+        "so a key-less auditor can authenticate the bundle. "
+        "'hmac-chain+rfc3161+pubkey' (v2) attaches both."
+    ),
+)
+@click.option(
+    "--rfc3161-token",
+    "rfc3161_token",
+    default=None,
+    help=(
+        "Tenant mode: path to a base64-encoded DER RFC 3161 TimeStampToken "
+        "(required iff --signature-kind contains 'rfc3161')."
+    ),
+)
+@click.option(
+    "--rfc3161-tsa-url",
+    "rfc3161_tsa_url",
+    default=None,
+    help="Tenant mode: URL of the TSA that issued the token (informational).",
+)
+@click.option(
+    "--head-signing-key-path",
+    "head_signing_key_path",
+    default=None,
+    type=click.Path(dir_okay=False, exists=True, resolve_path=True),
+    help=(
+        "Tenant mode (v2): path to the Ed25519 private key (PEM PKCS#8 or "
+        "raw 32-byte) used to sign head_sha256. Required iff "
+        "--signature-kind contains 'pubkey' and --head-signing-env-var is "
+        "not supplied. Reuses the lineage signer key (see "
+        "src/bernstein/core/security/lineage_kms.py)."
+    ),
+)
+@click.option(
+    "--head-signing-env-var",
+    "head_signing_env_var",
+    default=None,
+    help=(
+        "Tenant mode (v2): env var carrying a PEM Ed25519 private key. Mutually exclusive with --head-signing-key-path."
+    ),
+)
+@click.option(
+    "--head-signing-key-id",
+    "head_signing_key_id",
+    default=None,
+    help="Tenant mode (v2): operator-stable JWK 'kid' for the head signature.",
+)
+@click.option(
+    "--output",
+    "-o",
+    default=None,
+    help="Output directory (defaults to .sdd/evidence/).",
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    default=False,
+    help="Article 12 / tenant modes: build the bundle in-memory and print the manifest without writing to disk.",
+)
+@click.option("--dir", "workdir", default=".", show_default=True, help="Project root directory.")
+def export_cmd(
+    period: str | None,
+    standard: str | None,
+    task: str,
+    out: str | None,
+    article_12: bool,
+    tenant: str | None,
+    since: str | None,
+    until: str | None,
+    risk_class: str,
+    fmt: str,
+    signature_kind: str,
+    rfc3161_token: str | None,
+    rfc3161_tsa_url: str | None,
+    head_signing_key_path: str | None,
+    head_signing_env_var: str | None,
+    head_signing_key_id: str | None,
+    output: str | None,
+    dry_run: bool,
+    workdir: str,
+) -> None:
+    """Export an evidence package for auditors.
+
+    \b
+    Four modes:
+      * SOC 2 mode (default): bernstein audit export --period Q1-2026
+      * Compliance pack:      bernstein audit export --standard ai-act \
+            [--since 2026-01-01] [--task <id|all>] --out /tmp/pack.zip
+      * EU AI Act Article 12: bernstein audit export --article-12 \
+            --since 2026-08-01T00:00:00+00:00 --until 2026-09-01T00:00:00+00:00
+      * Multi-tenant slice:   bernstein audit export --tenant acme \
+            --since ... --until ... [--signature-kind ...]
+
+    \b
+    SOC 2 mode collects audit logs, HMAC verification (RFC 2104), Merkle
+    seals, compliance config, WAL entries, and SBOM into a single package.
+
+    \b
+    Article 12 mode emits a deterministic, retention-pinned bundle for
+    EU AI Act high-risk-system record-keeping (Article 12 of Regulation
+    (EU) 2024/1689): audit log slice, data-governance catalog, and an
+    EU-AI-Act clause map. manifest.json contains artefact SHA-256 hashes
+    for auditor verification.
+
+    \b
+    Multi-tenant mode emits a deterministic JSON bundle per the schema at
+    schemas/audit-multitenant-export-v1.json: events tagged with the
+    given tenant_id are filtered, then re-chained over a slice-local
+    HMAC so an external auditor can replay-verify offline. Cross-tenant
+    leakage is blocked at filter time and detected at verify time.
+    """
+    sdd_dir = Path(workdir).resolve() / ".sdd"
+    if not sdd_dir.is_dir():
+        console.print(f"[red]State directory not found:[/red] {sdd_dir}")
+        console.print("[dim]Run [bold]bernstein run[/bold] first to generate audit data.[/dim]")
+        raise SystemExit(1)
+
+    if standard:
+        _run_standard_export(
+            sdd_dir=sdd_dir,
+            standard=standard,
+            since=since,
+            task=task,
+            out=out,
+            dry_run=dry_run,
+        )
+        return
+
+    if tenant:
+        _run_tenant_export(
+            sdd_dir=sdd_dir,
+            tenant_id=tenant,
+            since=since,
+            until=until,
+            signature_kind=signature_kind,
+            rfc3161_token=rfc3161_token,
+            rfc3161_tsa_url=rfc3161_tsa_url,
+            head_signing_key_path=head_signing_key_path,
+            head_signing_env_var=head_signing_env_var,
+            head_signing_key_id=head_signing_key_id,
+            output=output,
+            dry_run=dry_run,
+        )
+        return
+
+    if article_12:
+        _run_article12_export(
+            sdd_dir=sdd_dir,
+            since=since,
+            until=until,
+            risk_class=risk_class,
+            output=output,
+            dry_run=dry_run,
+        )
+        return
+
+    if not period:
+        console.print(
+            "[red]One of --period (SOC 2), --standard, --article-12, or --tenant is required.[/red]",
+        )
+        raise SystemExit(2)
+
+    from bernstein.core.compliance import export_soc2_package, parse_period
+
+    # Validate period before doing work
+    try:
+        start, end = parse_period(period)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise SystemExit(1) from None
+
+    output_path = Path(output).resolve() if output else None
+
+    try:
+        result = export_soc2_package(sdd_dir, period, output_path=output_path, fmt=fmt)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise SystemExit(1) from None
+
+    # Display summary
+    console.print()
+    console.print(
+        Panel(
+            "[bold]SOC 2 Evidence Package[/bold]",
+            border_style="green",
+            expand=False,
+        )
+    )
+
+    table = Table(show_header=False, box=None, padding=(0, 2))
+    table.add_column("Key", style="dim", no_wrap=True, min_width=14)
+    table.add_column("Value")
+    table.add_row("Period", f"{period}  ({start} to {end})")
+    table.add_row("Format", fmt)
+    table.add_row("Output", str(result))
+    console.print(table)
+    console.print()
+
+
+def _run_article12_export(
+    *,
+    sdd_dir: Path,
+    since: str | None,
+    until: str | None,
+    risk_class: str,
+    output: str | None,
+    dry_run: bool,
+) -> None:
+    """Execute the EU AI Act Article 12 evidence-pack flow."""
+    import json as _json
+    from typing import cast
+
+    from bernstein.core.security.article12_bundle import (
+        Article12Bundle,
+        RiskClass,
+        build_article12_bundle,
+    )
+
+    if not since or not until:
+        console.print("[red]--article-12 requires both --since and --until (ISO-8601).[/red]")
+        raise SystemExit(2)
+
+    audit_dir = sdd_dir / "audit"
+    output_dir = Path(output).resolve() if output else None
+
+    try:
+        bundle: Article12Bundle = build_article12_bundle(
+            audit_dir=audit_dir,
+            since=since,
+            until=until,
+            risk_class=cast("RiskClass", risk_class),
+            output_dir=output_dir,
+            write=not dry_run,
+        )
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise SystemExit(1) from None
+
+    console.print()
+    console.print(
+        Panel(
+            "[bold]EU AI Act Article 12 Evidence Pack[/bold]",
+            border_style="green",
+            expand=False,
+        )
+    )
+
+    table = Table(show_header=False, box=None, padding=(0, 2))
+    table.add_column("Key", style="dim", no_wrap=True, min_width=18)
+    table.add_column("Value")
+    table.add_row("Bundle ID", bundle.bundle_id)
+    table.add_row("Window", f"{bundle.since} → {bundle.until}")
+    table.add_row("Risk class", bundle.risk_class)
+    table.add_row("Events", str(bundle.event_count))
+    table.add_row("Chain anchor", bundle.chain_anchor[:16] + "…")
+    table.add_row("Retention until", bundle.retention.retention_until)
+    table.add_row("SHA-256", bundle.sha256[:16] + "…")
+    if bundle.archive_path is not None:
+        table.add_row("Archive", str(bundle.archive_path))
+    elif dry_run:
+        table.add_row("Archive", "(dry-run, not written)")
+    console.print(table)
+    console.print()
+
+    if dry_run:
+        console.print("[dim]Manifest (dry-run):[/dim]")
+        console.print(_json.dumps(bundle.to_dict(), indent=2))
+        console.print()
+
+
+def _run_standard_export(
+    *,
+    sdd_dir: Path,
+    standard: str,
+    since: str | None,
+    task: str,
+    out: str | None,
+    dry_run: bool,
+) -> None:
+    """Execute the issue #1316 one-command evidence-pack flow.
+
+    Walks .sdd/audit, .sdd/lineage, and the cost ledger; produces an
+    opinionated zip mapped to the chosen regulatory standard's control
+    IDs. See ``bernstein.compliance.evidence_pack`` for the layout.
+    """
+    import json as _json
+
+    from bernstein.compliance.evidence_pack import build_evidence_pack
+
+    since_value = since or ""
+    output_path = Path(out).resolve() if out else None
+
+    try:
+        pack = build_evidence_pack(
+            sdd_dir=sdd_dir,
+            standard=standard,
+            since=since_value,
+            task=task,
+            output_path=output_path,
+            write=not dry_run,
+        )
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise SystemExit(1) from None
+
+    console.print()
+    console.print(
+        Panel(
+            f"[bold]Compliance Evidence Pack - {standard}[/bold]",
+            border_style="green",
+            expand=False,
+        ),
+    )
+
+    table = Table(show_header=False, box=None, padding=(0, 2))
+    table.add_column("Key", style="dim", no_wrap=True, min_width=18)
+    table.add_column("Value")
+    table.add_row("Bundle ID", pack.bundle_id)
+    table.add_row("Standard", pack.standard)
+    table.add_row("Since", pack.since or "(none)")
+    table.add_row("Task", pack.task)
+    table.add_row("Audit events", str(pack.event_count))
+    table.add_row("Lineage entries", str(pack.lineage_count))
+    table.add_row("Cost snapshots", str(pack.cost_count))
+    table.add_row(
+        "Controls mapped/partial/todo",
+        f"{pack.controls_mapped} / {pack.controls_partial} / {pack.controls_todo}",
+    )
+    table.add_row("SHA-256", pack.sha256[:16] + "...")
+    if pack.archive_path is not None:
+        table.add_row("Archive", str(pack.archive_path))
+    elif dry_run:
+        table.add_row("Archive", "(dry-run, not written)")
+    console.print(table)
+    console.print()
+
+    if dry_run:
+        console.print("[dim]Manifest (dry-run):[/dim]")
+        console.print(_json.dumps(pack.to_dict(), indent=2))
+        console.print()
+
+
+def _run_tenant_export(
+    *,
+    sdd_dir: Path,
+    tenant_id: str,
+    since: str | None,
+    until: str | None,
+    signature_kind: str,
+    rfc3161_token: str | None,
+    rfc3161_tsa_url: str | None,
+    head_signing_key_path: str | None,
+    head_signing_env_var: str | None,
+    head_signing_key_id: str | None,
+    output: str | None,
+    dry_run: bool,
+) -> None:
+    """Execute the multi-tenant audit-chain export flow.
+
+    Loads the operator HMAC key from the canonical key path used by
+    :class:`bernstein.core.security.audit.AuditLog`, scopes the bundle
+    to ``tenant_id``, and writes a deterministic JSON bundle conforming
+    to ``schemas/audit-multitenant-export-v2.json``. When the operator
+    selects a ``+pubkey`` signature kind, the lineage KMS adapter
+    (file-based or env-based) is also wired up to sign ``head_sha256``.
+    """
+    import json as _json
+    from typing import cast
+
+    from bernstein.core.security.audit import load_or_create_audit_key
+    from bernstein.core.security.audit_multitenant import (
+        SignatureKind,
+        TenantScopedExport,
+        export_tenant_slice,
+    )
+    from bernstein.core.security.lineage_kms import (
+        EnvBasedKMSAdapter,
+        FileBasedKMSAdapter,
+        KMSAdapter,
+    )
+
+    if not since or not until:
+        console.print("[red]--tenant requires both --since and --until (ISO-8601).[/red]")
+        raise SystemExit(2)
+
+    rfc3161_token_b64: str | None = None
+    if rfc3161_token:
+        token_path = Path(rfc3161_token).expanduser()
+        if not token_path.is_file():
+            console.print(f"[red]--rfc3161-token file not found: {token_path}[/red]")
+            raise SystemExit(1)
+        rfc3161_token_b64 = token_path.read_text(encoding="utf-8").strip()
+
+    if "rfc3161" in signature_kind and not rfc3161_token_b64:
+        console.print(
+            f"[red]--signature-kind={signature_kind} requires --rfc3161-token <path>.[/red]",
+        )
+        raise SystemExit(2)
+
+    head_kms_adapter: KMSAdapter | None = None
+    if "pubkey" in signature_kind:
+        if head_signing_key_path and head_signing_env_var:
+            console.print(
+                "[red]--head-signing-key-path and --head-signing-env-var are mutually exclusive.[/red]",
+            )
+            raise SystemExit(2)
+        from bernstein.core.persistence.lineage_signer import LineageSignerError
+
+        try:
+            if head_signing_key_path:
+                head_kms_adapter = FileBasedKMSAdapter(
+                    Path(head_signing_key_path),
+                    kid=head_signing_key_id,
+                )
+            elif head_signing_env_var:
+                head_kms_adapter = EnvBasedKMSAdapter(
+                    head_signing_env_var,
+                    kid=head_signing_key_id,
+                )
+            else:
+                console.print(
+                    f"[red]--signature-kind={signature_kind} requires either "
+                    "--head-signing-key-path or --head-signing-env-var.[/red]",
+                )
+                raise SystemExit(2)
+        except (LineageSignerError, OSError, ValueError) as exc:
+            console.print(f"[red]Failed to load head signing key: {exc}[/red]")
+            raise SystemExit(1) from None
+
+    audit_dir = sdd_dir / "audit"
+    output_dir = Path(output).resolve() if output else None
+
+    try:
+        key = load_or_create_audit_key()
+    except OSError as exc:  # pragma: no cover - filesystem race
+        console.print(f"[red]Failed to load audit key: {exc}[/red]")
+        raise SystemExit(1) from None
+
+    try:
+        export: TenantScopedExport = export_tenant_slice(
+            audit_dir=audit_dir,
+            tenant_id=tenant_id,
+            since=since,
+            until=until,
+            key=key,
+            output_dir=output_dir,
+            signature_kind=cast("SignatureKind", signature_kind),
+            rfc3161_token_b64=rfc3161_token_b64,
+            rfc3161_tsa_url=rfc3161_tsa_url,
+            head_kms_adapter=head_kms_adapter,
+            write=not dry_run,
+        )
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise SystemExit(1) from None
+
+    console.print()
+    console.print(
+        Panel(
+            "[bold]Multi-tenant Audit Slice[/bold]",
+            border_style="green",
+            expand=False,
+        ),
+    )
+
+    table = Table(show_header=False, box=None, padding=(0, 2))
+    table.add_column("Key", style="dim", no_wrap=True, min_width=18)
+    table.add_column("Value")
+    table.add_row("Tenant", export.tenant_id)
+    table.add_row("Window", f"{export.since} → {export.until}")
+    table.add_row("Events", str(export.event_count))
+    table.add_row("Head HMAC", export.head_hmac[:16] + "…")
+    table.add_row("Head SHA-256", export.head_sha256[:16] + "…")
+    table.add_row("Signature kind", export.signature_kind)
+    if export.bundle_path is not None:
+        table.add_row("Bundle", str(export.bundle_path))
+    elif dry_run:
+        table.add_row("Bundle", "(dry-run, not written)")
+    console.print(table)
+    console.print()
+
+    if dry_run:
+        console.print("[dim]Bundle (dry-run):[/dim]")
+        console.print(_json.dumps(_json.loads(export.bundle_bytes.decode("utf-8")), indent=2))
+        console.print()
+
+
+@audit_group.command("verify-multitenant")
+@click.option(
+    "--bundle",
+    "bundle_path",
+    required=True,
+    type=click.Path(dir_okay=False, exists=True, resolve_path=True),
+    help="Path to a multi-tenant audit-export bundle (JSON) to verify.",
+)
+@click.option(
+    "--rfc3161-trusted-tsa-bundle",
+    "rfc3161_trust_bundle",
+    default=None,
+    type=click.Path(dir_okay=False, exists=True, resolve_path=True),
+    help=(
+        "Path to a PEM/DER X.509 trust bundle (operator-supplied TSA roots "
+        "+ intermediates). Enables RFC 3161 cryptographic chain validation. "
+        "Without this flag, the verifier confirms the token is well-formed "
+        "base64 but does NOT validate the TSA chain."
+    ),
+)
+@click.option(
+    "--head-signing-public-jwk",
+    "head_signing_public_jwk_path",
+    default=None,
+    type=click.Path(dir_okay=False, exists=True, resolve_path=True),
+    help=(
+        "Path to a JSON file containing the trusted Ed25519 verifier JWK "
+        "(RFC 8037 OKP form). When supplied, the bundle's embedded JWK "
+        "must match before the head_signature is trusted."
+    ),
+)
+def verify_multitenant_cmd(
+    bundle_path: str,
+    rfc3161_trust_bundle: str | None,
+    head_signing_public_jwk_path: str | None,
+) -> None:
+    """Verify a multi-tenant audit-export bundle offline.
+
+    \b
+    Runs the full v2 verifier:
+      1. Envelope structure + tenant purity + HMAC chain integrity.
+      2. SHA-256 anchor consistency (catches single-byte flips).
+      3. (opt) RFC 3161 cryptographic chain validation when
+         --rfc3161-trusted-tsa-bundle is supplied.
+      4. (opt) Ed25519 signature over head_sha256 when the bundle
+         carries a head_signature block. Pass
+         --head-signing-public-jwk to pin the verifier key.
+
+    Exits non-zero on any failure; prints every observed error.
+    """
+    import json as _json
+
+    from bernstein.core.security.audit import load_or_create_audit_key
+    from bernstein.core.security.audit_multitenant import verify_tenant_slice
+
+    try:
+        hmac_key = load_or_create_audit_key()
+    except OSError as exc:
+        console.print(f"[red]Failed to load audit key: {exc}[/red]")
+        raise SystemExit(1) from None
+
+    trusted_tsa_certs = None
+    if rfc3161_trust_bundle:
+        from bernstein.core.security.rfc3161_verifier import load_trusted_tsa_certs
+
+        try:
+            trusted_tsa_certs = load_trusted_tsa_certs(Path(rfc3161_trust_bundle))
+        except ValueError as exc:
+            console.print(f"[red]Trust bundle load failed: {exc}[/red]")
+            raise SystemExit(1) from None
+
+    trusted_jwk: dict | None = None
+    if head_signing_public_jwk_path:
+        try:
+            trusted_jwk = _json.loads(
+                Path(head_signing_public_jwk_path).read_text(encoding="utf-8"),
+            )
+        except (OSError, _json.JSONDecodeError) as exc:
+            console.print(f"[red]Trusted JWK load failed: {exc}[/red]")
+            raise SystemExit(1) from None
+        if not isinstance(trusted_jwk, dict):
+            console.print("[red]Trusted JWK must be a JSON object.[/red]")
+            raise SystemExit(1)
+
+    result = verify_tenant_slice(
+        Path(bundle_path),
+        key=hmac_key,
+        rfc3161_trusted_tsa_certs=trusted_tsa_certs,
+        head_signature_trusted_jwk=trusted_jwk,
+    )
+
+    console.print()
+    if result.ok:
+        console.print(
+            Panel(
+                "[bold green]Multi-tenant Audit Slice Verified[/bold green]",
+                border_style="green",
+                expand=False,
+            ),
+        )
+        bundle = result.bundle
+        table = Table(show_header=False, box=None, padding=(0, 2))
+        table.add_column("Key", style="dim", no_wrap=True, min_width=18)
+        table.add_column("Value")
+        table.add_row("Schema version", str(bundle.get("schema_version", "?")))
+        table.add_row("Tenant", str(bundle.get("tenant_id", "?")))
+        table.add_row("Events", str(bundle.get("event_count", "?")))
+        table.add_row(
+            "Signature kind",
+            str((bundle.get("signature") or {}).get("signature_kind", "?")),
+        )
+        rfc3161_state = (
+            "verified"
+            if trusted_tsa_certs
+            and "rfc3161"
+            in str(
+                (bundle.get("signature") or {}).get("signature_kind", ""),
+            )
+            else "skipped"
+        )
+        table.add_row("RFC 3161", rfc3161_state)
+        head_sig_state = "verified" if bundle.get("head_signature") else "absent"
+        table.add_row("Head signature", head_sig_state)
+        console.print(table)
+        console.print()
+        return
+
+    console.print(
+        Panel(
+            "[bold red]Multi-tenant Audit Slice FAILED[/bold red]",
+            border_style="red",
+            expand=False,
+        ),
+    )
+    for err in result.errors:
+        console.print(f"  [red]![/red] {err}")
+    console.print()
+    raise SystemExit(1)
+
+
+@audit_group.command("pack")
+@click.option(
+    "--soc2",
+    "soc2",
+    is_flag=True,
+    default=False,
+    help="Emit a SOC 2 evidence-checklist Markdown pack with per-control evidence references.",
+)
+@click.option(
+    "--include-runs",
+    "include_runs",
+    default=None,
+    help="ISO-8601 timestamp; only include runs newer than this in the run-log evidence row.",
+)
+@click.option(
+    "--period-label",
+    "period_label",
+    default="current",
+    show_default=True,
+    help="Human-readable period label rendered into the markdown header.",
+)
+@click.option(
+    "--stale-after-days",
+    "stale_after_days",
+    default=30,
+    show_default=True,
+    type=int,
+    help="Mark sources whose mtime is older than this window as STALE.",
+)
+@click.option(
+    "--output",
+    "-o",
+    default=None,
+    help="Output directory (defaults to .sdd/evidence/soc2/).",
+)
+@click.option("--workdir", "workdir", default=".", show_default=True, help="Project root directory.")
+def pack_cmd(
+    soc2: bool,
+    include_runs: str | None,
+    period_label: str,
+    stale_after_days: int,
+    output: str | None,
+    workdir: str,
+) -> None:
+    """Build a SOC 2 evidence checklist with real per-control evidence refs.
+
+    \b
+    Each Trust Service Criteria row in the output Markdown carries a
+    concrete pointer (path on disk, sha256 hash, or pending marker).
+    Drives auditor walkthroughs without copy-pasting from JSON.
+    """
+    if not soc2:
+        console.print("[red]bernstein audit pack currently supports only --soc2.[/red]")
+        raise SystemExit(2)
+
+    from datetime import UTC, datetime
+
+    from bernstein.core.security.audit_pack import generate_audit_pack
+
+    since: datetime | None = None
+    if include_runs:
+        try:
+            cleaned = include_runs.replace("Z", "+00:00") if include_runs.endswith("Z") else include_runs
+            since = datetime.fromisoformat(cleaned)
+            if since.tzinfo is None:
+                since = since.replace(tzinfo=UTC)
+        except ValueError as exc:
+            console.print(f"[red]Invalid --include-runs timestamp: {exc}[/red]")
+            raise SystemExit(2) from None
+
+    output_path = Path(output).resolve() if output else None
+
+    result = generate_audit_pack(
+        workdir=Path(workdir).resolve(),
+        output_dir=output_path,
+        period_label=period_label,
+        include_since=since,
+        stale_after_days=stale_after_days,
+        write=True,
+    )
+
+    table = Table(show_header=False, box=None, padding=(0, 2))
+    table.add_column("Key", style="dim", no_wrap=True, min_width=14)
+    table.add_column("Value")
+    ok_count = sum(1 for r in result.resolved if r.status == "OK")
+    pending_count = sum(1 for r in result.resolved if r.status == "PENDING")
+    stale_count = sum(1 for r in result.resolved if r.status == "STALE")
+    table.add_row("Period", period_label)
+    table.add_row("Sources", str(len(result.resolved)))
+    table.add_row("OK / Pending / Stale", f"{ok_count} / {pending_count} / {stale_count}")
+    if result.markdown_path is not None:
+        table.add_row("Markdown", str(result.markdown_path))
+    if result.manifest_path is not None:
+        table.add_row("Manifest", str(result.manifest_path))
+
+    console.print()
+    console.print(Panel("[bold]SOC 2 Evidence Pack[/bold]", border_style="green", expand=False))
+    console.print(table)
+    console.print()
+
+
+@audit_group.command("capabilities")
+@click.option(
+    "--workdir",
+    default=".",
+    show_default=True,
+    help="Project root (used to load templates/capabilities/).",
+)
+def capabilities_cmd(workdir: str) -> None:
+    """Print the lethal-trifecta capability matrix and any violations.
+
+    Loads tool capability declarations from
+    ``<workdir>/templates/capabilities/`` (falling back to the bundled
+    defaults), prints the matrix, and scans recorded spawn manifests
+    under ``.sdd/runtime/spawn_capabilities/`` for any chain that trips
+    all three capabilities.  Exits non-zero when a violation is found.
+    """
+    import json as _json
+
+    from bernstein.core.security.capability_matrix import (
+        Capability,
+        CapabilityRegistry,
+        EnforcementMode,
+        find_violating_chains,
+    )
+
+    root = Path(workdir).resolve()
+    registry = CapabilityRegistry.load_default(workdir=root, mode=EnforcementMode.ENFORCE)
+
+    table = Table(show_header=True, header_style="bold magenta")
+    table.add_column("Tool", style="bold")
+    table.add_column("Source", style="dim")
+    for cap in Capability:
+        table.add_column(cap.value, justify="center")
+
+    for name in sorted(registry.tools):
+        entry = registry.tools[name]
+        row: list[str] = [name, entry.source]
+        for cap in Capability:
+            row.append("[green]Y[/green]" if cap in entry.capabilities else "[dim]-[/dim]")
+        table.add_row(*row)
+
+    console.print()
+    console.print(Panel("[bold]Tool Capability Matrix[/bold]", border_style="cyan", expand=False))
+    console.print(table)
+    console.print(f"\n[dim]{len(registry.tools)} tool(s) declared[/dim]\n")
+
+    runtime_dir = root / ".sdd" / "runtime" / "spawn_capabilities"
+    chains: list[list[str]] = []
+    if runtime_dir.is_dir():
+        for path in sorted(runtime_dir.glob("*.json")):
+            try:
+                manifest = _json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, _json.JSONDecodeError):
+                continue
+            tools = manifest.get("tools", [])
+            if isinstance(tools, list):
+                chains.append([str(t) for t in tools])
+
+    violations = find_violating_chains(registry, chains)
+    if not violations:
+        console.print("[green]No lethal-trifecta violations in recorded spawns.[/green]\n")
+        return
+
+    console.print(
+        Panel(
+            f"[bold red]{len(violations)} lethal-trifecta violation(s)[/bold red]",
+            border_style="red",
+            expand=False,
+        )
+    )
+    for decision in violations:
+        console.print(f"  [red]![/red] {decision.reason}: tools=[bold]{list(decision.offending_tools)}[/bold]")
+    console.print()
+    raise SystemExit(1)
+
+
+@audit_group.command("taint")
+@click.argument("artefact")
+@click.option(
+    "--log",
+    "log_path",
+    default=".sdd/lineage/log.jsonl",
+    show_default=True,
+    help="Path to the lineage log.jsonl.",
+)
+@click.option(
+    "--cards",
+    "cards_dir",
+    default=".sdd/agents",
+    show_default=True,
+    help="Directory of <agent-id>/card.json Agent Cards.",
+)
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit the verdict as JSON.")
+def taint_cmd(artefact: str, log_path: str, cards_dir: str, as_json: bool) -> None:
+    """Recompute the propagated-taint verdict for ARTEFACT, offline.
+
+    ARTEFACT is a lineage entry hash (``sha256:...``) or a repo-relative
+    artefact path. The verdict is a pure function of the signed lineage log:
+    two independent verifiers holding the same log recompute a byte-identical
+    result with no live process. The lineage gate runs first, so a mutated
+    provenance record or a reparented edge surfaces as a verification failure.
+
+    Exit code: ``0`` when the artefact is trusted, ``1`` when tainted, ``2``
+    when verification fails (a tampered or unverifiable log).
+    """
+    import json as _json
+    import os
+
+    from bernstein.core.lineage.provenance import TaintVerificationError, verify_taint
+
+    secret_raw = os.environ.get("BERNSTEIN_LINEAGE_OP_SECRET")
+    operator_secret = secret_raw.encode("utf-8") if secret_raw else None
+
+    try:
+        verdict = verify_taint(
+            Path(log_path),
+            Path(cards_dir),
+            artefact,
+            operator_secret=operator_secret,
+        )
+    except TaintVerificationError as exc:
+        if as_json:
+            console.print(_json.dumps({"error": "verification_failed", "failures": exc.failures}))
+        else:
+            console.print("[bold red]Taint verification FAILED[/bold red] (lineage gate broke):")
+            for failure in exc.failures[:10]:
+                console.print(f"  [red]![/red] {failure}")
+        raise SystemExit(2) from exc
+
+    payload = {
+        "target": verdict.target,
+        "trust": verdict.trust.value,
+        "tainted": verdict.tainted,
+        "resolved": verdict.resolved,
+        "closure_size": len(verdict.closure),
+        "trust_records": [eh for eh, _ in verdict.trust_records],
+    }
+
+    if as_json:
+        console.print(_json.dumps(payload, sort_keys=True))
+    else:
+        colour = "red" if verdict.tainted else "green"
+        console.print()
+        console.print(
+            Panel(
+                f"[bold]{verdict.target}[/bold]\n"
+                f"effective trust: [bold {colour}]{verdict.trust.value}[/bold {colour}]\n"
+                f"tainted: [bold {colour}]{verdict.tainted}[/bold {colour}]  "
+                f"resolved: {verdict.resolved}  closure: {len(verdict.closure)} entries",
+                title="Provenance taint verdict",
+                border_style=colour,
+                expand=False,
+            )
+        )
+        if not verdict.resolved:
+            console.print("[yellow]No provenance found: fail-closed to lowest trust.[/yellow]")
+        console.print()
+
+    raise SystemExit(1 if verdict.tainted else 0)
+
+
+@audit_group.command("slice")
+@click.option(
+    "--from",
+    "from_hmac",
+    default=None,
+    help="Inclusive lower bound: HMAC of the first event to include.  Omit to start at the earliest recorded event.",
+)
+@click.option(
+    "--to",
+    "to_hmac",
+    default=None,
+    help="Inclusive upper bound: HMAC of the last event to include.  Omit to run through the latest event.",
+)
+@click.option(
+    "--output",
+    "-o",
+    required=True,
+    type=click.Path(dir_okay=False, writable=True, resolve_path=True),
+    help="Path to the output JSONL file.",
+)
+def slice_cmd(from_hmac: str | None, to_hmac: str | None, output: str) -> None:
+    """Write a deterministic subset of the audit log between two HMACs.
+
+    \b
+    Foundation for time-travel replay.  The output is byte-stable
+    JSONL - each line is sort-keys-serialised - so downstream replayers
+    can hash the slice directly.  The HMAC chain inside the slice is
+    re-verified before writing; a structural mismatch aborts the export.
+
+    \b
+    Examples:
+      bernstein audit slice --from <hash> --to <hash> -o /tmp/slice.jsonl
+      bernstein audit slice --to <hash> -o /tmp/head.jsonl
+      bernstein audit slice --from <hash> -o /tmp/tail.jsonl
+    """
+    from bernstein.core.security.audit_slice import (
+        AuditSliceError,
+        slice_audit_log,
+        verify_slice_chain,
+        write_slice_jsonl,
+    )
+
+    if not AUDIT_DIR.is_dir():
+        console.print(f"[red]Audit directory not found:[/red] {AUDIT_DIR}")
+        raise SystemExit(1)
+
+    try:
+        result = slice_audit_log(AUDIT_DIR, from_hmac=from_hmac, to_hmac=to_hmac)
+    except AuditSliceError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise SystemExit(1) from None
+
+    valid, errors = verify_slice_chain(result)
+    if not valid:
+        console.print(Panel("[bold red]Slice chain check FAILED[/bold red]", border_style="red", expand=False))
+        for err in errors:
+            console.print(f"  [red]![/red] {err}")
+        raise SystemExit(1)
+
+    out_path = write_slice_jsonl(result, Path(output))
+
+    console.print()
+    console.print(Panel("[bold]Audit slice written[/bold]", border_style="green", expand=False))
+    table = Table(show_header=False, box=None, padding=(0, 2))
+    table.add_column("Key", style="dim", no_wrap=True, min_width=14)
+    table.add_column("Value")
+    table.add_row("Events", str(result.event_count))
+    table.add_row("From", result.from_hmac or "(genesis)")
+    table.add_row("To", result.to_hmac or "(latest)")
+    table.add_row("Source files", ", ".join(result.source_files) or "-")
+    table.add_row("Output", str(out_path))
+    console.print(table)
+    console.print()
+
+
+@audit_group.command("query")
+@click.option("--event-type", default=None, help="Filter by event type.")
+@click.option("--actor", default=None, help="Filter by actor.")
+@click.option("--since", default=None, help="ISO 8601 lower bound (inclusive).")
+@click.option("--limit", default=50, show_default=True, help="Maximum number of events to return.")
+def query_cmd(event_type: str | None, actor: str | None, since: str | None, limit: int) -> None:
+    """Query audit log events with filters."""
+    from bernstein.core.audit import AuditLog
+
+    if not AUDIT_DIR.is_dir():
+        console.print(f"[red]Audit directory not found:[/red] {AUDIT_DIR}")
+        raise SystemExit(1)
+
+    events = AuditLog(AUDIT_DIR).query(event_type=event_type, actor=actor, since=since)
+    events = events[:limit]
+
+    if not events:
+        console.print("[yellow]No matching audit events found.[/yellow]")
+        return
+
+    table = Table(show_header=True, header_style="bold magenta", show_lines=False)
+    table.add_column("Timestamp", style="dim", no_wrap=True)
+    table.add_column("Event Type", style="bold")
+    table.add_column("Actor")
+    table.add_column("Resource")
+    table.add_column("HMAC", style="dim", no_wrap=True)
+
+    for ev in events:
+        table.add_row(
+            ev.timestamp[:19],
+            ev.event_type,
+            ev.actor,
+            f"{ev.resource_type}/{ev.resource_id}",
+            ev.hmac[:12] + "…",
+        )
+
+    console.print()
+    console.print(table)
+    console.print(f"\n[dim]Showing {len(events)} event(s)[/dim]\n")
+
+
+# ---------------------------------------------------------------------------
+# bernstein audit archive
+# ---------------------------------------------------------------------------
+# Safe, idempotent move of corrupt / pre-rotation jsonl files out of the
+# active audit chain so ``bernstein doctor airgap`` reports clean again.
+#
+# Design notes:
+#   * Move-only (never delete). Original is moved to <archive-dir>/<name>;
+#     a sibling ``<name>.archived.json`` metadata file records who/why/when.
+#   * Idempotent: refuses to overwrite an existing archived file with the
+#     same name. Operator gets a clear error and the source stays in place.
+#   * Refuses to touch the live archive subdirectory used by the rotation
+#     code path (``archive/``) and never operates on files outside the
+#     resolved audit dir.
+#   * Defaults to "show plan, then ask for --yes". ``--dry-run`` skips both
+#     the prompt and the actual move; ``--yes`` performs the move.
+
+
+_ARCHIVE_REASON_CORRUPT = "corrupt-hmac"
+_ARCHIVE_REASON_BEFORE = "before-date"
+_ARCHIVE_REASON_OPERATOR = "operator-archive"
+
+
+def _hmac_corrupt_files(audit_dir: Path, key: bytes | None = None) -> set[str]:
+    """Return the set of jsonl filenames whose HMACs do NOT match ``key``.
+
+    A file is corrupt iff ``_verify_log_file`` reports an HMAC mismatch
+    when its starting ``prev_hmac`` is taken from the file's own first
+    line. This isolates *internal* HMAC failures (the live-symptom case
+    from the 2026-05-13 ticket: entries written under a rotated key)
+    from downstream drift (a clean file whose chain anchor shifted
+    because an earlier file was archived). Operators want to remove the
+    former and keep the latter.
+
+    Args:
+        audit_dir: The audit directory to scan.
+        key: Optional HMAC key. When ``None``, the canonical key is
+            resolved via :func:`load_or_create_audit_key`.
+    """
+    import json as _json
+
+    from bernstein.core.security.audit import _verify_log_file, load_or_create_audit_key
+
+    if not audit_dir.is_dir():
+        return set()
+
+    if key is None:
+        key = load_or_create_audit_key()
+
+    corrupt: set[str] = set()
+    for log_path in sorted(audit_dir.glob("*.jsonl")):
+        # Read the file's own first prev_hmac so we don't penalise a
+        # downstream-clean file for an upstream archive event.
+        try:
+            first_line = next(
+                (ln for ln in log_path.read_text().splitlines() if ln.strip()),
+                None,
+            )
+        except OSError:
+            corrupt.add(log_path.name)
+            continue
+        if first_line is None:
+            continue
+        try:
+            first_entry = _json.loads(first_line)
+        except ValueError:
+            corrupt.add(log_path.name)
+            continue
+        start_prev = str(first_entry.get("prev_hmac", "0" * 64))
+
+        per_file_errors: list[str] = []
+        _verify_log_file(log_path, start_prev, key, per_file_errors)
+        # Only HMAC-content errors count as "corrupt"; a prev_hmac
+        # mismatch at line 1 against the chain head is upstream drift,
+        # not internal corruption.
+        for err in per_file_errors:
+            if "HMAC mismatch" in err or "non-canonical line bytes" in err or "invalid JSON" in err:
+                corrupt.add(log_path.name)
+                break
+    return corrupt
+
+
+def _parse_filename_date(name: str) -> date | None:
+    """Return the date encoded in ``YYYY-MM-DD.jsonl`` or ``None``."""
+    from datetime import datetime
+
+    stem = name.removesuffix(".jsonl")
+    try:
+        return datetime.strptime(stem, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def _sha256_of_file(path: Path) -> str:
+    """Return the hex SHA-256 digest of ``path``."""
+    import hashlib
+
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _is_safe_audit_dir(audit_dir: Path) -> tuple[bool, str]:
+    """Refuse archive on suspicious audit-dir locations (best-effort)."""
+    try:
+        resolved = audit_dir.resolve()
+    except OSError as exc:
+        return False, f"cannot resolve {audit_dir}: {exc}"
+    # Reject pseudo-filesystem paths the operator almost certainly didn't
+    # mean. A symlink to /proc resolves to exactly "/proc" (no trailing
+    # slash), so we must refuse both the bare mount root and anything under
+    # it -- while still allowing lookalike siblings such as /procurement.
+    suspicious_roots = ("/dev", "/proc", "/sys")
+    s = str(resolved)
+    for root in suspicious_roots:
+        if s == root or s.startswith(root + "/"):
+            return False, f"refusing to operate on {root}* path: {resolved}"
+    return True, ""
+
+
+def _plan_archive(
+    audit_dir: Path,
+    *,
+    before: str | None,
+    corrupt_only: bool,
+) -> tuple[list[Path], dict[str, str], list[str]]:
+    """Return ``(files, reason_by_name, warnings)`` for the archive plan.
+
+    ``files`` is the ordered list of jsonl paths matching the filter.
+    ``reason_by_name`` maps filename -> archive reason string.
+    ``warnings`` collects non-fatal notes (e.g. malformed filename).
+    """
+    warnings: list[str] = []
+    if not audit_dir.is_dir():
+        return [], {}, [f"audit dir not found: {audit_dir}"]
+
+    candidates = sorted(audit_dir.glob("*.jsonl"))
+    if not candidates:
+        return [], {}, []
+
+    before_date = None
+    if before is not None:
+        from datetime import datetime
+
+        try:
+            before_date = datetime.strptime(before, "%Y-%m-%d").date()
+        except ValueError as exc:
+            raise click.BadParameter(
+                f"--before must be YYYY-MM-DD (got {before!r}): {exc}",
+            ) from None
+
+    corrupt = _hmac_corrupt_files(audit_dir) if corrupt_only else set()
+
+    selected: list[Path] = []
+    reason_by_name: dict[str, str] = {}
+    for path in candidates:
+        file_date = _parse_filename_date(path.name)
+        if before_date is not None:
+            if file_date is None:
+                warnings.append(
+                    f"{path.name}: cannot parse date from filename, skipping --before filter",
+                )
+                continue
+            if file_date >= before_date:
+                continue
+        if corrupt_only and path.name not in corrupt:
+            continue
+        # Pick a reason - corrupt wins over before-date if both flags set.
+        if corrupt_only and path.name in corrupt:
+            reason_by_name[path.name] = _ARCHIVE_REASON_CORRUPT
+        elif before_date is not None:
+            reason_by_name[path.name] = _ARCHIVE_REASON_BEFORE
+        else:
+            reason_by_name[path.name] = _ARCHIVE_REASON_OPERATOR
+        selected.append(path)
+    return selected, reason_by_name, warnings
+
+
+def _default_archive_dir(audit_dir: Path) -> Path:
+    """Return ``<audit_dir>/_archived/<ISO-timestamp>/``."""
+    from datetime import UTC, datetime
+
+    stamp = datetime.now(tz=UTC).strftime("%Y%m%dT%H%M%SZ")
+    return audit_dir / "_archived" / stamp
+
+
+def _format_size(num_bytes: int) -> str:
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if num_bytes < 1024:
+            return f"{num_bytes:.0f} {unit}" if unit == "B" else f"{num_bytes:.1f} {unit}"
+        num_bytes = int(num_bytes / 1024)
+    return f"{num_bytes:.1f} TiB"
+
+
+@audit_group.command("archive")
+@click.option(
+    "--before",
+    default=None,
+    metavar="YYYY-MM-DD",
+    help="Archive jsonl files whose filename date is strictly earlier than this date.",
+)
+@click.option(
+    "--corrupt",
+    "corrupt_only",
+    is_flag=True,
+    default=False,
+    help="Archive only files whose HMAC chain currently fails verification.",
+)
+@click.option(
+    "--archive-dir",
+    "archive_dir_opt",
+    default=None,
+    type=click.Path(file_okay=False, resolve_path=True),
+    help="Destination directory. Defaults to .sdd/audit/_archived/<UTC timestamp>/.",
+)
+@click.option(
+    "--audit-dir",
+    "audit_dir_opt",
+    default=None,
+    type=click.Path(file_okay=False, resolve_path=True),
+    help="Override the audit directory (default: .sdd/audit/). Mostly for tests.",
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    default=False,
+    help="Print the plan; move nothing.",
+)
+@click.option(
+    "--yes",
+    "assume_yes",
+    is_flag=True,
+    default=False,
+    help="Skip the interactive confirmation. Required for a real move outside --dry-run.",
+)
+def archive_cmd(
+    before: str | None,
+    corrupt_only: bool,
+    archive_dir_opt: str | None,
+    audit_dir_opt: str | None,
+    dry_run: bool,
+    assume_yes: bool,
+) -> None:
+    """Safely archive corrupt / pre-rotation audit chain files.
+
+    \b
+    Use when ``bernstein doctor airgap`` reports HMAC mismatches on old
+    jsonl files (typically because the audit key was rotated without
+    re-hashing prior entries). This command MOVES the offending files to
+    an out-of-chain archive directory and writes a sibling metadata file
+    so the operator can later reconstruct context. It never deletes.
+
+    \b
+    Examples:
+      bernstein audit archive --corrupt --dry-run
+      bernstein audit archive --before 2026-05-01 --yes
+      bernstein audit archive --corrupt --yes
+
+    \b
+    Exits 0 when the post-move audit chain verifies cleanly. Exits 1 if
+    archiving failed, or if the chain still has errors after the move.
+    """
+    import json as _json
+    from datetime import UTC, datetime
+
+    audit_dir = Path(audit_dir_opt).resolve() if audit_dir_opt else AUDIT_DIR
+
+    safe, reason = _is_safe_audit_dir(audit_dir)
+    if not safe:
+        console.print(f"[red]Refusing to archive:[/red] {reason}")
+        raise SystemExit(1)
+
+    if not audit_dir.is_dir():
+        console.print(f"[red]Audit directory not found:[/red] {audit_dir}")
+        raise SystemExit(1)
+
+    try:
+        files, reason_by_name, warnings = _plan_archive(
+            audit_dir,
+            before=before,
+            corrupt_only=corrupt_only,
+        )
+    except click.BadParameter as exc:
+        console.print(f"[red]{exc.message}[/red]")
+        raise SystemExit(2) from None
+
+    for warn in warnings:
+        console.print(f"[yellow]warn:[/yellow] {warn}")
+
+    if not files:
+        console.print(
+            "[green]Nothing to archive.[/green]  No jsonl files matched the given filter.",
+        )
+        # Still run a verify so the operator sees the chain state.
+        _print_post_archive_verify(audit_dir)
+        raise SystemExit(0)
+
+    # Resolve archive dir.
+    archive_dir = Path(archive_dir_opt).resolve() if archive_dir_opt else _default_archive_dir(audit_dir)
+
+    # Print plan.
+    table = Table(show_header=True, header_style="bold magenta")
+    table.add_column("File", style="bold")
+    table.add_column("Size", justify="right")
+    table.add_column("sha256", style="dim")
+    table.add_column("Reason")
+    plan_rows: list[tuple[Path, int, str, str]] = []
+    for path in files:
+        try:
+            size = path.stat().st_size
+            digest = _sha256_of_file(path)
+        except OSError as exc:
+            console.print(f"[red]Failed to read {path}: {exc}[/red]")
+            raise SystemExit(1) from None
+        plan_rows.append((path, size, digest, reason_by_name[path.name]))
+        table.add_row(path.name, _format_size(size), digest[:16] + "…", reason_by_name[path.name])
+
+    console.print()
+    console.print(
+        Panel(
+            f"[bold]Audit archive plan[/bold]  →  {archive_dir}",
+            border_style="cyan",
+            expand=False,
+        ),
+    )
+    console.print(table)
+    console.print(f"\n[dim]{len(files)} file(s) selected.[/dim]\n")
+
+    if dry_run:
+        console.print("[yellow]--dry-run set, no files moved.[/yellow]\n")
+        raise SystemExit(0)
+
+    if not assume_yes:
+        console.print(
+            "[yellow]Refusing to move without --yes. "
+            "Re-run with --yes to proceed, or --dry-run to preview only.[/yellow]\n",
+        )
+        raise SystemExit(2)
+
+    # Idempotency / safety: refuse to overwrite an existing destination.
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    for path, _size, _digest, _reason in plan_rows:
+        dest = archive_dir / path.name
+        if dest.exists():
+            console.print(
+                f"[red]Refusing to overwrite[/red] {dest} - a file with the same name "
+                "already exists in the archive directory. Aborting before moving "
+                "anything else.",
+            )
+            raise SystemExit(1)
+
+    # Do the move + write metadata sidecar.
+    moved: list[str] = []
+    for path, size, digest, file_reason in plan_rows:
+        dest = archive_dir / path.name
+        try:
+            path.rename(dest)
+        except OSError:
+            # Cross-device move fallback - copy then unlink.
+            import shutil
+
+            try:
+                shutil.copy2(str(path), str(dest))
+                path.unlink()
+            except OSError as exc:
+                console.print(f"[red]Failed to archive {path.name}: {exc}[/red]")
+                raise SystemExit(1) from None
+
+        meta = {
+            "archived_at_utc": datetime.now(tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "reason": file_reason,
+            "original_path": str(path),
+            "archived_path": str(dest),
+            "size_bytes": size,
+            "sha256_of_archived_file": digest,
+        }
+        meta_path = archive_dir / f"{path.name}.archived.json"
+        meta_path.write_text(
+            _json.dumps(meta, sort_keys=True, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        moved.append(path.name)
+        console.print(f"  [green]archived[/green] {path.name}  →  {dest}")
+
+    console.print(
+        f"\n[bold green]Archived {len(moved)} file(s)[/bold green] to {archive_dir}\n",
+    )
+
+    rc = _print_post_archive_verify(audit_dir)
+    raise SystemExit(rc)
+
+
+def _print_post_archive_verify(audit_dir: Path) -> int:
+    """Re-run AuditLog.verify() against ``audit_dir`` and print the result.
+
+    Returns 0 if the chain verifies cleanly (or there is nothing to
+    verify), 1 otherwise.
+    """
+    from bernstein.core.security.audit import AuditLog
+
+    valid, errors = AuditLog(audit_dir).verify()
+    console.print()
+    if valid:
+        console.print(
+            Panel(
+                "[bold green]Post-archive HMAC chain verification PASSED[/bold green]",
+                border_style="green",
+                expand=False,
+            ),
+        )
+        console.print()
+        return 0
+    console.print(
+        Panel(
+            "[bold red]Post-archive HMAC chain verification FAILED[/bold red]",
+            border_style="red",
+            expand=False,
+        ),
+    )
+    for err in errors:
+        console.print(f"  [red]![/red] {err}")
+    console.print()
+    return 1
+
+
+# ---------------------------------------------------------------------------
+# Standard verifiable receipts (#2604)
+# ---------------------------------------------------------------------------
+
+
+@audit_group.group("receipt")
+def receipt_group() -> None:
+    """Export / verify standard, offline-verifiable audit receipts (#2604).
+
+    A receipt projects an existing audit-chain range into off-the-shelf
+    envelope formats (COSE_Sign1 per RFC 9052, in-toto / DSSE, and an RFC 6962
+    style transparency receipt) so an auditor can validate what an agent did
+    with tooling they already run - no bernstein install and no shared HMAC
+    secret. See docs/security/audit-receipt.md.
+    """
+
+
+def _find_receipt_verifier() -> Path | None:
+    """Locate the standalone ``tools/verify_audit_receipt.py`` script.
+
+    The verify wrapper deliberately shells out to the standalone tool to prove
+    it is self-contained. Resolution order: ``$BERNSTEIN_AUDIT_RECEIPT_VERIFIER``
+    override, then a ``tools/verify_audit_receipt.py`` walking up from the CWD
+    and from this module's location.
+    """
+    import os
+
+    override = os.environ.get("BERNSTEIN_AUDIT_RECEIPT_VERIFIER")
+    if override:
+        candidate = Path(override).expanduser()
+        return candidate if candidate.is_file() else None
+
+    for base in (Path.cwd(), Path(__file__).resolve()):
+        for parent in (base, *base.parents):
+            candidate = parent / "tools" / "verify_audit_receipt.py"
+            if candidate.is_file():
+                return candidate
+    return None
+
+
+@receipt_group.command("export")
+@click.option(
+    "--format",
+    "formats",
+    default="cose,intoto,transparency",
+    show_default=True,
+    help="Comma-separated receipt formats to emit (cose, intoto, transparency).",
+)
+@click.option("--since", required=True, help="ISO-8601 inclusive lower bound of the chain range.")
+@click.option("--until", required=True, help="ISO-8601 exclusive upper bound of the chain range.")
+@click.option(
+    "--signing-key-path",
+    "signing_key_path",
+    default=None,
+    type=click.Path(dir_okay=False, exists=True, resolve_path=True),
+    help=(
+        "Path to the Ed25519 private key (PEM PKCS#8 or raw 32-byte) that signs "
+        "every receipt format. Reuses the lineage / head-signature KMS key "
+        "(see src/bernstein/core/security/lineage_kms.py). Mutually exclusive "
+        "with --signing-env-var."
+    ),
+)
+@click.option(
+    "--signing-env-var",
+    "signing_env_var",
+    default=None,
+    help="Env var carrying a PEM Ed25519 private key. Mutually exclusive with --signing-key-path.",
+)
+@click.option("--signing-key-id", "signing_key_id", default=None, help="Operator-stable JWK 'kid' for the receipt key.")
+@click.option(
+    "--online-rekor",
+    is_flag=True,
+    default=False,
+    help="Also submit the subject to a Rekor transparency log (opt-in; needs network + the sigstore extra).",
+)
+@click.option("--output", "-o", default=None, help="Output directory (defaults to .sdd/evidence/).")
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    default=False,
+    help="Build the receipt in-memory and print the summary without writing to disk.",
+)
+@click.option("--dir", "workdir", default=".", show_default=True, help="Project root directory.")
+def receipt_export_cmd(
+    formats: str,
+    since: str,
+    until: str,
+    signing_key_path: str | None,
+    signing_env_var: str | None,
+    signing_key_id: str | None,
+    online_rekor: bool,
+    output: str | None,
+    dry_run: bool,
+    workdir: str,
+) -> None:
+    """Export a standard verifiable receipt over an audit-chain range.
+
+    \b
+      bernstein audit receipt export --format cose,intoto,transparency \\
+          --since 2026-01-01T00:00:00Z --until 2026-02-01T00:00:00Z \\
+          --signing-key-path /path/to/ed25519.pem
+
+    \b
+    The receipt subject digest IS the chain range head_sha256 - no format
+    recomputes a head of its own. The exported receipt re-verifies offline
+    with tools/verify_audit_receipt.py (stdlib + cryptography + cbor2), and
+    the export itself is recorded as an ``audit.receipt_export`` chain event.
+    """
+    from bernstein.core.persistence.lineage_signer import LineageSignerError
+    from bernstein.core.security.audit import load_or_create_audit_key
+    from bernstein.core.security.audit_chain import AuditChainStore, record_audit_receipt_export
+    from bernstein.core.security.audit_receipt import RekorUnavailableError, build_receipt
+    from bernstein.core.security.lineage_kms import EnvBasedKMSAdapter, FileBasedKMSAdapter, KMSAdapter
+
+    requested = tuple(f.strip() for f in formats.split(",") if f.strip())
+    if not requested:
+        console.print("[red]--format must name at least one of cose, intoto, transparency.[/red]")
+        raise SystemExit(2)
+
+    sdd_dir = Path(workdir).resolve() / ".sdd"
+    audit_dir = sdd_dir / "audit"
+    if not audit_dir.is_dir():
+        console.print(f"[red]Audit directory not found:[/red] {audit_dir}")
+        console.print("[dim]Run [bold]bernstein run[/bold] first to generate audit events.[/dim]")
+        raise SystemExit(1)
+
+    if signing_key_path and signing_env_var:
+        console.print("[red]--signing-key-path and --signing-env-var are mutually exclusive.[/red]")
+        raise SystemExit(2)
+
+    kms_adapter: KMSAdapter
+    try:
+        if signing_key_path:
+            kms_adapter = FileBasedKMSAdapter(Path(signing_key_path), kid=signing_key_id)
+        elif signing_env_var:
+            kms_adapter = EnvBasedKMSAdapter(signing_env_var, kid=signing_key_id)
+        else:
+            console.print("[red]Provide either --signing-key-path or --signing-env-var (Ed25519 receipt key).[/red]")
+            raise SystemExit(2)
+    except (LineageSignerError, OSError, ValueError) as exc:
+        console.print(f"[red]Failed to load receipt signing key: {exc}[/red]")
+        raise SystemExit(1) from None
+
+    output_dir = Path(output).resolve() if output else None
+    try:
+        hmac_key = load_or_create_audit_key()
+    except OSError as exc:  # pragma: no cover - filesystem race
+        console.print(f"[red]Failed to load audit key: {exc}[/red]")
+        raise SystemExit(1) from None
+
+    try:
+        receipt = build_receipt(
+            audit_dir,
+            since=since,
+            until=until,
+            key=hmac_key,
+            kms_adapter=kms_adapter,
+            formats=requested,
+            online_rekor=online_rekor,
+            output_dir=output_dir,
+            write=not dry_run,
+        )
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise SystemExit(1) from None
+    except RekorUnavailableError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise SystemExit(1) from None
+
+    # Record the export in the HMAC chain so the projection is itself attested.
+    if not dry_run:
+        try:
+            chain = AuditChainStore(audit_dir)
+            record_audit_receipt_export(
+                chain=chain,
+                head_sha256=receipt.head_sha256,
+                since=receipt.since,
+                until=receipt.until,
+                event_count=receipt.event_count,
+                receipt_sha256=receipt.sha256,
+                formats=receipt.formats,
+            )
+        except OSError as exc:  # pragma: no cover - filesystem race
+            console.print(f"[yellow]Receipt written but audit event not recorded: {exc}[/yellow]")
+
+    console.print()
+    console.print(Panel("[bold]Audit Receipt[/bold]", border_style="green", expand=False))
+    table = Table(show_header=False, box=None, padding=(0, 2))
+    table.add_column("Key", style="dim", no_wrap=True, min_width=18)
+    table.add_column("Value")
+    table.add_row("Window", f"{receipt.since} → {receipt.until}")
+    table.add_row("Events", str(receipt.event_count))
+    table.add_row("Head SHA-256", receipt.head_sha256[:16] + "…")
+    table.add_row("Formats", ", ".join(receipt.formats))
+    table.add_row("Receipt SHA-256", receipt.sha256[:16] + "…")
+    if receipt.receipt_path is not None:
+        table.add_row("Receipt", str(receipt.receipt_path))
+    elif dry_run:
+        table.add_row("Receipt", "(dry-run, not written)")
+    console.print(table)
+    console.print()
+
+    if dry_run:
+        import json as _json
+
+        console.print("[dim]Receipt (dry-run):[/dim]")
+        console.print(_json.dumps(receipt.receipt, indent=2))
+        console.print()
+
+
+@receipt_group.command("verify")
+@click.argument("receipt_path", type=click.Path(dir_okay=False, exists=True, resolve_path=True))
+@click.option(
+    "--jwk",
+    "jwk_path",
+    default=None,
+    type=click.Path(dir_okay=False, exists=True, resolve_path=True),
+    help="Optional trusted Ed25519 JWK (OKP) to pin; the embedded receipt key must match.",
+)
+@click.option(
+    "--public-key",
+    "public_key_path",
+    default=None,
+    type=click.Path(dir_okay=False, exists=True, resolve_path=True),
+    help="Optional trusted Ed25519 public key PEM to pin; the embedded receipt key must match.",
+)
+@click.option(
+    "--format",
+    "fmt",
+    default="all",
+    type=click.Choice(["cose", "intoto", "transparency", "all"]),
+    show_default=True,
+    help="Which format(s) to verify.",
+)
+def receipt_verify_cmd(
+    receipt_path: str,
+    jwk_path: str | None,
+    public_key_path: str | None,
+    fmt: str,
+) -> None:
+    """Verify an audit receipt by shelling to the standalone verifier.
+
+    \b
+    Runs tools/verify_audit_receipt.py in a subprocess - the same stdlib +
+    cryptography + cbor2 tool an external auditor runs - to prove the receipt
+    is self-contained and needs no bernstein code to validate. Exits non-zero
+    on any verification failure.
+    """
+    import subprocess
+    import sys
+
+    verifier = _find_receipt_verifier()
+    if verifier is None:
+        console.print(
+            "[red]Could not locate tools/verify_audit_receipt.py.[/red] "
+            "Set BERNSTEIN_AUDIT_RECEIPT_VERIFIER to its path, or run from a "
+            "bernstein source checkout.",
+        )
+        raise SystemExit(2)
+
+    cmd = [sys.executable, str(verifier), "--receipt", receipt_path, "--format", fmt, "--verbose"]
+    if jwk_path:
+        cmd.extend(["--jwk", jwk_path])
+    if public_key_path:
+        cmd.extend(["--public-key", public_key_path])
+
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if proc.stdout:
+        console.print(proc.stdout.rstrip())
+    if proc.returncode != 0 and proc.stderr:
+        console.print(f"[red]{proc.stderr.rstrip()}[/red]")
+    raise SystemExit(proc.returncode)
+
+
+# ---------------------------------------------------------------------------
+# audit diagnose - single-run first-fault localisation (#2928)
+# ---------------------------------------------------------------------------
+
+
+@audit_group.command("diagnose")
+@click.argument("args", nargs=-1, required=True)
+@click.option(
+    "--signal",
+    "signal_spec",
+    default=None,
+    help="Failure signal: gate[:RECEIPT_HASH] | artefact:<path> | incident:<case-id> | replay.",
+)
+@click.option(
+    "--sign-key",
+    "sign_key_path",
+    default=None,
+    type=click.Path(dir_okay=False, exists=True, resolve_path=True),
+    help="Ed25519 private key (PEM or raw 32-byte seed) that signs the diagnosis receipt.",
+)
+@click.option(
+    "--public-key",
+    "public_key_path",
+    default=None,
+    type=click.Path(dir_okay=False, exists=True, resolve_path=True),
+    help="Trusted Ed25519 public key to pin when verifying a receipt.",
+)
+@click.option(
+    "--out",
+    "-o",
+    "output_dir",
+    default=None,
+    help="Receipt output directory (default: <sdd-dir>/evidence).",
+)
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit the finding as JSON.")
+@click.option("--sdd-dir", "sdd_dir", default=".sdd", show_default=True, help="Project .sdd directory.")
+@click.option(
+    "--audit-key",
+    "audit_key_path",
+    default=None,
+    type=click.Path(dir_okay=False, resolve_path=True),
+    help="Audit HMAC key path override (default: the canonical resolver, load-only).",
+)
+def diagnose_cmd(
+    args: tuple[str, ...],
+    signal_spec: str | None,
+    sign_key_path: str | None,
+    public_key_path: str | None,
+    output_dir: str | None,
+    as_json: bool,
+    sdd_dir: str,
+    audit_key_path: str | None,
+) -> None:
+    """Name the exact first faulty step of a run from its signed journal.
+
+    \b
+    Usage:
+      bernstein audit diagnose <RUN_ID> --signal <SIGNAL> --sign-key KEY
+      bernstein audit diagnose verify <RECEIPT> [--public-key PEM]
+
+    \b
+    The per-run journal (.sdd/runs/<run_id>/journal.jsonl) already records
+    every step as a Merkle-chained row. `verify` (chain integrity) and
+    `replay diff` (two runs) cannot point at the first faulty step of one
+    run - this command can: it resolves --signal into a pure predicate over
+    on-disk records, names the minimal step index at which the predicate
+    first holds, and seals the finding (culprit_index + culprit_step_hash,
+    bound to the recomputed journal head) into an Ed25519-signed,
+    content-addressed diagnosis receipt under <sdd-dir>/evidence.
+    Complementary to `bernstein replay --verify/--from-step/diff`, which
+    reconstructs and diffs; diagnose localises and signs.
+
+    \b
+    Fail-closed: a missing/empty journal, a journal with any unparsable
+    line, an unavailable audit HMAC key, a chain-broken journal (for
+    content signals), or a signal that resolves to no recorded step all
+    exit non-zero and write no receipt - the diagnosis is a projection of
+    the signed record, never a heuristic scan.
+
+    \b
+    Exit codes (diagnose): 0 chain intact / nothing to report; 1 culprit
+    named and receipt written; 2 fail-closed refusal.
+    Exit codes (verify): 0 receipt re-derives byte-for-byte; 1 verification
+    failed; 2 usage or unreadable receipt.
+
+    Operator runbook: docs/security/audit-log.md (Diagnosing a run).
+    """
+    if args[0] == "verify":
+        raise SystemExit(
+            _diagnose_verify(
+                args[1:],
+                public_key_path=public_key_path,
+                sdd_dir=Path(sdd_dir),
+                audit_key_path=audit_key_path,
+                as_json=as_json,
+            )
+        )
+    raise SystemExit(
+        _diagnose_run_cli(
+            args,
+            signal_spec=signal_spec,
+            sign_key_path=sign_key_path,
+            output_dir=output_dir,
+            sdd_dir=Path(sdd_dir),
+            audit_key_path=audit_key_path,
+            as_json=as_json,
+        )
+    )
+
+
+def _diagnose_load_audit_key(audit_key_path: str | None) -> bytes:
+    """Load the operator audit HMAC key, never creating one (fail closed)."""
+    from bernstein.core.security.audit import load_audit_key
+
+    return load_audit_key(Path(audit_key_path) if audit_key_path else None)
+
+
+def _diagnose_run_cli(
+    args: tuple[str, ...],
+    *,
+    signal_spec: str | None,
+    sign_key_path: str | None,
+    output_dir: str | None,
+    sdd_dir: Path,
+    audit_key_path: str | None,
+    as_json: bool,
+) -> int:
+    """Run the diagnosis flow. Returns the process exit code."""
+    import json as _json
+
+    from bernstein.core.persistence.lineage_signer import Ed25519FileKeySigner, LineageSignerError
+    from bernstein.core.replay.diagnose import DiagnoseError, diagnose_run
+    from bernstein.core.replay.diagnose_signals import resolve_signal
+    from bernstein.core.replay.diagnosis_receipt import DiagnosisReceiptError, build_diagnosis_receipt
+    from bernstein.core.replay.journal import JournalPathError, run_journal_path
+    from bernstein.core.security.audit import AuditKeyMissingError, AuditKeyPermissionError
+
+    if len(args) != 1:
+        console.print("[red]Usage:[/red] bernstein audit diagnose <RUN_ID> --signal <SIGNAL> --sign-key KEY")
+        return 2
+    run_id = args[0]
+    if signal_spec is None:
+        console.print(
+            "[red]--signal is required[/red] (gate[:RECEIPT_HASH] | artefact:<path> | incident:<case-id> | replay)"
+        )
+        return 2
+    if sign_key_path is None:
+        console.print(
+            "[red]--sign-key is required:[/red] the diagnosis receipt is the deliverable and it "
+            "must be Ed25519-signed; refusing to emit an unsigned finding."
+        )
+        return 2
+
+    try:
+        journal_path = run_journal_path(sdd_dir, run_id)
+    except JournalPathError as exc:
+        console.print(f"[red]{exc}[/red]")
+        return 2
+    try:
+        audit_key = _diagnose_load_audit_key(audit_key_path)
+    except (AuditKeyMissingError, AuditKeyPermissionError) as exc:
+        console.print(f"[red]Audit HMAC key unavailable - failing closed, no receipt:[/red] {exc}")
+        return 2
+    try:
+        signer = Ed25519FileKeySigner.from_path(Path(sign_key_path))
+    except LineageSignerError as exc:
+        console.print(f"[red]Cannot load signing key:[/red] {exc}")
+        return 2
+    # The artefact signal runs the lineage gate; mirror `audit taint`: the
+    # operator HMAC layer is checked when BERNSTEIN_LINEAGE_OP_SECRET is set,
+    # and the mode used is disclosed inside the sealed receipt params.
+    import os as _os
+
+    secret_raw = _os.environ.get("BERNSTEIN_LINEAGE_OP_SECRET")
+    lineage_secret = secret_raw.encode("utf-8") if secret_raw else None
+    try:
+        predicate = resolve_signal(signal_spec, sdd_dir=sdd_dir, lineage_operator_secret=lineage_secret)
+        result = diagnose_run(journal_path, predicate, run_id=run_id)
+    except DiagnoseError as exc:
+        console.print(f"[red]Diagnosis refused (fail closed, no receipt):[/red] {exc}")
+        return 2
+
+    if not result.located:
+        if as_json:
+            click.echo(_json.dumps({"run_id": run_id, "located": False, "reason": result.reason}, sort_keys=True))
+        else:
+            console.print(f"[green]{result.reason}[/green] - nothing to report, no receipt emitted.")
+        return 0
+
+    from bernstein.core.security.audit_chain import AuditChainStore
+
+    chain_head = AuditChainStore(sdd_dir / "audit", key=audit_key).prev_chain_digest
+    try:
+        receipt = build_diagnosis_receipt(
+            result,
+            chain_head_hmac=chain_head,
+            signer=signer,
+            audit_key=audit_key,
+            output_dir=Path(output_dir) if output_dir else sdd_dir / "evidence",
+        )
+    except DiagnosisReceiptError as exc:
+        console.print(f"[red]Receipt build failed:[/red] {exc}")
+        return 2
+
+    if as_json:
+        click.echo(
+            _json.dumps(
+                {
+                    "run_id": run_id,
+                    "located": True,
+                    "culprit_index": result.culprit_index,
+                    "culprit_step_hash": result.culprit_step_hash,
+                    "reason_code": result.reason_code,
+                    "reason": result.reason,
+                    "predicate_id": result.predicate_id,
+                    "predicate_hash": result.predicate_hash,
+                    "journal_head": result.journal_head,
+                    "receipt_hash": receipt.receipt_hash,
+                    "receipt_sha256": receipt.sha256,
+                    "receipt_path": str(receipt.receipt_path),
+                },
+                sort_keys=True,
+            )
+        )
+        return 1
+
+    console.print()
+    console.print(
+        Panel(
+            f"[bold]run {run_id}[/bold]\n"
+            f"culprit step: [bold red]#{result.culprit_index}[/bold red] of {result.event_count}\n"
+            f"step hash:    {result.culprit_step_hash}\n"
+            f"reason:       [bold]{result.reason_code}[/bold] - {result.reason}\n"
+            f"journal head: {result.journal_head}",
+            title="Diagnosis",
+            border_style="red",
+            expand=False,
+        )
+    )
+    console.print(f"[green]Signed diagnosis receipt[/green] -> {receipt.receipt_path}")
+    console.print(f"  receipt_hash: {receipt.receipt_hash}")
+    console.print("[dim]Re-check offline with:[/dim] bernstein audit diagnose verify " + str(receipt.receipt_path))
+    return 1
+
+
+def _diagnose_verify(
+    args: tuple[str, ...],
+    *,
+    public_key_path: str | None,
+    sdd_dir: Path,
+    audit_key_path: str | None,
+    as_json: bool,
+) -> int:
+    """Verify a diagnosis receipt offline. Returns the process exit code."""
+    import json as _json
+
+    from bernstein.core.persistence.lineage_signer import Ed25519PublicKeyVerifier, LineageSignerError
+    from bernstein.core.replay.diagnosis_receipt import verify_diagnosis_receipt
+    from bernstein.core.replay.journal import JournalPathError, run_journal_path
+    from bernstein.core.security.audit import AuditKeyMissingError, AuditKeyPermissionError
+
+    if len(args) != 1:
+        console.print("[red]Usage:[/red] bernstein audit diagnose verify <RECEIPT> [--public-key PEM]")
+        return 2
+    receipt_path = Path(args[0])
+    if not receipt_path.is_file():
+        console.print(f"[red]Receipt not found:[/red] {receipt_path}")
+        return 2
+
+    try:
+        run_id = str(_json.loads(receipt_path.read_text(encoding="utf-8")).get("run_id", ""))
+        journal_path = run_journal_path(sdd_dir, run_id)
+    except (OSError, _json.JSONDecodeError, JournalPathError) as exc:
+        console.print(f"[red]Cannot locate the diagnosed journal:[/red] {exc}")
+        return 2
+
+    verifier = None
+    if public_key_path is not None:
+        try:
+            verifier = Ed25519PublicKeyVerifier.from_path(Path(public_key_path))
+        except LineageSignerError as exc:
+            console.print(f"[red]Cannot load public key:[/red] {exc}")
+            return 2
+
+    audit_key: bytes | None
+    try:
+        audit_key = _diagnose_load_audit_key(audit_key_path)
+    except (AuditKeyMissingError, AuditKeyPermissionError):
+        audit_key = None
+
+    outcome = verify_diagnosis_receipt(
+        receipt_path,
+        journal_path=journal_path,
+        verifier=verifier,
+        audit_key=audit_key,
+    )
+
+    if as_json:
+        click.echo(
+            _json.dumps(
+                {"ok": outcome.ok, "reason": outcome.reason, "hmac_checked": outcome.hmac_checked},
+                sort_keys=True,
+            )
+        )
+        return 0 if outcome.ok else 1
+
+    if outcome.ok:
+        console.print("[green]Diagnosis receipt verified:[/green] the culprit re-derives byte-for-byte.")
+        if not outcome.hmac_checked:
+            console.print("[yellow]Operator HMAC not checked (no audit key available).[/yellow]")
+        return 0
+    console.print(f"[red]Diagnosis receipt FAILED verification:[/red] {outcome.reason}")
+    return 1

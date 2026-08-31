@@ -1,0 +1,203 @@
+"""Unit tests for MCP auto-discovery registration/unregistration."""
+
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+import pytest
+from bernstein.cli.stop_cmd import _unregister_mcp_discovery
+from bernstein.core.bootstrap import _register_mcp_discovery
+
+
+def test_register_creates_mcp_json(tmp_path: Path) -> None:
+    """register writes .claude/mcp.json with bernstein entry."""
+    _register_mcp_discovery(tmp_path)
+
+    mcp_path = tmp_path / ".claude" / "mcp.json"
+    assert mcp_path.exists()
+    data = json.loads(mcp_path.read_text())
+    assert "bernstein" in data["mcpServers"]
+    entry = data["mcpServers"]["bernstein"]
+    assert entry["command"] == sys.executable
+    assert entry["args"] == ["-m", "bernstein.mcp.server"]
+
+
+def test_register_merges_with_existing(tmp_path: Path) -> None:
+    """register preserves pre-existing MCP server entries."""
+    mcp_path = tmp_path / ".claude" / "mcp.json"
+    mcp_path.parent.mkdir(parents=True)
+    mcp_path.write_text(json.dumps({"mcpServers": {"other": {"command": "other-cmd", "args": []}}}))
+
+    _register_mcp_discovery(tmp_path)
+
+    data = json.loads(mcp_path.read_text())
+    assert "other" in data["mcpServers"]
+    assert "bernstein" in data["mcpServers"]
+
+
+def test_register_overwrites_stale_bernstein_entry(tmp_path: Path) -> None:
+    """register replaces an existing (stale) bernstein entry with fresh config."""
+    mcp_path = tmp_path / ".claude" / "mcp.json"
+    mcp_path.parent.mkdir(parents=True)
+    stale = {"mcpServers": {"bernstein": {"command": "/old/python", "args": ["-m", "old.module"]}}}
+    mcp_path.write_text(json.dumps(stale))
+
+    _register_mcp_discovery(tmp_path)
+
+    data = json.loads(mcp_path.read_text())
+    assert data["mcpServers"]["bernstein"]["command"] == sys.executable
+
+
+def test_register_tolerates_corrupt_existing_file(tmp_path: Path) -> None:
+    """register handles corrupt JSON in existing mcp.json gracefully."""
+    mcp_path = tmp_path / ".claude" / "mcp.json"
+    mcp_path.parent.mkdir(parents=True)
+    mcp_path.write_text("NOT JSON {{{")
+
+    _register_mcp_discovery(tmp_path)  # must not raise
+
+    data = json.loads(mcp_path.read_text())
+    assert "bernstein" in data["mcpServers"]
+
+
+@pytest.mark.parametrize("payload", ["null", "[]", '"a string"', "5", "true"])
+def test_register_tolerates_non_object_json_root(tmp_path: Path, payload: str) -> None:
+    """Valid JSON with a non-object root must not abort bootstrap.
+
+    ``json.loads`` succeeds here, so the ``(ValueError, OSError)`` guard above
+    does not fire and the value flows on to ``.get()`` as a non-mapping.
+    """
+    mcp_path = tmp_path / ".claude" / "mcp.json"
+    mcp_path.parent.mkdir(parents=True)
+    mcp_path.write_text(payload)
+
+    _register_mcp_discovery(tmp_path)  # must not raise
+
+    data = json.loads(mcp_path.read_text())
+    assert "bernstein" in data["mcpServers"]
+
+
+@pytest.mark.parametrize("servers", [None, [], "a string", 5, True])
+def test_register_tolerates_malformed_mcpservers(tmp_path: Path, servers: object) -> None:
+    """A non-object ``mcpServers`` is reset without losing the rest of the file."""
+    mcp_path = tmp_path / ".claude" / "mcp.json"
+    mcp_path.parent.mkdir(parents=True)
+    mcp_path.write_text(json.dumps({"otherKey": "keep me", "mcpServers": servers}))
+
+    _register_mcp_discovery(tmp_path)  # must not raise
+
+    data = json.loads(mcp_path.read_text())
+    assert "bernstein" in data["mcpServers"]
+    assert data["otherKey"] == "keep me"
+
+
+def test_register_rejects_pair_list_mcpservers(tmp_path: Path) -> None:
+    """A list of pairs is not a server map, even though ``dict()`` accepts it."""
+    mcp_path = tmp_path / ".claude" / "mcp.json"
+    mcp_path.parent.mkdir(parents=True)
+    mcp_path.write_text(json.dumps({"mcpServers": [["smuggled", {"command": "x"}]]}))
+
+    _register_mcp_discovery(tmp_path)
+
+    data = json.loads(mcp_path.read_text())
+    assert "bernstein" in data["mcpServers"]
+    assert "smuggled" not in data["mcpServers"]
+
+
+def test_register_skips_rewrite_when_command_only_differs(tmp_path: Path) -> None:
+    """A tracked mcp.json committed on another machine is not rewritten (issue #2800).
+
+    The bernstein entry is identified by its ``args``. When an entry with the
+    same args already exists, only its machine-specific ``command`` could
+    differ, so register must leave the file byte-for-byte unchanged instead of
+    dirtying a tracked working tree on every run.
+    """
+    mcp_path = tmp_path / ".claude" / "mcp.json"
+    mcp_path.parent.mkdir(parents=True)
+    committed = {
+        "mcpServers": {"bernstein": {"command": "/other/machine/python", "args": ["-m", "bernstein.mcp.server"]}}
+    }
+    original_text = json.dumps(committed, indent=2) + "\n"
+    mcp_path.write_text(original_text)
+
+    _register_mcp_discovery(tmp_path)
+
+    assert mcp_path.read_text() == original_text
+
+
+def test_register_is_idempotent_on_second_run(tmp_path: Path) -> None:
+    """Two consecutive registers on the same machine leave the file unchanged."""
+    _register_mcp_discovery(tmp_path)
+    mcp_path = tmp_path / ".claude" / "mcp.json"
+    first = mcp_path.read_text()
+
+    _register_mcp_discovery(tmp_path)
+
+    assert mcp_path.read_text() == first
+
+
+def test_unregister_removes_bernstein_entry(tmp_path: Path) -> None:
+    """unregister removes only the bernstein entry, leaving others intact."""
+    mcp_path = tmp_path / ".claude" / "mcp.json"
+    mcp_path.parent.mkdir(parents=True)
+    mcp_path.write_text(json.dumps({"mcpServers": {"bernstein": {"command": "x"}, "other": {"command": "y"}}}))
+
+    _unregister_mcp_discovery(tmp_path)
+
+    data = json.loads(mcp_path.read_text())
+    assert "bernstein" not in data["mcpServers"]
+    assert "other" in data["mcpServers"]
+
+
+def test_unregister_noop_when_no_mcp_json(tmp_path: Path) -> None:
+    """unregister does nothing when .claude/mcp.json does not exist."""
+    _unregister_mcp_discovery(tmp_path)  # must not raise
+
+
+def test_unregister_noop_when_bernstein_not_present(tmp_path: Path) -> None:
+    """unregister is idempotent when bernstein entry is already absent."""
+    mcp_path = tmp_path / ".claude" / "mcp.json"
+    mcp_path.parent.mkdir(parents=True)
+    mcp_path.write_text(json.dumps({"mcpServers": {"other": {"command": "y"}}}))
+
+    _unregister_mcp_discovery(tmp_path)
+
+    data = json.loads(mcp_path.read_text())
+    assert "other" in data["mcpServers"]
+
+
+@pytest.mark.parametrize("payload", ["null", "[]", '"a string"', "5", "true"])
+def test_unregister_tolerates_non_object_json_root(tmp_path: Path, payload: str) -> None:
+    """Shutdown cleanup must survive the same shapes registration self-heals."""
+    mcp_path = tmp_path / ".claude" / "mcp.json"
+    mcp_path.parent.mkdir(parents=True)
+    mcp_path.write_text(payload)
+
+    _unregister_mcp_discovery(tmp_path)  # must not raise
+
+    assert mcp_path.read_text() == payload, "an unusable file is left untouched"
+
+
+@pytest.mark.parametrize("servers", [None, [], "a string", 5, True, [["bernstein", {}]]])
+def test_unregister_tolerates_malformed_mcpservers(tmp_path: Path, servers: object) -> None:
+    """A non-object ``mcpServers`` is a no-op, not a crash, and is left as-is."""
+    mcp_path = tmp_path / ".claude" / "mcp.json"
+    mcp_path.parent.mkdir(parents=True)
+    original = json.dumps({"otherKey": "keep me", "mcpServers": servers})
+    mcp_path.write_text(original)
+
+    _unregister_mcp_discovery(tmp_path)  # must not raise
+
+    assert mcp_path.read_text() == original
+
+
+def test_register_then_unregister_roundtrip(tmp_path: Path) -> None:
+    """register followed by unregister leaves file with no bernstein entry."""
+    _register_mcp_discovery(tmp_path)
+    _unregister_mcp_discovery(tmp_path)
+
+    mcp_path = tmp_path / ".claude" / "mcp.json"
+    data = json.loads(mcp_path.read_text())
+    assert "bernstein" not in data.get("mcpServers", {})

@@ -1,0 +1,97 @@
+name: Branch protection audit
+
+# Read the live repository ruleset that protects `main` and assert the
+# invariants operators rely on: the merge-queue rule is present, the
+# required status check matches the in-tree canary, force-pushes and
+# branch deletion stay blocked, and no bypass actor can skip the ruleset.
+# This catches repository-setting drift that workflow-file tests cannot
+# see.
+#
+# `main`'s protection is enforced entirely by a repository ruleset, not
+# classic branch protection, so this audit reads the ruleset endpoints
+# (`rules/branches/main`, `rulesets`, `rulesets/{id}`) rather than the
+# classic `branches/main/protection` endpoint. The classic endpoint has no
+# field for `merge_queue` or `bypass_actors` - it cannot represent either
+# invariant, so an audit built on it would stay green exactly when the
+# merge-queue rule is dropped or a bypass actor is added. It is not read
+# here at all, primary or secondary: every invariant it can represent is
+# already covered by the ruleset read, at the cost of one extra live call
+# instead of two.
+#
+# Required secret: BRANCH_PROTECTION_AUDIT_TOKEN
+#   The default GITHUB_TOKEN cannot read repository rulesets: that surface
+#   requires an admin-scoped token, and Actions cannot be granted admin.
+#   Configure a fine-grained PAT (or GitHub App installation token) with
+#   this repository's:
+#     - Administration: read-only
+#     - Contents: read
+#   and store it as the repo secret BRANCH_PROTECTION_AUDIT_TOKEN.
+#   The first job step fails loudly if the secret is absent; there is no
+#   github.token fallback because that token cannot satisfy the endpoint.
+#   (A PAT expiry re-surfaces as the same loud failure; an App
+#   installation token avoids the rotation.)
+
+on:
+  schedule:
+    - cron: "37 8 * * 2"  # Weekly, Tuesday 08:37 UTC
+  workflow_dispatch:
+
+concurrency:
+  group: branch-protection-audit-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  audit:
+    name: Branch protection audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Harden runner (audit mode)
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Audit live branch ruleset for main
+        id: run_audit
+        env:
+          # Admin-scoped read is required to fetch repository rulesets; the
+          # default github.token cannot do it. See the workflow header for the
+          # secret's required fine-grained PAT scopes. No github.token fallback.
+          GH_TOKEN: ${{ secrets.BRANCH_PROTECTION_AUDIT_TOKEN }}
+        # scripts/check_branch_ruleset_audit.py reads rules/branches/main,
+        # rulesets, and rulesets/{id} (stdlib-only, no `uv sync` needed for
+        # this job) and asserts: merge_queue, non_fast_forward and deletion
+        # rules present; required_status_checks contexts match the
+        # required-check canary; every referenced ruleset is 'active'; no
+        # bypass actor. See the workflow header for why the classic
+        # protection endpoint is not read here.
+        run: |
+          set +e
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::BRANCH_PROTECTION_AUDIT_TOKEN secret not configured. Create a fine-grained PAT (Administration: read-only, Contents: read) for this repo and store it as the BRANCH_PROTECTION_AUDIT_TOKEN secret. See the workflow header comment."
+            echo '{"exit_code": 2, "detail": "BRANCH_PROTECTION_AUDIT_TOKEN secret not configured"}' > .audit_result.json
+            exit 2
+          fi
+          python3 scripts/check_branch_ruleset_audit.py
+          CODE=$?
+          echo "{\"exit_code\": ${CODE}, \"detail\": \"check_branch_ruleset_audit exit code ${CODE}\"}" > .audit_result.json
+          exit ${CODE}
+
+      - name: Toggle branch protection audit marker issue
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          python3 scripts/toggle_branch_protection_audit_marker.py \
+            --repo "${REPO}" \
+            --result-file .audit_result.json

@@ -1,0 +1,233 @@
+/* Bernstein · Variant A · Decision-Grade Quiet Command
+   Tokens from design_handoff_bernstein_phase1/design-source/tokens.css.
+   HSL space-separated to match shadcn convention. */
+
+/* Font loading: both families are vendored under ./fonts and declared below,
+   so the dashboard renders with no outbound request at view time.
+
+   This used to be an @import of the Google Fonts stylesheet. That is not a
+   typography problem, it is a boot problem: a CSS @import blocks its own
+   stylesheet from finishing, and the stylesheet blocks the <script type=
+   "module"> after it. With no route to the font host the page commits,
+   document.readyState stays "interactive", DOMContentLoaded never fires and
+   #root stays empty - a blank dashboard, not a substituted typeface. The
+   system-ui fallback below never gets a chance to matter, because nothing
+   renders at all.
+
+   Two more reasons, the same ones that strip the CDN webfont from
+   docs/assets/tui-live.svg (docs/contributing/render-freshness.md): this
+   project ships an air-gap profile, and every operator opening the dashboard
+   would otherwise announce themselves to a third party.
+
+   One variable font per family covers every weight the UI asks for
+   (300-700 sans, 400-600 mono), so this is 4 files rather than 8 static
+   instances. Provenance, upstream URLs and hashes: ./fonts/README.md. */
+@font-face {
+  font-family: 'Inter Tight';
+  font-style: normal;
+  font-weight: 300 700;
+  font-display: swap;
+  src: url('./fonts/inter-tight-v9-latin.woff2') format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308,
+    U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: 'Inter Tight';
+  font-style: normal;
+  font-weight: 300 700;
+  font-display: swap;
+  src: url('./fonts/inter-tight-v9-latin-ext.woff2') format('woff2');
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329,
+    U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+@font-face {
+  font-family: 'JetBrains Mono';
+  font-style: normal;
+  font-weight: 400 600;
+  font-display: swap;
+  src: url('./fonts/jetbrains-mono-v24-latin.woff2') format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308,
+    U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: 'JetBrains Mono';
+  font-style: normal;
+  font-weight: 400 600;
+  font-display: swap;
+  src: url('./fonts/jetbrains-mono-v24-latin-ext.woff2') format('woff2');
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329,
+    U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    /* Match the active theme to native UA controls (scrollbars, form widgets,
+       autofill, system dialog selection). */
+    color-scheme: light;
+
+    /* shadcn core (light) */
+    --background:              40 37.5% 96.9%;
+    --foreground:              40 13% 9%;
+    --card:                    0 0% 100%;
+    --card-foreground:         40 13% 9%;
+    --popover:                 0 0% 100%;
+    --popover-foreground:      40 13% 9%;
+    --primary:                 40 13% 9%;
+    --primary-foreground:      40 37.5% 96.9%;
+    --secondary:               42 27.8% 92.9%;
+    --secondary-foreground:    40 13% 9%;
+    --muted:                   48 38.5% 97.5%;
+    --muted-foreground:        38.8 10.2% 32.7%;
+    --accent:                  178.6 33.3% 24.7%;
+    --accent-foreground:       40 37.5% 96.9%;
+    --destructive:             4.5 59.6% 34.9%;
+    --destructive-foreground:  40 37.5% 96.9%;
+    --border:                  41.7 24.7% 81.8%;
+    --input:                   41.7 24.7% 81.8%;
+    --ring:                    40 13% 9%;
+    --radius:                  0.375rem;
+
+    /* Bernstein additions */
+    --surface-raised:          48 38.5% 97.5%;
+    --border-subtle:           40 27.3% 89.2%;
+    --border-strong:           40.6 17.9% 66.1%;
+    /* meta-foreground: was 40 9.6% 51% (#8E8676) - failed WCAG AA on light
+       background (3.40:1). Bumped lightness to 38% (#6E6759 → 5.5:1). */
+    --meta-foreground:         40 9.6% 38%;
+    --success:                 130 28.9% 32.5%;
+    --success-foreground:      40 37.5% 96.9%;
+    /* warning: was 42.6 63.3% 33.1% - the solid warning-foreground/warning
+       pairing passed WCAG AA (4.72:1), but Pill (states.tsx) renders the
+       warning variant as text-warning on a 15%-opacity warning tint
+       (bg-warning/15) composited over --card / --surface-raised, which
+       measured 4.12:1 / 3.97:1 - below 4.5:1. Dropped lightness to 29% ->
+       composited 4.98:1 / 4.78:1, solid pairing improves to 5.81:1. */
+    --warning:                 42.6 63.3% 29%;
+    --warning-foreground:      40 37.5% 96.9%;
+  }
+
+  .dark {
+    color-scheme: dark;
+
+    --background:              60 11.8% 6.7%;
+    --foreground:              45 31.6% 92.5%;
+    --card:                    60 10.6% 9.2%;
+    --card-foreground:         45 31.6% 92.5%;
+    --popover:                 60 10.7% 11%;
+    --popover-foreground:      45 31.6% 92.5%;
+    --primary:                 45 31.6% 92.5%;
+    --primary-foreground:      60 11.8% 6.7%;
+    --secondary:               60 14.3% 4.1%;
+    --secondary-foreground:    45 31.6% 92.5%;
+    --muted:                   60 3% 12.9%;
+    --muted-foreground:        44.3 11.1% 59.4%;
+    /* Note: dark --accent (#7BC4BE) on --card (#1A1A15) is 8.72:1 - passes
+       WCAG AA (4.5:1). Known-bug claim was incorrect; no swap needed. */
+    --accent:                  175.1 38.2% 62.5%;
+    --accent-foreground:       60 14.3% 4.1%;
+    /* destructive: was 6.5 65.9% 64.3% - solid pairings all passed WCAG AA,
+       but the danger Pill's 15%-opacity tint (bg-destructive/15, states.tsx)
+       composited over --surface-raised measured 4.22:1 - below 4.5:1.
+       Bumped lightness to 70% -> composited 4.90:1 on --surface-raised,
+       5.41:1 on --card, solid pairings improve too. */
+    --destructive:             6.5 65.9% 70%;
+    --destructive-foreground:  60 11.8% 6.7%;
+    --border:                  60 8.5% 18.4%;
+    --input:                   60 8.5% 18.4%;
+    --ring:                    45 31.6% 92.5%;
+
+    --surface-raised:          60 3% 12.9%;
+    --border-subtle:           60 8.6% 13.7%;
+    --border-strong:           60 6.3% 31%;
+    /* meta-foreground: was 45 10.3% 38% (#6B6657) - failed WCAG AA on dark
+       card (3.05:1). Bumped lightness to 55% (#92897A → 5.6:1). */
+    --meta-foreground:         45 10.3% 55%;
+    --success:                 129.4 37.6% 63.5%;
+    --success-foreground:      60 14.3% 4.1%;
+    --warning:                 38.7 59.1% 63.5%;
+    --warning-foreground:      60 14.3% 4.1%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground;
+    font-family: 'Inter Tight', system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+    letter-spacing: -0.005em;
+    /* 'rlig' + 'calt' are universal OpenType features (req. ligatures, contextual
+       alts). 'cv11'/'ss01' are Inter-specific stylistic alternates that don't exist
+       in Inter Tight; the previous declaration was a no-op there and could conflict
+       with future font swaps. Keep only the universal features. */
+    font-feature-settings: 'rlig' 1, 'calt' 1;
+  }
+
+  /* Global selection color - uses accent token so it's theme-aware.
+     Without this, browsers fall back to default OS blue, which clashes
+     with the warm-bone palette. */
+  ::selection {
+    background-color: hsl(var(--accent) / 0.25);
+    color: hsl(var(--foreground));
+  }
+
+  /* Default focus-visible ring for any interactive element that doesn't
+     declare its own. Components that opt in to focus-visible:ring-* still
+     win because they target :focus-visible directly with higher specificity
+     via Tailwind's `ring` utilities. */
+  :focus-visible {
+    outline: 2px solid hsl(var(--ring));
+    outline-offset: 2px;
+  }
+
+  /* Scrollbar styling - uses border tokens so it tracks the active theme.
+     Firefox uses scrollbar-color/scrollbar-width; WebKit uses ::-webkit-scrollbar. */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: hsl(var(--border-strong)) transparent;
+  }
+  *::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  *::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  *::-webkit-scrollbar-thumb {
+    background-color: hsl(var(--border-strong));
+    border-radius: 9999px;
+    border: 2px solid transparent;
+    background-clip: padding-box;
+  }
+  *::-webkit-scrollbar-thumb:hover {
+    background-color: hsl(var(--meta-foreground));
+    background-clip: padding-box;
+  }
+
+  .font-num,
+  .num,
+  .tabular {
+    font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+/* Respect prefers-reduced-motion globally - disables Tailwind's animate-*,
+   transition-*, and the keyframe animations declared in tailwind.config.js
+   (drawer-in, fade-in). Components that key off prefersReducedMotion() in
+   JS are still encouraged to skip non-essential motion. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}

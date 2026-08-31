@@ -1,0 +1,268 @@
+name: Nightly deep tests
+
+# Heavyweight verification that runs once per day at 03:00 UTC.
+#
+# Every job here reports into the run conclusion. That is deliberate:
+# the workflow has no `pull_request` trigger and is not a required
+# status check, so a red night blocks nothing, and the jobs carry no
+# `needs` edges, so a failing job does not skip its siblings. The only
+# thing a job-level `continue-on-error` bought was a run that reported
+# `success` while a job inside it reported `failure`, which is how a
+# real Schemathesis regression went unread for eight nights.
+#
+# Where a tool is genuinely advisory (its non-zero exit means "here is
+# something to look at", not "the probe broke"), that is expressed at
+# the step level with an explicit `|| true` on the command, so the
+# scope of what is tolerated is visible where it is decided.
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: nightly-deep-tests
+  cancel-in-progress: true
+
+# Default-deny at workflow scope; jobs may escalate narrowly (Scorecard
+# token-permissions).
+permissions:
+  contents: read
+
+jobs:
+  unit-python-314:
+    # The only lane that executes the unit suite on Python 3.14.
+    #
+    # `ci.yml` runs the unit matrix on 3.13 for pull requests and on
+    # 3.12 + 3.13 for pushes to main; ci-macos-nightly.yml is 3.13. The only
+    # 3.14 pins anywhere were the uv-tool install smoke and a handful of
+    # automation workflows, none of which execute a test. A 3.14-only
+    # regression was therefore invisible to every test lane.
+    #
+    # Why nightly and not the pull_request matrix. The `test` matrix fans out
+    # over os x python x shard, so adding a python row adds 8 jobs to every
+    # pull request (measured: `ci.yml` puts 39 jobs on a pull request head and
+    # 47 on a push to main, out of 67 check-runs total on the head SHA,
+    # against a 20-concurrent-job ceiling). Buying 3.14 coverage there would
+    # lengthen the queue on every pull request for an interpreter nothing
+    # ships on yet. Here it costs 4 jobs once a day, on a workflow with no
+    # pull_request trigger and no required context, and a 3.14-only
+    # regression surfaces within 24 hours instead of never.
+    #
+    # Sharded rather than a single job because a full unfiltered shard takes
+    # roughly half an hour; one unsharded job would run about two.
+    name: Unit tests (Python 3.14, shard ${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - name: Harden runner (audit mode)
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/bootstrap
+        with:
+          python-version: "3.14"
+      - name: Run unit suite on 3.14
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: |
+          # Full discovery, no --affected: this lane exists to catch what the
+          # pull_request lane cannot see, so narrowing it to a diff would
+          # reintroduce the blind spot on a different axis.
+          uv run python scripts/run_tests.py --parallel 4 --shard "${SHARD}/4"
+
+  hypothesis-deep:
+    name: Hypothesis (deep, 1000 examples)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - name: Harden runner (audit mode)
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/bootstrap
+      - name: Run property suite under deep profile
+        env:
+          HYPOTHESIS_PROFILE: deep
+        run: uv run pytest tests/property/ -q --no-cov --timeout=300
+
+  schemathesis-deep:
+    name: Schemathesis (deep, full sweep)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - name: Harden runner (audit mode)
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/bootstrap
+      - name: Run Schemathesis deep profile
+        env:
+          SCHEMATHESIS_PROFILE: deep
+          BERNSTEIN_AUTH_DISABLED: "1"
+        run: uv run pytest tests/contract/ -q --no-cov --timeout=120 -p no:warnings
+
+  crosshair-pure-fns:
+    # CrossHair concolic execution on pure security/cluster helpers.
+    # Targets functions with type hints; reports counterexamples that
+    # break implicit invariants. 200 iterations per condition (vs. 20
+    # in the smoke profile that PR-time would use once contracts are
+    # added).
+    name: CrossHair (concolic, deep)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - name: Harden runner (audit mode)
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/bootstrap
+      - name: Run CrossHair on persistence + agents helpers
+        run: |
+          uv run crosshair check \
+            --max_uninteresting_iterations 200 \
+            --per_condition_timeout 30.0 \
+            --analysis_kind asserts \
+            src/bernstein/core/persistence/lineage.py \
+            src/bernstein/core/agents/prompt_cache_locality.py \
+            || true
+
+  mutmut-full:
+    name: Mutation (full repo, advisory)
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    permissions:
+      contents: read
+    steps:
+      - name: Harden runner (audit mode)
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/bootstrap
+      - name: Install dev group (mutmut)
+        run: uv sync --group dev
+      - name: Run mutmut on the configured critical paths
+        run: |
+          uv run mutmut run --no-progress || true
+          uv run mutmut results | tee mutmut_results.txt
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nightly-mutmut-results
+          path: |
+            mutmut_results.txt
+            .mutmut-cache
+          retention-days: 14
+          if-no-files-found: ignore
+
+  bandit-medium-and-high:
+    name: Bandit (full -ll, advisory)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Harden runner (audit mode)
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/bootstrap
+      - name: Run Bandit at -ll (MEDIUM + HIGH)
+        # Advisory by design: bandit exits non-zero on any MEDIUM+ finding,
+        # and the value here is the uploaded report, not a pass/fail gate.
+        # `|| true` states that at the step, rather than leaning on the
+        # pipe swallowing the exit status by accident.
+        run: uv run bandit -r src/ -ll | tee bandit-nightly.txt || true
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nightly-bandit-results
+          path: bandit-nightly.txt
+          retention-days: 14
+          if-no-files-found: ignore
+
+  pip-audit-deep:
+    name: pip-audit (full closure)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Harden runner (audit mode)
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/bootstrap
+      - name: Export production requirements (no project, hashed)
+        run: uv export --no-dev --no-emit-project --format requirements-txt -o /tmp/req-prod.txt
+      - name: Export dev requirements (no project, hashed)
+        run: uv export --no-emit-project --format requirements-txt -o /tmp/req-dev.txt
+      - name: Production deps (strict)
+        # `--no-deps` is safe: the exported file is fully pinned and the
+        # transitive closure is resolved by `uv.lock`. `--disable-pip`
+        # avoids spinning up a sub-venv just to run `pip install`.
+        #
+        # `--ignore-vuln PYSEC-2025-183` (CVE-2025-45768): disputed advisory
+        # against pyjwt that affects all released versions (introduced at 0,
+        # no fix version published) and is pulled in transitively via `mcp`.
+        # The maintainer disputes it because the key length is chosen by the
+        # calling application, not the library. There is nothing to upgrade
+        # to, so it is ignored with the rationale recorded here.
+        run: uv run pip-audit -r /tmp/req-prod.txt --strict --disable-pip --no-deps --ignore-vuln PYSEC-2025-183
+      - name: Dev deps (strict)
+        # Keep the dev-dependency audit on the same exported lockfile input as
+        # production so the local editable project package is not treated as a
+        # PyPI dependency.
+        run: uv run pip-audit -r /tmp/req-dev.txt --strict --disable-pip --no-deps --ignore-vuln PYSEC-2025-183
+
+  stress-leak-suite:
+    # TC-C: resource-leak + memory-growth + lock-contention probes.
+    # Gated off the default CI run via the ``stress`` marker so PRs
+    # don't pay the ~45 s wall-clock cost; runs once per day here.
+    name: Stress + resource-leak suite (TC-C)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Harden runner (audit mode)
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/bootstrap
+      - name: Run stress suite (-m stress)
+        run: uv run pytest tests/stress -m stress --no-cov --no-header -q

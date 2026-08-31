@@ -1,0 +1,73 @@
+name: License Compliance
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "pyproject.toml"
+      - "uv.lock"
+      - "requirements*.txt"
+  pull_request:
+    paths:
+      - "pyproject.toml"
+      - "uv.lock"
+      - "requirements*.txt"
+
+concurrency:
+  group: license-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  license-check:
+    name: License check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Harden runner (audit mode)
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/bootstrap
+        with:
+          python-version: "3.12"
+
+      - name: Export dependencies
+        # `uv pip install -e .` uses the SHA-pinned uv binary above, so
+        # there is no unpinned `pip install` step left
+        # (Scorecard pinned-dependencies). Install into a uv-managed venv
+        # since the runner's system Python is externally-managed (PEP 668).
+        run: |
+          uv venv --python 3.12 .venv-license
+          uv pip install --python .venv-license/bin/python -e .
+          uv pip freeze --python .venv-license/bin/python > requirements-all.txt
+
+      - name: Check licenses
+        id: license_check_report
+        uses: pilosus/action-pip-license-checker@e909b0226ff49d3235c99c4585bc617f49fff16a # v3
+        with:
+          requirements: "requirements-all.txt"
+          report-format: "json-pretty"
+          fail: "StrongCopyleft,NetworkCopyleft,Other,Error"
+
+      - name: Save report
+        if: always()
+        env:
+          REPORT: ${{ steps.license_check_report.outputs.report }}
+        run: printf '%s' "$REPORT" > license-report.json
+
+      - name: Upload license report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: license-report
+          retention-days: 14
+          path: license-report.json

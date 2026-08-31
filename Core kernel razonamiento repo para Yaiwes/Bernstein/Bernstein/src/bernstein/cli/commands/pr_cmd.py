@@ -1,0 +1,575 @@
+"""``bernstein pr`` - open a pull request from a completed session.
+
+This command describes the *change*, not the run that made it: it reads the
+branch's commits and diff, titles the pull request after the commit that
+altered ``src/`` most (skipping merges, WIP and formatting upkeep), composes
+a body from the linked issue's problem statement, the files the diff touches
+and the gates that ran, pushes the session branch if needed, and calls ``gh
+pr create``. Once the PR exists, the posted description is anchored against
+its diff through the review-receipt machinery, so a reader can check offline
+that the description belongs to this diff.
+
+All pure logic lives in :mod:`bernstein.core.integrations.pr_gen`; this
+module is a thin click wrapper that also handles subprocess calls to
+``git`` and ``gh``. When ``gh`` cannot find a token in its own keyring,
+we resolve a fallback ``GITHUB_TOKEN`` from the credential vault before
+spawning the subprocess so users who only ran ``bernstein connect github``
+don't also need ``gh auth login``.
+"""
+
+from __future__ import annotations
+
+import os
+import shutil
+import subprocess
+from dataclasses import replace
+from pathlib import Path
+
+import click
+
+from bernstein.core.integrations.pr_gen import (
+    COMMIT_LOG_FORMAT,
+    SessionSummary,
+    attest_pr_description,
+    build_pr_body,
+    build_pr_title,
+    build_provenance,
+    load_session_summary,
+    parse_commit_log,
+)
+from bernstein.core.integrations.tickets import (
+    TicketAuthError,
+    TicketParseError,
+    TicketPayload,
+    fetch_ticket,
+)
+
+_GH_MISSING_HINT = (
+    "Could not find the `gh` CLI on PATH. Install it with `brew install gh` "
+    "(macOS) or see https://cli.github.com/ for other platforms."
+)
+
+
+def _run_git(args: list[str], *, cwd: Path) -> subprocess.CompletedProcess[str]:
+    """Run ``git`` with captured output and a 30-second timeout.
+
+    Args:
+        args: Arguments to pass after ``git`` (e.g. ``["diff", "--stat"]``).
+        cwd: Working directory for the subprocess.
+
+    Returns:
+        The completed process; callers inspect ``returncode`` and
+        ``stdout`` / ``stderr``.
+    """
+    return subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+        check=False,
+    )
+
+
+_GIT_ERROR_MAX_CHARS = 200
+
+
+def _current_branch(cwd: Path) -> str:
+    """Return the current git branch, or ``"HEAD"`` when detached."""
+    result = _run_git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=cwd)
+    if result.returncode != 0:
+        return "HEAD"
+    return result.stdout.strip() or "HEAD"
+
+
+def _base_rev(cwd: Path, base: str) -> str:
+    """Return the revision to diff the branch against.
+
+    ``base`` names the branch the pull request will merge onto -- a name on
+    the hosting side. Inside the workspace that name is a local branch that
+    nothing maintains: a single-branch clone does not have it at all, and a
+    clone that has fetched since it was created has a stale one. Both were
+    published: a description composed where ``main`` did not resolve went
+    out under "the diff could not be read", and a stale ``main`` composes
+    the description against commits the pull request does not touch. The
+    remote-tracking ref is the branch the pull request actually merges
+    onto, so it wins whenever it exists; the local name is the fallback for
+    a workspace with no remote at all.
+    """
+    result = _run_git(["rev-parse", "--verify", "-q", f"refs/remotes/origin/{base}"], cwd=cwd)
+    if result.returncode == 0:
+        return f"origin/{base}"
+    return base
+
+
+def _git_error(
+    result: subprocess.CompletedProcess[str] | subprocess.CompletedProcess[bytes],
+) -> str:
+    """Summarise a failed git invocation in one line.
+
+    A description is written from what git answers.  When git does not
+    answer, the description must say so rather than describe the silence:
+    an unanswered query is not a negative answer.  This returns the line
+    the caller reports; ``""`` means the invocation succeeded.
+
+    Both stream types are accepted on purpose: the diff is captured as bytes
+    so its hash does not depend on this process's decoding, everything else
+    is captured as text, and both go through this one reporter.
+    """
+    if result.returncode == 0:
+        return ""
+    stderr = result.stderr
+    if isinstance(stderr, bytes):
+        stderr = stderr.decode("utf-8", "replace")
+    message = " ".join((stderr or "").split()) or f"git exited {result.returncode}"
+    return message[:_GIT_ERROR_MAX_CHARS]
+
+
+def _diff_stat(cwd: Path, base: str, head: str) -> tuple[str, str]:
+    """Return ``(git diff --stat base..head, error)``.
+
+    ``error`` is non-empty when git could not answer.  It is kept separate
+    from the output so an unreadable diff is never rendered as an empty one
+    -- the two are indistinguishable to a reader and only one of them means
+    the branch changed nothing.
+    """
+    result = _run_git(["diff", "--stat", f"{base}..{head}"], cwd=cwd)
+    error = _git_error(result)
+    return ("" if error else result.stdout), error
+
+
+def _diff_bytes(cwd: Path, base: str, head: str) -> tuple[bytes, str]:
+    """Return ``(git diff base..head as raw bytes, error)``.
+
+    Bytes, not text: the diff is hashed, and decoding it would make the hash
+    depend on this process's error handling rather than on the diff.
+    """
+    result = subprocess.run(
+        ["git", "diff", f"{base}..{head}"],
+        cwd=cwd,
+        capture_output=True,
+        timeout=60,
+        check=False,
+    )
+    error = _git_error(result)
+    return (b"" if error else result.stdout), error
+
+
+def _commit_log(cwd: Path, base: str, head: str) -> tuple[str, str]:
+    """Return ``(the branch's commits with per-file churn, error)``."""
+    result = _run_git(
+        ["log", f"--format={COMMIT_LOG_FORMAT}", "--numstat", "--no-color", f"{base}..{head}"],
+        cwd=cwd,
+    )
+    error = _git_error(result)
+    return ("" if error else result.stdout), error
+
+
+def _enrich_summary_with_git(summary: SessionSummary, cwd: Path) -> SessionSummary:
+    """Fill in the git-derived fields the state file could not supply.
+
+    Branch and diff-stat as before, plus the two the description is composed
+    from: the branch's commits (which commit the pull request is about) and
+    the provenance binding (which diff the description describes).
+
+    Args:
+        summary: The summary loaded from persisted state.
+        cwd: Repository root.
+
+    Returns:
+        A new :class:`SessionSummary` with git-derived fields populated
+        when they were missing from the original.
+    """
+    branch = summary.branch if summary.branch not in ("", "HEAD") else _current_branch(cwd)
+    base_rev = _base_rev(cwd, summary.base_branch)
+    errors: list[str] = []
+
+    diff_stat = summary.diff_stat
+    if not diff_stat:
+        diff_stat, error = _diff_stat(cwd, base_rev, branch)
+        if error:
+            errors.append(f"diff --stat: {error}")
+
+    commits = summary.commits
+    if not commits:
+        raw, error = _commit_log(cwd, base_rev, branch)
+        commits = parse_commit_log(raw)
+        if error:
+            errors.append(f"log: {error}")
+
+    # Provenance binds the description to a diff a verifier can recompute.
+    # An empty diff hashes to the SHA-256 of the empty string, which is a
+    # well-formed digest of nothing: published under a "verify this" command
+    # it is a receipt that cannot be honoured. Bind only a diff that exists.
+    provenance = summary.provenance
+    if provenance is None:
+        diff, error = _diff_bytes(cwd, base_rev, branch)
+        if error:
+            errors.append(f"diff: {error}")
+        if diff:
+            provenance = build_provenance(diff=diff, journal_head=summary.journal_head)
+
+    git_error = summary.git_error or "; ".join(errors)
+    if git_error:
+        # The publish log is where this gets diagnosed. Without the line, a
+        # description written from an unanswered git reads as a run that
+        # changed nothing, and nothing in the log says otherwise.
+        click.echo(
+            f"warning: git could not describe {base_rev}..{branch} ({git_error}); "
+            "the description says so instead of claiming the branch is empty",
+            err=True,
+        )
+
+    return replace(
+        summary,
+        branch=branch,
+        diff_stat=diff_stat,
+        commits=commits,
+        provenance=provenance,
+        git_error=git_error,
+    )
+
+
+def _push_branch(branch: str, cwd: Path) -> tuple[bool, str]:
+    """Push ``branch`` to ``origin`` with upstream tracking set.
+
+    Args:
+        branch: Branch name to push.
+        cwd: Repository root.
+
+    Returns:
+        ``(ok, message)``; ``message`` is stderr on failure, otherwise empty.
+    """
+    result = _run_git(["push", "--set-upstream", "origin", branch], cwd=cwd)
+    if result.returncode != 0:
+        return False, result.stderr.strip() or result.stdout.strip()
+    return True, ""
+
+
+def _resolve_github_token_for_subprocess() -> dict[str, str]:
+    """Inject ``GITHUB_TOKEN`` into the subprocess env from the vault if absent.
+
+    ``gh`` looks at ``GITHUB_TOKEN`` before consulting its own auth state,
+    so this lets a user who ran ``bernstein connect github`` skip ``gh
+    auth login``. Returns an env dict to pass as ``subprocess.run(env=...)``;
+    the caller merges it with the parent environment.
+    """
+    env = os.environ.copy()
+    if env.get("GITHUB_TOKEN"):
+        return env
+    try:
+        from bernstein.core.security.vault.factory import open_vault_silent
+        from bernstein.core.security.vault.resolver import resolve_secret
+    except ImportError:
+        return env
+    resolution = resolve_secret("github", vault=open_vault_silent())
+    if resolution.found:
+        env["GITHUB_TOKEN"] = resolution.secret
+    return env
+
+
+def _gh_pr_create(
+    *,
+    title: str,
+    body: str,
+    head: str,
+    base: str,
+    draft: bool,
+    cwd: Path,
+) -> tuple[bool, str]:
+    """Invoke ``gh pr create`` and return ``(ok, url_or_error)``."""
+    cmd = [
+        "gh",
+        "pr",
+        "create",
+        "--title",
+        title,
+        "--body",
+        body,
+        "--head",
+        head,
+        "--base",
+        base,
+    ]
+    if draft:
+        cmd.append("--draft")
+
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60,
+            check=False,
+            env=_resolve_github_token_for_subprocess(),
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        return False, str(exc)
+
+    if result.returncode != 0:
+        return False, result.stderr.strip() or result.stdout.strip()
+    return True, result.stdout.strip()
+
+
+def _resolve_issue(ref: str, workdir: Path) -> tuple[int, TicketPayload]:
+    """Resolve ``--issue`` (a number or a GitHub issue URL) to its ticket.
+
+    A bare number is resolved against the repository ``gh`` sees in
+    ``workdir``, then goes down the same path as a URL so the provider's
+    ``gh``-then-REST fallback is shared.
+    """
+    ref = ref.strip().lstrip("#")
+    url = ref
+    if ref.isdigit():
+        if shutil.which("gh") is None:
+            raise click.ClickException(_GH_MISSING_HINT)
+        slug = subprocess.run(
+            ["gh", "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"],
+            capture_output=True,
+            text=True,
+            cwd=str(workdir),
+            timeout=30,
+            check=False,
+        ).stdout.strip()
+        if not slug:
+            raise click.ClickException(
+                f"Could not tell which repository #{ref} belongs to. Pass the full issue URL instead."
+            )
+        url = f"https://github.com/{slug}/issues/{ref}"
+
+    try:
+        ticket = fetch_ticket(url)
+    except TicketAuthError as exc:
+        raise click.ClickException(f"Authentication error reading the issue: {exc}") from exc
+    except TicketParseError as exc:
+        raise click.ClickException(f"Could not read the issue: {exc}") from exc
+
+    number = ticket.id.rsplit("#", 1)[-1]
+    if not number.isdigit():
+        raise click.ClickException(f"{url} is not a GitHub issue; --issue needs one to link.")
+    return int(number), ticket
+
+
+@click.command("pr")
+@click.option(
+    "--session-id",
+    "session_id",
+    default=None,
+    help="Session to publish. Defaults to the most-recent completed session.",
+)
+@click.option(
+    "--base",
+    "base",
+    default="main",
+    show_default=True,
+    help="Base branch for the pull request.",
+)
+@click.option(
+    "--issue",
+    "issue_ref",
+    default=None,
+    metavar="N|URL",
+    help=(
+        "Link the PR to a GitHub issue: title it from the issue and open the "
+        "body with `Closes #N`. Reads the issue, so --dry-run makes that one "
+        "request."
+    ),
+)
+@click.option(
+    "--title",
+    "title_override",
+    default=None,
+    help="Override the auto-generated PR title.",
+)
+@click.option(
+    "--body",
+    "body_override",
+    default=None,
+    help="Override the auto-generated PR body. `Closes #N` is still prepended with --issue.",
+)
+@click.option(
+    "--draft",
+    is_flag=True,
+    default=False,
+    help="Open the pull request as a draft.",
+)
+@click.option(
+    "--dry-run",
+    "dry_run",
+    is_flag=True,
+    default=False,
+    help="Print the would-be title and body without calling gh.",
+)
+@click.option(
+    "--no-push",
+    "no_push",
+    is_flag=True,
+    default=False,
+    help="Skip `git push`; assume the branch is already on origin.",
+)
+def pr_cmd(
+    session_id: str | None,
+    base: str,
+    issue_ref: str | None,
+    title_override: str | None,
+    body_override: str | None,
+    draft: bool,
+    dry_run: bool,
+    no_push: bool,
+) -> None:
+    """Open a GitHub pull request from a completed Bernstein session.
+
+    The title names the commit that changed the most under ``src/``, so a run
+    that ends with a lint or formatting pass is still titled after the change
+    it made; a run that left nothing but upkeep falls back to the linked
+    issue's title. ``--title`` and ``--body`` override both.
+
+    The command is safe to re-run: on ``--dry-run`` it touches the network
+    only to read the issue named by ``--issue`` (nothing at all without it),
+    and when ``gh`` is missing it exits with a helpful message instead of a
+    traceback.
+    """
+    workdir = Path.cwd()
+
+    summary = load_session_summary(session_id, workdir=workdir, base_branch=base)
+    summary = _enrich_summary_with_git(summary, workdir)
+
+    issue_number: int | None = None
+    issue_title = ""
+    issue_body = ""
+    issue_labels: tuple[str, ...] = ()
+    if issue_ref is not None:
+        issue_number, ticket = _resolve_issue(issue_ref, workdir)
+        issue_title = ticket.title
+        issue_body = ticket.description
+        issue_labels = ticket.labels
+
+    summary = replace(summary, issue_problem=issue_body)
+
+    # The issue title is a cleaner source than the goal, which carries the
+    # instructions handed to the run; the branch's commits are cleaner still,
+    # because they say what actually landed. Labels come along so the PR does
+    # not announce a change type the issue it closes contradicts.
+    title = title_override or build_pr_title(
+        issue_title or summary.goal or summary.session_id,
+        summary.primary_role,
+        issue_labels,
+        changes_summary=summary.changes_summary,
+        commits=summary.commits,
+    )
+    body = body_override or build_pr_body(summary)
+    if issue_number is not None:
+        # GitHub links an issue from the body or a commit message only.
+        body = f"Closes #{issue_number}\n\n{body}"
+
+    if dry_run:
+        click.echo(f"Title: {title}")
+        click.echo("Body:")
+        click.echo(body)
+        return
+
+    if shutil.which("gh") is None:
+        raise click.ClickException(_GH_MISSING_HINT)
+
+    if not no_push:
+        ok, push_err = _push_branch(summary.branch, workdir)
+        if not ok:
+            raise click.ClickException(f"git push failed: {push_err}")
+
+    ok, message = _gh_pr_create(
+        title=title,
+        body=body,
+        head=summary.branch,
+        base=summary.base_branch,
+        draft=draft,
+        cwd=workdir,
+    )
+    if not ok:
+        raise click.ClickException(f"gh pr create failed: {message}")
+
+    click.echo(message)
+    _attest_description(
+        summary=summary,
+        pr_url=_pr_url_from_output(message),
+        description=f"{title}\n\n{body}",
+        issue_body=issue_body,
+        cwd=workdir,
+    )
+
+
+def _pr_url_from_output(message: str) -> str:
+    """Return the PR url ``gh pr create`` printed, or ``""``."""
+    for line in reversed(message.splitlines()):
+        candidate = line.strip()
+        if candidate.startswith(("http://", "https://")):
+            return candidate
+    return ""
+
+
+def _repo_slug_from_pr_url(pr_url: str) -> str:
+    """Return ``owner/repo`` for a GitHub pull-request url, or ``""``."""
+    parts = pr_url.rstrip("/").split("/")
+    if len(parts) < 5:
+        return ""
+    return f"{parts[-4]}/{parts[-3]}"
+
+
+def _attest_description(
+    *,
+    summary: SessionSummary,
+    pr_url: str,
+    description: str,
+    issue_body: str,
+    cwd: Path,
+) -> None:
+    """Anchor the posted description against the diff it describes.
+
+    Runs after the pull request exists, so the receipt names a real url. The
+    diff is re-read and its hash checked against the one the body published:
+    if the branch moved between composing the description and opening the PR,
+    the description no longer describes this diff and attesting it would
+    assert something false, so the receipt is skipped and the operator told.
+
+    Failure to attest never fails the command - the pull request is already
+    open by this point, and an unanchored description is a smaller problem
+    than a command that reports failure for work that succeeded.
+    """
+    if not pr_url or summary.provenance is None:
+        return
+    try:
+        diff, diff_error = _diff_bytes(cwd, _base_rev(cwd, summary.base_branch), summary.branch)
+        if diff_error:
+            click.echo(f"note: could not re-read the diff to anchor it: {diff_error}", err=True)
+            return
+        recomputed = build_provenance(diff=diff, journal_head=summary.journal_head)
+        if recomputed.diff_hash != summary.provenance.diff_hash:
+            click.echo(
+                "note: the branch changed while the pull request was being opened; "
+                "the description was not anchored to a diff.",
+                err=True,
+            )
+            return
+        attest_pr_description(
+            workdir=cwd,
+            pr_url=pr_url,
+            repo=_repo_slug_from_pr_url(pr_url),
+            issue_body=issue_body,
+            description=description,
+            diff=diff,
+            journal_head=summary.journal_head,
+            task_id=summary.session_id,
+        )
+    except Exception as exc:
+        # Deliberately every exception, not a named few. This step's whole
+        # contract is that it is optional, and a handler that names the errors
+        # it expects only honours that contract for failures someone thought
+        # of. The one that happened -- a TypeError from a mis-called helper --
+        # was not in the list, so it walked past the handler and failed a
+        # command whose pull request was already open and whose run had
+        # already passed its verification gate.
+        click.echo(f"note: could not anchor the pull-request description: {exc}", err=True)

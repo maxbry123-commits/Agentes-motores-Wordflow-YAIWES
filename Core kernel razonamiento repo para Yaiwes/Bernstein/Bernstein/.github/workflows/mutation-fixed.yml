@@ -1,0 +1,163 @@
+# Mutation testing on a fixed critical-path module list.
+#
+# Complements the diff-only mutmut job in ci.yml. The diff-only run only
+# fires on PRs that *touch* a given file, so stable critical modules with
+# stale tests never get exercised. This workflow runs the focused harness
+# in scripts/mutmut_critical.py against a fixed set of high-risk modules
+# (atomic claim, HMAC audit chain, lineage v1, config seed parser) and
+# fails the gate when kill rate drops below the per-module threshold
+# (see scripts/mutmut_critical.py:MODULES).
+#
+# Trigger model:
+#   - cron: weekly Sunday 04:17 UTC for a full audit independent of
+#     diff coverage. Per-PR mutation coverage of *touched* files lives in
+#     ci.yml's diff-only mutmut job, not here.
+#   - manual: workflow_dispatch with optional `module` input for ad-hoc
+#     runs against a single module key.
+#   - NOT on merge_group. The queue's only required context is `CI gate`,
+#     so this lane never gated a merge there - it only competed with
+#     ci.yml for runners on every queue entry and every queue reshuffle,
+#     which starved the check the queue actually waits for. Weekly cron
+#     and the diff-only job in ci.yml keep the coverage.
+#
+# Each module runs in its own matrix job so per-module budgets are
+# enforced separately and a slow module doesn't squeeze the others. Each
+# module uploads its JSON as an artifact for offline reading.
+#
+# `continue-on-error` is per-module (matrix `include` below), not a
+# blanket flag. Six of the seven modules hold their threshold with real
+# margin and gate for real: a kill-rate drop fails the workflow on the
+# weekly audit. `audit_log` is the one pinned exception - see its `include` entry and
+# tests/unit/test_mutation_fixed_workflow_yaml.py:ADVISORY_MODULES for
+# the kill-rate data behind it and the revisit date.
+name: Mutation (fixed critical paths)
+
+on:
+  schedule:
+    # Weekly full audit. Independent of any PR.
+    - cron: "17 4 * * 0"
+  workflow_dispatch:
+    inputs:
+      module:
+        description: "Single module key to run (see scripts/mutmut_critical.py --list). Empty = all."
+        required: false
+        default: ""
+
+# Conservative top-level permissions; jobs widen pull-requests:write only
+# where needed.
+permissions:
+  contents: read
+
+concurrency:
+  group: mutation-fixed-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  mutate:
+    name: ${{ matrix.module }}
+    runs-on: ubuntu-latest
+    # Hard total cap; per-module budgets enforced inside the harness.
+    timeout-minutes: 30
+    # Per-module, driven by matrix.advisory below - not a blanket flag.
+    # `false` means a kill-rate drop on this module fails the job for
+    # real on the weekly audit.
+    continue-on-error: ${{ matrix.advisory }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        module:
+          - claim_next
+          - audit_log
+          - audit_integrity
+          - lineage_gate
+          - lineage_tips
+          - lineage_merge
+          - config_seed_parser
+        # Per-module advisory flag: `true` opts the module out of the run
+        # conclusion. Keep this closed and reviewed - a module doesn't
+        # get to stay advisory by default (mirrors the
+        # NO_CANCEL_EXCEPTIONS pattern in
+        # tests/unit/test_pull_request_workflow_concurrency_yaml.py).
+        # tests/unit/test_mutation_fixed_workflow_yaml.py:ADVISORY_MODULES
+        # pins the expected set.
+        include:
+          - module: claim_next
+            advisory: false
+          - module: audit_log
+            # 32/80 killed vs a 70% threshold as of the 2026-08-16 weekly
+            # run - a 30-point gap, not sampling noise. Needs test
+            # coverage backfill on src/bernstein/core/security/audit.py
+            # before this can gate for real; revisit 2026-09-15.
+            advisory: true
+          - module: audit_integrity
+            advisory: false
+          - module: lineage_gate
+            advisory: false
+          - module: lineage_tips
+            advisory: false
+          - module: lineage_merge
+            advisory: false
+          - module: config_seed_parser
+            advisory: false
+    steps:
+      - name: Harden runner (audit mode)
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Set up uv
+        uses: ./.github/actions/bootstrap
+      - name: Install dev group (mutmut + test deps)
+        run: uv sync --group dev
+      # Workflow_dispatch with a specific module: skip every other matrix
+      # entry. The check costs one shell step and keeps the matrix as the
+      # single source of truth for module keys.
+      - name: Filter manual single-module runs
+        id: filter
+        env:
+          DISPATCH_MODULE: ${{ github.event.inputs.module }}
+          MATRIX_MODULE: ${{ matrix.module }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] \
+             && [ -n "$DISPATCH_MODULE" ] \
+             && [ "$DISPATCH_MODULE" != "$MATRIX_MODULE" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Manual dispatch targeted '$DISPATCH_MODULE'; skipping '$MATRIX_MODULE'."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Run focused mutation harness
+        if: steps.filter.outputs.skip != 'true'
+        env:
+          MATRIX_MODULE: ${{ matrix.module }}
+        run: |
+          mkdir -p mutation-results
+          # Per-module budget is enforced inside the harness; this is a
+          # belt-and-braces wall-clock cap so a hung mutation can't burn
+          # the full 30-minute job timeout. The harness's own exit code
+          # (0 pass, 1 gate failure, 2 baseline failure) is this step's
+          # exit code. It used to be swallowed by `|| echo`, so the step
+          # - and with it the job - reported success no matter what the
+          # harness found.
+          timeout 1500 uv run python scripts/mutmut_critical.py \
+            --only "$MATRIX_MODULE" \
+            --quiet \
+            --json "mutation-results/${MATRIX_MODULE}.json"
+      - name: Upload module result
+        # always(): a module below threshold now fails the previous step
+        # for real, and the artifact - the survivor list a human needs to
+        # act on it - must still be uploaded from the failing run.
+        if: always() && steps.filter.outputs.skip != 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mutation-${{ matrix.module }}
+          path: mutation-results/${{ matrix.module }}.json
+          retention-days: 14
+          if-no-files-found: warn
+
