@@ -1,0 +1,16 @@
+contrato: v3
+modo: fail-closed
+repo_contratos: Agentes-motores-Wordflow-YAIWES
+rama: main
+raiz: notas de trabajo grock y gpt
+input_block_literal:
+  I29: Solo 3 frentes. 63-96 fuera.
+  I30: YAIWES extract 69-119 dest Core kernel razonamiento repo para Yaiwes/{slug}. Extraer y bajar zip si falta.
+  I31: Reactivar router-universal-router-inteligente- wordflow-router-oss.yml
+  I32: Reactivar osquestador-auditor wordflow-osquestador-auditor-memoria.yml
+  I33: Copiar code del skill. No escribir code desde 0. Solo editar lista y destino.
+  I34: Eliminar auditoria adicional de los GHA pendientes. No preflight curl SKILL. No forensic extra.
+  I35: Plan CONTRATO-2 + loops. Dispatch real al inicia.
+prohibido: [LFS_enable, git_lfs, reescribir_packer, auditoria_extra, code_desde_0]
+estado: INICIA
+skill_lock: research-download-chain assets FORENSIC-PASS yml + py
