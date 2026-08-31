@@ -16,3 +16,5 @@
 {"number": 78, "parts": 7, "slug": "khoj", "source": "https://github.com/khoj-ai/khoj.git", "source_commit": "ae229ca894c0b80ad84664afcfdde523b5e87057", "status": "COMPLETE"}
 {"number": 79, "parts": 9, "slug": "inngest", "source": "https://github.com/inngest/inngest.git", "source_commit": "c2c9bc828e5b3c7c6a934a81306a619b9e1bcf5b", "status": "COMPLETE"}
 {"number": 80, "parts": 4, "slug": "trigger.dev", "source": "https://github.com/triggerdotdev/trigger.dev.git", "source_commit": "43ecf15f80277c0eb931c08ddd89de55179cc795", "status": "COMPLETE"}
+{"number": 81, "parts": 1, "slug": "restate", "source": "https://github.com/restatedev/restate.git", "source_commit": "285953f227244b55de71b532a5ea8347e3bc3b13", "status": "COMPLETE"}
+{"number": 82, "parts": 1, "slug": "dbos-transact-ts", "source": "https://github.com/dbos-inc/dbos-transact-ts.git", "source_commit": "0ef1f9bab9cd7f793beae548122c1bdb9c6ccc28", "status": "COMPLETE"}
