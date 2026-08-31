@@ -1,0 +1,14 @@
+{
+	"commands": [
+		"grep",
+		"egrep",
+		"fgrep"
+	],
+	"registry": {
+		"title": "grep",
+		"description": "GNU grep pattern matching (grep, egrep, fgrep).",
+		"priority": 40,
+		"image": "/images/registry/grep.svg",
+		"category": "core"
+	}
+}

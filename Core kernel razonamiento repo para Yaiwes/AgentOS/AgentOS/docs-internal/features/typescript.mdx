@@ -1,0 +1,35 @@
+---
+title: TypeScript
+description: Execute and type-check TypeScript through the AgentOS JavaScript API.
+icon: "code"
+---
+
+TypeScript is built into JavaScript execution.
+
+- No standalone TypeScript package or `/typescript` subpath.
+- Create an `AgentOs` VM and use its top-level `typescript` methods.
+
+## Install
+
+```bash
+pnpm add @rivet-dev/agentos
+```
+
+## Runnable example
+
+<CodeSnippet file="examples/js-typescript/src/index.ts" />
+
+## API
+
+`typescript` exposes:
+
+- `execute()` / `evaluate()` — run source / return a value. **Transpiles
+  without semantic type checking.**
+- `executeFile()` — run an existing file.
+- `check()` / `checkProject()` — explicit type checking; returns structured
+  diagnostics.
+
+Inline JavaScript and TypeScript share retained state when passed the same
+explicitly created `contextId`.
+
+See the [JavaScript execution guide](/docs/javascript).

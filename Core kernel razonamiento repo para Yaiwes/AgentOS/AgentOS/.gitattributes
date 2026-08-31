@@ -1,0 +1,31 @@
+# GitHub Linguist overrides — make the language bar reflect the Rust runtime.
+#
+# The Rust kernel is the substance of this repo; the rest is the TypeScript
+# client/protocol/registry plus a large test suite (the kernel itself lives in
+# the agentos repo). We count Rust in full, plus the core client surface
+# (the AgentOS client entrypoint + its sidecar wire layer) and the core JS
+# binary-resolver shim, and exclude everything else (tests, demos, tooling,
+# generated bundles, the website, and the remaining client/registry code).
+# Result: roughly Rust 70% / TypeScript 29%.
+
+# Default: TypeScript and JavaScript are not counted in the language bar...
+*.ts                                 linguist-detectable=false
+*.tsx                                linguist-detectable=false
+*.mts                                linguist-detectable=false
+*.cts                                linguist-detectable=false
+*.js                                 linguist-detectable=false
+*.cjs                                linguist-detectable=false
+*.mjs                                linguist-detectable=false
+
+# ...except the core client surface (SDK entrypoint + sidecar wire layer)...
+packages/core/src/agent-os.ts        linguist-detectable=true
+packages/core/src/sidecar/**         linguist-detectable=true
+
+# ...and the core binary-resolver shim.
+packages/sidecar-binary/index.js     linguist-detectable=true
+
+# Generated, vendored, and documentation content (also covers non-JS/TS files).
+*.d.ts                               linguist-generated
+**/vendor/**                         linguist-vendored
+website/**                           linguist-documentation
+examples/**                          linguist-documentation

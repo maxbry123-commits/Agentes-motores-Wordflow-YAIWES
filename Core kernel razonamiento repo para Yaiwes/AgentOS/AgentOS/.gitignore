@@ -1,0 +1,109 @@
+# Turborepo
+**/.turbo
+
+# Node.js and pnpm
+node_modules/
+npm-debug.log*
+pnpm-debug.log*
+.pnpm-store/
+**/.next/
+website/.astro/
+
+# Rust
+target/
+.cargo/
+.rustup/
+
+# TypeScript
+*.tsbuildinfo
+dist/
+*.aospkg
+packages/agentos/src/generated/*
+!packages/agentos/src/generated/actor-actions.generated.ts
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Core dumps. Patterns target dump files (`core`, `core.<pid>`) without
+# swallowing source directories named `core` such as `packages/core/`.
+/core
+core.[0-9]*
+**/core.[0-9]*
+
+# Secrets
+secrets/**/*
+
+# Generated WASM toolchain and software artifacts. These are rebuilt for tests
+# and releases and must never be committed.
+packages/runtime-core/commands/
+toolchain/vendor/
+toolchain/c/build/
+toolchain/c/vendor/
+toolchain/c/libs/
+toolchain/c/sysroot/
+toolchain/c/.cache/
+toolchain/std-patches/wasi-libc-overrides/*.o
+software/*/bin/
+software/vim/share/
+
+# Legacy registry build paths retained for old worktrees.
+registry/native/target/
+registry/native/vendor/
+registry/native/c/build/
+registry/native/c/vendor/
+registry/native/c/libs/
+registry/native/c/.cache/
+registry/native/c/sysroot/
+registry/software/coreutils/bin/
+registry/software/*/wasm/
+software/*/wasm/
+registry/software/*/agentos-package.meta.json
+registry/.last-publish-hash
+registry/software/*/.last-publish-hash
+registry/.build-markers/
+registry/.cache/
+
+# Ralph agent artifacts
+scripts/ralph/archive/
+scripts/ralph/codex-streams/
+scripts/ralph/.last-branch
+scripts/ralph/prd.json
+scripts/ralph/todo/prd.json
+scripts/ralph/progress.txt
+scripts/ralph/reviews/
+scripts/ralph/.codex-last-msg-*
+
+# Agent working files live user-scoped in ~/.agents/; ignore any in-repo .agent/ as a safety net
+.agent/
+.claude/scheduled_tasks.lock
+.amp/portals/
+
+# Local caches and stray outputs
+.agentos/
+crates/execution/assets/v8-bridge.js
+crates/execution/assets/v8-bridge-zlib.js
+crates/execution/.agentos-pyodide-cache/
+crates/execution/async-out.txt
+crates/sidecar/.tmp-sidecar-tests/
+packages/browser/.cache/
+packages/runtime-core/.cache/
+registry/agent/pi/.cache/
+scripts/benchmarks/results/
+
+# Vendored V8 bridge bundles staged at release time for crates.io publishing
+crates/execution/assets/generated/
+crates/v8-runtime/assets/generated/
+
+# Transient repro scratch files and Vite/Vitest config timestamp artifacts
+.tmp-*
+*.timestamp-*.mjs
+
+# staged local wasm command fixtures (11MB+ binaries; never commit)
+.local-cmds/

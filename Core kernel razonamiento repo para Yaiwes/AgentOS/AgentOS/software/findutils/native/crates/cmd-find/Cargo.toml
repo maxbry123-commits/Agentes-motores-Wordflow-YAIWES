@@ -1,0 +1,15 @@
+[package]
+workspace = "../../../../../toolchain"
+name = "cmd-find"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "find standalone binary for agentos VM"
+
+[[bin]]
+name = "find"
+path = "src/main.rs"
+
+[dependencies]
+findutils = { version = "0.9.0", default-features = false }
+uucore = { version = "0.9.0", default-features = false }

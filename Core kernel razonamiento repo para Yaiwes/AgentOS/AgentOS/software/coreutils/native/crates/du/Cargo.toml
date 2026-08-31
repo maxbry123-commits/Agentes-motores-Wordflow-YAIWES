@@ -1,0 +1,9 @@
+[package]
+workspace = "../../../../../toolchain"
+name = "agentos-du"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "du implementation for agentos standalone binaries"
+
+[dependencies]

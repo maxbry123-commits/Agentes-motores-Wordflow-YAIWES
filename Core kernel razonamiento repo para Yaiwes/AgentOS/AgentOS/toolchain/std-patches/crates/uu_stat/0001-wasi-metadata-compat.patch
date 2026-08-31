@@ -1,0 +1,206 @@
+--- a/src/stat.rs
++++ b/src/stat.rs
+@@ -4,17 +4,23 @@
+ // file that was distributed with this source code.
+ // spell-checker:ignore datetime
+ 
++// wasmVM: Enable wasi_ext for MetadataExt/FileTypeExt on WASI
++#![cfg_attr(target_os = "wasi", feature(wasi_ext))]
++
+ use uucore::error::{UError, UResult, USimpleError};
+ use uucore::translate;
+ 
+ use clap::builder::ValueParser;
+ use uucore::display::Quotable;
+-use uucore::fs::{display_permissions, major, minor};
++use uucore::fs::{display_permissions_unix, major, minor};
+ use uucore::fsext::{
+     FsMeta, MetadataTimeField, StatFs, metadata_get_time, pretty_filetype, pretty_fstype,
+     read_fs_list, statfs,
+ };
++#[cfg(unix)]
+ use uucore::libc::mode_t;
++#[cfg(target_os = "wasi")]
++use uucore::fs::mode_t;
+ use uucore::{entries, format_usage, show_error, show_warning};
+ 
+ use clap::{Arg, ArgAction, ArgMatches, Command};
+@@ -23,10 +29,91 @@
+ use std::ffi::{OsStr, OsString};
+ use std::fs::{FileType, Metadata};
+ use std::io::Write;
++#[cfg(unix)]
+ use std::os::unix::fs::{FileTypeExt, MetadataExt};
++#[cfg(target_os = "wasi")]
++use std::os::wasi::fs::{FileTypeExt, MetadataExt};
+ use std::path::Path;
+ use std::{env, fs};
+ 
++// wasmVM: WASI compatibility — provide methods not exposed by WASI MetadataExt
++#[cfg(target_os = "wasi")]
++mod wasi_stat_compat {
++    use std::fs::{FileType, Metadata};
++
++    pub trait MetadataCompatExt {
++        fn blksize(&self) -> u64;
++    }
++    impl MetadataCompatExt for Metadata {
++        fn blksize(&self) -> u64 { 4096 }
++    }
++
++    pub trait FileTypeIsExt {
++        fn is_fifo(&self) -> bool;
++    }
++    impl FileTypeIsExt for FileType {
++        fn is_fifo(&self) -> bool { false }
++    }
++}
++#[cfg(target_os = "wasi")]
++use wasi_stat_compat::{FileTypeIsExt, MetadataCompatExt};
++
++#[cfg(target_os = "wasi")]
++mod wasi_host_fs {
++    use super::{Metadata, MetadataExt, Path};
++
++    mod host_fs {
++        #[link(wasm_import_module = "host_fs")]
++        unsafe extern "C" {
++            pub fn path_mode(
++                fd: u32,
++                path_ptr: *const u8,
++                path_len: u32,
++                follow_symlinks: u32,
++            ) -> u32;
++            pub fn path_rdev(
++                fd: u32,
++                path_ptr: *const u8,
++                path_len: u32,
++                follow_symlinks: u32,
++            ) -> u64;
++        }
++    }
++
++    pub fn mode_for_path(path: &Path, meta: &Metadata, follow_symlinks: bool) -> u32 {
++        let Some(path_str) = path.to_str() else {
++            return meta.mode();
++        };
++        let mode = unsafe {
++            host_fs::path_mode(
++                3,
++                path_str.as_ptr(),
++                path_str.len() as u32,
++                if follow_symlinks { 1 } else { 0 },
++            )
++        };
++        if mode == 0 {
++            meta.mode()
++        } else {
++            mode
++        }
++    }
++
++    pub fn rdev_for_path(path: &Path, follow_symlinks: bool) -> u64 {
++        let Some(path_str) = path.to_str() else {
++            return 0;
++        };
++        unsafe {
++            host_fs::path_rdev(
++                3,
++                path_str.as_ptr(),
++                path_str.len() as u32,
++                if follow_symlinks { 1 } else { 0 },
++            )
++        }
++    }
++}
++
+ use thiserror::Error;
+ use uucore::time::{FormatSystemTimeFallback, format_system_time, system_time_to_sec};
+ 
+@@ -1032,6 +1119,8 @@
+         display_name: &str,
+         file: &OsString,
+         file_type: FileType,
++        effective_mode: u32,
++        effective_rdev: u64,
+         from_user: bool,
+         #[cfg(all(feature = "selinux", any(target_os = "linux", target_os = "android")))]
+         follow_symbolic_links: bool,
+@@ -1050,9 +1139,9 @@
+             } => {
+                 let output = match format {
+                     // access rights in octal
+-                    'a' => OutputType::UnsignedOct(0o7777 & meta.mode()),
++                    'a' => OutputType::UnsignedOct(0o7777 & effective_mode),
+                     // access rights in human readable form
+-                    'A' => OutputType::Str(display_permissions(meta, true)),
++                    'A' => OutputType::Str(display_permissions_unix(effective_mode as mode_t, true)),
+                     // number of blocks allocated (see %B)
+                     'b' => OutputType::Unsigned(meta.blocks()),
+ 
+@@ -1096,9 +1185,9 @@
+                     // device number in hex
+                     'D' => OutputType::UnsignedHex(meta.dev()),
+                     // raw mode in hex
+-                    'f' => OutputType::UnsignedHex(meta.mode() as u64),
++                    'f' => OutputType::UnsignedHex(effective_mode as u64),
+                     // file type
+-                    'F' => OutputType::Str(pretty_filetype(meta.mode() as mode_t, meta.len())),
++                    'F' => OutputType::Str(pretty_filetype(effective_mode as mode_t, meta.len())),
+                     // group ID of owner
+                     'g' => OutputType::Unsigned(meta.gid() as u64),
+                     // group name of owner
+@@ -1130,10 +1219,10 @@
+                     's' => OutputType::Integer(meta.len() as i64),
+                     // major device type in hex, for character/block device special
+                     // files
+-                    't' => OutputType::UnsignedHex(major(meta.rdev() as _) as u64),
++                    't' => OutputType::UnsignedHex(major(effective_rdev as _) as u64),
+                     // minor device type in hex, for character/block device special
+                     // files
+-                    'T' => OutputType::UnsignedHex(minor(meta.rdev() as _) as u64),
++                    'T' => OutputType::UnsignedHex(minor(effective_rdev as _) as u64),
+                     // user ID of owner
+                     'u' => OutputType::Unsigned(meta.uid() as u64),
+                     // user name of owner
+@@ -1176,10 +1265,10 @@
+                             .map_or((0, 0), system_time_to_sec);
+                         OutputType::Float(sec as f64 + nsec as f64 / 1_000_000_000.0)
+                     }
+-                    'R' => OutputType::UnsignedHex(meta.rdev()),
+-                    'r' if flag.major => OutputType::Unsigned(major(meta.rdev() as _) as u64),
+-                    'r' if flag.minor => OutputType::Unsigned(minor(meta.rdev() as _) as u64),
+-                    'r' => OutputType::Unsigned(meta.rdev()),
++                    'R' => OutputType::UnsignedHex(effective_rdev),
++                    'r' if flag.major => OutputType::Unsigned(major(effective_rdev as _) as u64),
++                    'r' if flag.minor => OutputType::Unsigned(minor(effective_rdev as _) as u64),
++                    'r' => OutputType::Unsigned(effective_rdev),
+                     _ => OutputType::Unknown,
+                 };
+                 print_it(&output, flag, width, precision);
+@@ -1234,6 +1323,16 @@
+             match result {
+                 Ok(meta) => {
+                     let file_type = meta.file_type();
++                    #[cfg(target_os = "wasi")]
++                    let effective_mode =
++                        wasi_host_fs::mode_for_path(Path::new(&file), &meta, follow_symbolic_links);
++                    #[cfg(not(target_os = "wasi"))]
++                    let effective_mode = meta.mode();
++                    #[cfg(target_os = "wasi")]
++                    let effective_rdev =
++                        wasi_host_fs::rdev_for_path(Path::new(&file), follow_symbolic_links);
++                    #[cfg(not(target_os = "wasi"))]
++                    let effective_rdev = meta.rdev();
+                     let tokens = if self.from_user
+                         || !(file_type.is_char_device() || file_type.is_block_device())
+                     {
+@@ -1249,6 +1348,8 @@
+                             &display_name,
+                             &file,
+                             file_type,
++                            effective_mode,
++                            effective_rdev,
+                             self.from_user,
+                             follow_symbolic_links,
+                         ) {

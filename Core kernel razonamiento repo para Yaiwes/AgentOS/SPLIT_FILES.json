@@ -1,0 +1,9 @@
+[
+  {
+    "repo": "AgentOS",
+    "path": "crates/execution/assets/pyodide/pyodide.asm.wasm",
+    "chunks_dir": "AgentOS/crates/execution/assets/pyodide/pyodide.asm.wasm.chunks",
+    "bytes": 8647684,
+    "chunk_bytes": 8388608
+  }
+]
