@@ -1,0 +1,411 @@
+import type { AgentLoopEvent } from "../../agent/agent-loop.js";
+import type { StepEvent } from "../../agent/step-executor.js";
+import type { ToolCallPayload } from "../../llm/grammar/tool-call-grammar.js";
+
+import type { TraceEvent } from "./trace-event.js";
+import type { TraceSink } from "./trace-bus.js";
+
+export interface TraceRecorderOptions {
+  sessionId: string;
+  /**
+   * Destination for the transformed events. Typically a
+   * `TraceBus.emit`, but tests may inject a plain collector.
+   */
+  emit: TraceSink;
+  /** Optional clock override — used by tests for deterministic timestamps. */
+  now?: () => number;
+}
+
+export interface TraceRecorderBeginInfo {
+  workingDir: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface TraceRecorder {
+  /**
+   * Emit the synthetic `session_started` event. Must be called exactly
+   * once per NDJSON file — the runtime calls it when a fresh session is
+   * created or when it starts writing traces for an existing session.
+   */
+  beginSession(info: TraceRecorderBeginInfo): void;
+  /** Transform and forward one `AgentLoopEvent` to the sink. */
+  onAgentEvent(event: AgentLoopEvent): void;
+  /**
+   * Memory-v2 phase 7a. Emit a `vote_applied` trace event. Called
+   * from the reflection-slot `VoteRunner` after a vote landed in
+   * `VoteStore` successfully. The recorder owns the monotonic
+   * `seq` counter so per-session traces stay totally ordered even
+   * when reflection fires after `turn_finished`.
+   *
+   * Fire-safe: payload errors never propagate; the recorder
+   * defaults `turnIndex` / `stepIndex` to the last observed values.
+   */
+  recordVoteApplied(payload: {
+    kind: "memory" | "lesson" | "profile" | "procedure";
+    targetId: number;
+    direction: 1 | -1;
+    score: number;
+    clampHit: boolean;
+  }): void;
+  /**
+   * Memory-v2 phase 7a. Emit a `vote_rejected` trace event for any
+   * vote that failed before reaching (or after rejecting from) the
+   * store — out-of-allowlist, target missing, clamp hit, parser
+   * rejection. One event per rejection.
+   */
+  recordVoteRejected(payload: {
+    kind: "memory" | "lesson" | "profile" | "procedure" | "unknown";
+    targetId: number | null;
+    direction: 1 | -1 | null;
+    reason: string;
+  }): void;
+  /**
+   * Memory-v2. Emit a `reflection` trace event for the end-of-turn
+   * SET/NOTE/EVOLVE extraction sub-call. Fired fire-and-forget after
+   * `turn_finished`; the recorder owns the monotonic `seq`.
+   */
+  recordReflection(payload: {
+    outcome: "ok" | "none" | "aborted" | "timeout" | "failed";
+    factsWritten?: number;
+    notesWritten?: number;
+    reason?: string;
+  }): void;
+  /**
+   * Memory-v2 phase 2. Emit a `link_generator` trace event for the
+   * reactive link-graph generation sub-call.
+   */
+  recordLinkGenerator(payload: {
+    outcome: "ok" | "none" | "skipped" | "aborted" | "timeout" | "failed";
+    linksWritten?: number;
+    candidates?: number;
+    reason?: string;
+  }): void;
+  /**
+   * Memory v2.5 phase A. Emit a `query_rewriter` trace event for the
+   * recall-side rewriter sub-call.
+   */
+  recordQueryRewriter(payload: {
+    outcome:
+      | "ok"
+      | "skipped_not_referential"
+      | "skipped_no_history"
+      | "aborted"
+      | "timeout"
+      | "failed";
+    reason?: string;
+  }): void;
+}
+
+/**
+ * Stateful transformer that maps `AgentLoopEvent` / inner `StepEvent`
+ * streams into the append-only `TraceEvent` union. Handles:
+ * - buffering `user_message` so it can be attached to the next
+ *   `turn_started` trace entry;
+ * - pairing `tool_call_parsed` + `tool_call_executed` into a single
+ *   `tool_invocation` trace event with both args and result;
+ * - assigning a monotonic `seq` within the session.
+ *
+ * The recorder never throws: unknown event shapes are ignored.
+ */
+export function createTraceRecorder(
+  options: TraceRecorderOptions,
+): TraceRecorder {
+  const now = options.now ?? (() => Date.now());
+  const sessionId = options.sessionId;
+  let seq = 0;
+  let currentTurnIndex = 0;
+  let currentStepIndex: number | null = null;
+  let pendingUserMessage: string | null = null;
+  // For a batched step, multiple `tool_call_parsed` events may arrive
+  // before any `tool_call_executed`. We keep the parsed calls keyed by
+  // their `batchIndex` so the executed callback can pair them
+  // deterministically. Solo steps land in `pendingCalls.get(0)`.
+  let pendingCalls = new Map<number, ToolCallPayload>();
+
+  const nextSeq = (): number => seq++;
+  const push = (event: TraceEvent): void => options.emit(event);
+
+  const onStepEvent = (inner: StepEvent): void => {
+    if (currentStepIndex === null) return;
+    switch (inner.type) {
+      case "prompt_captured":
+        push({
+          type: "prompt_captured",
+          seq: nextSeq(),
+          sessionId,
+          ts: now(),
+          turnIndex: currentTurnIndex,
+          stepIndex: inner.stepIndex,
+          stablePrefixHash: inner.stablePrefixHash,
+          tail: inner.tail,
+          tokens: inner.tokens,
+          slotId: inner.slotId,
+          cacheReused: inner.cacheReused,
+        });
+        return;
+      case "llm_raw_completion": {
+        const completion = inner.completion;
+        const reasoning =
+          typeof completion.reasoningContent === "string" &&
+          completion.reasoningContent.length > 0
+            ? completion.reasoningContent
+            : undefined;
+        push({
+          type: "llm_completion",
+          seq: nextSeq(),
+          sessionId,
+          ts: now(),
+          turnIndex: currentTurnIndex,
+          stepIndex: inner.stepIndex,
+          attempt: inner.attempt,
+          content: completion.content,
+          ...(reasoning !== undefined ? { reasoningContent: reasoning } : {}),
+          ...(completion.timing
+            ? {
+                timing: {
+                  promptMs: completion.timing.promptMs,
+                  predictedMs: completion.timing.predictedMs,
+                  promptTokens: completion.timing.promptTokens,
+                  predictedTokens: completion.timing.predictedTokens,
+                },
+              }
+            : {}),
+          cacheHitTokens: completion.cacheHitTokens,
+          modelId: completion.modelId,
+          stop: completion.stop,
+          truncated: completion.truncated,
+        });
+        return;
+      }
+      case "tool_call_parsed":
+        pendingCalls.set(inner.batchIndex, inner.call);
+        return;
+      case "tool_call_executed": {
+        const call = pendingCalls.get(inner.batchIndex);
+        pendingCalls.delete(inner.batchIndex);
+        push({
+          type: "tool_invocation",
+          seq: nextSeq(),
+          sessionId,
+          ts: now(),
+          turnIndex: currentTurnIndex,
+          stepIndex: currentStepIndex,
+          tool: inner.result.tool,
+          args: call?.args ?? {},
+          status: inner.result.status,
+          summary: inner.result.summary,
+          ...(inner.result.details !== undefined
+            ? { details: inner.result.details }
+            : {}),
+          ...(inner.result.truncated ? { toolTruncated: true } : {}),
+          ...(inner.batchSize > 1
+            ? { batchIndex: inner.batchIndex, batchSize: inner.batchSize }
+            : {}),
+        });
+        return;
+      }
+      case "parse_retry":
+        push({
+          type: "parse_retry",
+          seq: nextSeq(),
+          sessionId,
+          ts: now(),
+          turnIndex: currentTurnIndex,
+          stepIndex: inner.stepIndex,
+          attempt: inner.attempt,
+          reason: inner.reason,
+        });
+        return;
+      case "step_error":
+        push({
+          type: "error",
+          seq: nextSeq(),
+          sessionId,
+          ts: now(),
+          turnIndex: currentTurnIndex,
+          stepIndex: currentStepIndex,
+          message: inner.error.message,
+          ...(inner.error.stack ? { stack: inner.error.stack } : {}),
+          category: inner.category,
+        });
+        return;
+      default:
+        return;
+    }
+  };
+
+  return {
+    recordVoteApplied(payload) {
+      push({
+        type: "vote_applied",
+        seq: nextSeq(),
+        sessionId,
+        ts: now(),
+        kind: payload.kind,
+        targetId: payload.targetId,
+        direction: payload.direction,
+        score: payload.score,
+        clampHit: payload.clampHit,
+      });
+    },
+    recordVoteRejected(payload) {
+      push({
+        type: "vote_rejected",
+        seq: nextSeq(),
+        sessionId,
+        ts: now(),
+        kind: payload.kind,
+        targetId: payload.targetId,
+        direction: payload.direction,
+        reason: payload.reason,
+      });
+    },
+    recordReflection(payload) {
+      push({
+        type: "reflection",
+        seq: nextSeq(),
+        sessionId,
+        ts: now(),
+        outcome: payload.outcome,
+        ...(typeof payload.factsWritten === "number"
+          ? { factsWritten: payload.factsWritten }
+          : {}),
+        ...(typeof payload.notesWritten === "number"
+          ? { notesWritten: payload.notesWritten }
+          : {}),
+        ...(payload.reason ? { reason: payload.reason } : {}),
+      });
+    },
+    recordLinkGenerator(payload) {
+      push({
+        type: "link_generator",
+        seq: nextSeq(),
+        sessionId,
+        ts: now(),
+        outcome: payload.outcome,
+        ...(typeof payload.linksWritten === "number"
+          ? { linksWritten: payload.linksWritten }
+          : {}),
+        ...(typeof payload.candidates === "number"
+          ? { candidates: payload.candidates }
+          : {}),
+        ...(payload.reason ? { reason: payload.reason } : {}),
+      });
+    },
+    recordQueryRewriter(payload) {
+      push({
+        type: "query_rewriter",
+        seq: nextSeq(),
+        sessionId,
+        ts: now(),
+        outcome: payload.outcome,
+        ...(payload.reason ? { reason: payload.reason } : {}),
+      });
+    },
+    beginSession(info) {
+      push({
+        type: "session_started",
+        seq: nextSeq(),
+        sessionId,
+        ts: now(),
+        workingDir: info.workingDir,
+        ...(info.metadata !== undefined ? { metadata: info.metadata } : {}),
+      });
+    },
+    onAgentEvent(event) {
+      switch (event.type) {
+        case "user_message":
+          pendingUserMessage = event.text;
+          return;
+        case "turn_started":
+          currentTurnIndex = event.turnIndex;
+          push({
+            type: "turn_started",
+            seq: nextSeq(),
+            sessionId,
+            ts: now(),
+            turnIndex: event.turnIndex,
+            ...(pendingUserMessage !== null
+              ? { userMessage: pendingUserMessage }
+              : {}),
+          });
+          pendingUserMessage = null;
+          return;
+        case "turn_finished":
+          push({
+            type: "turn_finished",
+            seq: nextSeq(),
+            sessionId,
+            ts: now(),
+            turnIndex: event.turnIndex,
+            reason: event.reason,
+            stepCount: event.stepCount,
+            durationMs: event.durationMs,
+          });
+          return;
+        case "step_started":
+          currentStepIndex = event.stepIndex;
+          pendingCalls = new Map();
+          push({
+            type: "step_started",
+            seq: nextSeq(),
+            sessionId,
+            ts: now(),
+            turnIndex: currentTurnIndex,
+            stepIndex: event.stepIndex,
+          });
+          return;
+        case "step_finished":
+          push({
+            type: "step_finished",
+            seq: nextSeq(),
+            sessionId,
+            ts: now(),
+            turnIndex: currentTurnIndex,
+            stepIndex: event.stepIndex,
+            summary: event.summary,
+            durationMs: event.durationMs,
+          });
+          currentStepIndex = null;
+          pendingCalls = new Map();
+          return;
+        case "loop_detected":
+          push({
+            type: "loop_detected",
+            seq: nextSeq(),
+            sessionId,
+            ts: now(),
+            turnIndex: currentTurnIndex,
+            stepIndex: event.stepIndex,
+            tool: event.tool,
+            count: event.count,
+            ...(event.level !== undefined ? { level: event.level } : {}),
+            ...(event.detector !== undefined
+              ? { detector: event.detector }
+              : {}),
+          });
+          return;
+        case "loop_failed":
+          push({
+            type: "error",
+            seq: nextSeq(),
+            sessionId,
+            ts: now(),
+            turnIndex: currentTurnIndex,
+            ...(currentStepIndex !== null
+              ? { stepIndex: currentStepIndex }
+              : {}),
+            message: event.error.message,
+            ...(event.error.stack ? { stack: event.error.stack } : {}),
+            category: event.category,
+          });
+          return;
+        case "llm_event":
+          onStepEvent(event.event);
+          return;
+        default:
+          return;
+      }
+    },
+  };
+}

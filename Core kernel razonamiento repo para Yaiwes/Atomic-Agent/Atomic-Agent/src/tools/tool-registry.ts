@@ -1,0 +1,74 @@
+import type { CompressedToolResult } from "../compressor/result-compressor.js";
+import { coerceToolArgs } from "./coerce-tool-args.js";
+
+export interface ToolContext {
+  /** Working directory for OS tools and relative path resolution. */
+  workingDir: string;
+  sessionId: string;
+  stepIndex: number;
+  signal: AbortSignal;
+}
+
+export interface ToolDefinition {
+  name: string;
+  description: string;
+  readonly: boolean;
+  run: (args: Record<string, unknown>, ctx: ToolContext) => Promise<CompressedToolResult>;
+}
+
+export class ToolNotFoundError extends Error {
+  constructor(name: string) {
+    super(`tool not registered: ${name}`);
+    this.name = "ToolNotFoundError";
+  }
+}
+
+/**
+ * Tool registry: the agent loop calls `invoke()` and the registry takes
+ * care of dispatch. Individual tools live in their own files and are
+ * registered explicitly (no dynamic discovery).
+ */
+export class ToolRegistry {
+  private readonly tools = new Map<string, ToolDefinition>();
+
+  register(definition: ToolDefinition): void {
+    this.tools.set(definition.name, definition);
+  }
+
+  /**
+   * Remove a tool by name. Returns `true` when a tool was actually
+   * unregistered, `false` when the name was not known. Used by the
+   * MCP manager to detach a server's tools cleanly on stop /
+   * restart — the static native tools never call this.
+   */
+  unregister(name: string): boolean {
+    return this.tools.delete(name);
+  }
+
+  list(): ToolDefinition[] {
+    return Array.from(this.tools.values());
+  }
+
+  has(name: string): boolean {
+    return this.tools.has(name);
+  }
+
+  get(name: string): ToolDefinition {
+    const tool = this.tools.get(name);
+    if (!tool) throw new ToolNotFoundError(name);
+    return tool;
+  }
+
+  async invoke(
+    name: string,
+    args: Record<string, unknown>,
+    ctx: ToolContext,
+  ): Promise<CompressedToolResult> {
+    const tool = this.get(name);
+    // Models sometimes emit a JSON value one level over-encoded (a
+    // number as "200000", an array as "[\"a.png\"]"). Unwrap those
+    // before dispatch; anything that cannot be coerced is passed
+    // through untouched so the tool reports its own error.
+    return tool.run(coerceToolArgs(name, args), ctx);
+  }
+}
