@@ -4,8 +4,8 @@ on:
 permissions:
   contents: write
 concurrency:
-  group: extract-69-119
-  cancel-in-progress: false
+  group: research-download-chain-final
+  cancel-in-progress: true
 jobs:
   extract:
     runs-on: ubuntu-latest
