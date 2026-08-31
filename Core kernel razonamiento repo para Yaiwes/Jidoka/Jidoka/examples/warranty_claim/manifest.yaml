@@ -1,0 +1,17 @@
+name: warranty_claim
+title: Warranty Claim
+summary: A deterministic multimodal claim review with model fallback and typed result repair.
+agent: JidokaExamples.WarrantyClaim.Agent
+features:
+  - code_first_authoring
+  - data_defined_authoring
+  - dynamic_instructions
+  - model_routing
+  - multimodal_content
+  - provider_model_abstraction
+  - result_repair
+  - structured_results
+  - typed_context
+tests:
+  - test/warranty_claim_triage_test.exs
+livebook: warranty_claim.livemd

@@ -1,0 +1,424 @@
+defmodule Jidoka.Runtime.Controls.Operation do
+  @moduledoc """
+  Runtime evaluator for operation-scoped controls.
+  """
+
+  alias Jidoka.Agent.Spec.Controls.Operation, as: OperationControl
+  alias Jidoka.Agent.Spec.Operation, as: OperationSpec
+  alias Jidoka.Effect
+  alias Jidoka.Review.Approval
+  alias Jidoka.Review.Interrupt
+  alias Jidoka.Review.Policy
+  alias Jidoka.Runtime.Controls.Decision
+  alias Jidoka.Runtime.Controls.OperationContext
+  alias Jidoka.Runtime.Context, as: RuntimeContext
+  alias Jidoka.Runtime.Review, as: RuntimeReview
+  alias Jidoka.Turn
+
+  @doc "Applies matching operation controls to an operation intent."
+  @spec run(Turn.State.t(), Effect.Intent.t(), keyword()) ::
+          {:ok, Turn.State.t()} | {:interrupt, Interrupt.t(), Turn.State.t()} | {:error, term()}
+  def run(state, intent, opts \\ [])
+
+  def run(%Turn.State{} = state, %Effect.Intent{kind: :operation} = intent, opts) do
+    run_unapproved(state, intent, opts)
+  end
+
+  def run(%Turn.State{} = state, %Effect.Intent{}, _opts), do: {:ok, state}
+
+  defp run_unapproved(%Turn.State{} = state, %Effect.Intent{kind: :operation} = intent, opts) do
+    with {:ok, request} <- Effect.OperationRequest.from_input(intent.payload) do
+      operation = operation_for(state, request.name)
+      operation_kind = operation_kind(operation, request)
+      operation_match = operation_match_data(operation, request, operation_kind, intent)
+
+      with {:ok, implicit_controls} <- implicit_approval_controls(operation, operation_match, opts) do
+        controls =
+          state.plan.spec.controls.operations
+          |> Enum.filter(&OperationControl.matches?(&1, operation_match))
+          |> Kernel.++(implicit_controls)
+
+        run_controls(state, controls, request, operation, operation_match, intent, opts)
+      end
+    end
+  end
+
+  defp run_controls(
+         %Turn.State{} = state,
+         controls,
+         %Effect.OperationRequest{} = request,
+         operation,
+         operation_match,
+         %Effect.Intent{} = intent,
+         opts
+       )
+       when is_list(controls) do
+    controls
+    |> Enum.with_index()
+    |> Enum.reduce_while({:ok, state}, fn {control, index}, {:ok, state} ->
+      gate_id = control_gate_id(intent, control, index)
+      interrupt = operation_interrupt(control, state, request, operation_match, intent, reason: nil, gate_id: gate_id)
+
+      cond do
+        RuntimeReview.gate_completed?(current_intent(state, intent), gate_id) ->
+          {:cont, {:ok, state}}
+
+        RuntimeReview.approved_gate?(current_intent(state, intent), gate_id, interrupt.id) ->
+          state =
+            state
+            |> append_approval_reused_event(intent, interrupt.id)
+            |> RuntimeReview.complete_gate(intent, gate_id)
+
+          {:cont, {:ok, state}}
+
+        true ->
+          run_control(
+            control,
+            gate_id,
+            state,
+            request,
+            operation,
+            operation_match,
+            intent,
+            opts
+          )
+      end
+    end)
+  end
+
+  defp run_control(control, gate_id, state, request, operation, operation_match, intent, opts) do
+    case call_control(control, state, request, operation, operation_match, intent, opts)
+         |> Decision.normalize() do
+      :allow ->
+        state =
+          state
+          |> append_control_event(control, request, operation_match)
+          |> RuntimeReview.complete_gate(intent, gate_id)
+
+        {:cont, {:ok, state}}
+
+      {:block, reason} ->
+        {:halt, {:error, {:control_blocked, control.control, :operation, reason}}}
+
+      {:interrupt, reason} ->
+        interrupt =
+          operation_interrupt(control, state, request, operation_match, intent,
+            reason: reason,
+            gate_id: gate_id
+          )
+
+        state = append_control_event(state, control, request, operation_match, interrupt)
+
+        {:halt, {:interrupt, interrupt, state}}
+
+      {:error, reason} ->
+        {:halt, {:error, {:control_failed, control.control, :operation, reason}}}
+
+      {:invalid, decision} ->
+        {:halt, {:error, {:invalid_control_decision, control.control, :operation, decision}}}
+    end
+  end
+
+  defp call_control(
+         %OperationControl{} = control,
+         %Turn.State{} = state,
+         %Effect.OperationRequest{} = request,
+         operation,
+         operation_match,
+         %Effect.Intent{} = intent,
+         opts
+       ) do
+    control_name = control_name(control.control)
+
+    control.control.call(
+      OperationContext.new!(
+        type: :control,
+        boundary: :operation,
+        control: control.control,
+        control_name: control_name,
+        metadata: control.metadata,
+        request_metadata: state.request.metadata,
+        operation: request.name,
+        kind: operation_match.kind,
+        operation_kind: operation_match.kind,
+        source: operation_match.source,
+        arguments: request.arguments,
+        operation_match: control.match,
+        operation_metadata: operation_match.metadata,
+        idempotency: intent.idempotency,
+        idempotency_key: intent.idempotency_key,
+        spec: state.plan.spec,
+        plan: state.plan,
+        request: state.request,
+        input: state.request.input,
+        context: Jidoka.Context.data(state.request.context),
+        ctx:
+          RuntimeContext.from_operation!(
+            state,
+            request,
+            operation,
+            operation_match,
+            intent,
+            runtime: Keyword.get(opts, :operation_context, %{}),
+            control: control.control,
+            control_name: control_name,
+            metadata: control.metadata
+          ),
+        agent_state: state.agent_state,
+        intent: intent,
+        operation_request: request,
+        operation_spec: operation
+      )
+    )
+  rescue
+    exception -> {:error, exception}
+  catch
+    kind, reason -> {:error, {kind, reason}}
+  end
+
+  defp append_control_event(
+         %Turn.State{} = state,
+         %OperationControl{} = control,
+         %Effect.OperationRequest{} = request,
+         operation_match,
+         interrupt \\ nil
+       ) do
+    state
+    |> Turn.Transition.new!()
+    |> Turn.Transition.event(control_event(interrupt),
+      agent_id: state.plan.spec.id,
+      request_id: state.request.request_id,
+      loop_index: state.loop_index,
+      operation: request.name,
+      data:
+        %{
+          boundary: :operation,
+          control: control_name(control.control),
+          operation: request.name,
+          operation_kind: operation_match.kind,
+          source: operation_match.source,
+          interrupt_id: interrupt_id(interrupt)
+        }
+        |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+        |> Map.new()
+    )
+    |> Turn.Transition.commit()
+  end
+
+  defp append_approval_reused_event(%Turn.State{} = state, %Effect.Intent{} = intent, interrupt_id) do
+    case Effect.OperationRequest.from_input(intent.payload) do
+      {:ok, request} ->
+        state
+        |> Turn.Transition.new!()
+        |> Turn.Transition.event(:approval_applied,
+          agent_id: state.plan.spec.id,
+          request_id: request.request_id || state.request.request_id,
+          loop_index: request.loop_index,
+          effect_id: intent.id,
+          effect_kind: intent.kind,
+          operation: request.name,
+          data: %{
+            interrupt_id: interrupt_id,
+            operation: request.name
+          }
+        )
+        |> Turn.Transition.commit()
+
+      {:error, _reason} ->
+        state
+    end
+  end
+
+  defp operation_interrupt(
+         %OperationControl{} = control,
+         %Turn.State{} = state,
+         %Effect.OperationRequest{} = request,
+         operation_match,
+         %Effect.Intent{} = intent,
+         opts
+       ) do
+    reason = Keyword.fetch!(opts, :reason)
+    gate_id = Keyword.fetch!(opts, :gate_id)
+
+    Interrupt.new!(
+      id:
+        Interrupt.stable_id([
+          state.plan.spec.id,
+          state.request.request_id,
+          intent.id,
+          gate_id,
+          control.control,
+          request.name
+        ]),
+      boundary: :operation,
+      control: control.control,
+      control_name: control_name(control.control),
+      reason: reason,
+      agent_id: state.plan.spec.id,
+      request_id: state.request.request_id,
+      loop_index: state.loop_index,
+      effect_id: intent.id,
+      effect_kind: intent.kind,
+      operation: request.name,
+      operation_kind: operation_match.kind,
+      arguments: request.arguments,
+      idempotency: intent.idempotency,
+      idempotency_key: intent.idempotency_key,
+      metadata: %{
+        "gate_id" => gate_id,
+        "operation_match" => control.match,
+        "control_metadata" => control.metadata
+      }
+    )
+  end
+
+  defp implicit_approval_controls(operation, operation_match, opts) do
+    with {:ok, operation_controls} <- operation_approval_controls(operation, operation_match),
+         {:ok, request_controls} <- request_approval_controls(operation || operation_match, operation_match, opts) do
+      {:ok, operation_controls ++ request_controls}
+    end
+  end
+
+  defp operation_approval_controls(%OperationSpec{approval: %Policy{} = policy}, operation_match) do
+    {:ok, [approval_control(policy, operation_match, :operation)]}
+  end
+
+  defp operation_approval_controls(_operation, _operation_match), do: {:ok, []}
+
+  defp request_approval_controls(operation, operation_match, opts) do
+    case Keyword.get(opts, :require_tool_approval) do
+      nil ->
+        {:ok, []}
+
+      approval ->
+        case Approval.policy_for_operation(approval, operation) do
+          {:ok, %Policy{} = policy} -> {:ok, [approval_control(policy, operation_match, :request)]}
+          {:ok, nil} -> {:ok, []}
+          {:error, reason} -> {:error, {:invalid_request_approval_policy, reason}}
+        end
+    end
+  end
+
+  defp approval_control(%Policy{} = policy, operation_match, source) do
+    OperationControl.new!(
+      control: Jidoka.Controls.RequireApproval,
+      match: %{name: Map.get(operation_match, :name)},
+      metadata: %{
+        "source" => Atom.to_string(source),
+        "policy" => Policy.to_map(policy)
+      }
+    )
+  end
+
+  defp control_event(nil), do: :control_allowed
+  defp control_event(%Interrupt{}), do: :control_interrupted
+
+  defp interrupt_id(nil), do: nil
+  defp interrupt_id(%Interrupt{id: id}), do: id
+
+  defp operation_for(%Turn.State{plan: %{spec: %{operations: operations}}}, name) do
+    Enum.find(operations, &(&1.name == name))
+  end
+
+  defp operation_kind(%OperationSpec{} = operation, _request), do: OperationSpec.kind(operation)
+
+  defp operation_kind(nil, %Effect.OperationRequest{metadata: metadata}) do
+    kind_from_metadata(metadata) || :operation
+  end
+
+  defp operation_match_data(
+         operation,
+         %Effect.OperationRequest{} = request,
+         operation_kind,
+         intent
+       ) do
+    metadata = operation_metadata(operation, request)
+
+    %{
+      name: request.name,
+      kind: operation_kind,
+      source: source_from_metadata(metadata),
+      idempotency: operation_idempotency(operation, intent),
+      metadata: metadata
+    }
+  end
+
+  defp operation_metadata(%OperationSpec{metadata: metadata}, _request) when is_map(metadata),
+    do: metadata
+
+  defp operation_metadata(_operation, %Effect.OperationRequest{metadata: metadata})
+       when is_map(metadata),
+       do: metadata
+
+  defp operation_idempotency(%OperationSpec{idempotency: idempotency}, _intent), do: idempotency
+
+  defp operation_idempotency(_operation, %Effect.Intent{idempotency: idempotency}),
+    do: idempotency
+
+  defp source_from_metadata(metadata) when is_map(metadata) do
+    metadata
+    |> get_any([:source, "source", :runtime, "runtime"])
+    |> normalize_source()
+  end
+
+  defp kind_from_metadata(metadata) do
+    metadata_kind(metadata) || runtime_kind(metadata)
+  end
+
+  defp metadata_kind(metadata) do
+    metadata
+    |> get_any([:kind, "kind", :operation_kind, "operation_kind", :source_kind, "source_kind"])
+    |> normalize_kind()
+  end
+
+  defp runtime_kind(metadata) do
+    case get_any(metadata, [:runtime, "runtime", :source, "source"]) do
+      value when value in [:jido_action, "jido_action"] -> :action
+      _value -> nil
+    end
+  end
+
+  defp normalize_kind(kind) when is_atom(kind) do
+    if kind in OperationControl.valid_kinds(), do: kind
+  end
+
+  defp normalize_kind(kind) when is_binary(kind) do
+    normalized = kind |> String.trim() |> String.downcase()
+
+    Enum.find(OperationControl.valid_kinds(), &(Atom.to_string(&1) == normalized))
+  end
+
+  defp normalize_kind(_kind), do: nil
+
+  defp normalize_source(source) when is_atom(source) and not is_nil(source),
+    do: Atom.to_string(source)
+
+  defp normalize_source(source) when is_binary(source), do: source
+  defp normalize_source(_source), do: nil
+
+  defp control_gate_id(intent, control, index) do
+    RuntimeReview.gate_id([
+      intent.id,
+      :operation_control,
+      index,
+      control.control,
+      control.match,
+      control.metadata
+    ])
+  end
+
+  defp current_intent(state, fallback) do
+    Enum.find(state.pending_effects, &(&1.id == fallback.id)) || fallback
+  end
+
+  defp get_any(map, keys) do
+    Enum.find_value(keys, &Map.get(map, &1))
+  end
+
+  defp control_name(control) do
+    case Jidoka.Control.control_name(control) do
+      {:ok, name} -> name
+      {:error, _reason} -> inspect(control)
+    end
+  end
+end

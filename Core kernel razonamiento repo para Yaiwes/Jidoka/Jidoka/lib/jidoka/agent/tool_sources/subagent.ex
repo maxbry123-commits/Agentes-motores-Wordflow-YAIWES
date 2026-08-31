@@ -1,0 +1,63 @@
+defmodule Jidoka.Agent.ToolSources.Subagent do
+  @moduledoc false
+
+  alias Jidoka.Agent.Dsl.Subagent
+  alias Jidoka.Agent.ToolSources.Common
+  alias Jidoka.Operation.Source
+  alias Jidoka.Operation.Source.Subagent, as: SubagentSource
+  alias Jidoka.Review.Approval
+
+  @spec compiled!(term()) :: Jidoka.Operation.Source.Compiled.t()
+  def compiled!(%Subagent{} = subagent) do
+    source = source!(subagent)
+
+    Common.compile_source!(source, subagent.approval, fn source, _operations ->
+      metadata(source, subagent)
+    end)
+  end
+
+  @spec source!(term()) :: SubagentSource.t()
+  def source!(%Subagent{} = subagent) do
+    SubagentSource.new!(
+      agent: subagent.agent,
+      as: subagent.as,
+      description: subagent.description,
+      timeout: subagent.timeout || 30_000,
+      forward_context: subagent.forward_context || :public,
+      result: subagent.result || :structured,
+      metadata: subagent.metadata || %{}
+    )
+  end
+
+  @spec operations!(term()) :: [Jidoka.Agent.Spec.Operation.t()]
+  def operations!(%Subagent{} = subagent) do
+    subagent
+    |> source!()
+    |> Source.operations()
+    |> case do
+      {:ok, operations} -> Approval.apply_to_operations!(operations, subagent.approval)
+      {:error, reason} -> raise ArgumentError, "invalid subagent source: #{inspect(reason)}"
+    end
+  end
+
+  @spec metadata!(term()) :: [map()]
+  def metadata!(%Subagent{} = subagent) do
+    source = source!(subagent)
+    metadata(source, subagent)
+  end
+
+  defp metadata(source, subagent) do
+    [
+      %{
+        "source" => "subagent",
+        "name" => source.name,
+        "agent" => inspect(source.agent),
+        "timeout" => source.timeout,
+        "forward_context" => inspect(source.forward_context),
+        "result" => Atom.to_string(source.result),
+        "approval" => Approval.source_policy_map(subagent.approval)
+      }
+      |> Jidoka.Agent.ToolSources.Common.reject_nil_values()
+    ]
+  end
+end

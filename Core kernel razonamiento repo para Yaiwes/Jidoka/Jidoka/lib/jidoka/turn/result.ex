@@ -1,0 +1,107 @@
+defmodule Jidoka.Turn.Result do
+  @moduledoc "Final app-facing result of one Jidoka turn."
+
+  alias Jidoka.Agent
+  alias Jidoka.Config
+  alias Jidoka.ContentPart
+  alias Jidoka.Effect
+  alias Jidoka.Portable
+  alias Jidoka.Schema
+  alias Jidoka.Turn
+
+  @schema Zoi.struct(
+            __MODULE__,
+            %{
+              content: Zoi.string(),
+              parts:
+                Zoi.array(Zoi.lazy({ContentPart, :schema, []}))
+                |> Zoi.default([]),
+              value: Zoi.any() |> Zoi.nullish(),
+              agent_state: Zoi.lazy({Agent.State, :schema, []}),
+              journal: Zoi.lazy({Effect.Journal, :schema, []}),
+              events: Zoi.array(Zoi.lazy({Jidoka.Event, :schema, []})) |> Zoi.default([]),
+              usage: Zoi.map() |> Zoi.default(%{}),
+              limit_usage: Zoi.map() |> Zoi.default(%{}),
+              metadata: Zoi.map() |> Zoi.default(%{})
+            },
+            coerce: true
+          )
+
+  @type t :: unquote(Zoi.type_spec(@schema))
+  @enforce_keys Zoi.Struct.enforce_keys(@schema)
+  defstruct Zoi.Struct.struct_fields(@schema)
+
+  @doc "Returns the Zoi schema for a completed turn result."
+  @spec schema() :: Zoi.schema()
+  def schema, do: @schema
+
+  @doc "Builds a turn result from keyword or map attributes."
+  @spec new(keyword() | map()) :: {:ok, t()} | {:error, term()}
+  def new(attrs), do: Schema.parse(@schema, attrs)
+
+  @doc "Builds a turn result and raises if the attributes are invalid."
+  @spec new!(keyword() | map()) :: t()
+  def new!(attrs), do: Schema.parse!(@schema, attrs, "turn result")
+
+  @doc "Projects finished turn state into the public result contract."
+  @spec from_turn_state!(Turn.State.t()) :: t()
+  def from_turn_state!(%Turn.State{status: :finished, result: content} = state) do
+    new!(
+      content: content,
+      parts: state.result_parts,
+      value: state.result_value,
+      agent_state: state.agent_state,
+      journal: state.journal,
+      events: state.events,
+      usage: Jidoka.Usage.from_journal(state.journal),
+      limit_usage: state.limit_ledger,
+      metadata: %{debug: debug_metadata(state)}
+    )
+  end
+
+  defp debug_metadata(%Turn.State{} = state) do
+    %{
+      request_id: state.request.request_id,
+      agent_id: state.plan.spec.id,
+      model: Config.model_ref(state.plan.spec.model),
+      input: state.request.input,
+      context_keys: context_keys(Jidoka.Context.data(state.request.context)),
+      prompt: prompt_debug(state.prompt, state.context_projection),
+      diagnostics: state.diagnostics,
+      started_at_ms: state.started_at_ms
+    }
+  end
+
+  defp prompt_debug(nil, _context_projection), do: nil
+
+  defp prompt_debug(%{} = prompt, context_projection) do
+    operations = Map.get(prompt, :operations, Map.get(prompt, "operations", []))
+
+    %{
+      model: Map.get(prompt, :model, Map.get(prompt, "model")),
+      loop_index: Map.get(prompt, :loop_index, Map.get(prompt, "loop_index")),
+      messages:
+        prompt
+        |> Map.get(:messages, Map.get(prompt, "messages", []))
+        |> Portable.project(),
+      message_count: length(Map.get(prompt, :messages, Map.get(prompt, "messages", []))),
+      operations: operations,
+      operation_names: Enum.map(operations, &operation_name/1),
+      operation_count: length(operations),
+      result: Map.get(prompt, :result, Map.get(prompt, "result")),
+      memory: Map.get(prompt, :memory, Map.get(prompt, "memory")),
+      generation: Map.get(prompt, :generation, Map.get(prompt, "generation")),
+      context_projection: Portable.project(context_projection)
+    }
+  end
+
+  defp operation_name(%{} = operation), do: Map.get(operation, :name, Map.get(operation, "name"))
+  defp operation_name(_operation), do: nil
+
+  defp context_keys(%{} = context) do
+    context
+    |> Map.keys()
+    |> Enum.map(&to_string/1)
+    |> Enum.sort()
+  end
+end

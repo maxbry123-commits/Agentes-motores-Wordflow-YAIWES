@@ -1,0 +1,203 @@
+defmodule Jidoka.HarnessSessionIntegrationTest do
+  use ExUnit.Case, async: true
+
+  alias Jidoka.Agent
+  alias Jidoka.Agent.Spec.Controls
+  alias Jidoka.Agent.Spec.Operation
+  alias Jidoka.Effect
+  alias Jidoka.Harness
+  alias Jidoka.Session.Data, as: Session
+  alias Jidoka.Session.Store.InMemory
+  alias Jidoka.Review
+  alias Jidoka.Snapshot
+  alias Jidoka.Runtime.LocalOperations
+  alias Jidoka.Turn
+
+  import Jidoka.TestSupport, only: [count_results: 2, final_llm: 1]
+
+  defmodule RequireReviewControl do
+    @moduledoc false
+
+    use Jidoka.Control, name: "require_review"
+
+    @impl true
+    def call(_operation), do: {:interrupt, :approval_required}
+  end
+
+  test "sessions persist hibernate and resume to completion through a store" do
+    {:ok, pid} = InMemory.start_link()
+    store = {InMemory, pid: pid}
+    spec = chat_spec()
+
+    assert {:ok, %Session{session_id: "sess_chat"}} =
+             Harness.start_session(spec, session_id: "sess_chat", store: store)
+
+    llm = final_llm("stored hello")
+
+    assert {:hibernate, %Session{status: :hibernated} = hibernated, %Snapshot{} = snapshot} =
+             Harness.run_session("sess_chat", "Say hello",
+               store: store,
+               llm: llm,
+               checkpoint: :after_prompt
+             )
+
+    assert snapshot.cursor.phase == :after_prompt
+    assert [%Snapshot{}] = hibernated.snapshots
+
+    assert {:ok, %Session{status: :finished} = finished, %Turn.Result{content: "stored hello"}} =
+             Harness.resume_session("sess_chat", store: store, llm: llm)
+
+    assert finished.session_id == "sess_chat"
+
+    assert {:ok, %Session{status: :finished, result: %Turn.Result{content: "stored hello"}}} =
+             Harness.store_get_session(store, "sess_chat")
+
+    assert {:error, {:session_not_resumable, "sess_chat", :finished}} =
+             Harness.resume_session("sess_chat", store: store, llm: llm)
+  end
+
+  test "sessions are marked running before effect interpretation to guard duplicate turns" do
+    parent = self()
+    {:ok, pid} = InMemory.start_link()
+    store = {InMemory, pid: pid}
+    spec = chat_spec()
+
+    assert {:ok, %Session{session_id: "sess_race"}} =
+             Harness.start_session(spec, session_id: "sess_race", store: store)
+
+    llm = fn _intent, _journal, _ctx ->
+      send(parent, {:llm_started, self()})
+
+      receive do
+        :finish_llm -> {:ok, %{type: :final, content: "first turn complete"}}
+      after
+        2_000 -> {:ok, %{type: :final, content: "first turn timed out"}}
+      end
+    end
+
+    task =
+      Task.async(fn ->
+        Harness.run_session("sess_race", "First turn", store: store, llm: llm)
+      end)
+
+    assert_receive {:llm_started, llm_pid}, 1_000
+
+    assert {:ok, %Session{status: :running, requests: [%Turn.Request{input: "First turn"}]}} =
+             Harness.store_get_session(store, "sess_race")
+
+    assert {:error, {:session_already_running, "sess_race"}} =
+             Harness.run_session("sess_race", "Second turn", store: store, llm: llm)
+
+    send(llm_pid, :finish_llm)
+
+    assert {:ok, %Session{status: :finished}, %Turn.Result{content: "first turn complete"}} =
+             Task.await(task)
+
+    assert {:ok, %Session{status: :finished, requests: [%Turn.Request{input: "First turn"}]}} =
+             Harness.store_get_session(store, "sess_race")
+  end
+
+  test "sessions list pending approvals and resume approved operation reviews" do
+    test_pid = self()
+    {:ok, pid} = InMemory.start_link()
+    store = {InMemory, pid: pid}
+    spec = review_spec()
+
+    assert {:ok, %Session{session_id: "sess_review"}} =
+             Harness.start_session(spec, session_id: "sess_review", store: store)
+
+    llm = fn _intent, %Effect.Journal{} = journal, _ctx ->
+      case count_results(journal, :llm) do
+        0 ->
+          {:ok,
+           %{
+             type: :operation,
+             name: "refund_order",
+             arguments: %{"order_id" => "order_123"}
+           }}
+
+        1 ->
+          {:ok, %{type: :final, content: "Refund refund_123 is queued."}}
+      end
+    end
+
+    operations =
+      LocalOperations.operations(%{
+        refund_order: fn intent, _journal, _ctx ->
+          arguments = Jidoka.Schema.get_key(intent.payload, :arguments)
+          send(test_pid, {:refund_called, arguments})
+          {:ok, %{"refund_id" => "refund_123", "order_id" => arguments["order_id"]}}
+        end
+      })
+
+    assert {:hibernate, %Session{status: :waiting} = waiting, %Snapshot{} = snapshot} =
+             Harness.run_session("sess_review", "Refund order_123",
+               store: store,
+               llm: llm,
+               operations: operations
+             )
+
+    assert snapshot.cursor.phase == :review
+
+    assert {:ok, [%Review.Request{interrupt_id: interrupt_id, operation: "refund_order"}]} =
+             Harness.pending_reviews(store)
+
+    assert waiting |> Session.pending_reviews() |> hd() |> Map.get(:interrupt_id) == interrupt_id
+
+    approval = Review.Response.approve(interrupt_id)
+
+    assert {:ok, %Session{status: :finished} = finished, %Turn.Result{content: "Refund refund_123 is queued."}} =
+             Harness.resume_session("sess_review",
+               store: store,
+               approval: approval,
+               llm: llm,
+               operations: operations
+             )
+
+    assert Session.pending_reviews(finished) == []
+
+    assert_receive {:refund_called, %{"order_id" => "order_123"}}
+
+    assert {:ok,
+            %Jidoka.Session.Replay{
+              session_id: "sess_review",
+              status: :finished,
+              pending_reviews: [],
+              timeline: timeline
+            }} = Harness.replay(finished)
+
+    assert Enum.any?(timeline, &(&1.event == :approval_requested))
+    assert Enum.any?(timeline, &(&1.event == :approval_responded))
+    assert Enum.any?(timeline, &(&1.event == :turn_finished))
+  end
+
+  defp chat_spec do
+    Agent.Spec.new!(
+      id: "session_chat_agent",
+      instructions: "Answer tersely.",
+      model: %{provider: :test, id: "model"}
+    )
+  end
+
+  defp review_spec do
+    Agent.Spec.new!(
+      id: "session_review_agent",
+      instructions: "Use refund_order when refunds are requested.",
+      model: %{provider: :test, id: "model"},
+      operations: [
+        Operation.new!(
+          name: "refund_order",
+          description: "Starts a refund.",
+          idempotency: :unsafe_once
+        )
+      ],
+      controls:
+        Controls.new!(
+          operations: [
+            %{control: RequireReviewControl, match: %{name: "refund_order"}}
+          ]
+        ),
+      runtime_defaults: %{max_model_turns: 4}
+    )
+  end
+end
