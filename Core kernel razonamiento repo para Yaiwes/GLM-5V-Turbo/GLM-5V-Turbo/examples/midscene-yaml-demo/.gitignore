@@ -1,0 +1,9 @@
+package-lock.json
+pnpm-lock.yaml
+node_modules
+.env
+
+# Midscene.js dump files
+midscene_run
+
+/output

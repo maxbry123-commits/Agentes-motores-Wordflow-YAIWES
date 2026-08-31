@@ -1,0 +1,16 @@
+{
+  "name": "midscene-yaml-demo",
+  "private": true,
+  "version": "1.0.0",
+  "description": "quick start",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "test": "midscene ./midscene-scripts/search-headphone-on-ebay.yaml"
+  },
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@midscene/cli": "latest"
+  }
+}
