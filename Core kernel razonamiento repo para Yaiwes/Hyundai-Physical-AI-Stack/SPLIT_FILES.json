@@ -1,0 +1,16 @@
+[
+  {
+    "repo": "Hyundai-Physical-AI-Stack",
+    "path": "docs/python/fetch_tutorial/files/models-with-protos.zip",
+    "chunks_dir": "Hyundai-Physical-AI-Stack/docs/python/fetch_tutorial/files/models-with-protos.zip.chunks",
+    "bytes": 33202325,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "Hyundai-Physical-AI-Stack",
+    "path": "docs/html/docs/python/fetch_tutorial/files/models-with-protos.zip",
+    "chunks_dir": "Hyundai-Physical-AI-Stack/docs/html/docs/python/fetch_tutorial/files/models-with-protos.zip.chunks",
+    "bytes": 33202325,
+    "chunk_bytes": 8388608
+  }
+]
