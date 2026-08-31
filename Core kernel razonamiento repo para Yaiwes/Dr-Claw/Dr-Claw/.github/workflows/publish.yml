@@ -1,0 +1,37 @@
+# Publish to npm when a GitHub Release is created (by release-it or manually)
+name: Publish to npm
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  publish:
+    # Codex bootstrap releases use their own tag namespace and must never
+    # publish the Dr. Claw application package to npm.
+    if: startsWith(github.event.release.tag_name, 'v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+          cache: 'npm'
+
+      # Note: npm ci may compile native modules (node-pty, better-sqlite3) —
+      # ubuntu-latest includes build-essential by default
+      - run: npm ci
+
+      - run: npm run build
+
+      - run: npm test
+
+      - run: npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

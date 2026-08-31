@@ -1,0 +1,398 @@
+{
+  "buttons": {
+    "save": "Save",
+    "cancel": "Cancel",
+    "delete": "Delete",
+    "create": "Create",
+    "edit": "Edit",
+    "close": "Close",
+    "confirm": "Confirm",
+    "submit": "Submit",
+    "retry": "Retry",
+    "refresh": "Refresh",
+    "search": "Search",
+    "clear": "Clear",
+    "copy": "Copy",
+    "download": "Download",
+    "upload": "Upload",
+    "browse": "Browse"
+  },
+  "tabs": {
+    "dashboard": "Dashboard",
+    "trash": "Trash",
+    "chat": "Chat",
+    "survey": "Knowledge Base",
+    "shell": "Shell",
+    "files": "Files",
+    "git": "Code History",
+    "tasks": "Tasks",
+    "researchLab": "Research Lab",
+    "skills": "Skills",
+    "compute": "Compute Resource",
+    "news": "News",
+    "autoResearch": "Auto Research"
+  },
+  "researchLabGuide": {
+    "title": "How to Use Dr. Claw",
+    "description": "Use the inno-pipeline-planner skill in Chat to start a 5-stage research pipeline, then review tasks and artifacts here in Research Lab.",
+    "step1": "Go to Chat and ask the agent to use the inno-pipeline-planner skill for your research topic, goal, or paper idea.",
+    "step2": "Answer the clarifying questions so the agent can define your research brief and pipeline correctly.",
+    "step3": "The agent creates your research brief and stage-based task pipeline.",
+    "step4": "Return to Research Lab to review progress across the 5 stages: Survey, Ideation, Experiment, Publication, and Promotion.",
+    "step5": "Click Go to Chat on any task to execute it, then refresh this page to inspect the latest artifacts and keep the pipeline moving.",
+    "interfaceMap": "Interface: Task pipeline on the left, Artifacts Explorer and preview on the right. Click an artifact to inspect it or Go to Chat on any task to execute it.",
+    "readmeHint": "For full process details, see README.md -> Usage Guide.",
+    "briefEditingTitle": "Research Brief Editing Guidance",
+    "briefEditingStep1": "Fill core constraints first (goal, boundaries, metrics). Incomplete inputs are acceptable for initial task generation.",
+    "briefEditingStep2": "Click Apply Template + Generate Tasks to update the research brief and regenerate the task list.",
+    "briefEditingStep3": "Use Use in Chat from the Pipeline Task List below in sequence, and keep writing clarified conclusions back to the research brief."
+  },
+  "researchLabTaskBoard": {
+    "doubleClickToEdit": "Double-click to edit",
+    "taskTitlePlaceholder": "Task title",
+    "taskDescriptionPlaceholder": "Task description",
+    "saving": "Saving...",
+    "untitledTask": "Untitled Task",
+    "editHint": "Double-click task card or use Edit button"
+  },
+  "status": {
+    "loading": "Loading...",
+    "success": "Success",
+    "error": "Error",
+    "failed": "Failed",
+    "pending": "Pending",
+    "completed": "Completed",
+    "inProgress": "In Progress"
+  },
+  "messages": {
+    "savedSuccessfully": "Saved successfully",
+    "deletedSuccessfully": "Deleted successfully",
+    "updatedSuccessfully": "Updated successfully",
+    "operationFailed": "Operation failed",
+    "networkError": "Network error. Please check your connection.",
+    "unauthorized": "Unauthorized. Please log in.",
+    "notFound": "Not found",
+    "invalidInput": "Invalid input",
+    "requiredField": "This field is required",
+    "unknownError": "An unknown error occurred"
+  },
+  "navigation": {
+    "settings": "Settings",
+    "home": "Home",
+    "back": "Back",
+    "next": "Next",
+    "previous": "Previous",
+    "logout": "Logout"
+  },
+  "mobileNav": {
+    "survey": "KB",
+    "researchLab": "Lab",
+    "git": "Git",
+    "trash": "Trash"
+  },
+  "surveyPage": {
+    "title": "Knowledge Base",
+    "description": "Browse and preview project knowledge files including papers, graphs, reports, and notes.",
+    "filterPlaceholder": "Filter files...",
+    "loading": "Loading knowledge base...",
+    "summary": {
+      "papers": "Papers",
+      "reports": "Reports",
+      "graphs": "Graphs",
+      "tasks": "Tasks"
+    },
+    "labels": {
+      "workspaceTag": "Knowledge Base",
+      "focusTag": "Project Knowledge",
+      "library": "File Library",
+      "preview": "Preview"
+    },
+    "actions": {
+      "collapse": "Collapse",
+      "expand": "Expand"
+    },
+    "sections": {
+      "papers": "Papers",
+      "reports": "Reports",
+      "graphs": "Graphs",
+      "notes": "Notes",
+      "tasks": "Tasks",
+      "references": "References"
+    },
+    "errors": {
+      "loadFailed": "Failed to load knowledge base for this project."
+    },
+    "empty": {
+      "noSurveyFiles": "No knowledge files found under Survey/ or Research/ yet.",
+      "noSectionFiles": "No {{section}} files match the current filter.",
+      "noTasks": "No tasks available yet.",
+      "noSelection": "Select a file or task to preview it here.",
+      "noTaskDescription": "This task does not have a description yet."
+    },
+    "preview": {
+      "loading": "Loading preview...",
+      "failed": "Failed to load the selected item.",
+      "notFound": "File not found — it may have been moved or deleted.",
+      "forbidden": "Permission denied — unable to access this file.",
+      "unsupported": "This file type is not previewable yet.",
+      "surveyTask": "Task",
+      "taskDescription": "Task Description",
+      "dragHint": "Drag to pan the diagram",
+      "zoomIn": "Zoom In",
+      "zoomOut": "Zoom Out",
+      "fit": "Fit",
+      "resetZoom": "Reset",
+      "openInWindow": "Open in Window",
+      "windowLoadFailed": "Failed to open the diagram in a separate window."
+    }
+  },
+  "common": {
+    "language": "Language",
+    "theme": "Theme",
+    "darkMode": "Dark Mode",
+    "lightMode": "Light Mode",
+    "name": "Name",
+    "description": "Description",
+    "enabled": "Enabled",
+    "disabled": "Disabled",
+    "optional": "Optional",
+    "version": "Version",
+    "select": "Select",
+    "selectAll": "Select All",
+    "deselectAll": "Deselect All"
+  },
+  "time": {
+    "justNow": "Just now",
+    "oneMinuteAgo": "1 min ago",
+    "minutesAgo": "{{count}} mins ago",
+    "oneHourAgo": "1 hour ago",
+    "hoursAgo": "{{count}} hours ago",
+    "oneDayAgo": "1 day ago",
+    "daysAgo": "{{count}} days ago",
+    "yesterday": "Yesterday"
+  },
+  "fileOperations": {
+    "newFile": "New File",
+    "newFolder": "New Folder",
+    "rename": "Rename",
+    "move": "Move",
+    "copyPath": "Copy Path",
+    "openInEditor": "Open in Editor"
+  },
+  "mainContent": {
+    "loading": "Loading Dr. Claw",
+    "settingUpWorkspace": "Setting up your workspace...",
+    "chooseProject": "Choose Your Project",
+    "selectProjectDescription": "Select a project from the sidebar to start coding with Claude. Each project contains your chat sessions and file history.",
+    "tip": "Tip",
+    "createProjectMobile": "Tap the menu button above to access projects",
+    "createProjectDesktop": "Create a new project by clicking the folder icon in the sidebar",
+    "newSession": "New Session",
+    "untitledSession": "Untitled Session",
+    "projectFiles": "Project Files"
+  },
+  "projectDashboard": {
+    "title": "Project Dashboard",
+    "trashTitle": "Project Trash",
+    "trashSubtitle": "Deleted projects are moved here first so you can restore them or remove records and files separately.",
+    "trashBadge": "Trash",
+    "trashEmptyTitle": "Trash is empty",
+    "trashEmptyDescription": "Projects deleted from the dashboard are moved here first instead of being erased immediately.",
+    "trashDeletedAt": "Deleted {{time}}",
+    "trashSessions": "{{count}} conversations",
+    "trashFilesMissing": "Workspace files already missing",
+    "restoreProject": "Restore Project",
+    "deleteFromTrash": "Delete From Trash",
+    "trashDeleteTitle": "Choose how to delete this trashed project",
+    "trashDeleteDescription": "Logical delete removes the database record only. Physical delete also permanently removes files still stored in trash.",
+    "logicalDelete": "Delete Record Only",
+    "physicalDelete": "Delete Files Permanently",
+    "subtitle": "Track every workspace and jump back into active work quickly.",
+    "overviewBadge": "Workspace Overview",
+    "sharedBadge": "Shared Workspace Resource",
+    "skillsTitle": "Skills Library",
+    "skillsDescription": "All projects use the same installed skills. Manage and inspect them here from the global dashboard instead of inside each project.",
+    "openSkillsLibrary": "Open Skills Library",
+    "activityTitle": "Latest Activity",
+    "projectsSectionTitle": "Projects",
+    "projectsSectionSubtitle": "Open active workspaces, review progress, and jump into the next task without digging through the sidebar.",
+    "emptyTitle": "No projects yet",
+    "emptyDescription": "Create or add a workspace from the sidebar to start tracking project progress here.",
+    "summary": {
+      "projects": "Projects",
+      "sessions": "Sessions",
+      "tracked": "Tracked Projects",
+      "progress": "Average Progress",
+      "todayTokens": "Today Tokens",
+      "weekTokens": "This Week Tokens",
+      "trackedProjects": "{{count}} tracked"
+    },
+    "metrics": {
+      "sessions": "Sessions",
+      "tasks": "Tasks",
+      "completed": "Completed",
+      "todayTokens": "Today Tokens",
+      "weekTokens": "This Week Tokens"
+    },
+    "actions": {
+      "chat": "Open Chat",
+      "files": "Browse Files",
+      "researchLab": "Open Lab",
+      "shell": "Open Shell"
+    },
+    "openProject": "Open Project",
+    "progressTitle": "Progress",
+    "progressBadge": "{{progress}}% complete",
+    "progressValue": "{{progress}}% complete",
+    "notTracked": "No tracked progress",
+    "notTrackedShort": "N/A",
+    "lastActivity": "Last activity {{time}}",
+    "pipelineUpdated": "Pipeline updated {{time}}",
+    "noRecentActivity": "No recent activity"
+  },
+  "fileTree": {
+    "loading": "Loading files...",
+    "files": "Files",
+    "simpleView": "Simple view",
+    "compactView": "Compact view",
+    "detailedView": "Detailed view",
+    "searchPlaceholder": "Search files and folders...",
+    "clearSearch": "Clear search",
+    "name": "Name",
+    "size": "Size",
+    "modified": "Modified",
+    "permissions": "Permissions",
+    "noFilesFound": "No files found",
+    "checkProjectPath": "Check if the project path is accessible",
+    "noMatchesFound": "No matches found",
+    "tryDifferentSearch": "Try a different search term or clear the search",
+    "justNow": "just now",
+    "minAgo": "{{count}} min ago",
+    "hoursAgo": "{{count}} hours ago",
+    "daysAgo": "{{count}} days ago",
+    "uploadFiles": "Upload files",
+    "uploading": "Uploading...",
+    "uploadSuccess": "{{count}} file(s) uploaded successfully",
+    "uploadError": "Upload failed",
+    "dropFilesHere": "Drop files here",
+    "copyPath": "Copy Path",
+    "deleteFile": "Delete",
+    "confirmDelete": "Are you sure you want to delete \"{{name}}\"?",
+    "deleteSuccess": "Deleted successfully",
+    "uploadToFolder": "Upload to this folder",
+    "askAboutFile": "Ask about this file",
+    "askAboutDirectory": "Ask about this folder",
+    "askAboutFilePrompt": "Please explain the file `{{path}}`. What does it do, how is it used in this project, and what should I know before editing it?",
+    "askAboutDirectoryPrompt": "Please explain the folder `{{path}}`. What is its purpose, what are the important files or submodules inside it, and how does it fit into this project?"
+  },
+  "projectWizard": {
+    "title": "Create New Project",
+    "steps": {
+      "type": "Type",
+      "configure": "Configure",
+      "confirm": "Confirm"
+    },
+    "step1": {
+      "question": "Do you already have a workspace, or would you like to create a new one?",
+      "existing": {
+        "title": "Existing Workspace",
+        "description": "I already have a workspace on my server and just need to add it to the project list"
+      },
+      "new": {
+        "title": "New Workspace",
+        "description": "Create a new workspace, optionally clone from a GitHub repository"
+      }
+    },
+    "step2": {
+      "existingPath": "Workspace Path",
+      "newPath": "Workspace Path",
+      "existingPlaceholder": "/path/to/existing/workspace",
+      "newPlaceholder": "/path/to/new/workspace",
+      "existingHelp": "Full path to your existing workspace directory",
+      "newHelp": "Full path to your workspace directory",
+      "projectName": "Project Name",
+      "projectNamePlaceholder": "Enter project name",
+      "projectNameHelp": "A friendly name for your project.",
+      "githubUrl": "GitHub URL (Optional)",
+      "githubPlaceholder": "https://github.com/username/repository",
+      "githubHelp": "Optional: provide a GitHub URL to clone a repository",
+      "githubAuth": "GitHub Authentication (Optional)",
+      "githubAuthHelp": "Only required for private repositories. Public repos can be cloned without authentication.",
+      "loadingTokens": "Loading stored tokens...",
+      "storedToken": "Stored Token",
+      "newToken": "New Token",
+      "nonePublic": "None (Public)",
+      "selectToken": "Select Token",
+      "selectTokenPlaceholder": "-- Select a token --",
+      "tokenPlaceholder": "ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "tokenHelp": "This token will be used only for this operation",
+      "publicRepoInfo": "Public repositories don't require authentication. You can skip providing a token if cloning a public repo.",
+      "noTokensHelp": "No stored tokens available. You can add tokens in Settings → API Keys for easier reuse.",
+      "optionalTokenPublic": "GitHub Token (Optional for Public Repos)",
+      "tokenPublicPlaceholder": "ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx (leave empty for public repos)"
+    },
+    "step3": {
+      "reviewConfig": "Review Your Configuration",
+      "workspaceType": "Workspace Type:",
+      "existingWorkspace": "Existing Workspace",
+      "newWorkspace": "New Workspace",
+      "path": "Path:",
+      "cloneFrom": "Clone From:",
+      "authentication": "Authentication:",
+      "usingStoredToken": "Using stored token:",
+      "usingProvidedToken": "Using provided token",
+      "noAuthentication": "No authentication",
+      "sshKey": "SSH Key",
+      "existingInfo": "The workspace will be added to your project list and will be available for research sessions.",
+      "newWithClone": "The repository will be cloned from this folder.",
+      "newEmpty": "The workspace will be added to your project list and will be available for research sessions.",
+      "cloningRepository": "Cloning repository..."
+    },
+    "buttons": {
+      "cancel": "Cancel",
+      "back": "Back",
+      "next": "Next",
+      "createProject": "Create Project",
+      "creating": "Creating...",
+      "cloning": "Cloning..."
+    },
+    "folderBrowser": {
+      "regenerateName": "Generate new name"
+    },
+    "errors": {
+      "selectType": "Please select whether you have an existing workspace or want to create a new one",
+      "providePath": "Please provide a workspace path",
+      "failedToCreate": "Failed to create workspace",
+      "failedToCreateFolder": "Failed to create folder"
+    }
+  },
+  "versionUpdate": {
+    "title": "Update Available",
+    "newVersionReady": "A new version is ready",
+    "currentVersion": "Current Version",
+    "latestVersion": "Latest Version",
+    "whatsNew": "What's New:",
+    "viewFullRelease": "View full release",
+    "updateProgress": "Update Progress:",
+    "manualUpgrade": "Manual upgrade:",
+    "npmUpgradeCommand": "npm install -g dr-claw@latest",
+    "manualUpgradeHint": "Or click \"Update Now\" to run the update automatically.",
+    "updateCompleted": "Update completed successfully!",
+    "restartServer": "Please restart the server to apply changes.",
+    "updateFailed": "Update failed",
+    "buttons": {
+      "close": "Close",
+      "later": "Remind Me Later",
+      "copyCommand": "Copy Command",
+      "updateNow": "Update Now",
+      "updating": "Updating..."
+    },
+    "ariaLabels": {
+      "closeModal": "Close version upgrade modal",
+      "showSidebar": "Show sidebar",
+      "settings": "Settings",
+      "updateAvailable": "Update available",
+      "closeSidebar": "Close sidebar"
+    }
+  }
+}

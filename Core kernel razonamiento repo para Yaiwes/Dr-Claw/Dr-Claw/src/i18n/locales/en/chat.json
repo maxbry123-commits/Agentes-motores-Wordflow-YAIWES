@@ -1,0 +1,595 @@
+{
+  "status": {
+    "thinking": "Thinking...",
+    "runningCode": "Running code"
+  },
+  "codeBlock": {
+    "copy": "Copy",
+    "copied": "Copied",
+    "copyCode": "Copy code"
+  },
+  "messageTypes": {
+    "user": "U",
+    "error": "Error",
+    "tool": "Tool",
+    "claude": "Claude",
+    "cursor": "Cursor",
+    "codex": "Codex",
+    "gemini": "Gemini"
+  },
+  "error": {
+    "retry": "Retry",
+    "usageLimitHint": "You can retry when your usage limit resets"
+  },
+  "messageActions": {
+    "copy": "Copy",
+    "resend": "Resend",
+    "edit": "Edit",
+    "editedVersion": "Edited message",
+    "superseded": "Superseded by later edit",
+    "attachmentsUnsupported": "Resend and edit are unavailable for messages with attachments right now.",
+    "confirmReplaceDraft": "Replace your current unsent draft with this message?"
+  },
+  "tools": {
+    "settings": "Tool Settings",
+    "error": "Tool Error",
+    "result": "Tool Result",
+    "viewParams": "View input parameters",
+    "viewRawParams": "View raw parameters",
+    "viewDiff": "View edit diff for",
+    "creatingFile": "Creating new file:",
+    "updatingTodo": "Updating Todo List",
+    "read": "Read",
+    "readFile": "Read file",
+    "updateTodo": "Update todo list",
+    "readTodo": "Read todo list",
+    "searchResults": "results"
+  },
+  "search": {
+    "found": "Found {{count}} {{type}}",
+    "file": "file",
+    "files": "files",
+    "pattern": "pattern:",
+    "in": "in:"
+  },
+  "fileOperations": {
+    "updated": "File updated successfully",
+    "created": "File created successfully",
+    "written": "File written successfully",
+    "diff": "Diff",
+    "newFile": "New File",
+    "viewContent": "View file content",
+    "viewFullOutput": "View full output ({{count}} chars)",
+    "contentDisplayed": "The file content is displayed in the diff view above"
+  },
+  "interactive": {
+    "title": "Interactive Prompt",
+    "waiting": "Waiting for your response in the CLI",
+    "instruction": "Please select an option in your terminal where Claude is running.",
+    "selectedOption": "✓ Claude selected option {{number}}",
+    "instructionDetail": "In the CLI, you would select this option interactively using arrow keys or by typing the number."
+  },
+  "thinking": {
+    "title": "Thinking...",
+    "emoji": "💭 Thinking..."
+  },
+  "agentTurn": {
+    "thought": "Thought",
+    "usedTools": "Used {{count}} tools",
+    "steps": "Agent steps",
+    "streaming": "Streaming..."
+  },
+  "skill": {
+    "contentLoaded": "Skill Content Loaded"
+  },
+  "json": {
+    "response": "JSON Response"
+  },
+  "permissions": {
+    "grant": "Grant permission for {{tool}}",
+    "added": "Permission added",
+    "addTo": "Adds {{entry}} to Allowed Tools.",
+    "retry": "Permission saved. Retry the request to use the tool.",
+    "error": "Unable to update permissions. Please try again.",
+    "openSettings": "Open settings"
+  },
+  "todo": {
+    "updated": "Todo list has been updated successfully",
+    "current": "Current Todo List"
+  },
+  "plan": {
+    "viewPlan": "📋 View implementation plan",
+    "title": "Implementation Plan"
+  },
+  "usageLimit": {
+    "resetAt": "Claude usage limit reached. Your limit will reset at **{{time}} {{timezone}}** - {{date}}"
+  },
+  "tokenUsage": {
+    "unavailable": "Ctx N/A",
+    "unavailableTitle": "Current context usage is unavailable for this session."
+  },
+  "codex": {
+    "permissionMode": "Permission Mode",
+    "modes": {
+      "default": "Default Mode",
+      "acceptEdits": "Accept Edits",
+      "bypassPermissions": "Bypass Permissions",
+      "plan": "Plan Mode"
+    },
+    "descriptions": {
+      "default": "Only trusted commands (ls, cat, grep, git status, etc.) run automatically. Other commands are skipped. Can write to workspace.",
+      "acceptEdits": "All commands run automatically within the workspace. Full auto mode with sandboxed execution.",
+      "bypassPermissions": "Full system access with no restrictions. All commands run automatically with full disk and network access. Use with caution.",
+      "plan": "Planning mode - no commands are executed"
+    },
+    "technicalDetails": "Technical details"
+  },
+  "input": {
+    "placeholder": "Describe your research goal, ask a question, or start a workflow...",
+    "placeholderDefault": "Type your message...",
+    "disabled": "Input disabled",
+    "attachFiles": "Attach files",
+    "attachReferences": "Attach references",
+    "attachImages": "Attach images",
+    "dropFilesHere": "Drop files here",
+    "attachmentOnlyFallback": "Please inspect the attached files and help me with them.",
+    "send": "Send",
+    "stop": "Stop",
+    "hintText": {
+      "ctrlEnter": "Ctrl+Enter to send • Shift+Enter for new line • Tab to change modes • / for slash commands",
+      "enter": "Enter to send • Shift+Enter for new line • Tab to change modes • / for slash commands"
+    },
+    "clickToChangeMode": "Click to change permission mode (or press Tab in input)",
+    "showAllCommands": "Show all commands",
+    "clearInput": "Clear input",
+    "scrollToBottom": "Scroll to bottom"
+  },
+  "thinkingMode": {
+    "selector": {
+      "title": "Thinking Mode",
+      "description": "Extended thinking gives Claude more time to evaluate alternatives",
+      "active": "Active",
+      "tip": "Higher thinking modes take more time but provide more thorough analysis"
+    },
+    "modes": {
+      "none": {
+        "name": "Standard",
+        "description": "Regular Claude response",
+        "prefix": ""
+      },
+      "think": {
+        "name": "Think",
+        "description": "Basic extended thinking",
+        "prefix": "think"
+      },
+      "thinkHard": {
+        "name": "Think Hard",
+        "description": "More thorough evaluation",
+        "prefix": "think hard"
+      },
+      "thinkHarder": {
+        "name": "Think Harder",
+        "description": "Deep analysis with alternatives",
+        "prefix": "think harder"
+      },
+      "ultrathink": {
+        "name": "Ultrathink",
+        "description": "Maximum thinking budget",
+        "prefix": "ultrathink"
+      }
+    },
+    "buttonTitle": "Thinking mode: {{mode}}"
+  },
+  "codexReasoningEffort": {
+    "selector": {
+      "title": "Reasoning Effort",
+      "description": "Control how much deliberate reasoning Codex uses before responding",
+      "active": "Active",
+      "tip": "Higher reasoning effort usually improves hard-task quality, but increases latency"
+    },
+    "levels": {
+      "default": {
+        "name": "Default",
+        "description": "Use the model default reasoning effort"
+      },
+      "minimal": {
+        "name": "Minimal",
+        "description": "Fastest response with minimal deliberate reasoning"
+      },
+      "none": {
+        "name": "None",
+        "description": "No additional reasoning effort"
+      },
+      "low": {
+        "name": "Low",
+        "description": "Light reasoning with lower latency"
+      },
+      "medium": {
+        "name": "Medium",
+        "description": "Balanced depth and latency"
+      },
+      "high": {
+        "name": "High",
+        "description": "More deliberate reasoning for harder tasks"
+      },
+      "xhigh": {
+        "name": "Extra High",
+        "description": "Very high reasoning effort for complex tasks"
+      },
+      "max": {
+        "name": "Max",
+        "description": "Maximum reasoning effort"
+      }
+    },
+    "buttonTitle": "Reasoning effort: {{level}}"
+  },
+  "geminiThinking": {
+    "selector": {
+      "title": "Thinking Strength",
+      "descriptionGemini3": "Gemini 3 models use official thinking levels",
+      "descriptionGemini25": "Gemini 2.5 models use fixed thinking-budget presets",
+      "active": "Active",
+      "tipGemini3": "Gemini 3 uses official thinking levels. Higher levels usually improve reasoning depth but increase latency.",
+      "tipGemini25": "Gemini 2.5 uses token budgets. Higher budgets allow more reasoning tokens before the final answer."
+    },
+    "modes": {
+      "default": {
+        "name": "Default",
+        "description": "Use Gemini CLI default behavior for this model"
+      },
+      "minimal": {
+        "name": "Minimal",
+        "description": "Lowest official thinking level"
+      },
+      "low": {
+        "name": "Low",
+        "description": "Lower latency with light reasoning"
+      },
+      "medium": {
+        "name": "Medium",
+        "description": "Balanced reasoning depth and latency"
+      },
+      "high": {
+        "name": "High",
+        "description": "Maximum official thinking level"
+      },
+      "dynamic": {
+        "name": "Dynamic",
+        "description": "Let the model adjust its thinking budget dynamically"
+      },
+      "off": {
+        "name": "Off",
+        "description": "Disable thinking"
+      },
+      "light": {
+        "name": "Light",
+        "description": "Use a small fixed thinking budget ({{budget}} tokens)"
+      },
+      "balanced": {
+        "name": "Balanced",
+        "description": "Use a medium thinking budget ({{budget}} tokens)"
+      },
+      "deep": {
+        "name": "Deep",
+        "description": "Use a large thinking budget ({{budget}} tokens)"
+      },
+      "max": {
+        "name": "Max",
+        "description": "Use the maximum supported thinking budget ({{budget}} tokens)"
+      }
+    },
+    "buttonTitle": "Thinking strength: {{mode}}"
+  },
+  "providerSelection": {
+    "title": "Choose Your AI Assistant",
+    "description": "Select a provider to start a new conversation",
+    "selectModel": "Select Model",
+    "notInstalled": "Not installed",
+    "installRequired": "{{provider}} CLI is not installed",
+    "unavailableHint": "Some CLI backends are unavailable on this machine. Install the missing tools in Settings before using them.",
+    "providerInfo": {
+      "anthropic": "by Anthropic",
+      "openai": "by OpenAI",
+      "google": "by Google",
+      "cursorEditor": "AI Code Editor",
+      "openrouter": "Any Model via API",
+      "local": "Run on Your GPU",
+      "nano": "Python harness (stream-json)"
+    },
+    "readyPrompt": {
+      "claude": "Ready to use Claude with {{model}}. Start typing your message below.",
+      "cursor": "Ready to use Cursor with {{model}}. Start typing your message below.",
+      "gemini": "Ready to use Gemini with {{model}}. Start typing your message below.",
+      "codex": "Ready to use Codex with {{model}}. Start typing your message below.",
+      "openrouter": "Ready to use OpenRouter with {{model}}. Start typing your message below.",
+      "local": "Ready to use Local GPU with {{model}}. Start typing your message below.",
+      "nano": "Ready to use Nano Claude Code with {{model}}. Start typing your message below.",
+      "default": "Select a provider above to begin"
+    }
+  },
+  "localModels": {
+    "loading": "Loading models...",
+    "notRunning": "Ollama offline",
+    "loadFailed": "Model load failed",
+    "networkError": "Model server unreachable",
+    "empty": "No models"
+  },
+  "session": {
+    "mode": {
+      "title": "Choose Session Type",
+      "badge_one": "{{count}} mode",
+      "badge_other": "{{count}} modes",
+      "subtitle": "Decide whether this session should drive research planning or stay focused on workspace questions.",
+      "research": "Research",
+      "workspaceQa": "Files Q&A",
+      "researchTitle": "Research Session",
+      "researchDescription": "Use the project research workflow, onboarding prompts, and pipeline guidance.",
+      "workspaceQaTitle": "Workspace Q&A",
+      "workspaceQaDescription": "Ask about files, modules, and implementation details without triggering the research workflow.",
+      "workspaceQaGreeting": "Ask about any file, module, or implementation detail in this workspace. I will stay focused on code and project structure unless you explicitly ask to start research planning.",
+      "workspaceQaHint": "This session stays focused on repository questions unless you explicitly ask to start research planning.",
+      "workspaceQaPlaceholder": "Ask about any file, module, or implementation detail..."
+    },
+    "continue": {
+      "title": "Continue your conversation",
+      "description": "Ask questions about your code, request changes, or get help with development tasks"
+    },
+    "loading": {
+      "olderMessages": "Loading older messages...",
+      "sessionMessages": "Loading session messages..."
+    },
+    "messages": {
+      "showingOf": "Showing {{shown}} of {{total}} messages",
+      "scrollToLoad": "Scroll up to load more",
+      "showingLast": "Showing last {{count}} messages ({{total}} total)",
+      "loadEarlier": "Load earlier messages",
+      "loadAll": "Load all messages",
+      "loadingAll": "Loading all messages...",
+      "allLoaded": "All messages loaded",
+      "perfWarning": "All messages loaded — scrolling may be slower. Click \"Scroll to bottom\" to restore performance."
+    }
+  },
+  "sessionContext": {
+    "title": "Session Context",
+    "description": "Files, tasks, and outputs actually observed in this session trace.",
+    "codexNotice": "Codex visibility is partial and depends on the tool events currently exposed by the runtime.",
+    "traceError": "Failed to load the full session trace. Showing live in-memory messages only.",
+    "fileTreeError": "Failed to load project files.",
+    "stats": {
+      "mode": "Mode",
+      "provider": "Provider",
+      "contextFiles": "Context Files",
+      "unreadOutputs": "Unread Outputs"
+    },
+    "sections": {
+      "injectedContext": "Referenced Context",
+      "skillsSubheader": "Skills",
+      "taskContext": "Task Context",
+      "reviewQueue": "Review Queue",
+      "fileReview": "File Review"
+    },
+    "actions": {
+      "collapse": "Collapse context sidebar",
+      "expand": "Expand context sidebar",
+      "resize": "Drag to resize"
+    },
+    "filters": {
+      "all": "All",
+      "unread": "Unread",
+      "reviewed": "Reviewed"
+    },
+    "kinds": {
+      "task": "task",
+      "todo": "todo",
+      "skill": "skill",
+      "directory": "directory"
+    },
+    "empty": {
+      "injectedContext": "No file or directory context has been observed yet.",
+      "taskContext": "No task or todo context captured yet.",
+      "reviewQueue": "No generated files found for this session yet.",
+      "files": "No files found"
+    },
+    "sidebarTabs": {
+      "context": "Context",
+      "research": "Research",
+      "files": "Files",
+      "shell": "Shell",
+      "git": "Code History"
+    },
+    "showLess": "Show less",
+    "preview": {
+      "titleFallback": "Preview",
+      "selectFile": "Select a file to preview",
+      "open": "Open",
+      "loading": "Loading preview...",
+      "loadError": "Failed to load preview. {{error}}",
+      "selectToReview": "Select a file to review",
+      "unreadHint": "Outputs stay unread until you open them from the review queue.",
+      "closePreview": "Close preview",
+      "openInEditor": "Open in Editor"
+    }
+  },
+  "shell": {
+    "selectProject": {
+      "title": "Select a Project",
+      "description": "Choose a project to open an interactive shell in that directory"
+    },
+    "status": {
+      "newSession": "New Session",
+      "initializing": "Initializing...",
+      "restarting": "Restarting..."
+    },
+    "actions": {
+      "disconnect": "Disconnect",
+      "disconnectTitle": "Disconnect from shell",
+      "restart": "Restart",
+      "restartTitle": "Restart Shell (disconnect first)",
+      "connect": "Continue in Shell",
+      "connectTitle": "Connect to shell"
+    },
+    "loading": "Loading terminal...",
+    "connecting": "Connecting to shell...",
+    "startSession": "Start a new Claude session",
+    "resumeSession": "Resume session: {{displayName}}...",
+    "runCommand": "Run {{command}} in {{projectName}}",
+    "openTerminal": "Open terminal in {{projectName}}",
+    "startCli": "Starting Claude CLI in {{projectName}}",
+    "historyEdit": {
+      "action": "Edit message history",
+      "promptTitle": "Continue history edits in Shell",
+      "promptDescription": "Web Chat does not rewrite message history directly. To use the model's native edit, rewind, or retry flow, continue in Shell.",
+      "cancel": "Cancel",
+      "confirm": "Open Shell",
+      "bannerTitle": "This session is now open in Shell",
+      "bannerDescription": "Use the model's native history edit, rewind, or retry flow here. Web Chat only displays the conversation and does not rewrite history directly."
+    },
+    "workspace": {
+      "currentSession": "Current Session",
+      "newShell": "New shell",
+      "tabTitle": "Shell {{index}}",
+      "closeShell": "Close {{title}}"
+    }
+  },
+  "projectSelection": {
+    "startChatWithProvider": "Select a project to start chatting with {{provider}}"
+  },
+  "tasks": {
+    "nextTaskPrompt": "Start the next task",
+    "compact": {
+      "progress": "{{done}}/{{total}} done · {{pending}} pending",
+      "useInChat": "Use in Chat",
+      "allTasks": "All Tasks",
+      "allDone": "All tasks completed",
+      "done": "Done",
+      "inProgress": "In Progress",
+      "pending": "Pending",
+      "expand": "Expand task progress",
+      "collapse": "Collapse task progress",
+      "noTasks": "No tasks yet. Start by chatting with the Agent.",
+      "emptyTitle": "Task progress unavailable",
+      "emptyHint": "Talk to the Agent to generate and configure a research pipeline."
+    },
+    "loading": "Loading tasks..."
+  },
+  "skillShortcuts": {
+    "title": "Skill Shortcuts",
+    "useAll": "Use All",
+    "categories": {
+      "pipeline": "Pipeline Planning",
+      "deepResearch": "Deep Research",
+      "ideation": "Research Ideation",
+      "experiment": "Experiment Dev",
+      "paperWriting": "Paper Writing",
+      "paperReview": "Paper Review",
+      "grantWriting": "Grant Writing",
+      "promotion": "Promotion"
+    },
+    "promptSingle": "Please use the {{skill}} skill to help me with this task.\n\nDescribe your task here:",
+    "promptMulti": "Please use the following skills for this task: {{skills}}.\n\nDescribe your research task here:"
+  },
+  "guidedStarter": {
+    "greeting": "Hi {{username}}",
+    "title": "What should we do next?",
+    "description": "Choose a direction to fill the prompt quickly.",
+    "refresh": "Randomize",
+    "recommendedSkills": "Recommended skills for this option",
+    "loadingSkills": "Checking available skills...",
+    "noAvailableSkills": "No matched installed skills for this option yet.",
+    "noAvailableSkillsFallback": "No installed match found, showing the default recommended skills for this option.",
+    "useAllSkills": "Use all skills",
+    "template": {
+      "intro": "Please help me with \"{{scenario}}\" and use these skills when needed: {{skills}}.",
+      "background": "Research background:",
+      "goal": "Goal and expected outcome:",
+      "inputs": "Current data/code/resources:",
+      "constraints": "Constraints (time/compute/venue/etc.):",
+      "output": "Please provide a step-by-step plan and start with the first actionable task."
+    },
+    "scenarios": {
+      "startFullProject": {
+        "title": "Start a project",
+        "description": "Set up the full research project, define the pipeline, and turn the idea into an actionable plan."
+      },
+      "paperReproduction": {
+        "title": "Reproduce a paper",
+        "description": "Read the paper, identify key implementation details, and build a reproducibility plan."
+      },
+      "literatureSurvey": {
+        "title": "Literature survey",
+        "description": "Collect recent papers, summarize trends, and map open research gaps."
+      },
+      "researchIdea": {
+        "title": "Refine an idea",
+        "description": "Turn a rough direction into clear hypotheses, novelty, and evaluation criteria."
+      },
+      "experimentPlan": {
+        "title": "Plan an experiment",
+        "description": "Design baselines, metrics, ablations, and risk controls before implementation."
+      },
+      "paperWriting": {
+        "title": "Draft a paper",
+        "description": "Structure sections, sharpen claims, and align writing with target venue expectations."
+      },
+      "manuscriptReview": {
+        "title": "Review a draft",
+        "description": "Run a reviewer-style check for methods, evidence, references, and writing quality."
+      },
+      "rebuttalResponse": {
+        "title": "Write a rebuttal",
+        "description": "Respond to reviewer comments with venue-aware strategies, safety gates, and issue tracking."
+      },
+      "grantProposal": {
+        "title": "Grant proposal",
+        "description": "Plan, draft, revise, or resubmit a faculty funding proposal for NSF, NIH, DOE, DARPA, NASA, or NSFC."
+      },
+      "presentationPromotion": {
+        "title": "Presentation materials",
+        "description": "Turn the paper into slides, narration scripts, TTS audio, and a demo video."
+      },
+      "arisFullPipeline": {
+        "title": "Full Auto Research",
+        "description": "End-to-end: idea discovery → experiments → cross-model review → paper writing."
+      },
+      "arisIdeaDiscovery": {
+        "title": "Auto Idea Discovery",
+        "description": "Literature survey → idea generation → novelty check → cross-model review."
+      },
+      "arisAutoReview": {
+        "title": "Auto Review Loop",
+        "description": "Multi-round cross-model adversarial review with GPT/Gemini."
+      },
+      "arisPaperWriting": {
+        "title": "Auto Paper Writing",
+        "description": "Plan → figures → LaTeX → compile → cross-model improvement loop."
+      },
+      "autoresearchLoop": {
+        "title": "Autoresearch Loop",
+        "description": "Autonomous iteration: modify → verify → keep/discard → repeat."
+      }
+    },
+    "autoResearchTitle": "Auto Research"
+  },
+  "attachedPrompt": {
+    "showPrompt": "Show prompt",
+    "hidePrompt": "Hide prompt",
+    "remove": "Remove"
+  },
+  "pipelineOnboarding": {
+    "noBrief": {
+      "title": "Set Up Your Research Pipeline",
+      "description": "Describe your research idea below and the agent will interactively build your pipeline, generating a research brief and task list.",
+      "stepsLabel": "What to include",
+      "step1": "Your research topic and high-level goal",
+      "step2": "Scope, boundaries, and target venue (if any)",
+      "step3": "Preferred methods and evaluation approach",
+      "buttonLabel": "Use in Chat"
+    },
+    "noTasks": {
+      "title": "Generate Tasks from Your Brief",
+      "description": "A research brief exists but no tasks have been generated yet. Let the agent read your brief and create a task list.",
+      "briefExists": "research_brief.json detected",
+      "buttonLabel": "Use in Chat"
+    }
+  }
+}

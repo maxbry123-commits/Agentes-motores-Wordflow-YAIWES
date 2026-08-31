@@ -1,0 +1,3314 @@
+#!/usr/bin/env node
+// Load environment variables before other imports execute
+import './load-env.js';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { dirname } from 'path';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+const installMode = fs.existsSync(path.join(__dirname, '..', '.git')) ? 'git' : 'npm';
+const npmPackageName = process.env.NPM_PACKAGE_NAME || 'dr-claw';
+
+// ANSI color codes for terminal output
+const colors = {
+    reset: '\x1b[0m',
+    bright: '\x1b[1m',
+    cyan: '\x1b[36m',
+    green: '\x1b[32m',
+    yellow: '\x1b[33m',
+    blue: '\x1b[34m',
+    dim: '\x1b[2m',
+};
+
+const c = {
+    info: (text) => `${colors.cyan}${text}${colors.reset}`,
+    ok: (text) => `${colors.green}${text}${colors.reset}`,
+    warn: (text) => `${colors.yellow}${text}${colors.reset}`,
+    tip: (text) => `${colors.blue}${text}${colors.reset}`,
+    bright: (text) => `${colors.bright}${text}${colors.reset}`,
+    dim: (text) => `${colors.dim}${text}${colors.reset}`,
+};
+
+import express from 'express';
+import { WebSocketServer, WebSocket } from 'ws';
+import os from 'os';
+import http from 'http';
+import cors from 'cors';
+import { promises as fsPromises } from 'fs';
+import { spawn } from 'child_process';
+import pty from 'node-pty';
+import fetch from 'node-fetch';
+import mime from 'mime-types';
+
+import { getProjects, getTrashedProjects, getSessions, getSessionMessages, renameProject, renameSession, deleteSession, deleteProject, restoreProject, deleteTrashedProject, addProjectManually, extractProjectDirectory, resolveClaudeProjectDirs, clearProjectDirectoryCache, projectsEvents } from './projects.js';
+import { getProjectTokenUsageSummary } from './project-token-usage.js';
+import { queryClaudeSDK, abortClaudeSDKSession, isClaudeSDKSessionActive, getClaudeSDKSessionStartTime, getActiveClaudeSDKSessions, resolveToolApproval } from './claude-sdk.js';
+import { spawnCursor, abortCursorSession, isCursorSessionActive, getCursorSessionStartTime, getActiveCursorSessions } from './cursor-cli.js';
+import { queryCodex, abortCodexSession, isCodexSessionActive, getCodexSessionStartTime, getActiveCodexSessions } from './openai-codex.js';
+import { spawnGemini, abortGeminiSession, isGeminiSessionActive, getGeminiSessionStartTime, getActiveGeminiSessions } from './gemini-cli.js';
+import { queryOpenRouter, abortOpenRouterSession, isOpenRouterSessionActive, getOpenRouterSessionStartTime, getActiveOpenRouterSessions } from './openrouter.js';
+import { queryLocalGPU, abortLocalGPUSession, isLocalGPUSessionActive, getLocalGPUSessionStartTime, getActiveLocalGPUSessions } from './local-gpu.js';
+import { spawnNanoClaudeCode, abortNanoClaudeCodeSession, isNanoClaudeCodeSessionActive, getNanoClaudeCodeSessionStartTime, getActiveNanoClaudeCodeSessions } from './nano-claude-code.js';
+import gitRoutes from './routes/git.js';
+import authRoutes from './routes/auth.js';
+import mcpRoutes from './routes/mcp.js';
+import cursorRoutes from './routes/cursor.js';
+import taskmasterRoutes from './routes/taskmaster.js';
+import mcpUtilsRoutes from './routes/mcp-utils.js';
+import commandsRoutes from './routes/commands.js';
+import claudeBtwRoutes from './routes/claude-btw.js';
+import btwRoutes from './routes/btw.js';
+import settingsRoutes from './routes/settings.js';
+import agentRoutes from './routes/agent.js';
+import projectsRoutes, { WORKSPACES_ROOT, getWorkspacesRoot, validateWorkspacePath } from './routes/projects.js';
+import cliAuthRoutes from './routes/cli-auth.js';
+import userRoutes from './routes/user.js';
+import codexRoutes from './routes/codex.js';
+import skillsRoutes from './routes/skills.js';
+import telemetryRoutes from './routes/telemetry.js';
+import computeRoutes from './routes/compute.js';
+import newsRoutes from './routes/news.js';
+import autoResearchRoutes from './routes/auto-research.js';
+import referencesRoutes from './routes/references.js';
+import quickQaRoutes from './routes/quick-qa.js';
+import { initializeDatabase, sessionDb, tagDb } from './database/db.js';
+import { validateApiKey, authenticateToken, authenticateWebSocket } from './middleware/auth.js';
+import { IS_PLATFORM } from './constants/config.js';
+import { enqueueTelemetryEvent } from './telemetry.js';
+import { resolveCursorCliCommand, isCursorLoginCommand, isGeminiLoginCommand, normalizeCursorLoginCommand } from './utils/cursorCommand.js';
+import { buildCodexCliEnv, codexCommandForShell } from './utils/codexCli.js';
+import { resolveCodexHome } from './utils/codexHome.js';
+import { getGeminiApiKeyForUser, withGeminiApiKeyEnv } from './utils/geminiApiKey.js';
+import {
+    DEFAULT_BACKEND_PORT,
+    DEFAULT_FRONTEND_PORT,
+    getFrontendPortSync,
+    listenOnAvailablePort,
+    parsePortNumber,
+    setRuntimePortSync,
+} from './utils/runtimePorts.js';
+import { buildCodexTokenUsageFromJsonl } from './utils/sessionTokenUsage.js';
+import { getNanoDrClawSessionsRoot } from './nanoSessionPaths.js';
+
+// File system watchers for provider project/session folders
+const PROVIDER_WATCH_PATHS = [
+    { provider: 'claude', rootPath: path.join(os.homedir(), '.claude', 'projects') },
+    { provider: 'cursor', rootPath: path.join(os.homedir(), '.cursor', 'chats') },
+    { provider: 'codex', rootPath: path.join(resolveCodexHome(), 'sessions') },
+    { provider: 'gemini', rootPath: path.join(os.homedir(), '.gemini', 'sessions') },
+    { provider: 'nano', rootPath: getNanoDrClawSessionsRoot() },
+];
+const WATCHER_IGNORED_PATTERNS = [
+    '**/node_modules/**',
+    '**/.git/**',
+    '**/dist/**',
+    '**/build/**',
+    '**/*.tmp',
+    '**/*.swp',
+    '**/.DS_Store'
+];
+const WATCHER_DEBOUNCE_MS = 1000;
+let projectsWatchers = [];
+let projectsWatcherDebounceTimer = null;
+const connectedClients = new Set();
+let isGetProjectsRunning = false; // Flag to prevent reentrant calls
+let hasPendingProjectsUpdate = false;
+let lastWatcherEvent = null;
+let lastProjectsUpdateSignature = '';
+// Assigned by setupProjectsWatcher(); lets background discovery passes reuse the
+// same debounced broadcast instead of pushing their own project snapshots.
+let scheduleProjectsBroadcast = null;
+
+function shouldProcessProjectsWatcherEvent(eventType, filePath, provider) {
+    // 'discovery' is synthetic: emitted by background project discovery rather
+    // than by chokidar, so there is no file path to filter on.
+    if (eventType === 'addDir' || eventType === 'unlinkDir' || eventType === 'discovery') {
+        return true;
+    }
+
+    const normalized = String(filePath || '').toLowerCase();
+    if (provider === 'claude' || provider === 'codex' || provider === 'gemini') {
+        return normalized.endsWith('.jsonl');
+    }
+
+    if (provider === 'cursor') {
+        return (
+            normalized.endsWith('.db') ||
+            normalized.endsWith('.db-wal') ||
+            normalized.endsWith('.db-shm') ||
+            normalized.endsWith('.sqlite') ||
+            normalized.endsWith('.json')
+        );
+    }
+
+    if (provider === 'nano') {
+        const base = path.basename(String(filePath || '').replace(/\\/g, '/')).toLowerCase();
+        return base.endsWith('.json') && base.startsWith('drclaw-nano-');
+    }
+
+    return true;
+}
+
+// Broadcast progress to all connected WebSocket clients
+function broadcastProgress(progress) {
+    const message = JSON.stringify({
+        type: 'loading_progress',
+        ...progress
+    });
+    connectedClients.forEach(client => {
+        if (client.readyState === WebSocket.OPEN) {
+            client.send(message);
+        }
+    });
+}
+
+// Setup file system watchers for Claude, Cursor, and Codex project/session folders
+async function setupProjectsWatcher() {
+    const chokidar = (await import('chokidar')).default;
+
+    if (projectsWatcherDebounceTimer) {
+        clearTimeout(projectsWatcherDebounceTimer);
+        projectsWatcherDebounceTimer = null;
+    }
+
+    await Promise.all(
+        projectsWatchers.map(async (watcher) => {
+            try {
+                await watcher.close();
+            } catch (error) {
+                console.error('[WARN] Failed to close watcher:', error);
+            }
+        })
+    );
+    projectsWatchers = [];
+
+    const debouncedUpdate = (eventType, filePath, provider, rootPath) => {
+        if (!shouldProcessProjectsWatcherEvent(eventType, filePath, provider)) {
+            return;
+        }
+
+        lastWatcherEvent = { eventType, filePath, provider, rootPath };
+
+        if (projectsWatcherDebounceTimer) {
+            clearTimeout(projectsWatcherDebounceTimer);
+        }
+
+        projectsWatcherDebounceTimer = setTimeout(async () => {
+            // Prevent reentrant calls
+            if (isGetProjectsRunning) {
+                hasPendingProjectsUpdate = true;
+                return;
+            }
+
+            try {
+                isGetProjectsRunning = true;
+                hasPendingProjectsUpdate = false;
+
+                // Clear project directory cache when files change
+                clearProjectDirectoryCache();
+
+                // Get updated projects list
+                const updatedProjects = await getProjects();
+
+                // Serialize once and reuse it as the change signature. The
+                // project list can be megabytes, so stringifying it twice per
+                // watcher event was pure GC pressure on the main thread.
+                const projectsJson = JSON.stringify(updatedProjects);
+
+                // Skip broadcasting identical snapshots
+                if (projectsJson === lastProjectsUpdateSignature) {
+                    return;
+                }
+                lastProjectsUpdateSignature = projectsJson;
+
+                // Notify all connected clients about the project changes
+                const updateMessage = '{"type":"projects_updated","projects":' + projectsJson
+                    + ',"timestamp":' + JSON.stringify(new Date().toISOString())
+                    + ',"changeType":' + JSON.stringify(eventType ?? null)
+                    + ',"changedFile":' + JSON.stringify(rootPath && filePath ? path.relative(rootPath, filePath) : null)
+                    + ',"watchProvider":' + JSON.stringify(provider ?? null)
+                    + '}';
+
+                connectedClients.forEach(client => {
+                    if (client.readyState === WebSocket.OPEN) {
+                        client.send(updateMessage);
+                    }
+                });
+
+            } catch (error) {
+                console.error('[ERROR] Error handling project changes:', error);
+            } finally {
+                isGetProjectsRunning = false;
+                if (hasPendingProjectsUpdate && lastWatcherEvent) {
+                    hasPendingProjectsUpdate = false;
+                    const { eventType, filePath, provider, rootPath } = lastWatcherEvent;
+                    debouncedUpdate(eventType, filePath, provider, rootPath);
+                }
+            }
+        }, WATCHER_DEBOUNCE_MS);
+    };
+
+    scheduleProjectsBroadcast = debouncedUpdate;
+
+    for (const { provider, rootPath } of PROVIDER_WATCH_PATHS) {
+        try {
+            // chokidar v4 emits ENOENT via the "error" event for missing roots and will not auto-recover.
+            // Ensure provider folders exist before creating the watcher so watching stays active.
+            await fsPromises.mkdir(rootPath, { recursive: true });
+
+            // Initialize chokidar watcher with optimized settings
+            const watcher = chokidar.watch(rootPath, {
+                ignored: WATCHER_IGNORED_PATTERNS,
+                persistent: true,
+                ignoreInitial: true, // Don't fire events for existing files on startup
+                followSymlinks: false,
+                depth: 10, // Reasonable depth limit
+                awaitWriteFinish: {
+                    stabilityThreshold: 100, // Wait 100ms for file to stabilize
+                    pollInterval: 50
+                }
+            });
+
+            // Set up event listeners
+            watcher
+                .on('add', (filePath) => debouncedUpdate('add', filePath, provider, rootPath))
+                .on('change', (filePath) => debouncedUpdate('change', filePath, provider, rootPath))
+                .on('unlink', (filePath) => debouncedUpdate('unlink', filePath, provider, rootPath))
+                .on('addDir', (dirPath) => debouncedUpdate('addDir', dirPath, provider, rootPath))
+                .on('unlinkDir', (dirPath) => debouncedUpdate('unlinkDir', dirPath, provider, rootPath))
+                .on('error', (error) => {
+                    console.error(`[ERROR] ${provider} watcher error:`, error);
+                })
+                .on('ready', () => {
+                });
+
+            projectsWatchers.push(watcher);
+        } catch (error) {
+            console.error(`[ERROR] Failed to setup ${provider} watcher for ${rootPath}:`, error);
+        }
+    }
+
+    if (projectsWatchers.length === 0) {
+        console.error('[ERROR] Failed to setup any provider watchers');
+    }
+}
+
+
+const app = express();
+const server = http.createServer(app);
+
+const ptySessionsMap = new Map();
+const PTY_SESSION_TIMEOUT = 30 * 60 * 1000;
+const SHELL_URL_PARSE_BUFFER_LIMIT = 32768;
+const ANSI_ESCAPE_SEQUENCE_REGEX = /\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1B\\))/g;
+const TRAILING_URL_PUNCTUATION_REGEX = /[)\]}>.,;:!?]+$/;
+const REPLAY_TERMINAL_QUERY_REGEXES = [
+    /\x1B\[[>?0-9;]*c/g,
+    /\x1B\[[0-9;?]*n/g,
+    /\x1B\[\?[0-9;]*\$p/g,
+];
+const SHELL_EMBEDDED_ENV_KEYS_TO_REMOVE = [
+    'TERM_PROGRAM',
+    'TERM_PROGRAM_VERSION',
+    'ITERM_SESSION_ID',
+    'LC_TERMINAL',
+    'LC_TERMINAL_VERSION',
+    'WT_SESSION',
+];
+
+function safePtyKill(session, sessionKey) {
+    if (!session?.pty?.kill) return;
+    try {
+        session.pty.kill();
+    } catch (err) {
+        console.warn(`⚠️ Failed to kill PTY process (${sessionKey}):`, err);
+    }
+}
+
+function stripAnsiSequences(value = '') {
+    return value.replace(ANSI_ESCAPE_SEQUENCE_REGEX, '');
+}
+
+function stripReplayTerminalQueries(value = '') {
+    return REPLAY_TERMINAL_QUERY_REGEXES.reduce(
+        (currentValue, regex) => currentValue.replace(regex, ''),
+        value,
+    );
+}
+
+function buildEmbeddedShellEnv(baseEnv = process.env) {
+    const env = {
+        ...baseEnv,
+        TERM: 'xterm-256color',
+        COLORTERM: 'truecolor',
+        FORCE_COLOR: '3'
+    };
+
+    SHELL_EMBEDDED_ENV_KEYS_TO_REMOVE.forEach((key) => {
+        delete env[key];
+    });
+
+    Object.keys(env).forEach((key) => {
+        if (
+            key.startsWith('VSCODE_') ||
+            key.startsWith('FIG_') ||
+            key.startsWith('QTERM_')
+        ) {
+            delete env[key];
+        }
+    });
+
+    return env;
+}
+
+function normalizeDetectedUrl(url) {
+    if (!url || typeof url !== 'string') return null;
+
+    const cleaned = url.trim().replace(TRAILING_URL_PUNCTUATION_REGEX, '');
+    if (!cleaned) return null;
+
+    try {
+        const parsed = new URL(cleaned);
+        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+            return null;
+        }
+        return parsed.toString();
+    } catch {
+        return null;
+    }
+}
+
+function extractUrlsFromText(value = '') {
+    const directMatches = value.match(/https?:\/\/[^\s<>"'`\\\x1b\x07]+/gi) || [];
+
+    // Handle wrapped terminal URLs split across lines by terminal width.
+    const wrappedMatches = [];
+    const continuationRegex = /^[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+$/;
+    const lines = value.split(/\r?\n/);
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i].trim();
+        const startMatch = line.match(/https?:\/\/[^\s<>"'`\\\x1b\x07]+/i);
+        if (!startMatch) continue;
+
+        let combined = startMatch[0];
+        let j = i + 1;
+        while (j < lines.length) {
+            const continuation = lines[j].trim();
+            if (!continuation) break;
+            if (!continuationRegex.test(continuation)) break;
+            combined += continuation;
+            j++;
+        }
+
+        wrappedMatches.push(combined.replace(/\r?\n\s*/g, ''));
+    }
+
+    return Array.from(new Set([...directMatches, ...wrappedMatches]));
+}
+
+function shouldAutoOpenUrlFromOutput(value = '') {
+    const normalized = value.toLowerCase();
+    return (
+        normalized.includes('browser didn\'t open') ||
+        normalized.includes('open this url') ||
+        normalized.includes('continue in your browser') ||
+        normalized.includes('press enter to open') ||
+        normalized.includes('open_url:') ||
+        normalized.includes('paste code here')
+    );
+}
+
+// Single WebSocket server that handles both paths
+const wss = new WebSocketServer({
+    server,
+    verifyClient: (info) => {
+        const authHeader = info.req.headers.authorization || '';
+        const tokenFromHeader = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+        const requestUrl = new URL(info.req.url || '/', 'http://localhost');
+        const token = tokenFromHeader || requestUrl.searchParams.get('token');
+        const user = authenticateWebSocket(token);
+        if (!user) {
+            console.log('[WARN] WebSocket authentication failed');
+            return false;
+        }
+        info.req.user = user;
+        return true;
+    }
+});
+
+// Make WebSocket server available to routes
+app.locals.wss = wss;
+
+// Parse VITE_PORT early so CORS reflects the actual frontend port.
+const CORS_VITE_PORT = parsePortNumber(process.env.VITE_PORT, DEFAULT_FRONTEND_PORT);
+app.use(cors({
+  origin: process.env.DR_CLAW_CORS_ORIGINS
+    ? process.env.DR_CLAW_CORS_ORIGINS.split(',').map((o) => o.trim()).filter(Boolean)
+    : [`http://localhost:${getFrontendPortSync(CORS_VITE_PORT)}`, `http://127.0.0.1:${getFrontendPortSync(CORS_VITE_PORT)}`],
+  credentials: true,
+}));
+app.use(express.json({
+  limit: '50mb',
+  type: (req) => {
+    // Skip multipart/form-data requests (for file uploads like images)
+    const contentType = req.headers['content-type'] || '';
+    if (contentType.includes('multipart/form-data')) {
+      return false;
+    }
+    return contentType.includes('json');
+  }
+}));
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
+
+// Public health check endpoint (no authentication required)
+app.get('/health', (req, res) => {
+  const isDesktop = process.env.DR_CLAW_DESKTOP === '1';
+  const response = {
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+    installMode: isDesktop ? 'desktop' : installMode,
+  };
+
+  if (isDesktop) {
+    response.desktop = {
+      platform: process.platform,
+      arch: process.arch,
+    };
+  }
+
+  res.json(response);
+});
+
+// Optional API key validation (if configured)
+app.use('/api', validateApiKey);
+
+// Authentication routes (public)
+app.use('/api/auth', authRoutes);
+
+// Projects API Routes (protected)
+app.use('/api/projects', authenticateToken, projectsRoutes);
+
+// Git API Routes (protected)
+app.use('/api/git', authenticateToken, gitRoutes);
+
+// MCP API Routes (protected)
+app.use('/api/mcp', authenticateToken, mcpRoutes);
+
+// Cursor API Routes (protected)
+app.use('/api/cursor', authenticateToken, cursorRoutes);
+
+// TaskMaster API Routes (protected)
+app.use('/api/taskmaster', authenticateToken, taskmasterRoutes);
+
+// MCP utilities
+app.use('/api/mcp-utils', authenticateToken, mcpUtilsRoutes);
+
+// Commands API Routes (protected)
+app.use('/api/commands', authenticateToken, commandsRoutes);
+
+// Ephemeral side question (/btw) — unified multi-provider endpoint
+app.use('/api/btw', authenticateToken, btwRoutes);
+// Legacy Claude-only /btw endpoint (backward compat)
+app.use('/api/claude', authenticateToken, claudeBtwRoutes);
+
+// Settings API Routes (protected)
+app.use('/api/settings', authenticateToken, settingsRoutes);
+
+// CLI Authentication API Routes (protected)
+app.use('/api/cli', authenticateToken, cliAuthRoutes);
+
+// User API Routes (protected)
+app.use('/api/user', authenticateToken, userRoutes);
+
+// Codex API Routes (protected)
+app.use('/api/codex', authenticateToken, codexRoutes);
+
+// Skills API Routes (protected)
+app.use('/api/skills', authenticateToken, skillsRoutes);
+
+// Telemetry API Routes (protected)
+app.use('/api/telemetry', authenticateToken, telemetryRoutes);
+
+// Compute API Routes (protected)
+app.use('/api/compute', authenticateToken, computeRoutes);
+
+// News API Routes (protected)
+app.use('/api/news', authenticateToken, newsRoutes);
+
+// Auto Research API Routes (protected)
+app.use('/api/auto-research', authenticateToken, autoResearchRoutes);
+
+// References (literature library) API Routes (protected)
+app.use('/api/references', authenticateToken, referencesRoutes);
+
+app.use('/api/quick-qa', authenticateToken, quickQaRoutes);
+
+// Agent API Routes (uses API key authentication)
+app.use('/api/agent', agentRoutes);
+
+const expandWorkspacePath = async (inputPath) => {
+    if (!inputPath) return inputPath;
+    if (inputPath === '~') {
+        return os.homedir();
+    }
+    if (inputPath.startsWith('~/') || inputPath.startsWith('~\\')) {
+        return path.join(os.homedir(), inputPath.slice(2));
+    }
+    return inputPath;
+};
+
+// Browse filesystem endpoint for project suggestions - uses existing getFileTree
+app.get('/api/browse-filesystem', authenticateToken, async (req, res) => {
+    try {
+        const { path: dirPath, showHidden: showHiddenQuery } = req.query;
+        const showHidden = showHiddenQuery === 'true';
+
+        console.log('[API] Browse filesystem request for path:', dirPath, 'showHidden:', showHidden);
+        const homeDir = os.homedir();
+        // Default to home directory if no path provided
+        let targetPath = dirPath ? await expandWorkspacePath(dirPath) : homeDir;
+
+        // Resolve and normalize the path
+        targetPath = path.resolve(targetPath);
+
+        // Security check - ensure path is valid
+        const validation = await validateWorkspacePath(targetPath);
+        if (!validation.valid) {
+            return res.status(403).json({ error: validation.error });
+        }
+        const resolvedPath = validation.resolvedPath || targetPath;
+
+        // Security check - ensure path is accessible
+        try {
+            await fs.promises.access(resolvedPath);
+            const stats = await fs.promises.stat(resolvedPath);
+
+            if (!stats.isDirectory()) {
+                return res.status(400).json({ error: 'Path is not a directory' });
+            }
+        } catch (err) {
+            return res.status(404).json({ error: 'Directory not accessible' });
+        }
+
+        // Use existing getFileTree function with shallow depth (only direct children)
+        // For browsing, we use a more permissive version that doesn't skip node_modules etc.
+        const fileTree = await getFileTree(resolvedPath, 1, 0, showHidden, true); // maxDepth=1, showHidden, isBrowsing=true
+
+        // Filter only directories and format for suggestions
+        const directories = fileTree
+            .filter(item => item.type === 'directory')
+            .map(item => ({
+                path: item.path,
+                name: item.name,
+                type: 'directory'
+            }))
+            .sort((a, b) => {
+                const aHidden = a.name.startsWith('.');
+                const bHidden = b.name.startsWith('.');
+                if (aHidden && !bHidden) return 1;
+                if (!aHidden && bHidden) return -1;
+                return a.name.localeCompare(b.name);
+            });
+
+        // Add common directories if browsing home directory
+        const suggestions = [];
+        let resolvedHomeDir = homeDir;
+        try {
+            resolvedHomeDir = await fs.promises.realpath(homeDir);
+        } catch (error) {
+            // Use home dir as-is if realpath fails
+        }
+
+        if (resolvedPath === resolvedHomeDir) {
+            const commonDirs = ['Desktop', 'Documents', 'Downloads', 'Projects', 'Development', 'Dev', 'Code', 'workspace', 'vibelab'];
+            const existingCommon = directories.filter(dir => commonDirs.includes(dir.name));
+            const otherDirs = directories.filter(dir => !commonDirs.includes(dir.name));
+
+            suggestions.push(...existingCommon, ...otherDirs);
+        } else {
+            suggestions.push(...directories);
+        }
+
+        res.json({
+            path: resolvedPath,
+            suggestions: suggestions
+        });
+
+    } catch (error) {
+        console.error('Error browsing filesystem:', error);
+        res.status(500).json({ error: 'Failed to browse filesystem' });
+    }
+});
+
+app.post('/api/create-folder', authenticateToken, async (req, res) => {
+    try {
+        const { path: folderPath } = req.body;
+        if (!folderPath) {
+            return res.status(400).json({ error: 'Path is required' });
+        }
+        const expandedPath = await expandWorkspacePath(folderPath);
+        const resolvedInput = path.resolve(expandedPath);
+        const validation = await validateWorkspacePath(resolvedInput);
+        if (!validation.valid) {
+            return res.status(403).json({ error: validation.error });
+        }
+        const targetPath = validation.resolvedPath || resolvedInput;
+        const parentDir = path.dirname(targetPath);
+        try {
+            await fs.promises.access(parentDir);
+        } catch (err) {
+            return res.status(404).json({ error: 'Parent directory does not exist' });
+        }
+        try {
+            await fs.promises.access(targetPath);
+            return res.status(409).json({ error: 'Folder already exists' });
+        } catch (err) {
+            // Folder doesn't exist, which is what we want
+        }
+        try {
+            await fs.promises.mkdir(targetPath, { recursive: false });
+            res.json({ success: true, path: targetPath });
+        } catch (mkdirError) {
+            if (mkdirError.code === 'EEXIST') {
+                return res.status(409).json({ error: 'Folder already exists' });
+            }
+            throw mkdirError;
+        }
+    } catch (error) {
+        console.error('Error creating folder:', error);
+        res.status(500).json({ error: 'Failed to create folder' });
+    }
+});
+
+// Serve public files (like api-docs.html)
+app.use(express.static(path.join(__dirname, '../public')));
+
+// Static files served after API routes
+// Add cache control: HTML files should not be cached, but assets can be cached
+app.use(express.static(path.join(__dirname, '../dist'), {
+  setHeaders: (res, filePath) => {
+    if (filePath.endsWith('.html')) {
+      // Prevent HTML caching to avoid service worker issues after builds
+      res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+      res.setHeader('Pragma', 'no-cache');
+      res.setHeader('Expires', '0');
+    } else if (filePath.match(/\.(js|css|woff2?|ttf|eot|svg|png|jpg|jpeg|gif|ico)$/)) {
+      // Cache static assets for 1 year (they have hashed names)
+      res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+    }
+  }
+}));
+
+// API Routes (protected)
+// /api/config endpoint removed - no longer needed
+// Frontend now uses window.location for WebSocket URLs
+
+// System update endpoint
+app.post('/api/system/update', authenticateToken, async (req, res) => {
+    try {
+        if (process.env.DR_CLAW_DESKTOP === '1') {
+            return res.status(400).json({
+                success: false,
+                error: 'Desktop builds do not support in-app self-update yet. Install a newer desktop package instead.'
+            });
+        }
+
+        // Get the project root directory (parent of server directory)
+        const projectRoot = path.join(__dirname, '..');
+
+        console.log('Starting system update from directory:', projectRoot);
+
+        // Run the update command based on installation mode
+        const updateCommand = installMode === 'git'
+            ? 'git stash && git checkout main && git pull && npm install'
+            : `npm install -g ${npmPackageName}@latest`;
+
+        const child = spawn('sh', ['-c', updateCommand], {
+            cwd: installMode === 'git' ? projectRoot : os.homedir(),
+            env: process.env
+        });
+
+        let output = '';
+        let errorOutput = '';
+
+        child.stdout.on('data', (data) => {
+            const text = data.toString();
+            output += text;
+            console.log('Update output:', text);
+        });
+
+        child.stderr.on('data', (data) => {
+            const text = data.toString();
+            errorOutput += text;
+            console.error('Update error:', text);
+        });
+
+        child.on('close', (code) => {
+            if (code === 0) {
+                res.json({
+                    success: true,
+                    output: output || 'Update completed successfully',
+                    message: 'Update completed. Please restart the server to apply changes.'
+                });
+            } else {
+                res.status(500).json({
+                    success: false,
+                    error: 'Update command failed',
+                    output: output,
+                    errorOutput: errorOutput
+                });
+            }
+        });
+
+        child.on('error', (error) => {
+            console.error('Update process error:', error);
+            res.status(500).json({
+                success: false,
+                error: error.message
+            });
+        });
+
+    } catch (error) {
+        console.error('System update error:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+app.get('/api/projects', authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user?.id;
+        const projects = await getProjects(userId, broadcastProgress);
+        res.json(projects);
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.get('/api/projects/trash', authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user?.id;
+        const projects = await getTrashedProjects(userId);
+        res.json(projects);
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.post('/api/projects/token-usage-summary', authenticateToken, async (req, res) => {
+    try {
+        const projectRefs = req.body?.projects;
+        if (!Array.isArray(projectRefs)) {
+            return res.status(400).json({ error: 'projects array is required' });
+        }
+
+        const summary = await getProjectTokenUsageSummary(projectRefs);
+        res.json(summary);
+    } catch (error) {
+        console.error('Error building project token usage summary:', error);
+        res.status(500).json({ error: 'Failed to build project token usage summary' });
+    }
+});
+
+app.get('/api/projects/:projectName/sessions', authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user?.id;
+        const { limit = 5, offset = 0 } = req.query;
+        const result = await getSessions(req.params.projectName, parseInt(limit), parseInt(offset), userId);
+        res.json(result);
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Get messages for a specific session
+app.get('/api/projects/:projectName/sessions/:sessionId/messages', authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user?.id;
+        const { projectName, sessionId } = req.params;
+        const { limit, offset, provider } = req.query;
+
+        // Parse limit and offset if provided
+        const parsedLimit = limit ? parseInt(limit, 10) : null;
+        const parsedOffset = offset ? parseInt(offset, 10) : 0;
+
+        const result = await getSessionMessages(projectName, sessionId, parsedLimit, parsedOffset, provider, userId);
+
+        // Handle both old and new response formats
+        if (Array.isArray(result)) {
+            // Backward compatibility: no pagination parameters were provided
+            res.json({ messages: result });
+        } else {
+            // New format with pagination info
+            res.json(result);
+        }
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.get('/api/projects/:projectName/tags', authenticateToken, async (req, res) => {
+    try {
+        const { projectName } = req.params;
+        // Lazy initialization: idempotent, uses INSERT OR IGNORE internally.
+        tagDb.ensureDefaultStageTags(projectName);
+        const { tagType } = req.query;
+        const tags = tagDb.listProjectTags(projectName, tagType || null);
+        res.json({ tags });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.get('/api/projects/:projectName/sessions/:sessionId/tags', authenticateToken, async (req, res) => {
+    try {
+        const { projectName, sessionId } = req.params;
+        // Lazy initialization: idempotent, uses INSERT OR IGNORE internally.
+        tagDb.ensureDefaultStageTags(projectName);
+        const session = sessionDb.getSessionById(sessionId);
+        if (!session || session.project_name !== projectName) {
+            return res.status(404).json({ error: 'Session not found' });
+        }
+
+        const tags = tagDb.listTagsForSession(sessionId);
+        res.json({ tags });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.put('/api/projects/:projectName/sessions/:sessionId/tags', authenticateToken, async (req, res) => {
+    try {
+        const { projectName, sessionId } = req.params;
+        const { tagIds } = req.body || {};
+
+        if (!Array.isArray(tagIds)) {
+            return res.status(400).json({ error: 'tagIds array is required' });
+        }
+
+        // Lazy initialization: idempotent, uses INSERT OR IGNORE internally.
+        tagDb.ensureDefaultStageTags(projectName);
+        const session = sessionDb.getSessionById(sessionId);
+        if (!session || session.project_name !== projectName) {
+            return res.status(404).json({ error: 'Session not found' });
+        }
+
+        const tags = tagDb.replaceSessionTags(sessionId, projectName, tagIds, {
+            linkedBy: req.user?.username || 'user',
+            source: 'manual',
+        });
+        res.json({ success: true, tags });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.get('/api/projects/:projectName/sessions/:sessionId/context-review', authenticateToken, async (req, res) => {
+    try {
+        const { projectName, sessionId } = req.params;
+        const session = sessionDb.getSessionById(sessionId);
+
+        if (!session || session.project_name !== projectName) {
+            return res.status(404).json({ error: 'Session not found' });
+        }
+
+        res.json({
+            sessionId,
+            projectName,
+            reviews: sessionDb.getSessionContextReview(sessionId),
+        });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.put('/api/projects/:projectName/sessions/:sessionId/context-review', authenticateToken, async (req, res) => {
+    try {
+        const { projectName, sessionId } = req.params;
+        const { reviews } = req.body || {};
+        const session = sessionDb.getSessionById(sessionId);
+
+        if (!session || session.project_name !== projectName) {
+            return res.status(404).json({ error: 'Session not found' });
+        }
+
+        res.json({
+            sessionId,
+            projectName,
+            reviews: sessionDb.updateSessionContextReview(sessionId, reviews),
+        });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Rename project endpoint
+app.put('/api/projects/:projectName/rename', authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user?.id;
+        const { displayName } = req.body;
+        await renameProject(req.params.projectName, displayName, userId);
+        res.json({ success: true });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Rename session endpoint
+app.put('/api/projects/:projectName/sessions/:sessionId/rename', authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user?.id;
+        const { projectName, sessionId } = req.params;
+        const { summary, provider } = req.body;
+        await renameSession(projectName, sessionId, summary, provider, userId);
+        res.json({ success: true });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Delete session endpoint
+app.delete('/api/projects/:projectName/sessions/:sessionId', authenticateToken, async (req, res) => {
+    try {
+        const { projectName, sessionId } = req.params;
+        const { provider } = req.query;
+        console.log(`[API] Deleting session: ${sessionId} from project: ${projectName}, provider: ${provider || 'claude'}`);
+        await deleteSession(projectName, sessionId, provider);
+        console.log(`[API] Session ${sessionId} deleted successfully`);
+        res.json({ success: true });
+    } catch (error) {
+        console.error(`[API] Error deleting session ${req.params.sessionId}:`, error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Delete project endpoint (force=true to delete with sessions)
+app.delete('/api/projects/:projectName', authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user?.id;
+        const { projectName } = req.params;
+        const force = req.query.force === 'true';
+        await deleteProject(projectName, force, userId);
+        res.json({ success: true });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.post('/api/projects/trash/:projectName/restore', authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user?.id;
+        await restoreProject(req.params.projectName, userId);
+        res.json({ success: true });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.delete('/api/projects/trash/:projectName', authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user?.id;
+        const mode = req.query.mode === 'physical' ? 'physical' : 'logical';
+        await deleteTrashedProject(req.params.projectName, mode, userId);
+        res.json({ success: true });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Create project endpoint
+async function handleCreateProject(req, res) {
+    try {
+        const { path: projectPath, displayName = null } = req.body;
+
+        if (!projectPath || !projectPath.trim()) {
+            return res.status(400).json({ error: 'Project path is required' });
+        }
+
+        const project = await addProjectManually(projectPath.trim(), displayName, req.user?.id);
+        res.json({ success: true, project });
+    } catch (error) {
+        console.error('Error creating project:', error);
+        res.status(500).json({ error: error.message });
+    }
+}
+
+app.post('/api/projects/create', authenticateToken, handleCreateProject);
+app.post('/api/projects', authenticateToken, handleCreateProject);
+
+// Read file content endpoint
+app.get('/api/projects/:projectName/file', authenticateToken, async (req, res) => {
+    try {
+        const { projectName } = req.params;
+        const { filePath } = req.query;
+
+
+        // Security: ensure the requested path is inside the project root
+        if (!filePath) {
+            return res.status(400).json({ error: 'Invalid file path' });
+        }
+
+        const projectRoot = await extractProjectDirectory(projectName).catch(() => null);
+        if (!projectRoot) {
+            return res.status(404).json({ error: 'Project not found' });
+        }
+
+        // Handle both absolute and relative paths with pipeline file fallback + bare name search
+        const result = await resolveProjectFilePath(projectRoot, filePath);
+        if (result.candidates) {
+            return res.json({ ambiguous: true, candidates: result.candidates });
+        }
+        const resolved = result.resolved;
+        const normalizedRoot = path.resolve(projectRoot) + path.sep;
+        if (!resolved.startsWith(normalizedRoot)) {
+            return res.status(403).json({ error: 'Path must be under project root' });
+        }
+
+        const content = await fsPromises.readFile(resolved, 'utf8');
+        res.json({ content, path: resolved });
+    } catch (error) {
+        if (error.code === 'ENOENT') {
+            // File not found is a normal condition (e.g. optional config files) — no noisy log
+            res.status(404).json({ error: 'File not found' });
+        } else if (error.code === 'EACCES') {
+            console.error('Permission denied reading file:', resolved);
+            res.status(403).json({ error: 'Permission denied' });
+        } else {
+            console.error('Error reading file:', error);
+            res.status(500).json({ error: error.message });
+        }
+    }
+});
+
+// Serve binary file content endpoint (for images, etc.)
+app.get('/api/projects/:projectName/files/content', authenticateToken, async (req, res) => {
+    try {
+        const { projectName } = req.params;
+        const { path: filePath } = req.query;
+
+
+        // Security: ensure the requested path is inside the project root
+        if (!filePath) {
+            return res.status(400).json({ error: 'Invalid file path' });
+        }
+
+        const projectRoot = await extractProjectDirectory(projectName).catch(() => null);
+        if (!projectRoot) {
+            return res.status(404).json({ error: 'Project not found' });
+        }
+
+        const resolved = path.isAbsolute(filePath)
+            ? path.resolve(filePath)
+            : path.resolve(projectRoot, filePath);
+        const normalizedRoot = path.resolve(projectRoot) + path.sep;
+        if (!resolved.startsWith(normalizedRoot)) {
+            return res.status(403).json({ error: 'Path must be under project root' });
+        }
+
+        // Check if file exists
+        try {
+            await fsPromises.access(resolved);
+        } catch (error) {
+            return res.status(404).json({ error: 'File not found' });
+        }
+
+        // Get file extension and set appropriate content type
+        const mimeType = mime.lookup(resolved) || 'application/octet-stream';
+        res.setHeader('Content-Type', mimeType);
+
+        // Stream the file
+        const fileStream = fs.createReadStream(resolved);
+        fileStream.pipe(res);
+
+        fileStream.on('error', (error) => {
+            console.error('Error streaming file:', error);
+            if (!res.headersSent) {
+                res.status(500).json({ error: 'Error reading file' });
+            }
+        });
+
+    } catch (error) {
+        console.error('Error serving binary file:', error);
+        if (!res.headersSent) {
+            res.status(500).json({ error: error.message });
+        }
+    }
+});
+
+// Save file content endpoint
+app.put('/api/projects/:projectName/file', authenticateToken, async (req, res) => {
+    try {
+        const { projectName } = req.params;
+        const { filePath, content } = req.body;
+
+
+        // Security: ensure the requested path is inside the project root
+        if (!filePath) {
+            return res.status(400).json({ error: 'Invalid file path' });
+        }
+
+        if (content === undefined) {
+            return res.status(400).json({ error: 'Content is required' });
+        }
+
+        const projectRoot = await extractProjectDirectory(projectName).catch(() => null);
+        if (!projectRoot) {
+            return res.status(404).json({ error: 'Project not found' });
+        }
+
+        // Handle both absolute and relative paths with pipeline file fallback + bare name search
+        const result = await resolveProjectFilePath(projectRoot, filePath);
+        if (result.candidates) {
+            return res.status(400).json({ error: 'Ambiguous filename', candidates: result.candidates });
+        }
+        const resolved = result.resolved;
+        const normalizedRoot = path.resolve(projectRoot) + path.sep;
+        if (!resolved.startsWith(normalizedRoot)) {
+            return res.status(403).json({ error: 'Path must be under project root' });
+        }
+
+        // Write the new content
+        await fsPromises.writeFile(resolved, content, 'utf8');
+
+        res.json({
+            success: true,
+            path: resolved,
+            message: 'File saved successfully'
+        });
+    } catch (error) {
+        console.error('Error saving file:', error);
+        if (error.code === 'ENOENT') {
+            res.status(404).json({ error: 'File or directory not found' });
+        } else if (error.code === 'EACCES') {
+            res.status(403).json({ error: 'Permission denied' });
+        } else {
+            res.status(500).json({ error: error.message });
+        }
+    }
+});
+
+// Delete a file or directory from the project filesystem
+app.delete('/api/projects/:projectName/file', authenticateToken, async (req, res) => {
+    try {
+        const projectName = req.params.projectName;
+        const { filePath } = req.body || {};
+
+        if (!filePath || typeof filePath !== 'string') {
+            return res.status(400).json({ error: 'Invalid file path' });
+        }
+
+        const projectRoot = await extractProjectDirectory(projectName).catch(() => null);
+        if (!projectRoot) {
+            return res.status(404).json({ error: 'Project not found' });
+        }
+
+        const resolved = path.isAbsolute(filePath)
+            ? path.resolve(filePath)
+            : path.resolve(projectRoot, filePath);
+        const normalizedRoot = path.resolve(projectRoot) + path.sep;
+        if (!resolved.startsWith(normalizedRoot)) {
+            return res.status(403).json({ error: 'Path must be under project root' });
+        }
+
+        await fsPromises.rm(resolved, { recursive: true });
+
+        res.json({ success: true });
+    } catch (error) {
+        console.error('Error deleting file:', error);
+        if (error.code === 'ENOENT') {
+            res.status(404).json({ error: 'File or directory not found' });
+        } else if (error.code === 'EACCES') {
+            res.status(403).json({ error: 'Permission denied' });
+        } else {
+            res.status(500).json({ error: error.message });
+        }
+    }
+});
+
+// Upload files to project filesystem
+app.post('/api/projects/:projectName/upload-files', authenticateToken, async (req, res) => {
+    try {
+        const multer = (await import('multer')).default;
+        const projectName = req.params.projectName;
+        const projectRoot = await extractProjectDirectory(projectName).catch(() => null);
+        if (!projectRoot) {
+            return res.status(404).json({ error: 'Project not found' });
+        }
+
+        const storage = multer.diskStorage({
+            destination: async (req, file, cb) => {
+                const targetDir = (req.body && req.body.targetDir) || '';
+                const resolved = path.resolve(projectRoot, targetDir);
+                const normalizedRoot = path.resolve(projectRoot) + path.sep;
+                if (!resolved.startsWith(normalizedRoot) && resolved !== path.resolve(projectRoot)) {
+                    return cb(new Error('Path must be under project root'));
+                }
+                await fsPromises.mkdir(resolved, { recursive: true });
+                cb(null, resolved);
+            },
+            filename: (req, file, cb) => {
+                const sanitized = file.originalname.replace(/[/\\]/g, '_').replace(/\.\./g, '_');
+                cb(null, sanitized);
+            }
+        });
+
+        const upload = multer({
+            storage,
+            limits: {
+                fileSize: 50 * 1024 * 1024, // 50MB
+                files: 20
+            }
+        });
+
+        upload.array('files', 20)(req, res, async (err) => {
+            if (err) {
+                const status = err.message === 'Path must be under project root' ? 403 : 400;
+                return res.status(status).json({ error: err.message });
+            }
+
+            if (!req.files || req.files.length === 0) {
+                return res.status(400).json({ error: 'No files provided' });
+            }
+
+            res.json({
+                files: req.files.map(f => ({
+                    name: f.filename,
+                    size: f.size,
+                    path: f.path
+                }))
+            });
+        });
+    } catch (error) {
+        console.error('Error in file upload endpoint:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Global skills endpoints (GET /api/skills, GET /api/skills/file) are handled
+// by the skillsRoutes router mounted above at /api/skills.
+
+app.get('/api/projects/:projectName/files', authenticateToken, async (req, res) => {
+    try {
+
+        // Using fsPromises from import
+
+        // Use extractProjectDirectory to get the actual project path
+        let actualPath;
+        try {
+            actualPath = await extractProjectDirectory(req.params.projectName);
+        } catch (error) {
+            console.error('Error extracting project directory:', error);
+            // Fallback to simple dash replacement
+            actualPath = req.params.projectName.replace(/-/g, '/');
+        }
+
+        const projectRoot = path.resolve(actualPath);
+        const { path: requestedPath, maxDepth: maxDepthQuery, showHidden: showHiddenQuery } = req.query;
+
+        let targetPath = projectRoot;
+        if (typeof requestedPath === 'string' && requestedPath.trim()) {
+            targetPath = path.isAbsolute(requestedPath)
+                ? path.resolve(requestedPath)
+                : path.resolve(projectRoot, requestedPath);
+
+            const normalizedRoot = projectRoot + path.sep;
+            if (targetPath !== projectRoot && !targetPath.startsWith(normalizedRoot)) {
+                return res.status(403).json({ error: 'Path must be under project root' });
+            }
+        }
+
+        // Check if path exists
+        try {
+            await fsPromises.access(targetPath);
+        } catch (e) {
+            return res.status(404).json({ error: `Project path not found: ${targetPath}` });
+        }
+
+        let maxDepth = 10;
+        if (maxDepthQuery !== undefined) {
+            const parsedDepth = Number.parseInt(String(maxDepthQuery), 10);
+            if (!Number.isNaN(parsedDepth)) {
+                maxDepth = Math.min(10, Math.max(0, parsedDepth));
+            }
+        }
+
+        const showHidden = showHiddenQuery === undefined
+            ? true
+            : ['1', 'true', 'yes', 'on'].includes(String(showHiddenQuery).toLowerCase());
+
+        const stats = await fsPromises.stat(targetPath);
+        if (!stats.isDirectory()) {
+            return res.status(400).json({ error: 'Path must be a directory' });
+        }
+
+        const files = await getFileTree(targetPath, maxDepth, 0, showHidden);
+        res.json(files);
+    } catch (error) {
+        console.error('[ERROR] File tree error:', error.message);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// WebSocket connection handler that routes based on URL path
+wss.on('connection', (ws, request) => {
+    const url = request.url;
+    console.log('[INFO] Client connected to:', url);
+
+    // Parse URL to get pathname without query parameters
+    const urlObj = new URL(url, 'http://localhost');
+    const pathname = urlObj.pathname;
+
+    if (pathname === '/shell') {
+        handleShellConnection(ws);
+    } else if (pathname === '/ws') {
+        handleChatConnection(ws, request);
+    } else if (pathname === '/compute-shell') {
+        const nodeId = urlObj.searchParams.get('nodeId') || null;
+        handleComputeShellConnection(ws, nodeId);
+    } else {
+        console.log('[WARN] Unknown WebSocket path:', pathname);
+        ws.close();
+    }
+});
+
+/**
+ * WebSocket Writer - Wrapper for WebSocket to match SSEStreamWriter interface
+ */
+class WebSocketWriter {
+  constructor(ws, telemetryContext = null) {
+    this.ws = ws;
+    this.sessionId = null;
+    this.isWebSocketWriter = true;  // Marker for transport detection
+    this.telemetryContext = telemetryContext;
+    this.projectPath = null;
+  }
+
+  send(data) {
+    if (this.ws.readyState === 1) { // WebSocket.OPEN
+      // Providers send raw objects, we stringify for WebSocket
+      this.ws.send(JSON.stringify(data));
+      trackAgentResponseTelemetry(data, this.telemetryContext);
+    }
+  }
+
+  setSessionId(sessionId) {
+    this.sessionId = sessionId;
+  }
+
+  setProjectPath(projectPath) {
+    this.projectPath = projectPath;
+  }
+
+  getSessionId() {
+    return this.sessionId;
+  }
+
+  getProjectPath() {
+    return this.projectPath;
+  }
+}
+
+function enqueueConversationTelemetry(event, context = {}) {
+    if (context.telemetryEnabled === false) {
+        return;
+    }
+    enqueueTelemetryEvent({
+        source: 'chat-websocket',
+        ...context,
+        ...event,
+        receivedAt: new Date().toISOString(),
+    });
+}
+
+function hasAgentResponseContent(payload) {
+    if (!payload || typeof payload !== 'object') {
+        return false;
+    }
+
+    if (payload.type === 'claude-response') {
+        const data = payload.data;
+        if (!data || typeof data !== 'object') {
+            return false;
+        }
+
+        if (typeof data.content === 'string' && data.content.trim()) {
+            return true;
+        }
+
+        if (Array.isArray(data.content)) {
+            return data.content.some((part) => part?.type === 'text' && typeof part?.text === 'string' && part.text.trim());
+        }
+
+        return false;
+    }
+
+    if (payload.type === 'cursor-result') {
+        const result = payload.data?.result;
+        return typeof result === 'string' && Boolean(result.trim());
+    }
+
+    if (payload.type === 'codex-response') {
+        const codexData = payload.data;
+        if (!codexData || typeof codexData !== 'object') {
+            return false;
+        }
+        if (codexData.type === 'item' && codexData.itemType === 'agent_message') {
+            const content = codexData.message?.content;
+            return typeof content === 'string' && Boolean(content.trim());
+        }
+    }
+
+    return false;
+}
+
+function trackAgentResponseTelemetry(payload, context = {}) {
+    if (context.telemetryEnabled === false) {
+        return;
+    }
+    if (context.provider === 'claude' && payload?.type === 'claude-response') {
+        const streamData = payload.data;
+        const sessionKey = `${context.provider}:${payload.sessionId || 'pending'}`;
+
+        if (streamData?.type === 'content_block_delta' && typeof streamData?.delta?.text === 'string') {
+            trackAgentResponseTelemetry.streamBuffers.set(sessionKey, true);
+            return;
+        }
+
+        if (streamData?.type === 'content_block_stop') {
+            const hasContent = trackAgentResponseTelemetry.streamBuffers.get(sessionKey);
+            if (hasContent) {
+                enqueueConversationTelemetry(
+                    {
+                        name: 'agent_dialogue_meta',
+                        direction: 'agent_to_user',
+                        provider: context.provider || 'unknown',
+                        sessionId: payload.sessionId || context.sessionId || null,
+                        transportType: payload.type || 'unknown',
+                    },
+                    context,
+                );
+            }
+            trackAgentResponseTelemetry.streamBuffers.delete(sessionKey);
+            return;
+        }
+    }
+
+    if (!hasAgentResponseContent(payload)) {
+        return;
+    }
+
+    enqueueConversationTelemetry(
+        {
+            name: 'agent_dialogue_meta',
+            direction: 'agent_to_user',
+            provider: context.provider || 'unknown',
+            sessionId: payload.sessionId || context.sessionId || null,
+            transportType: payload.type || 'unknown',
+        },
+        context,
+    );
+}
+trackAgentResponseTelemetry.streamBuffers = new Map();
+
+// Handle chat WebSocket connections
+function handleChatConnection(ws, request) {
+    console.log('[INFO] Chat WebSocket connected');
+
+    // Add to connected clients for project updates
+    connectedClients.add(ws);
+
+    const user = request?.user || {};
+    const userId = user.userId || user.id || null;
+    const telemetryContext = {
+        userId: userId,
+        username: user.username || null,
+        clientType: 'websocket',
+        telemetryEnabled: true,
+    };
+
+    const geminiApiKey = getGeminiApiKeyForUser(userId);
+    const sessionEnv = withGeminiApiKeyEnv(process.env, geminiApiKey);
+
+    // Wrap WebSocket with writer for consistent interface with SSEStreamWriter
+    const writer = new WebSocketWriter(ws, telemetryContext);
+
+    ws.on('message', async (message) => {
+        try {
+            const data = JSON.parse(message);
+            console.log(`[DEBUG] Received WebSocket message: ${data.type}`);
+            
+            if (data.type === 'telemetry-settings') {
+                const enabled = data.enabled !== false;
+                writer.telemetryContext = {
+                    ...(writer.telemetryContext || telemetryContext),
+                    telemetryEnabled: enabled,
+                };
+            } else if (data.type === 'claude-command') {
+                console.log('[DEBUG] User message:', data.command || '[Continue/Resume]');
+                console.log('📁 Project:', data.options?.projectPath || 'Unknown');
+                console.log('🔄 Session:', data.options?.sessionId ? 'Resume' : 'New');
+                const commandTelemetryEnabled = data.options?.telemetryEnabled !== false;
+                enqueueConversationTelemetry(
+                    {
+                        name: 'agent_dialogue_meta',
+                        direction: 'user_to_agent',
+                        provider: 'claude',
+                        sessionId: data.options?.sessionId || data.sessionId || null,
+                        projectPath: data.options?.projectPath || data.options?.cwd || null,
+                        transportType: data.type,
+                    },
+                    { ...telemetryContext, telemetryEnabled: commandTelemetryEnabled },
+                );
+                writer.telemetryContext = { ...telemetryContext, provider: 'claude', telemetryEnabled: commandTelemetryEnabled };
+                writer.setProjectPath(data.options?.projectPath || data.options?.cwd || null);
+
+                // Use Claude Agents SDK
+                const sessionId = data.options?.sessionId || data.sessionId;
+                if (sessionId && isClaudeSDKSessionActive(sessionId)) {
+                    console.log(`[WARN] Session ${sessionId} is already active. Ignoring concurrent request.`);
+                    return;
+                }
+                
+                queryClaudeSDK(data.command, { ...data.options, env: sessionEnv }, writer).catch(error => {
+                    console.error('[ERROR] Claude query error:', error);
+                });
+            } else if (data.type === 'cursor-command') {
+                console.log('[DEBUG] Cursor message:', data.command || '[Continue/Resume]');
+                console.log('📁 Project:', data.options?.cwd || 'Unknown');
+                console.log('🔄 Session:', data.options?.sessionId ? 'Resume' : 'New');
+                console.log('🤖 Model:', data.options?.model || 'default');
+                const commandTelemetryEnabled = data.options?.telemetryEnabled !== false;
+                const sessionId = data.options?.sessionId || data.sessionId;
+                
+                if (sessionId && isCursorSessionActive(sessionId)) {
+                    console.log(`[WARN] Cursor session ${sessionId} is already active. Ignoring concurrent request.`);
+                    return;
+                }
+                
+                enqueueConversationTelemetry(
+                    {
+                        name: 'agent_dialogue_meta',
+                        direction: 'user_to_agent',
+                        provider: 'cursor',
+                        sessionId: sessionId || null,
+                        projectPath: data.options?.projectPath || data.options?.cwd || null,
+                        transportType: data.type,
+                    },
+                    { ...telemetryContext, telemetryEnabled: commandTelemetryEnabled },
+                );
+                writer.telemetryContext = { ...telemetryContext, provider: 'cursor', telemetryEnabled: commandTelemetryEnabled };
+                writer.setProjectPath(data.options?.projectPath || data.options?.cwd || null);
+                spawnCursor(data.command, { ...data.options, env: sessionEnv }, writer).catch(error => {
+                    console.error('[ERROR] Cursor spawn error:', error);
+                });
+            } else if (data.type === 'codex-command') {
+                console.log('[DEBUG] Codex message:', data.command || '[Continue/Resume]');
+                console.log('📁 Project:', data.options?.projectPath || data.options?.cwd || 'Unknown');
+                console.log('🔄 Session:', data.options?.sessionId ? 'Resume' : 'New');
+                console.log('🤖 Model:', data.options?.model || 'default');
+                const commandTelemetryEnabled = data.options?.telemetryEnabled !== false;
+                const sessionId = data.options?.sessionId || data.sessionId;
+                
+                if (sessionId && isCodexSessionActive(sessionId)) {
+                    console.log(`[WARN] Codex session ${sessionId} is already active. Ignoring concurrent request.`);
+                    return;
+                }
+                
+                enqueueConversationTelemetry(
+                    {
+                        name: 'agent_dialogue_meta',
+                        direction: 'user_to_agent',
+                        provider: 'codex',
+                        sessionId: sessionId || null,
+                        projectPath: data.options?.projectPath || data.options?.cwd || null,
+                        transportType: data.type,
+                    },
+                    { ...telemetryContext, telemetryEnabled: commandTelemetryEnabled },
+                );
+                writer.telemetryContext = { ...telemetryContext, provider: 'codex', telemetryEnabled: commandTelemetryEnabled };
+                writer.setProjectPath(data.options?.projectPath || data.options?.cwd || null);
+                queryCodex(data.command, { ...data.options, env: sessionEnv }, writer).catch(error => {
+                    console.error('[ERROR] Codex query error:', error);
+                });
+            } else if (data.type === 'gemini-command') {
+                console.log('[DEBUG] Gemini message:', data.command || '[Continue/Resume]');
+                console.log('📁 Project:', data.options?.projectPath || data.options?.cwd || 'Unknown');
+                console.log('🔄 Session:', data.options?.sessionId ? 'Resume' : 'New');
+                console.log('🤖 Model:', data.options?.model || 'default');
+                const commandTelemetryEnabled = data.options?.telemetryEnabled !== false;
+                const sessionId = data.options?.sessionId || data.sessionId;
+                
+                if (sessionId && isGeminiSessionActive(sessionId)) {
+                    console.log(`[WARN] Gemini session ${sessionId} is already active. Ignoring concurrent request.`);
+                    return;
+                }
+                
+                enqueueConversationTelemetry(
+                    {
+                        name: 'agent_dialogue_meta',
+                        direction: 'user_to_agent',
+                        provider: 'gemini',
+                        sessionId: sessionId || null,
+                        projectPath: data.options?.projectPath || data.options?.cwd || null,
+                        transportType: data.type,
+                    },
+                    { ...telemetryContext, telemetryEnabled: commandTelemetryEnabled },
+                );
+                writer.telemetryContext = { ...telemetryContext, provider: 'gemini', telemetryEnabled: commandTelemetryEnabled };
+                writer.setProjectPath(data.options?.projectPath || data.options?.cwd || null);
+                spawnGemini(data.command, { ...data.options, env: sessionEnv }, writer).catch(error => {
+                    console.error('[ERROR] Gemini spawn error:', error);
+                });
+            } else if (data.type === 'openrouter-command') {
+                console.log('[DEBUG] OpenRouter message:', data.command || '[Continue/Resume]');
+                console.log('📁 Project:', data.options?.projectPath || data.options?.cwd || 'Unknown');
+                console.log('🔄 Session:', data.options?.sessionId ? 'Resume' : 'New');
+                console.log('🤖 Model:', data.options?.model || 'default');
+                const commandTelemetryEnabled = data.options?.telemetryEnabled !== false;
+                const sessionId = data.options?.sessionId || data.sessionId;
+
+                if (sessionId && isOpenRouterSessionActive(sessionId)) {
+                    console.log(`[WARN] OpenRouter session ${sessionId} is already active. Ignoring concurrent request.`);
+                    return;
+                }
+
+                enqueueConversationTelemetry(
+                    {
+                        name: 'agent_dialogue_meta',
+                        direction: 'user_to_agent',
+                        provider: 'openrouter',
+                        sessionId: sessionId || null,
+                        projectPath: data.options?.projectPath || data.options?.cwd || null,
+                        transportType: data.type,
+                    },
+                    { ...telemetryContext, telemetryEnabled: commandTelemetryEnabled },
+                );
+                writer.telemetryContext = { ...telemetryContext, provider: 'openrouter', telemetryEnabled: commandTelemetryEnabled };
+                writer.setProjectPath(data.options?.projectPath || data.options?.cwd || null);
+                queryOpenRouter(data.command, { ...data.options, env: sessionEnv }, writer).catch(error => {
+                    console.error('[ERROR] OpenRouter query error:', error);
+                });
+            } else if (data.type === 'local-command') {
+                console.log('[DEBUG] Local GPU message:', data.command || '[Continue/Resume]');
+                console.log('📁 Project:', data.options?.projectPath || data.options?.cwd || 'Unknown');
+                console.log('🔄 Session:', data.options?.sessionId ? 'Resume' : 'New');
+                console.log('🤖 Model:', data.options?.model || 'default');
+                console.log('🖥️ Server:', data.options?.serverUrl || 'default');
+                const commandTelemetryEnabled = data.options?.telemetryEnabled !== false;
+                const sessionId = data.options?.sessionId || data.sessionId;
+
+                if (sessionId && isLocalGPUSessionActive(sessionId)) {
+                    console.log(`[WARN] Local GPU session ${sessionId} is already active. Ignoring concurrent request.`);
+                    return;
+                }
+
+                enqueueConversationTelemetry(
+                    {
+                        name: 'agent_dialogue_meta',
+                        direction: 'user_to_agent',
+                        provider: 'local',
+                        sessionId: sessionId || null,
+                        projectPath: data.options?.projectPath || data.options?.cwd || null,
+                        transportType: data.type,
+                    },
+                    { ...telemetryContext, telemetryEnabled: commandTelemetryEnabled },
+                );
+                writer.telemetryContext = { ...telemetryContext, provider: 'local', telemetryEnabled: commandTelemetryEnabled };
+                writer.setProjectPath(data.options?.projectPath || data.options?.cwd || null);
+                queryLocalGPU(data.command, { ...data.options, env: sessionEnv }, writer).catch(error => {
+                    console.error('[ERROR] Local GPU query error:', error);
+                });
+            } else if (data.type === 'nano-command') {
+                console.log('[DEBUG] Nano Claude Code message:', data.command || '[Continue/Resume]');
+                console.log('📁 Project:', data.options?.projectPath || data.options?.cwd || 'Unknown');
+                console.log('🔄 Session:', data.options?.sessionId ? 'Resume' : 'New');
+                console.log('🤖 Model:', data.options?.model || 'default');
+                const commandTelemetryEnabled = data.options?.telemetryEnabled !== false;
+                const sessionId = data.options?.sessionId || data.sessionId;
+
+                if (sessionId && isNanoClaudeCodeSessionActive(sessionId)) {
+                    console.log(`[WARN] Nano Claude Code session ${sessionId} is already active. Ignoring concurrent request.`);
+                    return;
+                }
+
+                enqueueConversationTelemetry(
+                    {
+                        name: 'agent_dialogue_meta',
+                        direction: 'user_to_agent',
+                        provider: 'nano',
+                        sessionId: sessionId || null,
+                        projectPath: data.options?.projectPath || data.options?.cwd || null,
+                        transportType: data.type,
+                    },
+                    { ...telemetryContext, telemetryEnabled: commandTelemetryEnabled },
+                );
+                writer.telemetryContext = { ...telemetryContext, provider: 'nano', telemetryEnabled: commandTelemetryEnabled };
+                writer.setProjectPath(data.options?.projectPath || data.options?.cwd || null);
+                spawnNanoClaudeCode(data.command, { ...data.options, env: sessionEnv }, writer).catch(error => {
+                    console.error('[ERROR] Nano Claude Code error:', error);
+                });
+            } else if (data.type === 'cursor-resume') {
+                // Backward compatibility: treat as cursor-command with resume and no prompt
+                console.log('[DEBUG] Cursor resume session (compat):', data.sessionId);
+                const sessionId = data.sessionId;
+                
+                if (sessionId && isCursorSessionActive(sessionId)) {
+                    console.log(`[WARN] Cursor session ${sessionId} is already active. Ignoring concurrent request.`);
+                    return;
+                }
+                
+                spawnCursor('', {
+                    sessionId: data.sessionId,
+                    resume: true,
+                    cwd: data.options?.cwd,
+                    env: sessionEnv
+                }, writer).catch(error => {
+                    console.error('[ERROR] Cursor resume error:', error);
+                });
+            } else if (data.type === 'abort-session') {
+                console.log('[DEBUG] Abort session request:', data.sessionId);
+                const provider = data.provider || 'claude';
+                let success;
+
+                if (provider === 'cursor') {
+                    success = abortCursorSession(data.sessionId);
+                } else if (provider === 'codex') {
+                    success = abortCodexSession(data.sessionId);
+                } else if (provider === 'gemini') {
+                    success = abortGeminiSession(data.sessionId);
+                } else if (provider === 'openrouter') {
+                    success = abortOpenRouterSession(data.sessionId);
+                } else if (provider === 'local') {
+                    success = abortLocalGPUSession(data.sessionId);
+                } else if (provider === 'nano') {
+                    success = abortNanoClaudeCodeSession(data.sessionId);
+                } else {
+                    // Use Claude Agents SDK
+                    success = await abortClaudeSDKSession(data.sessionId);
+                }
+
+                writer.send({
+                    type: 'session-aborted',
+                    sessionId: data.sessionId,
+                    provider,
+                    success
+                });
+            } else if (data.type === 'claude-permission-response') {
+                // Relay UI approval decisions back into the SDK control flow.
+                // This does not persist permissions; it only resolves the in-flight request,
+                // introduced so the SDK can resume once the user clicks Allow/Deny.
+                if (data.requestId) {
+                    resolveToolApproval(data.requestId, {
+                        allow: Boolean(data.allow),
+                        updatedInput: data.updatedInput,
+                        message: data.message,
+                        rememberEntry: data.rememberEntry
+                    });
+                }
+            } else if (data.type === 'cursor-abort') {
+                console.log('[DEBUG] Abort Cursor session:', data.sessionId);
+                const success = abortCursorSession(data.sessionId);
+                writer.send({
+                    type: 'session-aborted',
+                    sessionId: data.sessionId,
+                    provider: 'cursor',
+                    success
+                });
+            } else if (data.type === 'check-session-status') {
+                // Check if a specific session is currently processing
+                const provider = data.provider || 'claude';
+                const sessionId = data.sessionId;
+                let isActive;
+                let startTime = null;
+
+                if (provider === 'cursor') {
+                    isActive = isCursorSessionActive(sessionId);
+                    startTime = getCursorSessionStartTime(sessionId);
+                } else if (provider === 'codex') {
+                    isActive = isCodexSessionActive(sessionId);
+                    startTime = getCodexSessionStartTime(sessionId);
+                } else if (provider === 'gemini') {
+                    isActive = isGeminiSessionActive(sessionId);
+                    startTime = getGeminiSessionStartTime(sessionId);
+                } else if (provider === 'openrouter') {
+                    isActive = isOpenRouterSessionActive(sessionId);
+                    startTime = getOpenRouterSessionStartTime(sessionId);
+                } else if (provider === 'local') {
+                    isActive = isLocalGPUSessionActive(sessionId);
+                    startTime = getLocalGPUSessionStartTime(sessionId);
+                } else if (provider === 'nano') {
+                    isActive = isNanoClaudeCodeSessionActive(sessionId);
+                    startTime = getNanoClaudeCodeSessionStartTime(sessionId);
+                } else {
+                    // Use Claude Agents SDK
+                    isActive = isClaudeSDKSessionActive(sessionId);
+                    startTime = getClaudeSDKSessionStartTime(sessionId);
+                }
+
+                writer.send({
+                    type: 'session-status',
+                    sessionId,
+                    provider,
+                    isProcessing: isActive,
+                    startTime
+                });
+            } else if (data.type === 'get-active-sessions') {
+                // Get all currently active sessions
+                const activeSessions = {
+                    claude: getActiveClaudeSDKSessions(),
+                    cursor: getActiveCursorSessions(),
+                    codex: getActiveCodexSessions(),
+                    gemini: getActiveGeminiSessions(),
+                    local: getActiveLocalGPUSessions(),
+                    nano: getActiveNanoClaudeCodeSessions()
+                };
+
+                writer.send({
+                    type: 'active-sessions',
+                    sessions: activeSessions
+                });
+            }
+        } catch (error) {
+            console.error('[ERROR] Chat WebSocket error:', error.message);
+            writer.send({
+                type: 'error',
+                error: error.message
+            });
+        }
+    });
+
+    ws.on('close', () => {
+        console.log('🔌 Chat client disconnected');
+        // Remove from connected clients
+        connectedClients.delete(ws);
+    });
+}
+
+// Handle shell WebSocket connections
+function handleShellConnection(ws) {
+    console.log('🐚 Shell client connected');
+    let shellProcess = null;
+    let ptySessionKey = null;
+    let urlDetectionBuffer = '';
+    const announcedAuthUrls = new Set();
+
+    ws.on('message', async (message) => {
+        try {
+            const data = JSON.parse(message);
+            console.log('📨 Shell message received:', data.type);
+
+            if (data.type === 'init') {
+                const projectPath = data.projectPath || process.cwd();
+                const sessionId = data.sessionId;
+                const hasSession = data.hasSession;
+                const provider = ['claude', 'cursor', 'codex', 'gemini', 'plain-shell'].includes(data.provider)
+                    ? data.provider
+                    : 'claude';
+                const initialCommand = data.initialCommand;
+                const normalizedInitialCommand = normalizeCursorLoginCommand(initialCommand || '');
+                const isPlainShell = data.isPlainShell || (!!initialCommand && !hasSession) || provider === 'plain-shell';
+                urlDetectionBuffer = '';
+                announcedAuthUrls.clear();
+
+                // Login commands (Claude/Cursor auth) should never reuse cached sessions
+                const isLoginCommand = initialCommand && (
+                    initialCommand.includes('setup-token') ||
+                    initialCommand.includes('/login') ||
+                    isCursorLoginCommand(initialCommand) ||
+                    isGeminiLoginCommand(initialCommand) ||
+                    initialCommand.includes('auth login')
+                );
+                // Include command hash in session key so different commands get separate sessions
+                const commandSuffix = isPlainShell && initialCommand
+                    ? `_cmd_${Buffer.from(initialCommand).toString('base64').slice(0, 16)}`
+                    : '';
+                const providerSuffix = isPlainShell ? '_provider_plain-shell' : `_provider_${provider}`;
+                ptySessionKey = `${projectPath}_${sessionId || 'default'}${providerSuffix}${commandSuffix}`;
+
+                // Kill any existing login session before starting fresh
+                if (isLoginCommand) {
+                    const oldSession = ptySessionsMap.get(ptySessionKey);
+                    if (oldSession) {
+                        console.log('🧹 Cleaning up existing login session:', ptySessionKey);
+                        if (oldSession.timeoutId) clearTimeout(oldSession.timeoutId);
+                        safePtyKill(oldSession, ptySessionKey);
+                        ptySessionsMap.delete(ptySessionKey);
+                    }
+                }
+
+                const existingSession = isLoginCommand ? null : ptySessionsMap.get(ptySessionKey);
+                if (existingSession) {
+                    console.log('♻️  Reconnecting to existing PTY session:', ptySessionKey);
+                    shellProcess = existingSession.pty;
+
+                    clearTimeout(existingSession.timeoutId);
+
+                    ws.send(JSON.stringify({
+                        type: 'output',
+                        data: `\x1b[36m[Reconnected to existing session]\x1b[0m\r\n`
+                    }));
+
+                    if (existingSession.buffer && existingSession.buffer.length > 0) {
+                        console.log(`📜 Sending ${existingSession.buffer.length} buffered messages`);
+                        existingSession.buffer.forEach(bufferedData => {
+                            const replayData = stripReplayTerminalQueries(bufferedData);
+                            if (!replayData) {
+                                return;
+                            }
+                            ws.send(JSON.stringify({
+                                type: 'output',
+                                data: replayData
+                            }));
+                        });
+                    }
+
+                    existingSession.ws = ws;
+
+                    return;
+                }
+
+                console.log('[INFO] Starting shell in:', projectPath);
+                console.log('📋 Session info:', hasSession ? `Resume session ${sessionId}` : (isPlainShell ? 'Plain shell mode' : 'New session'));
+                console.log('🤖 Provider:', isPlainShell ? 'plain-shell' : provider);
+                if (initialCommand) {
+                    console.log('⚡ Initial command:', initialCommand);
+                }
+
+                // First send a welcome message
+                let welcomeMsg;
+                if (isPlainShell) {
+                    welcomeMsg = `\x1b[36mStarting terminal in: ${projectPath}\x1b[0m\r\n`;
+                } else {
+                    const providerName = provider === 'cursor' ? 'Cursor' : 
+                                      provider === 'codex' ? 'Codex' : 
+                                      provider === 'gemini' ? 'Gemini' : 
+                                      'Claude';
+                    welcomeMsg = hasSession ?
+                        `\x1b[36mResuming ${providerName} session ${sessionId} in: ${projectPath}\x1b[0m\r\n` :
+                        `\x1b[36mStarting new ${providerName} session in: ${projectPath}\x1b[0m\r\n`;
+                }
+                ws.send(JSON.stringify({
+                    type: 'output',
+                    data: welcomeMsg
+                }));
+
+                try {
+                    // Prepare the shell command adapted to the platform and provider
+                    let shellCommand;
+                    if (isPlainShell) {
+                        // Plain shell mode - run the initial command or launch interactive shell
+                        const shellInitialCommand = normalizedInitialCommand || initialCommand;
+                        if (shellInitialCommand) {
+                            // Has a command to run - wrap it in bash -c / powershell
+                            if (os.platform() === 'win32') {
+                                shellCommand = `Set-Location -Path "${projectPath}"; ${shellInitialCommand}`;
+                            } else {
+                                shellCommand = `cd "${projectPath}" && ${shellInitialCommand}`;
+                            }
+                        } else {
+                            // No command - launch interactive shell directly (handled in spawn below)
+                            shellCommand = null;
+                        }
+                    } else if (provider === 'cursor') {
+                        const cursorCommand = resolveCursorCliCommand();
+                        if (!cursorCommand) {
+                            ws.send(JSON.stringify({
+                                type: 'output',
+                                data: '\x1b[31mCursor CLI not found. Install Cursor CLI or set CURSOR_CLI_PATH to `agent` or `cursor-agent`.\x1b[0m\r\n'
+                            }));
+                            return;
+                        }
+
+                        const cursorCommandForShell = cursorCommand.includes(' ')
+                            ? `"${cursorCommand.replace(/"/g, '\\"')}"`
+                            : cursorCommand;
+
+                        // Use resolved Cursor CLI command (`cursor-agent` or `agent`)
+                        if (os.platform() === 'win32') {
+                            if (hasSession && sessionId) {
+                                shellCommand = `Set-Location -Path "${projectPath}"; ${cursorCommandForShell} --resume="${sessionId}"`;
+                            } else {
+                                shellCommand = `Set-Location -Path "${projectPath}"; ${cursorCommandForShell}`;
+                            }
+                        } else {
+                            if (hasSession && sessionId) {
+                                shellCommand = `cd "${projectPath}" && ${cursorCommandForShell} --resume="${sessionId}"`;
+                            } else {
+                                shellCommand = `cd "${projectPath}" && ${cursorCommandForShell}`;
+                            }
+                        }
+                    } else if (provider === 'codex') {
+                        const codexCommand = codexCommandForShell(process.env, os.platform());
+                        if (os.platform() === 'win32') {
+                            if (hasSession && sessionId) {
+                                shellCommand = `Set-Location -Path "${projectPath}"; ${codexCommand} resume ${sessionId}; if ($LASTEXITCODE -ne 0) { ${codexCommand} }`;
+                            } else {
+                                shellCommand = `Set-Location -Path "${projectPath}"; ${codexCommand}`;
+                            }
+                        } else {
+                            if (hasSession && sessionId) {
+                                shellCommand = `cd "${projectPath}" && ${codexCommand} resume ${sessionId} || ${codexCommand}`;
+                            } else {
+                                shellCommand = `cd "${projectPath}" && ${codexCommand}`;
+                            }
+                        }
+                    } else if (provider === 'gemini') {
+                        // Use gemini command
+                        const command = initialCommand || 'gemini';
+                        if (os.platform() === 'win32') {
+                            if (hasSession && sessionId) {
+                                shellCommand = `Set-Location -Path "${projectPath}"; gemini --resume ${sessionId}; if ($LASTEXITCODE -ne 0) { gemini }`;
+                            } else {
+                                shellCommand = `Set-Location -Path "${projectPath}"; ${command}`;
+                            }
+                        } else {
+                            if (hasSession && sessionId) {
+                                shellCommand = `cd "${projectPath}" && gemini --resume ${sessionId} || gemini`;
+                            } else {
+                                shellCommand = `cd "${projectPath}" && ${command}`;
+                            }
+                        }
+                    } else {
+                            // Use claude command (default) or initialCommand if provided
+
+                        const command = initialCommand || 'claude';
+                        if (os.platform() === 'win32') {
+                            if (hasSession && sessionId) {
+                                // Try to resume session, but with fallback to new session if it fails
+                                shellCommand = `Set-Location -Path "${projectPath}"; claude --resume ${sessionId}; if ($LASTEXITCODE -ne 0) { claude }`;
+                            } else {
+                                shellCommand = `Set-Location -Path "${projectPath}"; ${command}`;
+                            }
+                        } else {
+                            if (hasSession && sessionId) {
+                                shellCommand = `cd "${projectPath}" && claude --resume ${sessionId} || claude`;
+                            } else {
+                                shellCommand = `cd "${projectPath}" && ${command}`;
+                            }
+                        }
+                    }
+
+                    console.log('🔧 Executing shell command:', shellCommand);
+
+                    // Determine shell, args, and cwd based on command mode
+                    let spawnShell, spawnArgs, spawnCwd;
+                    if (shellCommand === null) {
+                        // Interactive shell mode - launch user's default shell directly
+                        if (os.platform() === 'win32') {
+                            spawnShell = 'powershell.exe';
+                            spawnArgs = [];
+                        } else {
+                            spawnShell = process.env.SHELL || '/bin/bash';
+                            spawnArgs = ['--login'];
+                        }
+                        spawnCwd = projectPath;
+                    } else {
+                        // Command mode - run via shell -c
+                        spawnShell = os.platform() === 'win32' ? 'powershell.exe' : 'bash';
+                        spawnArgs = os.platform() === 'win32' ? ['-Command', shellCommand] : ['-c', shellCommand];
+                        spawnCwd = os.homedir();
+                    }
+
+                    // Use terminal dimensions from client if provided, otherwise use defaults
+                    const termCols = data.cols || 80;
+                    const termRows = data.rows || 24;
+                    console.log('📐 Using terminal dimensions:', termCols, 'x', termRows);
+
+                    shellProcess = pty.spawn(spawnShell, spawnArgs, {
+                        name: 'xterm-256color',
+                        cols: termCols,
+                        rows: termRows,
+                        cwd: spawnCwd,
+                        env: provider === 'codex'
+                            ? buildEmbeddedShellEnv(buildCodexCliEnv(process.env))
+                            : buildEmbeddedShellEnv(process.env)
+                    });
+
+                    console.log('🟢 Shell process started with PTY, PID:', shellProcess.pid);
+
+                    ptySessionsMap.set(ptySessionKey, {
+                        pty: shellProcess,
+                        ws: ws,
+                        buffer: [],
+                        timeoutId: null,
+                        projectPath,
+                        sessionId
+                    });
+
+                    // Handle data output
+                    shellProcess.onData((data) => {
+                        const session = ptySessionsMap.get(ptySessionKey);
+                        if (!session) return;
+
+                        if (session.buffer.length < 5000) {
+                            session.buffer.push(data);
+                        } else {
+                            session.buffer.shift();
+                            session.buffer.push(data);
+                        }
+
+                        if (session.ws && session.ws.readyState === WebSocket.OPEN) {
+                            let outputData = data;
+
+                            const cleanChunk = stripAnsiSequences(data);
+                            urlDetectionBuffer = `${urlDetectionBuffer}${cleanChunk}`.slice(-SHELL_URL_PARSE_BUFFER_LIMIT);
+
+                            outputData = outputData.replace(
+                                /OPEN_URL:\s*(https?:\/\/[^\s\x1b\x07]+)/g,
+                                '[INFO] Opening in browser: $1'
+                            );
+
+                            const emitAuthUrl = (detectedUrl, autoOpen = false) => {
+                                const normalizedUrl = normalizeDetectedUrl(detectedUrl);
+                                if (!normalizedUrl) return;
+
+                                const isNewUrl = !announcedAuthUrls.has(normalizedUrl);
+                                if (isNewUrl) {
+                                    announcedAuthUrls.add(normalizedUrl);
+                                    session.ws.send(JSON.stringify({
+                                        type: 'auth_url',
+                                        url: normalizedUrl,
+                                        autoOpen
+                                    }));
+                                }
+
+                            };
+
+                            const normalizedDetectedUrls = extractUrlsFromText(urlDetectionBuffer)
+                                .map((url) => normalizeDetectedUrl(url))
+                                .filter(Boolean);
+
+                            // Prefer the most complete URL if shorter prefix variants are also present.
+                            const dedupedDetectedUrls = Array.from(new Set(normalizedDetectedUrls)).filter((url, _, urls) =>
+                                !urls.some((otherUrl) => otherUrl !== url && otherUrl.startsWith(url))
+                            );
+
+                            dedupedDetectedUrls.forEach((url) => emitAuthUrl(url, false));
+
+                            if (shouldAutoOpenUrlFromOutput(cleanChunk) && dedupedDetectedUrls.length > 0) {
+                                const bestUrl = dedupedDetectedUrls.reduce((longest, current) =>
+                                    current.length > longest.length ? current : longest
+                                );
+                                emitAuthUrl(bestUrl, true);
+                            }
+
+                            // Send regular output
+                            session.ws.send(JSON.stringify({
+                                type: 'output',
+                                data: outputData
+                            }));
+                        }
+                    });
+
+                    // Handle process exit
+                    shellProcess.onExit((exitCode) => {
+                        console.log('🔚 Shell process exited with code:', exitCode.exitCode, 'signal:', exitCode.signal);
+                        const session = ptySessionsMap.get(ptySessionKey);
+                        if (session && session.ws && session.ws.readyState === WebSocket.OPEN) {
+                            session.ws.send(JSON.stringify({
+                                type: 'output',
+                                data: `\r\n\x1b[33mProcess exited with code ${exitCode.exitCode}${exitCode.signal ? ` (${exitCode.signal})` : ''}\x1b[0m\r\n`
+                            }));
+                        }
+                        if (session && session.timeoutId) {
+                            clearTimeout(session.timeoutId);
+                        }
+                        ptySessionsMap.delete(ptySessionKey);
+                        shellProcess = null;
+                    });
+
+                } catch (spawnError) {
+                    console.error('[ERROR] Error spawning process:', spawnError);
+                    ws.send(JSON.stringify({
+                        type: 'output',
+                        data: `\r\n\x1b[31mError: ${spawnError.message}\x1b[0m\r\n`
+                    }));
+                }
+
+            } else if (data.type === 'input') {
+                // Send input to shell process
+                if (shellProcess && shellProcess.write) {
+                    try {
+                        shellProcess.write(data.data);
+                    } catch (error) {
+                        console.error('Error writing to shell:', error);
+                    }
+                } else {
+                    console.warn('No active shell process to send input to');
+                }
+            } else if (data.type === 'resize') {
+                // Handle terminal resize
+                if (shellProcess && shellProcess.resize) {
+                    console.log('Terminal resize requested:', data.cols, 'x', data.rows);
+                    shellProcess.resize(data.cols, data.rows);
+                }
+            }
+        } catch (error) {
+            console.error('[ERROR] Shell WebSocket error:', error.message);
+            if (ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({
+                    type: 'output',
+                    data: `\r\n\x1b[31mError: ${error.message}\x1b[0m\r\n`
+                }));
+            }
+        }
+    });
+
+    ws.on('close', () => {
+        console.log('🔌 Shell client disconnected');
+
+        if (ptySessionKey) {
+            const session = ptySessionsMap.get(ptySessionKey);
+            if (session) {
+                console.log('⏳ PTY session kept alive, will timeout in 30 minutes:', ptySessionKey);
+                session.ws = null;
+
+                session.timeoutId = setTimeout(() => {
+                    console.log('⏰ PTY session timeout, killing process:', ptySessionKey);
+                    safePtyKill(session, ptySessionKey);
+                    ptySessionsMap.delete(ptySessionKey);
+                }, PTY_SESSION_TIMEOUT);
+            }
+        }
+    });
+
+    ws.on('error', (error) => {
+        console.error('[ERROR] Shell WebSocket error:', error);
+    });
+}
+
+function handleComputeShellConnection(ws, urlNodeId) {
+    console.log('🖥️  Compute shell client connected');
+    let shellProcess = null;
+    let ptySessionKey = null;
+
+    const getComputeNodeConfig = async (nodeId) => {
+        const { loadNodeConfig, getActiveNode } = await import('./compute-node.js');
+        const effectiveNodeId = nodeId || urlNodeId;
+        if (effectiveNodeId) {
+            return await loadNodeConfig(effectiveNodeId);
+        }
+        return await getActiveNode();
+    };
+
+    ws.on('message', async (message) => {
+        try {
+            const data = JSON.parse(message);
+            console.log('📨 Compute shell message received:', data.type);
+
+            if (data.type === 'init') {
+                const requestedNodeId = data.nodeId;
+                let config;
+                try {
+                    config = await getComputeNodeConfig(requestedNodeId);
+                } catch (e) {
+                    ws.send(JSON.stringify({
+                        type: 'output',
+                        data: '\x1b[31mCompute node not configured. Please save configuration first.\x1b[0m\r\n'
+                    }));
+                    return;
+                }
+
+                if (!config || !config.host || !config.user) {
+                    ws.send(JSON.stringify({
+                        type: 'output',
+                        data: '\x1b[31mCompute node configuration incomplete (missing host/user).\x1b[0m\r\n'
+                    }));
+                    return;
+                }
+
+                const termCols = data.cols || 80;
+                const termRows = data.rows || 24;
+
+                ptySessionKey = `compute_${config.id || 'default'}_${config.host}_${config.user}`;
+
+                const existingSession = ptySessionsMap.get(ptySessionKey);
+                if (existingSession) {
+                    console.log('♻️  Reconnecting to existing compute PTY session:', ptySessionKey);
+                    shellProcess = existingSession.pty;
+                    clearTimeout(existingSession.timeoutId);
+
+                    ws.send(JSON.stringify({
+                        type: 'output',
+                        data: '\x1b[36m[Reconnected to compute node]\x1b[0m\r\n'
+                    }));
+
+                    if (existingSession.buffer && existingSession.buffer.length > 0) {
+                        existingSession.buffer.forEach(bufferedData => {
+                            ws.send(JSON.stringify({ type: 'output', data: bufferedData }));
+                        });
+                    }
+
+                    existingSession.ws = ws;
+                    return;
+                }
+
+                const spawnCmd = 'ssh';
+                const sshArgs = ['-o', 'StrictHostKeyChecking=no', '-tt'];
+
+                const sshPort = config.port || 22;
+                if (sshPort !== 22) {
+                    sshArgs.push('-p', String(sshPort));
+                }
+
+                if (config.keyPath) {
+                    sshArgs.push('-i', config.keyPath);
+                }
+
+                sshArgs.push(`${config.user}@${config.host}`);
+
+                if (config.workDir && config.workDir !== '~') {
+                    sshArgs.push(`cd ${config.workDir} && exec $SHELL -l`);
+                }
+
+                const usePasswordAuth = config.password && !config.keyPath;
+
+                ws.send(JSON.stringify({
+                    type: 'output',
+                    data: `\x1b[36mConnecting to ${config.user}@${config.host}${config.workDir && config.workDir !== '~' ? ` (workDir: ${config.workDir})` : ''}...\x1b[0m\r\n`
+                }));
+
+                try {
+                    shellProcess = pty.spawn(spawnCmd, sshArgs, {
+                        name: 'xterm-256color',
+                        cols: termCols,
+                        rows: termRows,
+                        cwd: os.homedir(),
+                        env: {
+                            ...process.env,
+                            TERM: 'xterm-256color',
+                            COLORTERM: 'truecolor',
+                            FORCE_COLOR: '3'
+                        }
+                    });
+
+                    console.log('🟢 Compute shell process started, PID:', shellProcess.pid);
+
+                    let passwordAutoFilled = false;
+                    let earlyOutput = '';
+
+                    ptySessionsMap.set(ptySessionKey, {
+                        pty: shellProcess,
+                        ws: ws,
+                        buffer: [],
+                        timeoutId: null,
+                        host: config.host
+                    });
+
+                    shellProcess.onData((outputData) => {
+                        const session = ptySessionsMap.get(ptySessionKey);
+                        if (!session) return;
+
+                        if (usePasswordAuth && !passwordAutoFilled) {
+                            earlyOutput += outputData;
+                            const cleanText = earlyOutput.replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, '');
+                            if (/[Pp]assword[:\s]*$/.test(cleanText)) {
+                                passwordAutoFilled = true;
+                                shellProcess.write(config.password + '\n');
+                                return;
+                            }
+                        }
+
+                        if (session.buffer.length < 5000) {
+                            session.buffer.push(outputData);
+                        } else {
+                            session.buffer.shift();
+                            session.buffer.push(outputData);
+                        }
+
+                        if (session.ws && session.ws.readyState === WebSocket.OPEN) {
+                            session.ws.send(JSON.stringify({
+                                type: 'output',
+                                data: outputData
+                            }));
+                        }
+                    });
+
+                    shellProcess.onExit((exitCode) => {
+                        console.log('🔚 Compute shell exited with code:', exitCode.exitCode);
+                        const session = ptySessionsMap.get(ptySessionKey);
+                        if (session && session.ws && session.ws.readyState === WebSocket.OPEN) {
+                            session.ws.send(JSON.stringify({
+                                type: 'output',
+                                data: `\r\n\x1b[33mSSH session ended (code ${exitCode.exitCode})\x1b[0m\r\n`
+                            }));
+                        }
+                        if (session && session.timeoutId) {
+                            clearTimeout(session.timeoutId);
+                        }
+                        ptySessionsMap.delete(ptySessionKey);
+                        shellProcess = null;
+                    });
+
+                } catch (spawnError) {
+                    console.error('[ERROR] Error spawning SSH process:', spawnError);
+                    ws.send(JSON.stringify({
+                        type: 'output',
+                        data: `\r\n\x1b[31mError: ${spawnError.message}\x1b[0m\r\n`
+                    }));
+                }
+
+            } else if (data.type === 'input') {
+                if (shellProcess && shellProcess.write) {
+                    try {
+                        shellProcess.write(data.data);
+                    } catch (error) {
+                        console.error('Error writing to compute shell:', error);
+                    }
+                }
+            } else if (data.type === 'resize') {
+                if (shellProcess && shellProcess.resize) {
+                    shellProcess.resize(data.cols, data.rows);
+                }
+            }
+        } catch (error) {
+            console.error('[ERROR] Compute shell WebSocket error:', error.message);
+            if (ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({
+                    type: 'output',
+                    data: `\r\n\x1b[31mError: ${error.message}\x1b[0m\r\n`
+                }));
+            }
+        }
+    });
+
+    ws.on('close', () => {
+        console.log('🔌 Compute shell client disconnected');
+        if (ptySessionKey) {
+            const session = ptySessionsMap.get(ptySessionKey);
+            if (session) {
+                console.log('⏳ Compute PTY session kept alive for 30 minutes:', ptySessionKey);
+                session.ws = null;
+                session.timeoutId = setTimeout(() => {
+                    console.log('⏰ Compute PTY session timeout, killing:', ptySessionKey);
+                    safePtyKill(session, ptySessionKey);
+                    ptySessionsMap.delete(ptySessionKey);
+                }, PTY_SESSION_TIMEOUT);
+            }
+        }
+    });
+
+    ws.on('error', (error) => {
+        console.error('[ERROR] Compute shell WebSocket error:', error);
+    });
+}
+
+// Audio transcription endpoint
+app.post('/api/transcribe', authenticateToken, async (req, res) => {
+    try {
+        const multer = (await import('multer')).default;
+        const upload = multer({ storage: multer.memoryStorage() });
+
+        // Handle multipart form data
+        upload.single('audio')(req, res, async (err) => {
+            if (err) {
+                return res.status(400).json({ error: 'Failed to process audio file' });
+            }
+
+            if (!req.file) {
+                return res.status(400).json({ error: 'No audio file provided' });
+            }
+
+            const apiKey = process.env.OPENAI_API_KEY;
+            if (!apiKey) {
+                return res.status(500).json({ error: 'OpenAI API key not configured. Please set OPENAI_API_KEY in server environment.' });
+            }
+
+            try {
+                // Create form data for OpenAI
+                const FormData = (await import('form-data')).default;
+                const formData = new FormData();
+                formData.append('file', req.file.buffer, {
+                    filename: req.file.originalname,
+                    contentType: req.file.mimetype
+                });
+                formData.append('model', 'whisper-1');
+                formData.append('response_format', 'json');
+                formData.append('language', 'en');
+
+                // Make request to OpenAI
+                const response = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Bearer ${apiKey}`,
+                        ...formData.getHeaders()
+                    },
+                    body: formData
+                });
+
+                if (!response.ok) {
+                    const errorData = await response.json().catch(() => ({}));
+                    throw new Error(errorData.error?.message || `Whisper API error: ${response.status}`);
+                }
+
+                const data = await response.json();
+                let transcribedText = data.text || '';
+
+                // Check if enhancement mode is enabled
+                const mode = req.body.mode || 'default';
+
+                // If no transcribed text, return empty
+                if (!transcribedText) {
+                    return res.json({ text: '' });
+                }
+
+                // If default mode, return transcribed text without enhancement
+                if (mode === 'default') {
+                    return res.json({ text: transcribedText });
+                }
+
+                // Handle different enhancement modes
+                try {
+                    const OpenAI = (await import('openai')).default;
+                    const openai = new OpenAI({ apiKey });
+
+                    let prompt, systemMessage, temperature = 0.7, maxTokens = 800;
+
+                    switch (mode) {
+                        case 'prompt':
+                            systemMessage = 'You are an expert prompt engineer who creates clear, detailed, and effective prompts.';
+                            prompt = `You are an expert prompt engineer. Transform the following rough instruction into a clear, detailed, and context-aware AI prompt.
+
+Your enhanced prompt should:
+1. Be specific and unambiguous
+2. Include relevant context and constraints
+3. Specify the desired output format
+4. Use clear, actionable language
+5. Include examples where helpful
+6. Consider edge cases and potential ambiguities
+
+Transform this rough instruction into a well-crafted prompt:
+"${transcribedText}"
+
+Enhanced prompt:`;
+                            break;
+
+                        case 'vibe':
+                        case 'instructions':
+                        case 'architect':
+                            systemMessage = 'You are a helpful assistant that formats ideas into clear, actionable instructions for AI agents.';
+                            temperature = 0.5; // Lower temperature for more controlled output
+                            prompt = `Transform the following idea into clear, well-structured instructions that an AI agent can easily understand and execute.
+
+IMPORTANT RULES:
+- Format as clear, step-by-step instructions
+- Add reasonable implementation details based on common patterns
+- Only include details directly related to what was asked
+- Do NOT add features or functionality not mentioned
+- Keep the original intent and scope intact
+- Use clear, actionable language an agent can follow
+
+Transform this idea into agent-friendly instructions:
+"${transcribedText}"
+
+Agent instructions:`;
+                            break;
+
+                        default:
+                            // No enhancement needed
+                            break;
+                    }
+
+                    // Only make GPT call if we have a prompt
+                    if (prompt) {
+                        const completion = await openai.chat.completions.create({
+                            model: 'gpt-4o-mini',
+                            messages: [
+                                { role: 'system', content: systemMessage },
+                                { role: 'user', content: prompt }
+                            ],
+                            temperature: temperature,
+                            max_tokens: maxTokens
+                        });
+
+                        transcribedText = completion.choices[0].message.content || transcribedText;
+                    }
+
+                } catch (gptError) {
+                    console.error('GPT processing error:', gptError);
+                    // Fall back to original transcription if GPT fails
+                }
+
+                res.json({ text: transcribedText });
+
+            } catch (error) {
+                console.error('Transcription error:', error);
+                res.status(500).json({ error: error.message });
+            }
+        });
+    } catch (error) {
+        console.error('Endpoint error:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Image upload endpoint
+app.post('/api/projects/:projectName/upload-images', authenticateToken, async (req, res) => {
+    try {
+        const multer = (await import('multer')).default;
+        const path = (await import('path')).default;
+        const fs = (await import('fs')).promises;
+        const os = (await import('os')).default;
+
+        // Configure multer for image uploads
+        const storage = multer.diskStorage({
+            destination: async (req, file, cb) => {
+                const uploadDir = path.join(os.tmpdir(), 'claude-ui-uploads', String(req.user.id));
+                await fs.mkdir(uploadDir, { recursive: true });
+                cb(null, uploadDir);
+            },
+            filename: (req, file, cb) => {
+                const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+                const sanitizedName = file.originalname.replace(/[^a-zA-Z0-9.-]/g, '_');
+                cb(null, uniqueSuffix + '-' + sanitizedName);
+            }
+        });
+
+        const upload = multer({
+            storage,
+            limits: {
+                fileSize: 10 * 1024 * 1024, // 10MB
+                files: 5
+            }
+        });
+
+        // Handle multipart form data
+        upload.array('images', 5)(req, res, async (err) => {
+            if (err) {
+                return res.status(400).json({ error: err.message });
+            }
+
+            if (!req.files || req.files.length === 0) {
+                return res.status(400).json({ error: 'No files provided' });
+            }
+
+            try {
+                // Process uploaded images
+                const processedImages = await Promise.all(
+                    req.files.map(async (file) => {
+                        // Read file and convert to base64
+                        const buffer = await fs.readFile(file.path);
+                        const base64 = buffer.toString('base64');
+                        const mimeType = file.mimetype;
+
+                        // Clean up temp file immediately
+                        await fs.unlink(file.path);
+
+                        return {
+                            name: file.originalname,
+                            data: `data:${mimeType};base64,${base64}`,
+                            size: file.size,
+                            mimeType: mimeType
+                        };
+                    })
+                );
+
+                res.json({ images: processedImages });
+            } catch (error) {
+                console.error('Error processing images:', error);
+                // Clean up any remaining files
+                await Promise.all(req.files.map(f => fs.unlink(f.path).catch(() => { })));
+                res.status(500).json({ error: 'Failed to process images' });
+            }
+        });
+    } catch (error) {
+        console.error('Error in image upload endpoint:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Get token usage for a specific session
+app.get('/api/projects/:projectName/sessions/:sessionId/token-usage', authenticateToken, async (req, res) => {
+  try {
+    const { projectName, sessionId } = req.params;
+    const { provider = 'claude' } = req.query;
+    const homeDir = os.homedir();
+
+    // Allow only safe characters in sessionId
+    const safeSessionId = String(sessionId).replace(/[^a-zA-Z0-9._-]/g, '');
+    if (!safeSessionId) {
+      return res.status(400).json({ error: 'Invalid sessionId' });
+    }
+
+    // Handle Cursor sessions - they use SQLite and don't have token usage info
+    if (provider === 'cursor') {
+      return res.json({
+        used: 0,
+        total: 0,
+        breakdown: { input: 0, cacheCreation: 0, cacheRead: 0 },
+        unsupported: true,
+        message: 'Token usage tracking not available for Cursor sessions'
+      });
+    }
+
+    // Handle Codex sessions
+    if (provider === 'codex') {
+      const codexSessionsDir = path.join(resolveCodexHome(), 'sessions');
+
+      // Find the session file by searching for the session ID
+      const findSessionFile = async (dir) => {
+        try {
+          const entries = await fsPromises.readdir(dir, { withFileTypes: true });
+          for (const entry of entries) {
+            const fullPath = path.join(dir, entry.name);
+            if (entry.isDirectory()) {
+              const found = await findSessionFile(fullPath);
+              if (found) return found;
+            } else if (entry.name.includes(safeSessionId) && entry.name.endsWith('.jsonl')) {
+              return fullPath;
+            }
+          }
+        } catch (error) {
+          // Skip directories we can't read
+        }
+        return null;
+      };
+
+      const sessionFilePath = await findSessionFile(codexSessionsDir);
+
+      if (!sessionFilePath) {
+        return res.status(404).json({ error: 'Codex session file not found', sessionId: safeSessionId });
+      }
+
+      // Read and parse the Codex JSONL file
+      let fileContent;
+      try {
+        fileContent = await fsPromises.readFile(sessionFilePath, 'utf8');
+      } catch (error) {
+        if (error.code === 'ENOENT') {
+          return res.status(404).json({ error: 'Session file not found', path: sessionFilePath });
+        }
+        throw error;
+      }
+      return res.json(buildCodexTokenUsageFromJsonl(fileContent));
+    }
+
+    // Handle Gemini sessions
+    if (provider === 'gemini') {
+      const geminiSessionPath = path.join(homeDir, '.gemini', 'sessions', `${safeSessionId}.jsonl`);
+      let fileContent;
+      try {
+        fileContent = await fsPromises.readFile(geminiSessionPath, 'utf8');
+      } catch (error) {
+        if (error.code === 'ENOENT') {
+          return res.status(404).json({ error: 'Session file not found', path: geminiSessionPath });
+        }
+        throw error;
+      }
+
+      const lines = fileContent.trim().split('\n');
+      let latestStats = null;
+      for (let i = lines.length - 1; i >= 0; i--) {
+        try {
+          const entry = JSON.parse(lines[i]);
+          if (entry.type === 'status' && entry.stats) {
+            latestStats = entry.stats;
+            break;
+          }
+        } catch {
+          // Ignore malformed line
+        }
+      }
+
+      const used = latestStats
+        ? (latestStats.total_tokens || ((latestStats.input_tokens || 0) + (latestStats.output_tokens || 0)))
+        : 0;
+      const total = parseInt(process.env.GEMINI_CONTEXT_WINDOW || process.env.CONTEXT_WINDOW || '2000000', 10);
+      const cacheCreation = latestStats?.cache_creation_input_tokens || 0;
+      const cacheRead = latestStats?.cache_read_input_tokens || 0;
+      const input = latestStats?.input_tokens || 0;
+      const output = latestStats?.output_tokens || 0;
+
+      return res.json({
+        used,
+        total,
+        breakdown: {
+          input,
+          output,
+          cacheCreation,
+          cacheRead
+        }
+      });
+    }
+
+    // Handle Claude sessions (default)
+    // Extract actual project path
+    let projectPath;
+    try {
+      projectPath = await extractProjectDirectory(projectName);
+    } catch (error) {
+      console.error('Error extracting project directory:', error);
+      return res.status(500).json({ error: 'Failed to determine project path' });
+    }
+
+    // Locate the session JSONL among the CLI session directories for this project
+    const projectDirs = await resolveClaudeProjectDirs(projectName, projectPath);
+
+    let fileContent = null;
+    for (const projectDir of projectDirs) {
+      const jsonlPath = path.join(projectDir, `${safeSessionId}.jsonl`);
+
+      // Constrain to projectDir
+      const rel = path.relative(path.resolve(projectDir), path.resolve(jsonlPath));
+      if (rel.startsWith('..') || path.isAbsolute(rel)) {
+        return res.status(400).json({ error: 'Invalid path' });
+      }
+
+      try {
+        fileContent = await fsPromises.readFile(jsonlPath, 'utf8');
+        break;
+      } catch (error) {
+        if (error.code !== 'ENOENT') {
+          throw error; // Re-throw other errors to be caught by outer try-catch
+        }
+      }
+    }
+
+    if (fileContent === null) {
+      return res.status(404).json({ error: 'Session file not found' });
+    }
+    const lines = fileContent.trim().split('\n');
+
+    let inputTokens = 0;
+    let cacheCreationTokens = 0;
+    let cacheReadTokens = 0;
+    let modelName = null;
+
+    // Find the latest assistant message with usage data (scan from end)
+    for (let i = lines.length - 1; i >= 0; i--) {
+      try {
+        const entry = JSON.parse(lines[i]);
+
+        // Only count assistant messages which have usage data
+        if (entry.type === 'assistant' && entry.message?.usage) {
+          const usage = entry.message.usage;
+
+          // Use token counts from latest assistant message only
+          inputTokens = usage.input_tokens || 0;
+          cacheCreationTokens = usage.cache_creation_input_tokens || 0;
+          cacheReadTokens = usage.cache_read_input_tokens || 0;
+          modelName = entry.message.model || null;
+
+          break; // Stop after finding the latest assistant message
+        }
+      } catch (parseError) {
+        // Skip lines that can't be parsed
+        continue;
+      }
+    }
+
+    // Determine context window from model name
+    const MODEL_CONTEXT_WINDOWS = {
+      'claude-fable-5[1m]':  1000000,
+      'claude-fable-5':      200000,
+      'claude-opus-4-8':     200000,
+      'claude-opus-4-7':     200000,
+      'claude-opus-4-6':     200000,
+      'claude-opus-4-20250918': 200000,
+      'claude-sonnet-4-6':   200000,
+      'claude-sonnet-4-20250514': 200000,
+      'claude-haiku-4-5':    200000,
+      'claude-haiku-4-5-20251001': 200000,
+      'claude-3-5-sonnet':   200000,
+      'claude-3-5-sonnet-20241022': 200000,
+      'claude-3-5-haiku':    200000,
+      'claude-3-5-haiku-20241022': 200000,
+      'claude-3-opus':       200000,
+      'claude-3-opus-20240229': 200000,
+      'claude-3-sonnet':     200000,
+      'claude-3-haiku':      200000,
+    };
+
+    // Priority: env var override > model-based lookup > default
+    const parsedContextWindow = parseInt(process.env.CONTEXT_WINDOW, 10);
+    let contextWindow;
+    if (Number.isFinite(parsedContextWindow)) {
+      contextWindow = parsedContextWindow;
+    } else if (modelName) {
+      // Try exact match first, then prefix match
+      contextWindow = MODEL_CONTEXT_WINDOWS[modelName];
+      if (!contextWindow) {
+        const prefix = Object.keys(MODEL_CONTEXT_WINDOWS).find(k => modelName.startsWith(k));
+        contextWindow = prefix ? MODEL_CONTEXT_WINDOWS[prefix] : 200000;
+      }
+    } else {
+      contextWindow = 200000;
+    }
+
+    // Calculate total context usage (excluding output_tokens, as per ccusage)
+    const totalUsed = inputTokens + cacheCreationTokens + cacheReadTokens;
+
+    res.json({
+      used: totalUsed,
+      total: contextWindow,
+      model: modelName,
+      breakdown: {
+        input: inputTokens,
+        cacheCreation: cacheCreationTokens,
+        cacheRead: cacheReadTokens
+      }
+    });
+  } catch (error) {
+    console.error('Error reading session token usage:', error);
+    res.status(500).json({ error: 'Failed to read session token usage' });
+  }
+});
+
+// Serve React app for all other routes (excluding static files)
+app.get('*', (req, res) => {
+  // Skip requests for static assets (files with extensions)
+  if (path.extname(req.path)) {
+    return res.status(404).send('Not found');
+  }
+
+  // Only serve index.html for HTML routes, not for static assets
+  // Static assets should already be handled by express.static middleware above
+  const indexPath = path.join(__dirname, '../dist/index.html');
+
+  // Check if dist/index.html exists (production build available)
+  if (fs.existsSync(indexPath)) {
+    // Set no-cache headers for HTML to prevent service worker issues
+    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+    res.sendFile(indexPath);
+  } else {
+    // In development, redirect to Vite dev server only if dist doesn't exist
+    res.redirect(`http://${DISPLAY_HOST}:${getFrontendPortSync(REQUESTED_VITE_PORT)}`);
+  }
+});
+
+// Global error handler — final safety net for synchronous throws, body-parser
+// failures (e.g. malformed JSON), and errors forwarded via next(err). Returns a
+// consistent JSON shape and never leaks stack traces to clients. Declared with the
+// 4-arg signature Express requires to recognize error-handling middleware.
+// eslint-disable-next-line no-unused-vars
+app.use((err, req, res, next) => {
+  console.error('[ERROR] Unhandled request error:', err);
+  if (res.headersSent) {
+    return next(err);
+  }
+  const status = err.status || err.statusCode || 500;
+  res.status(status).json({
+    error: status >= 400 && status < 500 ? 'Bad request' : 'Internal server error',
+  });
+});
+
+// Helper function to convert permissions to rwx format
+function permToRwx(perm) {
+    const r = perm & 4 ? 'r' : '-';
+    const w = perm & 2 ? 'w' : '-';
+    const x = perm & 1 ? 'x' : '-';
+    return r + w + x;
+}
+
+async function findAllFilesInProject(projectRoot, fileName, maxDepth = 10) {
+    const SKIP_DIRS = new Set(['node_modules', '.git', 'dist', 'build']);
+    const results = [];
+    const queue = [[projectRoot, 0]];
+
+    while (queue.length > 0) {
+        const [dirPath, depth] = queue.shift();
+        let entries;
+        try {
+            entries = await fsPromises.readdir(dirPath, { withFileTypes: true });
+        } catch { continue; }
+
+        for (const entry of entries) {
+            const entryPath = path.join(dirPath, entry.name);
+            let isDir = entry.isDirectory();
+
+            // Resolve symlinks (e.g. .claude/skills/* are symlinked directories)
+            if (!isDir && entry.isSymbolicLink()) {
+                try {
+                    const stats = await fsPromises.stat(entryPath);
+                    isDir = stats.isDirectory();
+                } catch { continue; }
+            }
+
+            if (entry.name === fileName && !isDir) {
+                results.push(entryPath);
+                if (results.length >= 20) return results;
+            }
+            if (isDir && !SKIP_DIRS.has(entry.name)
+                && depth < maxDepth) {
+                queue.push([entryPath, depth + 1]);
+            }
+        }
+    }
+    return results;
+}
+
+async function resolveProjectFilePath(projectRoot, inputPath) {
+    if (!inputPath || typeof inputPath !== 'string') return { resolved: path.resolve(projectRoot, '') };
+    if (path.isAbsolute(inputPath)) return { resolved: path.resolve(inputPath) };
+
+    const direct = path.resolve(projectRoot, inputPath);
+    const isSimpleName = !inputPath.includes('/') && !inputPath.includes('\\');
+
+    // For paths with separators (e.g. "src/main.tsx"), check direct first, then search
+    if (!isSimpleName) {
+        try {
+            await fsPromises.access(direct);
+            return { resolved: direct };
+        } catch { /* not found at direct path */ }
+
+        // Search for the filename, then filter matches ending with the partial path
+        const fileName = path.basename(inputPath);
+        const normalizedInput = inputPath.split(path.sep).join('/');
+        const matches = await findAllFilesInProject(projectRoot, fileName);
+        const filtered = matches.filter(m => {
+            const rel = path.relative(projectRoot, m).split(path.sep).join('/');
+            return rel === normalizedInput || rel.endsWith('/' + normalizedInput);
+        });
+
+        if (filtered.length === 1) {
+            return { resolved: filtered[0] };
+        }
+        if (filtered.length > 1) {
+            return {
+                resolved: null,
+                candidates: filtered.map(m => path.relative(projectRoot, m))
+            };
+        }
+
+        return { resolved: direct };
+    }
+
+    // 1. Hardcoded pipeline fallbacks
+    const fallbackMap = {
+        'research_brief.json': '.pipeline/docs/research_brief.json',
+        'tasks.json': '.pipeline/tasks/tasks.json',
+        'pipeline_config.json': '.pipeline/config.json'
+    };
+    const mapped = fallbackMap[inputPath];
+    if (mapped) return { resolved: path.resolve(projectRoot, mapped) };
+
+    // 2. If the file exists at project root, use it
+    try {
+        await fsPromises.access(direct);
+        return { resolved: direct };
+    } catch { /* not at root */ }
+
+    // 3. Search project tree
+    const matches = await findAllFilesInProject(projectRoot, inputPath);
+    if (matches.length === 1) {
+        return { resolved: matches[0] };
+    }
+    if (matches.length > 1) {
+        return {
+            resolved: null,
+            candidates: matches.map(m => path.relative(projectRoot, m))
+        };
+    }
+
+    // 4. No match — fall back to direct path (will 404)
+    return { resolved: direct };
+}
+
+async function getFileTree(dirPath, maxDepth = 3, currentDepth = 0, showHidden = true, isBrowsing = false) {
+    // Using fsPromises from import
+    const items = [];
+
+    try {
+        const entries = await fsPromises.readdir(dirPath, { withFileTypes: true });
+
+        for (const entry of entries) {
+            // Debug: log all entries including hidden files
+            if (!showHidden && entry.name.startsWith('.')) continue;
+
+            // Skip heavy build directories and VCS directories unless we are browsing
+            if (!isBrowsing && (
+                entry.name === 'node_modules' ||
+                entry.name === 'dist' ||
+                entry.name === 'build' ||
+                entry.name === '.git' ||
+                entry.name === '.svn' ||
+                entry.name === '.hg'
+            )) continue;
+
+            const itemPath = path.join(dirPath, entry.name);
+            let isDirectory = entry.isDirectory();
+
+            // Resolve symlinked directories (e.g. .claude/skills/*) as directories.
+            if (!isDirectory && entry.isSymbolicLink()) {
+                try {
+                    const targetStats = await fsPromises.stat(itemPath);
+                    isDirectory = targetStats.isDirectory();
+                } catch (_) {
+                    // Broken symlink or inaccessible target; keep as file.
+                }
+            }
+
+            const item = {
+                name: entry.name,
+                path: itemPath,
+                type: isDirectory ? 'directory' : 'file'
+            };
+
+            // Get file stats for additional metadata
+            try {
+                const stats = await fsPromises.stat(itemPath);
+                item.size = stats.size;
+                item.modified = stats.mtime.toISOString();
+
+                // Convert permissions to rwx format
+                const mode = stats.mode;
+                const ownerPerm = (mode >> 6) & 7;
+                const groupPerm = (mode >> 3) & 7;
+                const otherPerm = mode & 7;
+                item.permissions = ((mode >> 6) & 7).toString() + ((mode >> 3) & 7).toString() + (mode & 7).toString();
+                item.permissionsRwx = permToRwx(ownerPerm) + permToRwx(groupPerm) + permToRwx(otherPerm);
+            } catch (statError) {
+                // If stat fails, provide default values
+                item.size = 0;
+                item.modified = null;
+                item.permissions = '000';
+                item.permissionsRwx = '---------';
+            }
+
+            if (isDirectory && currentDepth < maxDepth) {
+                // Recursively get subdirectories but limit depth
+                try {
+                    // Check if we can access the directory before trying to read it
+                    await fsPromises.access(item.path, fs.constants.R_OK);
+                    item.children = await getFileTree(item.path, maxDepth, currentDepth + 1, showHidden);
+                } catch (e) {
+                    // Silently skip directories we can't access (permission denied, etc.)
+                    item.children = [];
+                }
+            }
+
+            items.push(item);
+        }
+    } catch (error) {
+        // Only log non-permission errors to avoid spam
+        if (error.code !== 'EACCES' && error.code !== 'EPERM') {
+            console.error('Error reading directory:', error);
+        }
+    }
+
+    return items.sort((a, b) => {
+        if (a.type !== b.type) {
+            return a.type === 'directory' ? -1 : 1;
+        }
+        return a.name.localeCompare(b.name);
+    });
+}
+
+const REQUESTED_PORT = parsePortNumber(process.env.PORT, DEFAULT_BACKEND_PORT);
+const REQUESTED_VITE_PORT = parsePortNumber(process.env.VITE_PORT, DEFAULT_FRONTEND_PORT);
+const HOST = process.env.HOST || '127.0.0.1';
+const STRICT_PORT = process.env.DR_CLAW_STRICT_PORT === '1';
+const IS_DESKTOP = process.env.DR_CLAW_DESKTOP === '1';
+// Show localhost when binding to all interfaces; 0.0.0.0 is not directly connectable.
+const DISPLAY_HOST = HOST === '0.0.0.0' ? 'localhost' : HOST;
+
+// Initialize database and start server
+async function startServer() {
+    try {
+        // Initialize authentication database
+        await initializeDatabase();
+
+        // Check if running in production mode (dist folder exists)
+        const distIndexPath = path.join(__dirname, '../dist/index.html');
+        const isProduction = fs.existsSync(distIndexPath);
+
+        // Log Claude implementation mode
+        console.log(`${c.info('[INFO]')} Using Claude Agents SDK for Claude integration`);
+        if (IS_DESKTOP) {
+            console.log(`${c.info('[INFO]')} Running inside Electron desktop shell`);
+        }
+        console.log(`${c.info('[INFO]')} Running in ${c.bright(isProduction ? 'PRODUCTION' : 'DEVELOPMENT')} mode`);
+
+        if (!isProduction) {
+            console.log(`${c.warn('[WARN]')} Note: Requests will be proxied to Vite dev server at ${c.dim('http://' + DISPLAY_HOST + ':' + getFrontendPortSync(REQUESTED_VITE_PORT))}`);
+        }
+
+        const activePort = await listenOnAvailablePort(server, {
+            startPort: REQUESTED_PORT,
+            host: HOST,
+            maxAttempts: STRICT_PORT ? 1 : undefined,
+        });
+        setRuntimePortSync('backend', activePort);
+
+        const appInstallPath = path.join(__dirname, '..');
+        const vitePort = getFrontendPortSync(REQUESTED_VITE_PORT);
+
+        if (activePort !== REQUESTED_PORT) {
+            console.log(`${c.warn('[WARN]')} Port ${REQUESTED_PORT} is busy, switched backend to ${activePort}`);
+        }
+
+        console.log('');
+        console.log(c.dim('═'.repeat(63)));
+        console.log(`  ${c.bright('Dr. Claw Server - Ready')}`);
+        console.log(c.dim('═'.repeat(63)));
+        console.log('');
+
+        if (isProduction) {
+            console.log(`${c.info('[INFO]')} Server URL:  ${c.bright('http://' + DISPLAY_HOST + ':' + activePort)}`);
+        } else {
+            console.log(`${c.info('[INFO]')} Backend URL: ${c.dim('http://' + DISPLAY_HOST + ':' + activePort)}`);
+            console.log(`${c.ok('[OK]')}   Frontend URL: ${c.bright('http://' + DISPLAY_HOST + ':' + vitePort)} (Use this for development)`);
+        }
+
+        console.log(`${c.info('[INFO]')} Installed at: ${c.dim(appInstallPath)}`);
+        console.log(`${c.tip('[TIP]')}  Run "dr-claw status" for full configuration details`);
+        console.log('');
+
+        // Ensure the workspaces root directory exists
+        const startupWorkspaceRoot = await getWorkspacesRoot();
+        await fsPromises.mkdir(startupWorkspaceRoot, { recursive: true });
+
+        // Start watching the projects folder for changes
+        await setupProjectsWatcher();
+
+        // Background discovery (e.g. the Codex session scan) runs off the request
+        // path, so it publishes its results through this event instead.
+        projectsEvents.on('projects-changed', (detail) => {
+            scheduleProjectsBroadcast?.('discovery', null, detail?.reason || 'discovery', null);
+        });
+    } catch (error) {
+        console.error('[ERROR] Failed to start server:', error);
+        process.exit(1);
+    }
+}
+
+// Graceful shutdown — clean up PTY (terminal) sessions, WebSocket connections and the
+// HTTP server on SIGTERM/SIGINT (e.g. when the Electron shell quits or a deploy restarts
+// the process) so in-flight work and SQLite WAL writes are flushed cleanly instead of the
+// process being hard-killed. A force-exit timer guarantees we never hang on shutdown.
+let shuttingDown = false;
+function gracefulShutdown(signal) {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`\n${c.info('[INFO]')} Received ${signal}, shutting down gracefully...`);
+
+    // Backstop: force-exit if graceful close stalls. Unref'd so it can't keep us alive.
+    setTimeout(() => process.exit(0), 3000).unref();
+
+    // Kill active PTY sessions.
+    for (const session of ptySessionsMap.values()) {
+        try { session.pty?.kill(); } catch {}
+    }
+    ptySessionsMap.clear();
+
+    // Terminate WebSocket clients so server.close() can complete, then close servers.
+    try {
+        for (const client of wss.clients) {
+            try { client.terminate(); } catch {}
+        }
+        wss.close();
+    } catch {}
+
+    server.close(() => process.exit(0));
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
+startServer();

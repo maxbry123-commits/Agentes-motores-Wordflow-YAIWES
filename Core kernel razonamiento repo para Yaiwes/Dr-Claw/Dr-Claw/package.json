@@ -1,0 +1,202 @@
+{
+  "name": "dr-claw",
+  "version": "1.1.4",
+  "description": "Dr. Claw — Desktop and mobile UI for Claude Code, Cursor CLI, Codex, and OpenRouter with Research Lab",
+  "type": "module",
+  "main": "server/index.js",
+  "bin": {
+    "vibelab": "server/cli.js",
+    "dr-claw": "server/cli.js"
+  },
+  "files": [
+    "agent-harness/",
+    "bootstrap/codex/",
+    "server/",
+    "shared/",
+    "skills/",
+    "dist/",
+    "public/",
+    "scripts/",
+    "README.md",
+    "NOTICE",
+    "LICENSE"
+  ],
+  "homepage": "https://github.com/OpenLAIR/dr-claw",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/OpenLAIR/dr-claw.git"
+  },
+  "bugs": {
+    "url": "https://github.com/OpenLAIR/dr-claw/issues"
+  },
+  "scripts": {
+    "predev": "node scripts/check-deps.js",
+    "dev": "npm run native:node && concurrently --kill-others \"npm run server\" \"npm run client\"",
+    "server": "npm run native:node && node --watch-path=./server/routes --watch-path=./server/middleware --watch-path=./server/database --watch-path=./server/utils --watch-path=./server/constants --watch-path=./server/index.js server/index.js",
+    "client": "vite --host",
+    "build": "vite build",
+    "native:node": "node scripts/native-runtime.mjs node",
+    "native:electron": "node scripts/native-runtime.mjs electron",
+    "desktop:icons": "node scripts/build-electron-icons.mjs",
+    "desktop:prepare": "node electron/cli.mjs prepare",
+    "desktop:dev": "node electron/cli.mjs dev",
+    "desktop:pack": "node electron/cli.mjs pack",
+    "desktop:dist": "node electron/cli.mjs dist",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "start": "npm run build && npm run server",
+    "release": "./release.sh",
+    "prepublishOnly": "npm run skills:catalog && npm run skills:validate && npm run bootstrap:test && npm run build",
+    "postinstall": "node scripts/fix-node-pty.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "skills:catalog": "node scripts/export-skills-catalog-v2.mjs",
+    "skills:validate": "python3 bootstrap/codex/skills/drclaw-skill-library/scripts/query_library.py --validate",
+    "bootstrap:test": "python3 -m unittest discover -s bootstrap/codex/tests -v",
+    "desktop:pack:mac": "node electron/cli.mjs pack --mac",
+    "desktop:pack:win": "node electron/cli.mjs pack --win",
+    "desktop:dist:mac": "node electron/cli.mjs dist --mac dmg --publish never",
+    "desktop:dist:win": "node electron/cli.mjs dist --win nsis --publish never"
+  },
+  "keywords": [
+    "claude code",
+    "ai",
+    "anthropic",
+    "openrouter",
+    "ui",
+    "mobile"
+  ],
+  "author": "Dr. Claw Contributors",
+  "license": "(GPL-3.0-only AND AGPL-3.0-only)",
+  "engines": {
+    "node": "22.x || 24.x"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "0.3.170",
+    "@codemirror/lang-css": "^6.3.1",
+    "@codemirror/lang-html": "^6.4.9",
+    "@codemirror/lang-javascript": "^6.2.4",
+    "@codemirror/lang-json": "^6.0.1",
+    "@codemirror/lang-markdown": "^6.3.3",
+    "@codemirror/lang-python": "^6.2.1",
+    "@codemirror/merge": "^6.11.1",
+    "@codemirror/theme-one-dark": "^6.1.2",
+    "@iarna/toml": "^2.2.5",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@octokit/rest": "^22.0.0",
+    "@openai/codex": "0.147.0",
+    "@openai/codex-sdk": "0.147.0",
+    "@replit/codemirror-minimap": "^0.5.2",
+    "@tailwindcss/typography": "^0.5.16",
+    "@uiw/react-codemirror": "^4.23.13",
+    "@xterm/addon-clipboard": "^0.1.0",
+    "@xterm/addon-fit": "^0.10.0",
+    "@xterm/addon-web-links": "^0.11.0",
+    "@xterm/addon-webgl": "^0.18.0",
+    "@xterm/xterm": "^5.5.0",
+    "adm-zip": "0.6.0",
+    "bcryptjs": "^3.0.2",
+    "better-sqlite3": "13.0.3",
+    "chokidar": "^4.0.3",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "cors": "^2.8.5",
+    "cross-spawn": "^7.0.3",
+    "express": "^4.18.2",
+    "fuse.js": "^7.0.0",
+    "glob": "^11.1.0",
+    "gray-matter": "^4.0.3",
+    "i18next": "^25.7.4",
+    "i18next-browser-languagedetector": "^8.2.0",
+    "jsonwebtoken": "^9.0.2",
+    "katex": "^0.16.25",
+    "lucide-react": "^0.515.0",
+    "mermaid": "^11.12.3",
+    "mime-types": "^3.0.1",
+    "multer": "^2.0.1",
+    "node-fetch": "^2.7.0",
+    "node-pty": "^1.1.0-beta34",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-dropzone": "^14.2.3",
+    "react-i18next": "^16.5.3",
+    "react-markdown": "^10.1.0",
+    "react-router-dom": "7.18.2",
+    "react-syntax-highlighter": "16.1.1",
+    "rehype-katex": "^7.0.1",
+    "rehype-raw": "^7.0.0",
+    "remark-gfm": "^4.0.0",
+    "remark-math": "^6.0.0",
+    "sqlite": "^5.1.1",
+    "sqlite3": "5.1.7",
+    "tailwind-merge": "^3.3.1",
+    "ws": "^8.14.2"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.58.2",
+    "@types/node": "^22.19.7",
+    "@types/react": "^18.2.43",
+    "@types/react-dom": "^18.2.17",
+    "@vitejs/plugin-react": "^4.6.0",
+    "auto-changelog": "^2.5.0",
+    "autoprefixer": "^10.4.16",
+    "concurrently": "^8.2.2",
+    "electron": "41.10.3",
+    "electron-builder": "26.15.0",
+    "node-gyp": "11.5.0",
+    "png-to-ico": "^3.0.1",
+    "postcss": "^8.4.32",
+    "release-it": "21.0.2",
+    "sharp": "0.35.3",
+    "tailwindcss": "^3.4.0",
+    "typescript": "^5.9.3",
+    "vite": "^7.0.4",
+    "vitest": "^4.1.0"
+  },
+  "build": {
+    "appId": "io.openlair.drclaw",
+    "productName": "Dr. Claw",
+    "directories": {
+      "output": "release"
+    },
+    "asar": false,
+    "extraMetadata": {
+      "main": "electron/main.mjs"
+    },
+    "files": [
+      "dist/**/*",
+      "public/**/*",
+      "server/**/*",
+      "shared/**/*",
+      "skills/**/*",
+      "electron/**/*",
+      "package.json"
+    ],
+    "mac": {
+      "icon": "build/icon.icns",
+      "target": [
+        "dmg"
+      ],
+      "category": "public.app-category.developer-tools",
+      "artifactName": "${productName}-${version}-mac-${arch}.${ext}"
+    },
+    "win": {
+      "icon": "build/icon.ico",
+      "target": [
+        "nsis"
+      ],
+      "artifactName": "${productName}-${version}-win-${arch}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true
+    }
+  },
+  "overrides": {
+    "tar": "7.5.22",
+    "make-fetch-happen": "14.0.3",
+    "cacache": "19.0.1",
+    "http-proxy-agent": "7.0.2"
+  }
+}

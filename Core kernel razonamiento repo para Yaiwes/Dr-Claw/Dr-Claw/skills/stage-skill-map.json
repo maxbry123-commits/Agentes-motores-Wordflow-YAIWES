@@ -1,0 +1,187 @@
+{
+  "survey": {
+    "base": [
+      "inno-deep-research",
+      "gemini-deep-research",
+      "academic-researcher",
+      "dataset-discovery",
+      "biorxiv-database",
+      "aris-idea-discovery",
+      "aris-research-lit",
+      "ds-scout"
+    ],
+    "byTaskType": {
+      "analysis": [
+        "inno-deep-research",
+        "gemini-deep-research",
+        "academic-researcher",
+        "aris-research-lit"
+      ],
+      "exploration": [
+        "inno-deep-research",
+        "gemini-deep-research",
+        "dataset-discovery",
+        "biorxiv-database",
+        "academic-researcher",
+        "aris-research-lit",
+        "aris-comm-lit-review",
+        "aris-arxiv",
+        "aris-semantic-scholar",
+        "ds-scout"
+      ]
+    }
+  },
+  "ideation": {
+    "base": [
+      "inno-pipeline-planner",
+      "inno-prepare-resources",
+      "inno-deep-research",
+      "dataset-discovery",
+      "inno-idea-generation",
+      "inno-idea-eval",
+      "biorxiv-database",
+      "academic-researcher",
+      "aris-idea-discovery",
+      "aris-idea-creator",
+      "ds-idea"
+    ],
+    "byTaskType": {
+      "analysis": [
+        "inno-idea-generation",
+        "inno-idea-eval",
+        "inno-deep-research",
+        "academic-researcher",
+        "aris-novelty-check",
+        "aris-research-review",
+        "ds-idea"
+      ],
+      "exploration": [
+        "inno-idea-generation",
+        "inno-code-survey",
+        "inno-deep-research",
+        "dataset-discovery",
+        "biorxiv-database",
+        "academic-researcher",
+        "aris-idea-creator",
+        "aris-novelty-check"
+      ],
+      "implementation": [
+        "inno-prepare-resources"
+      ]
+    }
+  },
+  "experiment": {
+    "base": [
+      "aris-compute-guard",
+      "inno-code-survey",
+      "dataset-discovery",
+      "inno-experiment-dev",
+      "inno-experiment-analysis",
+      "init-analysis",
+      "aris-experiment-bridge",
+      "aris-run-experiment",
+      "autoresearch",
+      "ds-experiment",
+      "ds-baseline"
+    ],
+    "byTaskType": {
+      "implementation": [
+        "inno-experiment-dev",
+        "init-analysis",
+        "aris-experiment-bridge",
+        "aris-experiment-plan",
+        "autoresearch",
+        "ds-experiment",
+        "ds-baseline"
+      ],
+      "analysis": [
+        "inno-experiment-analysis",
+        "init-analysis",
+        "aris-analyze-results",
+        "aris-result-to-claim",
+        "ds-analysis-campaign",
+        "ds-optimize"
+      ],
+      "exploration": [
+        "inno-code-survey",
+        "dataset-discovery",
+        "inno-deep-research",
+        "biorxiv-database"
+      ]
+    }
+  },
+  "publication": {
+    "base": [
+      "inno-paper-writing",
+      "inno-figure-gen",
+      "inno-paper-reviewer",
+      "inno-rebuttal",
+      "inno-humanizer",
+      "inno-reference-audit",
+      "inno-rclone-to-overleaf",
+      "scientific-writing",
+      "ml-paper-writing",
+      "inno-grant-proposal",
+      "aris-paper-writing",
+      "aris-auto-review-loop",
+      "aris-rebuttal",
+      "ds-write",
+      "ds-review",
+      "ds-rebuttal"
+    ],
+    "byTaskType": {
+      "writing": [
+        "inno-paper-writing",
+        "inno-figure-gen",
+        "inno-rebuttal",
+        "inno-humanizer",
+        "scientific-writing",
+        "ml-paper-writing",
+        "inno-grant-proposal",
+        "aris-paper-writing",
+        "aris-paper-write",
+        "aris-paper-figure",
+        "aris-paper-compile",
+        "ds-write",
+        "ds-figure-polish",
+        "ds-finalize"
+      ],
+      "analysis": [
+        "inno-paper-reviewer",
+        "inno-rebuttal",
+        "inno-reference-audit",
+        "inno-deep-research",
+        "aris-auto-review-loop",
+        "aris-rebuttal",
+        "ds-review",
+        "ds-rebuttal"
+      ],
+      "delivery": [
+        "inno-rclone-to-overleaf"
+      ]
+    }
+  },
+  "promotion": {
+    "base": [
+      "making-academic-presentations",
+      "aris-paper-poster",
+      "aris-paper-slides"
+    ],
+    "byTaskType": {
+      "scripting": [
+        "making-academic-presentations",
+        "aris-paper-slides"
+      ],
+      "rendering": [
+        "making-academic-presentations",
+        "aris-paper-poster"
+      ],
+      "narration": [
+        "making-academic-presentations"
+      ],
+      "delivery": [
+        "making-academic-presentations"
+      ]
+    }
+  }
+}
