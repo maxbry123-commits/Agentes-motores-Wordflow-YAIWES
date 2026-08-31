@@ -32,3 +32,4 @@
 {"number": 24, "parts": 1, "slug": "OpenMythos-MLX", "source": "https://github.com/DeadByDawn101/OpenMythos-MLX.git", "source_commit": "dbc37a5107d1958a84bae17f02f99ac7862b4693", "status": "COMPLETE"}
 {"number": 25, "parts": 1, "slug": "OpenMythos-Skill", "source": "https://github.com/SarthakDz/OpenMythos-Skill.git", "source_commit": "345e276421d605c53827ea308b67f91a9e71ac28", "status": "COMPLETE"}
 {"number": 26, "parts": 2, "slug": "dagu-org", "source": "https://github.com/dagu-org/dagu.git", "source_commit": "b59f742fa6ba859729880a71f62a4231008ce22b", "status": "COMPLETE"}
+{"number": 1, "parts": 6, "slug": "Aider", "source": "https://github.com/Aider-AI/aider.git", "source_commit": "5dc9490bb35f9729ef2c95d00a19ccd30c26339c", "status": "COMPLETE"}
