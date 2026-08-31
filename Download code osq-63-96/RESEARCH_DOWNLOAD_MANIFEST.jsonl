@@ -9,3 +9,7 @@
 {"number": 71, "parts": 7, "slug": "hermes-agent", "source": "https://github.com/NousResearch/hermes-agent.git", "source_commit": "b20cc5f787ea816ea8645603b7b2ac8234dcb8b4", "status": "COMPLETE"}
 {"number": 72, "parts": 3, "slug": "plandex", "source": "https://github.com/plandex-ai/plandex.git", "source_commit": "e2d772072efadbe41d2946d97d79be55532dbab5", "status": "COMPLETE"}
 {"number": 73, "parts": 1, "slug": "repomix", "source": "https://github.com/yamadashy/repomix.git", "source_commit": "b79ca3b5abcaea81d681d9436fd34d6b9a51eb6c", "status": "COMPLETE"}
+{"number": 74, "parts": 1, "slug": "crawl4ai", "source": "https://github.com/unclecode/crawl4ai.git", "source_commit": "862f6bccb9c063f49b9d42701baa0eea17a4993f", "status": "COMPLETE"}
+{"number": 75, "parts": 1, "slug": "yt-dlp", "source": "https://github.com/yt-dlp/yt-dlp.git", "source_commit": "bbc809a1161d3bfca51fa36f59dda35556ee85a0", "status": "COMPLETE"}
+{"number": 76, "parts": 1, "slug": "searxng", "source": "https://github.com/searxng/searxng.git", "source_commit": "d226b78bc4c9ab93a84849b8ad128a68c41be17c", "status": "COMPLETE"}
+{"number": 77, "parts": 4, "slug": "Perplexica", "source": "https://github.com/ItzCrazyKns/Perplexica.git", "source_commit": "7dc5d088f7262fbc5e39037f84940a8a2193c5fb", "status": "COMPLETE"}
