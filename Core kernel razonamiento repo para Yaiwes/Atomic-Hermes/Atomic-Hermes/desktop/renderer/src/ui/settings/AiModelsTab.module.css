@@ -1,0 +1,581 @@
+.root {
+  margin-top: 12px;
+}
+
+.title {
+  color: #fff;
+  font-size: 20px;
+  font-weight: 590;
+  line-height: 24px;
+  letter-spacing: -0.2px;
+  margin-bottom: 16px;
+}
+
+/* ── Active status bar ───────────────────────────────── */
+
+.statusBar {
+  display: flex;
+  padding: 12px 14px;
+  margin-bottom: 16px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  min-height: 42px;
+}
+
+.statusBarVertical {
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: flex-start;
+}
+
+.statusBarVerticalMain {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  column-gap: 40px;
+  row-gap: 8px;
+  width: 100%;
+  min-width: 0;
+}
+
+.statusBarVerticalMain .statusSegment {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  flex: 0 1 auto;
+  min-width: 80px;
+  max-width: 100%;
+}
+
+.statusBarVerticalMain .statusLabel {
+  flex-shrink: 0;
+  min-width: 0;
+}
+
+.statusBarVerticalMain .statusValue {
+  flex: 0 1 auto;
+  align-self: stretch;
+  min-width: 0;
+  min-height: 24px;
+}
+
+.statusBarVerticalMain .statusValueText {
+  line-height: 16px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.statusBarHorizontal {
+  flex-direction: row;
+  flex-wrap: nowrap;
+  align-items: stretch;
+}
+
+.statusBarHorizontalMain {
+  display: grid;
+  grid-template-columns: 160px minmax(240px, 1.2fr) 160px minmax(180px, 1fr);
+  column-gap: 24px;
+  row-gap: 4px;
+  align-items: start;
+  width: 100%;
+  min-width: 0;
+}
+
+.statusBarHorizontal .statusBarRunningModel {
+  max-width: 100%;
+}
+
+.statusBarHorizontal .statusBarRunningModel .statusLabel {
+  min-width: 0;
+}
+
+.statusBarHorizontal .statusSegment {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.statusBarHorizontal .statusLabel {
+  flex-shrink: 0;
+  min-width: 0;
+}
+
+.statusBarHorizontal .statusValue {
+  width: 100%;
+  min-width: 0;
+}
+
+.statusBarHorizontal .statusBarRunningModel .statusValue {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.statusBarHorizontal .statusValueText {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  line-height: 16px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@media (max-width: 1180px) {
+  .statusBarHorizontalMain {
+    grid-template-columns: minmax(140px, 1fr) minmax(180px, 1fr);
+    column-gap: 20px;
+    row-gap: 12px;
+  }
+
+  .statusBarHorizontal .statusBarRunningModel {
+    grid-column: 2;
+  }
+}
+
+.statusSegment {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  flex: 0 1 auto;
+  min-width: 80px;
+  max-width: 100%;
+}
+
+.statusLabel {
+  font-size: 13px;
+  font-weight: 500;
+  color: rgba(255, 255, 255, 0.4);
+}
+
+.statusValue {
+  font-size: 13px;
+  font-weight: 500;
+  color: rgba(255, 255, 255, 0.85);
+  min-height: 24px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.statusValueText {
+  line-height: 16px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.serverDot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: rgba(255, 255, 255, 0.25);
+}
+
+.serverDot--running {
+  background: #22c55e;
+}
+
+.serverDot--starting {
+  background: #ff9f0a;
+  animation: server-dot-pulse 1.2s ease-in-out infinite;
+}
+
+.serverDot--loading {
+  background: #5ac8fa;
+  animation: server-dot-pulse 1.2s ease-in-out infinite;
+}
+
+.serverDot--error {
+  background: #ff453a;
+}
+
+.serverDot--stopped {
+  background: rgba(255, 255, 255, 0.25);
+}
+
+.serverStopBtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  gap: 4px;
+  height: 20px;
+  margin: 0;
+  padding: 0 7px 0 6px;
+  border: 1px solid rgba(255, 69, 58, 0.45);
+  border-radius: 4px;
+  background: rgba(255, 69, 58, 0.12);
+  color: #ff6961;
+  cursor: pointer;
+  transition:
+    background 0.15s ease,
+    border-color 0.15s ease,
+    color 0.15s ease;
+}
+
+.serverStopBtnLabel {
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+}
+
+.serverStopBtn:hover:not(:disabled) {
+  background: rgba(255, 69, 58, 0.25);
+  border-color: rgba(255, 69, 58, 0.6);
+  color: #ff6961;
+}
+
+.serverStopBtn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+@keyframes server-dot-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+
+  50% {
+    opacity: 0.35;
+  }
+}
+
+/* ── Connection mode toggle ──────────────────────────── */
+
+.connectionSection {
+  margin-bottom: 24px;
+}
+
+.connectionSelector {
+  display: flex;
+  gap: 0;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  padding: 3px;
+}
+
+.connectionOption {
+  flex: 1;
+  padding: 7px 14px;
+  border: none;
+  border-radius: 7px;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.5);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition:
+    background 0.15s ease,
+    color 0.15s ease;
+  white-space: nowrap;
+}
+
+.connectionOption:hover:not(:disabled) {
+  color: rgba(255, 255, 255, 0.7);
+}
+
+.connectionOption--active {
+  background: rgba(255, 255, 255, 0.12);
+  color: #fff;
+}
+
+.connectionOption:disabled {
+  cursor: not-allowed;
+}
+
+/* ── Mode switch loader ──────────────────────────────── */
+
+.modeSwitchLoader {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 18px 16px;
+  margin-bottom: 24px;
+  border-radius: 14px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.modeSwitchSpinner {
+  width: 18px;
+  height: 18px;
+  border-radius: 999px;
+  border: 2px solid rgba(255, 255, 255, 0.18);
+  border-top-color: rgba(255, 255, 255, 0.9);
+  animation: ai-models-spin 0.8s linear infinite;
+  flex-shrink: 0;
+}
+
+.modeSwitchLoaderText {
+  color: rgba(255, 255, 255, 0.82);
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.4;
+}
+
+@keyframes ai-models-spin {
+  from {
+    transform: rotate(0deg);
+  }
+
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* ── Coming Soon banner (local models on non-Mac) ──── */
+
+.comingSoonBanner {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 24px 20px;
+  border-radius: 14px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.comingSoonIcon {
+  font-size: 28px;
+  flex-shrink: 0;
+}
+
+.comingSoonBody {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.comingSoonTitle {
+  font-size: 15px;
+  font-weight: 650;
+  color: rgba(255, 255, 255, 0.85);
+}
+
+.comingSoonDesc {
+  font-size: 13px;
+  color: rgba(255, 255, 255, 0.5);
+  line-height: 1.5;
+}
+
+.dropdownRow {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  margin-bottom: 24px;
+}
+
+.dropdownGroup {
+  display: flex;
+  flex-direction: column;
+}
+
+.dropdownLabel {
+  font-size: 13px;
+  font-weight: 500;
+  color: rgba(255, 255, 255, 0.55);
+  margin-bottom: 6px;
+}
+
+.noModelsHint {
+  font-size: 13px;
+  color: rgba(255, 255, 255, 0.88);
+  line-height: 1.5;
+  margin-bottom: 16px;
+}
+
+.hint {
+  font-size: 13px;
+  color: rgba(255, 255, 255, 0.6);
+  line-height: 1.5;
+  margin: 0 0 12px;
+}
+
+.errorWrap {
+  margin-bottom: 12px;
+}
+
+.apiKeySection {
+  border-top: 1px solid rgba(230, 237, 243, 0.08);
+  padding-top: 20px;
+  margin-top: 4px;
+}
+
+.apiKeyLabel {
+  font-size: 13px;
+  font-weight: 500;
+  color: rgba(255, 255, 255, 0.55);
+  margin-bottom: 10px;
+}
+
+.apiKeyConfiguredCard {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 14px;
+  padding: 16px;
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.apiKeyConfiguredIcon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.06);
+  flex-shrink: 0;
+  color: #34c759;
+}
+
+.apiKeyConfiguredBody {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.apiKeyConfiguredTitle {
+  font-size: 14px;
+  font-weight: 650;
+  line-height: 20px;
+  margin: 0;
+  color: #fff;
+}
+
+.apiKeyConfiguredHint {
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.4);
+  line-height: 16px;
+  margin: 0;
+}
+
+.apiKeyConfiguredButton {
+  width: 200px !important;
+}
+
+.apiKeyHelpText {
+  font-size: 13px;
+  color: rgba(255, 255, 255, 0.6);
+  line-height: 1.5;
+  margin-bottom: 12px;
+}
+
+.apiKeyInputRow {
+  margin-bottom: 12px;
+}
+
+.apiKeyActions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  padding-bottom: 24px;
+}
+
+.authStatusCard {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px;
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.authStatusRow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.authStatusDot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  flex-shrink: 0;
+  background: rgba(255, 255, 255, 0.25);
+}
+
+.authStatusDotReady {
+  background: #22c55e;
+}
+
+.authStatusDotInfo {
+  background: #5ac8fa;
+}
+
+.authStatusDotError {
+  background: #ff453a;
+}
+
+.authStatusText {
+  color: rgba(255, 255, 255, 0.82);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.oauthCode {
+  padding: 14px;
+  border-radius: 14px;
+  background: rgba(0, 0, 0, 0.22);
+  text-align: center;
+  letter-spacing: 0.22em;
+  font-size: 26px;
+  font-weight: 700;
+  color: #fff;
+}
+
+.inlineLink {
+  color: var(--accent-brand);
+  text-decoration: none;
+}
+
+.modalBody {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.modalActions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+@media (max-width: 860px) {
+  .dropdownRow {
+    grid-template-columns: 1fr;
+  }
+
+  .apiKeyConfiguredCard {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .apiKeyConfiguredButton {
+    width: 100% !important;
+  }
+
+  .apiKeyActions,
+  .modalActions {
+    flex-direction: column;
+  }
+}

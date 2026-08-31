@@ -1,0 +1,25 @@
+import { configureStore } from "@reduxjs/toolkit";
+import { configReducer } from "./slices/configSlice";
+import { gatewayReducer } from "./slices/gatewaySlice";
+import { onboardingReducer } from "./slices/onboardingSlice";
+import { chatReducer } from "./slices/chatSlice";
+import { skillsReducer } from "./slices/skillsSlice";
+import { llamacppReducer } from "./slices/llamacppSlice";
+import { desktopWarmupReducer } from "./slices/desktopWarmupSlice";
+import { atomicAuthReducer } from "./slices/atomicAuthSlice";
+
+export const store = configureStore({
+  reducer: {
+    config: configReducer,
+    gateway: gatewayReducer,
+    onboarding: onboardingReducer,
+    chat: chatReducer,
+    skills: skillsReducer,
+    llamacpp: llamacppReducer,
+    desktopWarmup: desktopWarmupReducer,
+    atomicAuth: atomicAuthReducer,
+  },
+});
+
+export type RootState = ReturnType<typeof store.getState>;
+export type AppDispatch = typeof store.dispatch;

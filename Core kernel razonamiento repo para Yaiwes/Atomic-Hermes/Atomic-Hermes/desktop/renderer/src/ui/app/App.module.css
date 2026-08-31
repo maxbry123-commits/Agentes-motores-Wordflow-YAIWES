@@ -1,0 +1,194 @@
+/* ── App layout ──────────────────────────────────────── */
+
+.UiCentered {
+  height: 100%;
+  display: grid;
+  place-items: center;
+}
+
+.UiAppShell {
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.UiAppPage {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.UiChatLayoutMain {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.UiChatLayout {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: row;
+}
+
+.UiCard {
+  width: min(860px, 92vw);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xl);
+  padding: 18px 18px 16px;
+  background: var(--panel);
+  box-shadow: 0 18px 45px rgba(0, 0, 0, 0.4);
+}
+
+.UiCardTitle {
+  font-size: 18px;
+  font-weight: 650;
+  margin: 0 0 8px;
+}
+
+.UiCardSubtitle {
+  font-size: 13px;
+  opacity: 0.86;
+  margin: 0 0 12px;
+  line-height: 1.5;
+}
+
+.UiMeta {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  align-items: center;
+  margin: 10px 0 14px;
+}
+
+.UiPill {
+  font-size: 12px;
+  padding: 6px 10px;
+  border-radius: var(--radius-full);
+  border: 1px solid rgba(230, 237, 243, 0.14);
+  background: rgba(230, 237, 243, 0.05);
+}
+
+.UiDashboardLayout {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.UiDashboardIframe {
+  flex: 1 1 auto;
+  width: 100%;
+  border: 0;
+  display: block;
+  background: #0f1318;
+}
+
+.UiOpenExternalButton {
+  appearance: none;
+  border: 1px solid rgba(230, 237, 243, 0.14);
+  border-radius: var(--radius-full);
+  background: rgba(230, 237, 243, 0.05);
+  color: var(--text);
+  cursor: pointer;
+  font-size: 12px;
+  padding: 6px 12px;
+  transition:
+    background 140ms ease,
+    border-color 140ms ease;
+}
+
+.UiOpenExternalButton:hover {
+  background: rgba(230, 237, 243, 0.1);
+  border-color: rgba(230, 237, 243, 0.24);
+}
+
+/* ── Fullscreen shell topbar ─────────────────────────── */
+
+.UiTopbar {
+  height: 56px;
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 0 16px;
+  border-bottom: 1px solid var(--border-light);
+  background: rgba(11, 15, 20, 0.55);
+  backdrop-filter: blur(18px);
+  flex: 0 0 56px;
+}
+
+.UiTopbarLeft {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-width: 0;
+}
+
+.UiTopbarTitle {
+  font-size: 15px;
+  font-weight: 600;
+  color: #fff;
+  white-space: nowrap;
+}
+
+.UiTopbarActions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex: 0 0 auto;
+}
+
+.UiTopbarBackButton {
+  display: flex;
+  height: 32px;
+  padding: 0 12px;
+  justify-content: center;
+  align-items: center;
+  gap: 6px;
+  border-radius: var(--radius-full);
+  background: rgba(230, 237, 243, 0.1);
+  color: #fff;
+  text-align: center;
+  font-size: 13px;
+  font-weight: 510;
+  line-height: 14px;
+  appearance: none;
+  border: 1px solid rgba(230, 237, 243, 0.14);
+  cursor: pointer;
+  text-decoration: none;
+  user-select: none;
+  transition:
+    background 140ms ease,
+    border-color 140ms ease;
+  box-sizing: border-box;
+}
+
+.UiTopbarBackButton:hover {
+  background: rgba(230, 237, 243, 0.16);
+  border-color: rgba(230, 237, 243, 0.24);
+}
+
+/* ── Top-right notification stack ─────────────────────── */
+
+.TopRightBannerStack {
+  position: fixed;
+  top: 20px;
+  right: 20px;
+  z-index: 9999;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  pointer-events: none;
+}
+
+.TopRightBannerStack > * {
+  pointer-events: auto;
+}
