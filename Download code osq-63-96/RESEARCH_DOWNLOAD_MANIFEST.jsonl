@@ -22,3 +22,8 @@
 {"number": 84, "parts": 4, "slug": "prefect", "source": "https://github.com/PrefectHQ/prefect.git", "source_commit": "3a128c2b55d57bf30f9db28c2148bba5e5b6c145", "status": "COMPLETE"}
 {"number": 85, "parts": 14, "slug": "dagster", "source": "https://github.com/dagster-io/dagster.git", "source_commit": "dfa399abbf6739cb21aa761a9fde0dc959bd97e6", "status": "COMPLETE"}
 {"number": 86, "parts": 2, "slug": "argo-workflows", "source": "https://github.com/argoproj/argo-workflows.git", "source_commit": "2434a0c5d4dcc20fd2c8c8407682e47105aede9f", "status": "COMPLETE"}
+{"number": 87, "parts": 7, "slug": "dolphinscheduler", "source": "https://github.com/apache/dolphinscheduler.git", "source_commit": "eca5d5e3df52f812c7820b5da6de5feb5cc140e4", "status": "COMPLETE"}
+{"number": 88, "parts": 1, "slug": "xxl-job", "source": "https://github.com/xuxueli/xxl-job.git", "source_commit": "e74c784f68f81fa89cb350913ef15794865d7b12", "status": "COMPLETE"}
+{"number": 89, "parts": 1, "slug": "elastic-job-lite", "source": "https://github.com/apache/shardingsphere-elasticjob.git", "source_commit": "837d1f324db5f32daf0d30c51d24c6c45fadb888", "status": "COMPLETE"}
+{"number": 90, "parts": 1, "slug": "PowerJob", "source": "https://github.com/PowerJob/PowerJob.git", "source_commit": "332179de26b44f0a949f7594ce9f57ee26fb6b27", "status": "COMPLETE"}
+{"number": 91, "parts": 2, "slug": "cadence", "source": "https://github.com/uber/cadence.git", "source_commit": "18f4ba86cf530fb6bf808eadf8bb8880e0c3d979", "status": "COMPLETE"}
