@@ -2,3 +2,7 @@
 {"number": 64, "parts": 7, "slug": "TriliumNext", "source": "https://github.com/TriliumNext/Trilium.git", "source_commit": "bb406ed858e0a3ab13675c03ed0100212705c5f2", "status": "COMPLETE"}
 {"number": 65, "parts": 6, "slug": "anytype-ts", "source": "https://github.com/anyproto/anytype-ts.git", "source_commit": "f880708081e95671b8f708242398ba73bd02dbbe", "status": "COMPLETE"}
 {"number": 66, "parts": 3, "slug": "AppFlowy", "source": "https://github.com/AppFlowy-IO/AppFlowy.git", "source_commit": "5cf3a365dec0d59f64bad1ee4bb1050471a39b93", "status": "COMPLETE"}
+{"number": 67, "parts": 8, "slug": "AFFiNE", "source": "https://github.com/toeverything/AFFiNE.git", "source_commit": "49536827790702ad0ab6d3be3405d891a6b19f83", "status": "COMPLETE"}
+{"number": 68, "parts": 4, "slug": "excalidraw", "source": "https://github.com/excalidraw/excalidraw.git", "source_commit": "e1bb9ff8f8931e783c11d104abb8967ac6605c9a", "status": "COMPLETE"}
+{"number": 69, "parts": 1, "slug": "argos-translate", "source": "https://github.com/argosopentech/argos-translate.git", "source_commit": "17ed1a9b055c5ba1b51d76b683bbb0c64e2a4a88", "status": "COMPLETE"}
+{"number": 70, "parts": 1, "slug": "LibreTranslate", "source": "https://github.com/LibreTranslate/LibreTranslate.git", "source_commit": "4ef133381ed7728afbab53ffc97ff5d5dd28a941", "status": "COMPLETE"}
