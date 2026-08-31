@@ -1,0 +1,12 @@
+[run]
+omit =
+    */tests/*
+    */ogx/providers/*
+    */ogx/templates/*
+    .venv/*
+    */ogx/cli/scripts/*
+    */ogx_ui/*
+    */ogx/distribution/ui/*
+    */ogx/strong_typing/*
+    */ogx/env.py
+    */__init__.py

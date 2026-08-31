@@ -1,0 +1,4 @@
+module: ogx_api_weather
+name: weather
+pip_packages: ["tests/external/ogx-api-weather"]
+protocol: WeatherProvider

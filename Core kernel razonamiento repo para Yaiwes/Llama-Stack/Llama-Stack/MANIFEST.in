@@ -1,0 +1,11 @@
+include pyproject.toml
+include src/ogx/models/llama/llama3/tokenizer.model
+include src/ogx/models/llama/llama4/tokenizer.model
+include src/ogx/core/*.sh
+include src/ogx/cli/scripts/*.sh
+include src/ogx/distributions/*/*.yaml
+exclude src/ogx/distributions/ci-tests
+include tests/integration/test_cases/inference/*.json
+include src/ogx/models/llama/*/*.md
+include src/ogx/tests/integration/*.jpg
+prune src/ogx/distributions/ci-tests

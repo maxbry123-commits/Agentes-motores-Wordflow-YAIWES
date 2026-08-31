@@ -1,0 +1,5 @@
+adapter_type: kaze
+pip_packages: ["tests/external/ogx-provider-kaze"]
+config_class: ogx_provider_kaze.config.KazeProviderConfig
+module: ogx_provider_kaze
+optional_api_dependencies: []
