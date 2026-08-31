@@ -1,0 +1,34 @@
+contrato: CONTRATO-8
+vigente: true
+fecha: "2026-08-31"
+origen: input Director 8 pasos + loop 1h
+skills:
+  - metodo-de-trabajo-grock-1
+  - descarga-repo-github-accion-1
+  - research-download-chain
+reglas:
+  - no LFS
+  - no reescribir packer
+  - copia fiel lock YAML+PY
+  - editar solo lista + destino + concurrency.group
+group_unico: research-download-chain-final
+pasos:
+  0: crear este contrato
+  0.1: leer metodo-de-trabajo-grock-1 + descarga-repo-github-accion-1
+  1: SKILL.md explica concurrency.group = research-download-chain-final siempre
+  2: GHA/copia 3 YAML lock descarga+extract
+  3: trazabilidad pendientes Router OSQ 69-119
+  4: edicion quirurgica lista+dest+group por file
+  5: xray no romper packer
+  6: validar listas pendientes en los 3 GHA
+  7: 3 dispatch
+  8: loop 1h chat/automation gaps no stop
+frentes:
+  - repo: router-universal-router-inteligente-
+    workflow: wordflow-router-oss.yml
+  - repo: osquestador-auditor
+    workflow: wordflow-osquestador-auditor-memoria.yml
+  - repo: Agentes-motores-Wordflow-YAIWES
+    workflow: extract-69-119-to-kernel.yml
+nota: group igual no serializa entre repos distintos
+cap_chat: 5min skill; loop 1h = automation no sesion unica
