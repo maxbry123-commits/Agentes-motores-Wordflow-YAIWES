@@ -31,3 +31,4 @@
 {"number": 93, "parts": 9, "slug": "hatchet", "source": "https://github.com/hatchet-dev/hatchet.git", "source_commit": "0c3e990d52f3acedc25d8bcb1f2fdd8269e63a80", "status": "COMPLETE"}
 {"number": 94, "parts": 2, "slug": "conductor", "source": "https://github.com/conductor-oss/conductor.git", "source_commit": "c4086f35abf709f5745a11e96ea22ad0862badd8", "status": "COMPLETE"}
 {"number": 95, "parts": 1, "slug": "typescript-sdk", "source": "https://github.com/modelcontextprotocol/typescript-sdk.git", "source_commit": "dcc01028ff6a499a5728c2b6181c1727d52e2fab", "status": "COMPLETE"}
+{"number": 96, "parts": 6, "slug": "litellm", "source": "https://github.com/BerriAI/litellm.git", "source_commit": "f93d9b6b67e12f88195167cb6f8298092bbd496d", "status": "COMPLETE"}
