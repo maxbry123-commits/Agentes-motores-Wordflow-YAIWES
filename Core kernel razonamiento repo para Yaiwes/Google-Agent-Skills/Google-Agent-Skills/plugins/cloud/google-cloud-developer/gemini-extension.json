@@ -1,0 +1,11 @@
+{
+  "name": "google-cloud-developer",
+  "version": "1.1.0",
+  "description": "Core Google Cloud guidance for coding agents: onboarding, authentication, and gcloud CLI safety.",
+  "mcpServers": {
+    "developer-knowledge": {
+      "httpUrl": "https://developerknowledge.googleapis.com/mcp",
+      "authProviderType": "google_credentials"
+    }
+  }
+}
