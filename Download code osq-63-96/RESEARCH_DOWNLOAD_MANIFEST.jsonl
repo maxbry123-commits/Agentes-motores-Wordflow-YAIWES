@@ -1,3 +1,4 @@
 {"number": 63, "parts": 3, "slug": "logseq", "source": "https://github.com/logseq/logseq.git", "source_commit": "de2ecabf6d6891a41c104d7c4041797bcaa54b3e", "status": "COMPLETE"}
 {"number": 64, "parts": 7, "slug": "TriliumNext", "source": "https://github.com/TriliumNext/Trilium.git", "source_commit": "bb406ed858e0a3ab13675c03ed0100212705c5f2", "status": "COMPLETE"}
 {"number": 65, "parts": 6, "slug": "anytype-ts", "source": "https://github.com/anyproto/anytype-ts.git", "source_commit": "f880708081e95671b8f708242398ba73bd02dbbe", "status": "COMPLETE"}
+{"number": 66, "parts": 3, "slug": "AppFlowy", "source": "https://github.com/AppFlowy-IO/AppFlowy.git", "source_commit": "5cf3a365dec0d59f64bad1ee4bb1050471a39b93", "status": "COMPLETE"}
