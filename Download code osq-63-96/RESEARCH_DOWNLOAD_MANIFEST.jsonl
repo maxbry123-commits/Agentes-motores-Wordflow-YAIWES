@@ -28,3 +28,6 @@
 {"number": 90, "parts": 1, "slug": "PowerJob", "source": "https://github.com/PowerJob/PowerJob.git", "source_commit": "332179de26b44f0a949f7594ce9f57ee26fb6b27", "status": "COMPLETE"}
 {"number": 91, "parts": 2, "slug": "cadence", "source": "https://github.com/uber/cadence.git", "source_commit": "18f4ba86cf530fb6bf808eadf8bb8880e0c3d979", "status": "COMPLETE"}
 {"number": 92, "parts": 18, "slug": "ray", "source": "https://github.com/ray-project/ray.git", "source_commit": "07f1204b8cb07e8c39271594857074326347693c", "status": "COMPLETE"}
+{"number": 93, "parts": 9, "slug": "hatchet", "source": "https://github.com/hatchet-dev/hatchet.git", "source_commit": "0c3e990d52f3acedc25d8bcb1f2fdd8269e63a80", "status": "COMPLETE"}
+{"number": 94, "parts": 2, "slug": "conductor", "source": "https://github.com/conductor-oss/conductor.git", "source_commit": "c4086f35abf709f5745a11e96ea22ad0862badd8", "status": "COMPLETE"}
+{"number": 95, "parts": 1, "slug": "typescript-sdk", "source": "https://github.com/modelcontextprotocol/typescript-sdk.git", "source_commit": "dcc01028ff6a499a5728c2b6181c1727d52e2fab", "status": "COMPLETE"}
