@@ -5,7 +5,7 @@ from skill_guard import guard_dest, push, run
 SRC=Path(sys.argv[1]).resolve()
 DEST_ROOT=Path(sys.argv[2]).resolve()
 MANIFEST=SRC/'RESEARCH_DOWNLOAD_MANIFEST.jsonl'
-NEED=set(range(69,120))
+NEED=set(range(60,120))
 def commit(label):
     run(['git','add','-A'])
     if subprocess.run(['git','diff','--cached','--quiet']).returncode==0: return
