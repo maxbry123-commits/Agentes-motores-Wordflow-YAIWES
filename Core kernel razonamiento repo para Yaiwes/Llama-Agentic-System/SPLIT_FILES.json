@@ -1,0 +1,9 @@
+[
+  {
+    "repo": "Llama-Agentic-System",
+    "path": "examples/interior_design_assistant/resources/images/fireplaces/010.jpeg",
+    "chunks_dir": "Llama-Agentic-System/examples/interior_design_assistant/resources/images/fireplaces/010.jpeg.chunks",
+    "bytes": 8600095,
+    "chunk_bytes": 8388608
+  }
+]
