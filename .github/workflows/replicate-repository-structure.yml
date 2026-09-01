@@ -12,7 +12,7 @@ env:
   GIT_TERMINAL_PROMPT: "0"
 concurrency:
   group: structure-replication
-  cancel-in-progress: false
+  cancel-in-progress: true
 jobs:
   replicate:
     runs-on: ubuntu-latest
@@ -22,6 +22,9 @@ jobs:
           ref: main
           fetch-depth: 1
           lfs: false
+          filter: blob:none
+          sparse-checkout: .github
+          sparse-checkout-cone-mode: false
           persist-credentials: true
       - name: Crear y verificar carpetas faltantes
         shell: bash
@@ -65,7 +68,7 @@ jobs:
           set -euo pipefail
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add -A -- ':!.github'
+          git add --sparse -A -- ':!.github'
           git diff --cached --quiet && echo 'PASS NOOP: estructura ya existe' && exit 0
           git commit -m 'structure: replicate osquestador-auditor and NCT roots'
           git pull --rebase origin main
