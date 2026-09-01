@@ -1,17 +1,5 @@
 name: Rebuild downloads NO-LFS
 on:
-  push:
-    branches: [main]
-    paths:
-      - '.github/workflows/*.yml'
-      - 'scripts/research_download_chain.py'
-      - 'scripts/research_download_kernel.py'
-      - 'scripts/research_download_extra.py'
-      - 'scripts/extract_inventory.py'
-      - 'scripts/extract_kernel.py'
-      - 'scripts/extract_extra.py'
-      - 'scripts/skill_guard.py'
-      - 'scripts/forensic_verify_rebuild.py'
   workflow_dispatch:
 permissions:
   contents: write
