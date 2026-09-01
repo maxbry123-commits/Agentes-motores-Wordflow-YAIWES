@@ -1,0 +1,120 @@
+name: yaiwes-sheriff-hourly-recovery-new
+run-name: YAIWES sheriff recovery • ${{ github.event_name }} • ${{ github.sha }}
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 * * * *'
+  push:
+    paths:
+      - '.github/workflows/yaiwes-sheriff-hourly-recovery-new.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: yaiwes-sheriff-hourly-recovery-new
+  cancel-in-progress: false
+
+jobs:
+  manifest-audit:
+    name: Audit manifests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Sparse checkout manifests
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          lfs: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            Download code/archivos/RESEARCH_DOWNLOAD_MANIFEST.jsonl
+            Download code/archivos/EXTRA_AGENTS_MANIFEST.jsonl
+            Core kernel razonamiento repo para Yaiwes/RESEARCH_DOWNLOAD_MANIFEST.jsonl
+      - name: Validate current manifests without stale hard-coded totals
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          files = {
+            "main": Path("Download code/archivos/RESEARCH_DOWNLOAD_MANIFEST.jsonl"),
+            "kernel": Path("Core kernel razonamiento repo para Yaiwes/RESEARCH_DOWNLOAD_MANIFEST.jsonl"),
+            "extra": Path("Download code/archivos/EXTRA_AGENTS_MANIFEST.jsonl"),
+          }
+          report = {}
+          gaps = []
+          for name, path in files.items():
+              if not path.exists():
+                  gaps.append(f"{name}: manifest missing")
+                  report[name] = {"rows": 0, "unique": 0, "complete": 0}
+                  continue
+              rows = [json.loads(x) for x in path.read_text().splitlines() if x.strip()]
+              latest = {}
+              for row in rows:
+                  latest[row.get("slug") or row.get("name") or str(len(latest))] = row
+              incomplete = [k for k,v in latest.items() if v.get("status") != "COMPLETE"]
+              missing_trace = [k for k,v in latest.items() if not v.get("source") or not v.get("source_commit")]
+              report[name] = {
+                  "rows": len(rows),
+                  "unique": len(latest),
+                  "complete": sum(v.get("status") == "COMPLETE" for v in latest.values()),
+                  "incomplete": incomplete,
+                  "missing_trace": missing_trace,
+              }
+              if incomplete: gaps.append(f"{name}: incomplete={incomplete}")
+              if missing_trace: gaps.append(f"{name}: missing_trace={missing_trace}")
+          print(json.dumps(report, indent=2, sort_keys=True))
+          if gaps:
+              raise SystemExit(" | ".join(gaps))
+          PY
+
+  workflow-policy-audit:
+    name: Audit workflow continuity policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Sparse checkout sheriff workflows
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          lfs: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            .github/workflows/yaiwes-sheriff-15m.yml
+            .github/workflows/yaiwes-sheriff-hourly-recovery-new.yml
+      - name: Validate old scheduler frozen and new scheduler isolated
+        shell: bash
+        run: |
+          set -euo pipefail
+          old='.github/workflows/yaiwes-sheriff-15m.yml'
+          new='.github/workflows/yaiwes-sheriff-hourly-recovery-new.yml'
+          if grep -q "cron:" "$old"; then echo "GAP: old 15m scheduler remains active"; exit 1; fi
+          grep -q "cron: '17 \* \* \* \*'" "$new"
+          grep -q "cancel-in-progress: false" "$new"
+          echo "PASS: old scheduler frozen; hourly recovery isolated"
+
+  final-gate:
+    name: Final gate always runs
+    if: ${{ always() }}
+    needs:
+      - manifest-audit
+      - workflow-policy-audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Consolidate independent audit results
+        shell: bash
+        env:
+          MANIFEST_RESULT: ${{ needs.manifest-audit.result }}
+          POLICY_RESULT: ${{ needs.workflow-policy-audit.result }}
+        run: |
+          set -euo pipefail
+          echo "manifest-audit=$MANIFEST_RESULT"
+          echo "workflow-policy-audit=$POLICY_RESULT"
+          if [ "$MANIFEST_RESULT" != success ] || [ "$POLICY_RESULT" != success ]; then
+            echo "GAP remains; independent checks completed"
+            exit 1
+          fi
+          echo "100 PASS"
