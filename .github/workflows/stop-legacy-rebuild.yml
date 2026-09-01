@@ -1,16 +1,20 @@
 name: Stop legacy rebuild safely
+
 on:
-  push:
-    branches: [main]
-    paths: ['.github/workflows/stop-legacy-rebuild.yml']
   workflow_dispatch:
+
 permissions:
   contents: read
+
 concurrency:
   group: rebuild-downloads-no-lfs
   cancel-in-progress: true
+
 jobs:
   stop:
     runs-on: ubuntu-latest
     steps:
-      - run: echo 'PASS: legacy automatic rebuild cancelled; workflow remains manual only'
+      - name: Confirm legacy rebuild remains manual
+        shell: bash
+        run: |
+          echo 'PASS: legacy automatic rebuild is frozen; no automatic workflow was reactivated'
