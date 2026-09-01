@@ -1,7 +1,5 @@
 name: yaiwes-sheriff-15m
 on:
-  schedule:
-    - cron: '*/15 * * * *'
   workflow_dispatch:
     inputs:
       apply_moves:
