@@ -1,0 +1,12 @@
+contrato: v6
+modo: fail-closed
+repo_contrato: Agentes-motores-Wordflow-YAIWES
+rama: main
+raiz: notas de trabajo grock y gpt
+ancla_v2: CONTRATO-2.yml
+estado: INICIA
+prohibido: [LFS_enable, git_lfs, reescribir_packer, mover_control-layer, mover_extensions, mover_dotgithub]
+input_block:
+  T1: raices Yaiwes en agentes + docs Desplegar a Documentos proyectos Yaiwes/documentos proyecto Yaiwes 1 + code Desplegar a Download code Yaiwes + indice Download code sandbox
+  T2: Wordflow Code a nct-core + inventario Frontend code NCT + crear raices NCT vacias
+  T3: xray 6 repos sandbox indice+perfil
