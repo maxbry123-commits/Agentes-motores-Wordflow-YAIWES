@@ -1,0 +1,16 @@
+[
+  {
+    "repo": "Safe-Lab-Agents",
+    "path": "docs/example_videos/demo_1min.gif",
+    "chunks_dir": "Safe-Lab-Agents/docs/example_videos/demo_1min.gif.chunks",
+    "bytes": 17992247,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "Safe-Lab-Agents",
+    "path": "docs/example_videos/demo.gif",
+    "chunks_dir": "Safe-Lab-Agents/docs/example_videos/demo.gif.chunks",
+    "bytes": 9406245,
+    "chunk_bytes": 8388608
+  }
+]

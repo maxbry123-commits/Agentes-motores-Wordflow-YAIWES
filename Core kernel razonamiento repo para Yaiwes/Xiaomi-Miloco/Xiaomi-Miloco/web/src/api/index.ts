@@ -1,0 +1,817 @@
+/**
+ * API 出口——直连 backend。
+ *
+ * 注:旧 `_mock/register.ts` + `vite.config.ts::mockAutoInject` mock 注入通道
+ * 已彻底删除(包含 vite plugin 函数)。如需 sessionStorage 假数据走 UI 调试,
+ * 从 git 历史拉回 plugin + 重起 vite serve。
+ */
+
+import * as realImpl from "./real";
+import { apiFetch } from "./client";
+import type {
+  ActivityEvent,
+  Device,
+  EventCropMeta,
+  HomeEntries,
+  HomeEntryType,
+  HomeId,
+  HomeStatus,
+  ProcSeries,
+  MemorySeries,
+  MemorySnapshot,
+  MonitorMeta,
+  PerceptionCamera,
+  PerfBucket,
+  PerfDropPoint,
+  PerfGatePoint,
+  PerfGateScoreRow,
+  PerfLatencyPoint,
+  PerfAgentRun,
+  PerfOmniErrorPoint,
+  PerfRtfPoint,
+  PerfStagePercentiles,
+  PerfSummary,
+  PerfTraceRow,
+  Features,
+  PerfWindow,
+  Person,
+  Pet,
+  PetObserveResult,
+  Scene,
+  ScopeCamera,
+  ScopeHome,
+  Task,
+  UsagePeriod,
+  UsageStats,
+  OmniConfigState,
+  OmniConfigUpdate,
+  OmniHealth,
+  OmniProfileRef,
+  OmniTestResult,
+  OmniModelsResult,
+  UpgradeCheck,
+  UpgradeStatus,
+} from "@/lib/types";
+export type { ScopeHome };
+
+const impl: typeof realImpl = realImpl;
+
+// 当前 backend 多家庭未上线,前端 homeId 永远 "primary"。isPrimary 永真,
+// 但保留兜底分支让未来 backend 接通多家庭时直接挂 listScopeHomes 路径。
+const PRIMARY: HomeId = "primary";
+const isPrimary = (homeId: HomeId | undefined): boolean =>
+  !homeId || homeId === PRIMARY;
+
+// ── 米家账号绑定（OAuth 三步：bind → 用户打开 oauth_url → authorize 提 code/state） ─
+export async function bindMiot(): Promise<{ oauthUrl: string }> {
+  return impl.realBindMiot();
+}
+
+export async function authorizeMiot(
+  code: string,
+  state: string,
+): Promise<void> {
+  return impl.realAuthorizeMiot(code, state);
+}
+
+export async function unbindMiot(): Promise<void> {
+  return impl.realUnbindMiot();
+}
+
+// ── 状态条 ────────────────────────────────────────────────
+export async function getHomeStatus(homeId?: HomeId): Promise<HomeStatus> {
+  if (!isPrimary(homeId)) {
+    return {
+      miot: { bound: false, devicesCount: 0, roomsCount: 0 },
+      perception: { running: false, ready: false },
+      maxEnabledCameras: 4,
+    };
+  }
+  return impl.realHomeStatus();
+}
+
+// ── 家人 ──────────────────────────────────────────────────
+export async function listPersons(homeId?: HomeId): Promise<Person[]> {
+  if (!isPrimary(homeId)) return [];
+  return impl.realListPersons();
+}
+
+export async function createPerson(payload: {
+  name: string;
+  role?: string;
+}): Promise<Person> {
+  return impl.realCreatePerson(payload);
+}
+
+export async function updatePerson(
+  id: string,
+  payload: { name?: string; role?: string },
+): Promise<void> {
+  return impl.realUpdatePerson(id, payload);
+}
+
+export async function deletePerson(id: string): Promise<void> {
+  return impl.realDeletePerson(id);
+}
+
+export async function enrollPersonSample(
+  personId: string,
+  imageBase64: string,
+): Promise<void> {
+  return impl.realEnrollPersonSample(personId, imageBase64);
+}
+
+// 手动头像：上传显式头像 / 清除（恢复默认→回落 tier_a face[0]）
+export async function uploadPersonAvatar(
+  personId: string,
+  image: Blob,
+  filename: string,
+): Promise<void> {
+  return impl.realUploadPersonAvatar(personId, image, filename);
+}
+
+export async function deletePersonAvatar(personId: string): Promise<void> {
+  return impl.realDeletePersonAvatar(personId);
+}
+
+// ── 宠物（非人家庭成员）────────────────────────────────────
+export async function listPets(homeId?: HomeId): Promise<Pet[]> {
+  if (!isPrimary(homeId)) return [];
+  return impl.realListPets();
+}
+
+export async function createPet(payload: {
+  name: string;
+  species?: string;
+}): Promise<Pet> {
+  return impl.realCreatePet(payload);
+}
+
+export async function updatePet(
+  id: string,
+  payload: { name?: string; species?: string },
+): Promise<Pet> {
+  return impl.realUpdatePet(id, payload);
+}
+
+export async function deletePet(id: string): Promise<void> {
+  return impl.realDeletePet(id);
+}
+
+export async function observePet(
+  files: File[],
+  grounding?: boolean,
+  signal?: AbortSignal,
+): Promise<PetObserveResult> {
+  return impl.realObservePet(files, grounding, signal);
+}
+
+export async function uploadPetAvatar(
+  petId: string,
+  image: Blob,
+  filename: string,
+): Promise<Pet> {
+  return impl.realUploadPetAvatar(petId, image, filename);
+}
+
+export async function uploadPetReferenceCrops(
+  petId: string,
+  crops: { blob: Blob; score?: number }[],
+  mode: "replace" | "append" = "replace",
+): Promise<Pet> {
+  return impl.realUploadPetReferenceCrops(petId, crops, mode);
+}
+
+// ── 实验性功能开关 ─────────────────────────────────────────
+export async function getFeatures(): Promise<Features> {
+  return impl.realGetFeatures();
+}
+
+export async function setFeatures(patch: Partial<Features>): Promise<Features> {
+  return impl.realSetFeatures(patch);
+}
+
+// ── 家庭档案（home_profile）────────────────────────────────
+// UI 只调这组语义函数；snake_case 的 op 构造全收在 real.ts，组件不碰。
+function today(): string {
+  return new Date().toISOString().slice(0, 10);
+}
+
+export async function listHomeEntries(
+  homeId?: HomeId,
+  target: "profile" | "candidates" | "both" = "both",
+): Promise<HomeEntries> {
+  if (!isPrimary(homeId)) {
+    return { profile: [], candidates: [], readyToPromote: [] };
+  }
+  return impl.realListHomeEntries(target);
+}
+
+// 住户手动新增一条正式记忆（user_told / confidence 满格由 user_edit 保证）。
+export async function addHomeEntry(input: {
+  type: HomeEntryType;
+  content: string;
+  subjectId?: string | null;
+  subjectName?: string | null;
+}): Promise<string> {
+  // 返回新条目 id：多步写入（如宠物注册）中途失败时，调用方靠它把重试改走 update，
+  // 既不重复插条目、也不丢住户重试前改过的内容（见 PetDrawer.writeAppearance）。
+  const [res] = await impl.realProfileWrite([
+    {
+      op: "add",
+      entry: {
+        type: input.type,
+        content: input.content,
+        subject_id: input.subjectId ?? null,
+        subject_name: input.subjectName ?? null,
+        source: "user_told",
+        confidence: 1.0,
+      },
+    },
+  ]);
+  return res?.id ?? "";
+}
+
+// 住户直编正式记忆（仅覆盖显式提供的字段）。
+// subjectId/subjectName 用于把「未关联成员」的记忆手动归到某个家人。
+export async function updateHomeEntry(
+  id: string,
+  patch: {
+    type?: HomeEntryType;
+    content?: string;
+    subjectId?: string | null;
+    subjectName?: string | null;
+  },
+): Promise<void> {
+  await impl.realProfileWrite([
+    {
+      op: "update",
+      id,
+      edit: {
+        ...(patch.type !== undefined && { type: patch.type }),
+        ...(patch.content !== undefined && { content: patch.content }),
+        ...(patch.subjectId !== undefined && { subject_id: patch.subjectId }),
+        ...(patch.subjectName !== undefined && {
+          subject_name: patch.subjectName,
+        }),
+      },
+    },
+  ]);
+}
+
+export async function deleteHomeEntry(id: string): Promise<void> {
+  await impl.realProfileWrite([{ op: "delete", id }]);
+}
+
+// 确认候选 → 提升为正式（backend 自动从候选区移除该条）。
+export async function confirmCandidate(candidateId: string): Promise<void> {
+  await impl.realProfileWrite([{ op: "add", from: candidateId }]);
+}
+
+// 忽略候选 → 直接从候选区删除。
+export async function ignoreCandidate(candidateId: string): Promise<void> {
+  return impl.realCandidateWrite([
+    { op: "delete", id: candidateId, date: today() },
+  ]);
+}
+
+export async function commitHomeProfile(): Promise<void> {
+  return impl.realCommitHomeProfile();
+}
+
+// ── 任务（miloco 任务管理）──────────────────────────────────
+export async function listTasks(homeId?: HomeId): Promise<Task[]> {
+  if (!isPrimary(homeId)) return [];
+  return impl.realListTasks();
+}
+
+export async function setTaskEnabled(
+  taskId: string,
+  enabled: boolean,
+): Promise<void> {
+  return impl.realSetTaskEnabled(taskId, enabled);
+}
+
+export async function deleteTask(taskId: string): Promise<void> {
+  return impl.realDeleteTask(taskId);
+}
+
+// 改任务描述。
+export async function updateTaskDescription(
+  taskId: string,
+  description: string,
+): Promise<void> {
+  return impl.realUpdateTaskDescription(taskId, description);
+}
+
+// 改驱动规则的触发条件文本（任务详情里就地编辑）。
+export async function updateRuleQuery(
+  ruleId: string,
+  query: string,
+): Promise<void> {
+  return impl.realUpdateRuleQuery(ruleId, query);
+}
+
+// ── 设备 ──────────────────────────────────────────────────
+export async function listDevices(homeId?: HomeId): Promise<Device[]> {
+  if (!isPrimary(homeId)) return [];
+  return impl.realListDevices();
+}
+
+export async function controlDeviceProp(
+  did: string,
+  iid: string,
+  value: number | string | boolean,
+): Promise<void> {
+  return impl.realControlDeviceProp(did, iid, value);
+}
+
+// ── 场景 ──────────────────────────────────────────────────
+export async function listScenes(homeId?: HomeId): Promise<Scene[]> {
+  if (!isPrimary(homeId)) return [];
+  return impl.realListScenes();
+}
+
+export async function triggerScene(id: string): Promise<void> {
+  return impl.realTriggerScene(id);
+}
+
+// ── 活动 ──────────────────────────────────────────────────
+export async function listActivity(
+  homeId?: HomeId,
+  opts?: { since?: number; before?: number; limit?: number; offset?: number },
+): Promise<ActivityEvent[]> {
+  if (!isPrimary(homeId)) return [];
+  return impl.realListActivity(opts);
+}
+
+/** 事件 clip mp4 URL,含 ?token=... query 鉴权(<video> 无法设 Authorization). */
+export function eventClipUrl(event_id: string, device_id: string): string {
+  return impl.realEventClipUrl(event_id, device_id);
+}
+
+/** 事件全景参考帧 ref.jpg URL(仅 Smart Crop 事件有,先看 event.has_ref). */
+export function eventRefUrl(event_id: string, device_id: string): string {
+  return impl.realEventRefUrl(event_id, device_id);
+}
+
+/**
+ * Smart Crop 裁切区域坐标(画框用).
+ *
+ * `null` = 后端明确说这台 device 这次没裁切(410);reject = 没问出来(网络 / 5xx,
+ * 含"裁过但 trace 读坏"这一档).二者调用方要区别对待:前者不该渲染参考卡,
+ * 后者只是画不了框.
+ */
+export async function eventCropMeta(
+  event_id: string,
+  device_id: string,
+): Promise<EventCropMeta | null> {
+  return impl.realEventCropMeta(event_id, device_id);
+}
+
+/** 订阅 /api/events/stream SSE;返回 unsubscribe. onOpen 重连成功时触发(可选). */
+export function subscribeEvents(
+  onEvent: (e: ActivityEvent) => void,
+  onOpen?: () => void,
+): () => void {
+  return impl.realSubscribeEvents(onEvent, onOpen);
+}
+
+// ── 主动查询日志 ──────────────────────────────────────────
+export async function listOnDemandLogs(
+  homeId?: HomeId,
+  opts?: { since?: number; before?: number; before_id?: string; limit?: number },
+): Promise<import("@/lib/types").OnDemandLogEntry[]> {
+  if (!isPrimary(homeId)) return [];
+  return impl.realListOnDemandLogs(opts);
+}
+
+export function onDemandClipUrl(logId: string, deviceId: string): string {
+  return impl.realOnDemandClipUrl(logId, deviceId);
+}
+
+export async function submitOnDemandFeedback(
+  logId: string,
+  errorTypes: string[],
+  feedbackText: string,
+): Promise<{ pack_path: string; pack_size_bytes: number }> {
+  return impl.realSubmitOnDemandFeedback(logId, errorTypes, feedbackText);
+}
+
+// ── 摄像头 ────────────────────────────────────────────────
+// ── 米家多家庭 ────────────────────────────────────────────
+export async function listScopeHomes(homeId?: HomeId): Promise<ScopeHome[]> {
+  if (!isPrimary(homeId)) return [];
+  return impl.realListScopeHomes();
+}
+
+export async function switchScopeHome(homeId: string): Promise<void> {
+  return impl.realSwitchScopeHome(homeId);
+}
+
+export async function listScopeCameras(
+  homeId?: HomeId,
+): Promise<ScopeCamera[]> {
+  if (!isPrimary(homeId)) return [];
+  return impl.realListScopeCameras();
+}
+
+// 轻量触发 backend 刷新相机云端 online 状态(节流见 impl,不扰流)。「此刻」页加载
+// 相机前调,让"已离线/在线"判断不读陈旧缓存。非主家庭(mock)直接 no-op。
+export async function refreshCameraOnline(
+  homeId?: HomeId,
+  force = false,
+): Promise<void> {
+  if (!isPrimary(homeId)) return;
+  return impl.realRefreshCameraOnline(force);
+}
+
+export async function toggleScopeCamera(
+  dids: string[],
+  inUse: boolean,
+): Promise<void> {
+  return impl.realToggleScopeCamera(dids, inUse);
+}
+
+// 切换相机拾音开关（PUT /api/miot/scope/cameras/voice；关闭 = 声音完全不被处理）。
+// 仅对感知已启用的相机可设。
+export async function toggleScopeCameraVoice(
+  dids: string[],
+  voiceInUse: boolean,
+): Promise<void> {
+  return impl.realToggleScopeCameraVoice(dids, voiceInUse);
+}
+
+// 设置相机自定义感知须知 prompt（PUT /api/miot/scope/cameras/prompt）。
+// text 必须非空。给该机位补环境说明 / 关注 / 忽略，指导感知消解固定误识。
+export async function setScopeCameraPrompt(
+  did: string,
+  text: string,
+): Promise<void> {
+  return impl.realSetScopeCameraPrompt(did, text);
+}
+
+// 清除相机自定义感知须知（DELETE /api/miot/scope/cameras/prompt）。
+export async function clearScopeCameraPrompt(did: string): Promise<void> {
+  return impl.realClearScopeCameraPrompt(did);
+}
+
+export async function listCameras(homeId?: HomeId): Promise<PerceptionCamera[]> {
+  if (!isPrimary(homeId)) {
+    return [];
+  }
+  return impl.realListCameras();
+}
+
+// ── 事件反馈 ────────────────────────────────────────────────
+export async function submitEventFeedback(
+  eventId: string,
+  errorTypes: string[],
+  feedbackText: string,
+  includeGallery: boolean,
+): Promise<{
+  uploaded: boolean;
+  upload_key?: string;
+  pack_path: string;
+  pack_size_bytes: number;
+}> {
+  return impl.realSubmitEventFeedback(
+    eventId,
+    errorTypes,
+    feedbackText,
+    includeGallery,
+  );
+}
+
+export async function revealDir(path: string): Promise<void> {
+  return impl.realRevealDir(path);
+}
+
+// ── 让它休息 / 唤醒 ────────────────────────────────────────
+// backend 当前只有 stop/start 两态，永久暂停直到手动唤醒，不支持定时恢复。
+// 返回值 {resumesAt: null} 给 UI 留住"以后接定时恢复"的形状，但当前永远 null。
+// 若未来 backend 加 duration 支持，签名改成 pausePerception(opts?: {until?: Date})
+// 让调用方显式传入"暂停到某点"——比 number 形参更清楚语义。
+export async function pausePerception(): Promise<{ resumesAt: string | null }> {
+  await impl.realPausePerception();
+  return { resumesAt: null };
+}
+
+export async function resumePerception(): Promise<void> {
+  return impl.realResumePerception();
+}
+
+// ── 摄像头抓帧（占位 — 等 miloco 提供 snapshot 接口后实现）────
+// NOTE: 当前无调用方，保留接口形状供后续接入。不导出，避免误用。
+// export async function snapshotCamera(did: string): Promise<{
+//   jpegBase64: string; timestamp: string;
+// }> { ... }
+
+// ── Token 用量统计（用量 tab）─────────────────────────
+export async function getUsageStats(
+  period: UsagePeriod = "today",
+  binMinutes?: number,
+): Promise<UsageStats> {
+  return impl.realGetUsageStats(period, binMinutes);
+}
+
+// 清空全部用量数据（实时表 + 日聚合，不可恢复）
+export async function clearUsageData(): Promise<void> {
+  return impl.realClearUsageData();
+}
+
+// ── omni 模型配置（「模型」页内读/写，多档案切换）────────────────
+export async function getOmniConfig(): Promise<OmniConfigState> {
+  return impl.realGetOmniConfig();
+}
+
+export async function updateOmniConfig(
+  input: OmniConfigUpdate,
+): Promise<OmniConfigState> {
+  return impl.realUpdateOmniConfig(input);
+}
+
+export async function activateOmniConfig(
+  ref: OmniProfileRef,
+): Promise<OmniConfigState> {
+  return impl.realActivateOmniConfig(ref);
+}
+
+export async function deleteOmniConfig(
+  ref: OmniProfileRef,
+): Promise<OmniConfigState> {
+  return impl.realDeleteOmniConfig(ref);
+}
+
+export async function deactivateOmniConfig(
+  ref: OmniProfileRef,
+): Promise<OmniConfigState> {
+  return impl.realDeactivateOmniConfig(ref);
+}
+
+export async function listOmniModels(input: {
+  base_url: string;
+  api_key?: string;
+  label?: string;
+}): Promise<OmniModelsResult> {
+  return impl.realListOmniModels(input);
+}
+
+export async function testOmniConfig(
+  input: OmniConfigUpdate,
+): Promise<OmniTestResult> {
+  return impl.realTestOmniConfig(input);
+}
+
+// 用户点「立即重试」触发一次 omni probe;跳过熔断剩余 backoff。
+export async function retryOmniProbe(): Promise<OmniConfigState> {
+  return impl.realRetryOmniProbe();
+}
+
+// 订阅 omni 熔断器实时健康度变化(全局 top banner 用)。首连即推当前状态,返回 unsubscribe。
+// onOpen 只在断线后重连时触发,调用方借此感知 backend 重启并 refetch config。
+export function subscribeOmniHealth(
+  onHealth: (h: OmniHealth) => void,
+  onOpen?: () => void,
+): () => void {
+  return impl.realSubscribeOmniHealth(onHealth, onOpen);
+}
+
+// SSE 重连后广播的全局事件名:让「模型」页监听并 refetch config
+// (backend 重启会断 SSE,重连意味着 config 可能已变)。
+export const OMNI_CONFIG_STALE_EVENT = "miloco:omni-config-stale";
+
+// ── 升级检测 / 一键升级 ────────────────────────────────
+export async function upgradeCheck(force = false): Promise<UpgradeCheck> {
+  return impl.realUpgradeCheck(force);
+}
+
+export async function triggerUpgrade(): Promise<void> {
+  return impl.realTriggerUpgrade();
+}
+
+export async function upgradeStatus(): Promise<UpgradeStatus> {
+  return impl.realUpgradeStatus();
+}
+
+export async function dismissUpgrade(version: string): Promise<void> {
+  return impl.realDismissUpgrade(version);
+}
+
+// ── 性能 tab（observability）────────────────────────────
+// backend observability/router.py 不走 Normal 包装,直接返回原始 JSON。
+
+const PERF_WINDOW_MS: Record<PerfWindow, number> = {
+  "1h": 60 * 60_000,
+  "6h": 6 * 60 * 60_000,
+  "24h": 24 * 60 * 60_000,
+  "3d": 3 * 24 * 60 * 60_000,
+};
+
+function windowToSince(w: PerfWindow): number {
+  return Date.now() - PERF_WINDOW_MS[w];
+}
+
+export async function getPerfSummary(w: PerfWindow): Promise<PerfSummary> {
+  const since = windowToSince(w);
+  return apiFetch<PerfSummary>(`/api/stats?metric=summary&since=${since}`);
+}
+
+export async function getPerfRtfSeries(
+  w: PerfWindow,
+  bucket: PerfBucket,
+): Promise<PerfRtfPoint[]> {
+  const since = windowToSince(w);
+  return apiFetch<PerfRtfPoint[]>(
+    `/api/stats?metric=rtf_series&bucket=${bucket}&since=${since}`,
+  );
+}
+
+export async function getPerfLatencyPercentiles(
+  w: PerfWindow,
+  bucket: PerfBucket,
+): Promise<PerfLatencyPoint[]> {
+  const since = windowToSince(w);
+  return apiFetch<PerfLatencyPoint[]>(
+    `/api/stats?metric=latency_percentiles&bucket=${bucket}&since=${since}`,
+  );
+}
+
+export async function getPerfGatePassRate(
+  w: PerfWindow,
+  bucket: PerfBucket,
+): Promise<PerfGatePoint[]> {
+  const since = windowToSince(w);
+  return apiFetch<PerfGatePoint[]>(
+    `/api/stats?metric=gate_pass_rate&bucket=${bucket}&since=${since}`,
+  );
+}
+
+export async function getPerfGateScorePercentiles(
+  w: PerfWindow,
+): Promise<PerfGateScoreRow[]> {
+  const since = windowToSince(w);
+  return apiFetch<PerfGateScoreRow[]>(
+    `/api/stats?metric=gate_score_percentiles&since=${since}`,
+  );
+}
+
+export async function getPerfDropSeries(
+  w: PerfWindow,
+  bucket: PerfBucket,
+): Promise<PerfDropPoint[]> {
+  const since = windowToSince(w);
+  return apiFetch<PerfDropPoint[]>(
+    `/api/stats?metric=drop_series&bucket=${bucket}&since=${since}`,
+  );
+}
+
+export async function getPerfOmniErrorSeries(
+  w: PerfWindow,
+  bucket: PerfBucket,
+): Promise<PerfOmniErrorPoint[]> {
+  const since = windowToSince(w);
+  return apiFetch<PerfOmniErrorPoint[]>(
+    `/api/stats?metric=omni_error_series&bucket=${bucket}&since=${since}`,
+  );
+}
+
+export async function getPerfStagePercentiles(
+  w: PerfWindow,
+): Promise<PerfStagePercentiles> {
+  const since = windowToSince(w);
+  return apiFetch<PerfStagePercentiles>(
+    `/api/stats?metric=stage_percentiles&since=${since}`,
+  );
+}
+
+export async function listPerfTraces(
+  w: PerfWindow,
+  limit: number = 100,
+): Promise<PerfTraceRow[]> {
+  const since = windowToSince(w);
+  return apiFetch<PerfTraceRow[]>(`/api/traces?since=${since}&limit=${limit}`);
+}
+
+export async function listPerfAgentRuns(
+  w: PerfWindow,
+  limit: number = 50,
+): Promise<PerfAgentRun[]> {
+  const since = windowToSince(w);
+  return apiFetch<PerfAgentRun[]>(
+    `/api/agent_runs?since=${since}&limit=${limit}`,
+  );
+}
+
+export async function getMemorySnapshot(): Promise<MemorySnapshot> {
+  return apiFetch<MemorySnapshot>(`/api/monitor/memory`);
+}
+
+// uname 是进程级静态信息，模块级缓存：整个 web app 生命周期只发一次请求
+let _unameLoaded = false;
+let _unameValue: string | undefined;
+let _unameInflight: Promise<string | undefined> | null = null;
+
+export async function getUname(): Promise<string | undefined> {
+  if (_unameLoaded) return _unameValue;
+  if (_unameInflight) return _unameInflight;
+  _unameInflight = apiFetch<MonitorMeta>(`/api/monitor/`)
+    .then((m) => {
+      _unameValue = m.uname;
+      _unameLoaded = true;
+      _unameInflight = null;
+      return m.uname;
+    })
+    .catch((e) => {
+      _unameInflight = null;
+      throw e;
+    });
+  return _unameInflight;
+}
+
+export async function getMemorySeries(
+  w: PerfWindow,
+  bucket: PerfBucket,
+): Promise<MemorySeries> {
+  return apiFetch<MemorySeries>(
+    `/api/monitor/memory/series?window=${w}&bucket=${bucket}`,
+  );
+}
+
+export async function getProcSeries(
+  w: PerfWindow,
+  bucket: PerfBucket,
+): Promise<ProcSeries> {
+  return apiFetch<ProcSeries>(
+    `/api/monitor/proc/series?window=${w}&bucket=${bucket}`,
+  );
+}
+
+// ─── Perception Config ─────────────────────────────────────────────────
+
+export type MinSuggestionUrgency = "low" | "medium" | "high";
+
+export interface PerceptionConfig {
+  video_short_edge: number;
+  omni_fps: number;
+  window_size: number;
+  /** Smart Crop 用户开关(backend crop_enhance.user_enabled)。与 video_short_edge
+   *  **正交**:裁不裁看这个,多清晰看分辨率档。老后端不返此字段 → undefined。 */
+  smart_crop_enabled?: boolean;
+  /** 发版级开关(backend crop_enhance.enabled)的只读投影,**PUT 不可写**。
+   *  false = 当前这一版没打开该能力,用户开关即便为 true 也不裁 → 前端置灰 + 提示,
+   *  避免"开关开着但后端不裁"的静默失效。老后端不返此字段 → undefined,同样置灰。 */
+  smart_crop_available?: boolean;
+  // 老 backend(<0.10.x)不返此字段,前端在读取处 ?? DEFAULTS.min_suggestion_urgency 回退。
+  // 声明成可选是为了把这层运行时兼容语义显式化,别让未来维护者把 ?? 当成死代码删。
+  min_suggestion_urgency?: MinSuggestionUrgency;
+}
+
+export async function getPerceptionConfig(): Promise<PerceptionConfig> {
+  const r = await apiFetch<{ code: number; data: PerceptionConfig }>(
+    "/api/admin/perception-config",
+  );
+  return r.data;
+}
+
+// PUT 额外带 restart_ok：config 已写盘，但引擎重启可能失败（磁盘满/模型加载异常），
+// 前端据此区分「已生效」与「已保存但需手动重启」，不把后者误报成「保存失败」。
+export type UpdatePerceptionConfigResult = PerceptionConfig & {
+  restart_ok?: boolean;
+};
+
+// smart_crop_available 从入参里 Omit 掉:它是发版级开关的只读投影,后端 PUT 也不收,
+// 在类型上挡住比让它静默被忽略更好。
+export async function updatePerceptionConfig(
+  input: Partial<Omit<PerceptionConfig, "smart_crop_available">>,
+): Promise<UpdatePerceptionConfigResult> {
+  const r = await apiFetch<{ code: number; data: UpdatePerceptionConfigResult }>(
+    "/api/admin/perception-config",
+    { method: "PUT", body: JSON.stringify(input) },
+  );
+  return r.data;
+}
+
+// ─── Scheduler Config（内置定时任务自动管理开关）──────────────────────────
+
+export interface SchedulerConfig {
+  enabled: boolean;
+}
+
+export async function getSchedulerConfig(): Promise<SchedulerConfig> {
+  const r = await apiFetch<{ code: number; data: SchedulerConfig }>(
+    "/api/admin/scheduler-config",
+  );
+  return r.data;
+}
+
+// 写盘 config.json；实际生效方是 openclaw 插件，故改动在 openclaw 网关下次重启后生效。
+export async function updateSchedulerConfig(
+  input: SchedulerConfig,
+): Promise<SchedulerConfig> {
+  const r = await apiFetch<{ code: number; data: SchedulerConfig }>(
+    "/api/admin/scheduler-config",
+    { method: "PUT", body: JSON.stringify(input) },
+  );
+  return r.data;
+}

@@ -1,0 +1,53 @@
+# Byte-compiled / optimized / DLL files
+**/__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+.Python
+env/
+build/
+dist/
+*.log
+
+# pyenv
+.python-version
+
+# dotenv
+.env
+
+# virtualenv
+.venv/
+venv/
+ENV/
+
+# VSCode settings
+.vscode
+
+# IDEA files
+.idea
+
+# OSX dir files
+.DS_Store
+
+# cursor
+.cursorindexingignore
+.specstory
+
+# Local/private model configuration
+src/vita/models.yaml
+
+# Generated evaluation outputs and local experiment artifacts
+data/simulations/
+data/miro_data/
+data/**/simulations/
+all_csv_result/
+csv_backup*/
+/*.csv
+/*.zip
+*.log
+/run_*.sh
+/check_num.py
+
+# Large generated task/sample dumps. Keep data/vita/domains/ in the repo.
+data/vita/synth_*/

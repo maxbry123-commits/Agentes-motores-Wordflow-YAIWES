@@ -1,0 +1,40 @@
+{
+  // Use IntelliSense to learn about possible attributes.
+  // Hover to view descriptions of existing attributes.
+  // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Current File",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${file}",
+      "console": "integratedTerminal",
+      "justMyCode": false
+    },
+    {
+      "name": "Certification",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/agent_contracts/certification/runtime_verification.py",
+      "console": "integratedTerminal",
+      "env": {
+        "RUNTIME_VERIFICATION_CONFIG": "${workspaceFolder}/configs/runtime-verification.yaml"
+      }
+    },
+    {
+      "name": "CLI",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/agent_contracts/__main__.py",
+      "console": "integratedTerminal",
+      "args": [
+        "list-run", "--timespan", "1d"
+        // "verify-run", "df6ba911", "/Users/antonap/relari/agent-templates/apps/langgraph-fin-agent/dataset.json", "--timespan", "1d", "--output", "df6ba911.json"
+        // "verify-trace", "3bdde92776245158e30f8610ce162982", "/Users/antonap/relari/agent-templates/apps/langgraph-fin-agent/dataset.json", "--output", "3bdde.json"
+        // "get-trace", "b3115513f9b0610180a495a292a1c49b"
+        // "get-trace", "d36897e3fa8f887400c380480dceec27"
+      ]
+    }
+  ]
+}

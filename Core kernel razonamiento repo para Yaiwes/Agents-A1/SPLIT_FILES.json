@@ -1,0 +1,44 @@
+[
+  {
+    "repo": "Agents-A1",
+    "path": "assets/a1_benchmarks_altair_grid.svg",
+    "chunks_dir": "Agents-A1/assets/a1_benchmarks_altair_grid.svg.chunks",
+    "bytes": 8892666,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "Agents-A1",
+    "path": "evaluation/Tools/tau2/data/tau2/domains/telecom/tasks.json",
+    "chunks_dir": "Agents-A1/evaluation/Tools/tau2/data/tau2/domains/telecom/tasks.json.chunks",
+    "bytes": 13977063,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "Agents-A1",
+    "path": "evaluation/Tools/tau2/data/tau2/domains/telecom/tasks_full.json",
+    "chunks_dir": "Agents-A1/evaluation/Tools/tau2/data/tau2/domains/telecom/tasks_full.json.chunks",
+    "bytes": 13977063,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "Agents-A1",
+    "path": "evaluation/Tools/vita/data/vita/domains/ota/tasks.json",
+    "chunks_dir": "Agents-A1/evaluation/Tools/vita/data/vita/domains/ota/tasks.json.chunks",
+    "bytes": 8732896,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "Agents-A1",
+    "path": "evaluation/Tools/vita/data/vita/domains/cross_domain/tasks.json",
+    "chunks_dir": "Agents-A1/evaluation/Tools/vita/data/vita/domains/cross_domain/tasks.json.chunks",
+    "bytes": 10318151,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "Agents-A1",
+    "path": "docs/assets/a1_benchmarks_altair_grid.svg",
+    "chunks_dir": "Agents-A1/docs/assets/a1_benchmarks_altair_grid.svg.chunks",
+    "bytes": 8892666,
+    "chunk_bytes": 8388608
+  }
+]

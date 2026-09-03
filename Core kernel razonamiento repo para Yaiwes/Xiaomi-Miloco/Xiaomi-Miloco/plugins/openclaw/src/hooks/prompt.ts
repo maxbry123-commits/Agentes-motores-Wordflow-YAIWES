@@ -1,0 +1,351 @@
+import path from "node:path";
+import { readFileSafe } from "../home-profile/helpers.js";
+import { buildPendingSuggestionBlock } from "../home-profile/injection.js";
+import {
+  lockOnboardingSession,
+  readOnboardingState,
+} from "../home-profile/onboarding_state.js";
+import { getCatalog } from "../services/catalog.js";
+import { logger } from "../utils/logger.js";
+import { deployTimezone, toLocalParts } from "../utils/time.js";
+import type { HookRegister } from "./index.js";
+
+// 注入 profile：按 session 类型组合不同的块（方案见 _local/prompt-refactor-plan.md §3）。
+// 只特判 rule / suggestion / cron，其余（含 agent:main:miloco 与一切用户 IM）兜底 full。
+type Profile = "full" | "suggestion" | "rule" | "minimal";
+
+// 定时任务（perception-digest / home-dreaming / habit-suggest 等）一律走 minimal：
+// 它们只需各自 skill + CLI 自取数据，不该拿到主 agent 的能力 / 感知 / 通知人格，否则会
+// 误把"结合感知记忆和家庭档案主动提醒/操作"当成自己的职责。isolated cron 的 sessionKey
+// 不含 :cron:，单看它会漏判成 full；而 openclaw 会把 cron 消息重写成 `[cron:<jobId> <name>] …`
+// 前缀、并带 trigger="cron"，故以这两者为主、sessionKey 为辅，任一命中即 minimal。
+export function resolveProfile(
+  sessionKey: string | undefined,
+  opts?: { prompt?: string; trigger?: string },
+): Profile {
+  const key = sessionKey ?? "";
+  if (
+    opts?.trigger === "cron" ||
+    opts?.prompt?.startsWith("[cron:") ||
+    key.includes(":cron:") ||
+    key.startsWith("cron:")
+  ) {
+    return "minimal";
+  }
+  if (key.includes("miloco-rule")) return "rule";
+  if (key.includes("miloco-suggest")) return "suggestion";
+  return "full";
+}
+
+// ===== prepend 指令块（静态） =====
+
+// 本块只赋「家庭管家能力」，不赋身份。早期版本写死「你是经验丰富的家庭智能管家 Miloco」，
+// 而本块是逐轮注入宿主 agent 系统上下文的第一段——它会盖掉宿主自己的人设：用户把 agent
+// 设成"华人牌智能手机傻妞"，装上插件后再问"你是谁"就答成"家庭智能管家 Miloco"。
+// 故改成能力叙述 + 显式身份保全：名字 / 人设 / 语气一律以宿主既有设定为准，插件只补能力
+// 与行事分寸。刻意不写「宿主没设身份就当管家」的兜底——那是宿主自己该管的事（openclaw
+// 本就会引导用户去做身份设定），插件不该趁虚塞一个人格进去。
+// 同理，后端发给 agent 的事件正文也不得要求它自称 miloco（见 welcome_service
+// ._format_message / onboarding_trigger._INSTRUCTION），否则会与本块在同一轮里打架。
+const B_IDENTITY = `## 身份与家庭能力
+你接入了 Miloco 插件，因而具备一位经验丰富的家庭管家的能力：能感知家中发生的事件，理解家庭成员的生活习惯，并据此做出贴心的行为或建议——查询和控制设备、把家调到成员舒适的状态，或在合适的时机给出有用的提醒。
+**Miloco 是你的能力来源，不是你的身份。** 你的名字、人设与说话风格一律沿用你自己既有的设定：用户问"你是谁"时按你自己的设定回答，不要改口自称 Miloco 或"家庭智能管家"；只有用户问起系统 / 插件本身时才提 Miloco。
+打理家中事务时，在不违背你自身人设的前提下：说话像住在这个家里的人——自然、利落、有分寸，不堆砌设备状态、传感器读数或技术细节，除非成员问起。`;
+
+const B_CAPABILITIES = `## 能力概览
+- 设备控制：查询和控制家中设备、调节环境、触发场景，把家调到成员舒适的状态
+- 实时感知：查看家里此刻的状态——传感器读数、摄像头多模态理解
+- 主动智能：结合感知记忆、家庭档案和当下的时间 / 环境，在合适时机给成员合理的提醒或建议，并通过语音 / IM / 米家推送送达
+- 任务编排：把成员交代的事编排成提醒、周期任务、累积统计，或"满足条件就自动执行"的规则
+- 家庭记忆：感知记忆（家中每天发生的事件）+ 家庭档案（成员构成、行为作息习惯、设备使用习惯）
+- 成员识别：家庭成员的注册与识别`;
+
+// 感知块：公共骨架 + 格式示例。full 列全部三种（综合会话需完整理解感知消息词汇）；
+// suggestion / rule 各只列自己那种。
+const PERCEPTION_FORMAT = {
+  voice: "- 语音指令（header `[感知引擎]语音提醒：`）：每条按 key:value 多段竖排（与规则触发同形），多条用 `═══` 分隔。字段：时间、来源、画面描述（可选）、说话人、语音指令。",
+  suggestion:
+    "- 事件提醒（header `[感知引擎]事件提醒：`）：每条按 key:value 多段竖排，多条用 `═══` 分隔。字段：时间、来源、画面描述（可选）、检测到、事件优先级、建议。",
+  rule: `- 规则触发（header \`[感知引擎]规则提醒：\`）：每条 callback 按 key:value 多段展开（无编号），单 callback 内三段（意图/处理流程/额外信息）用 \`---\` 分隔，多条 callback 用 \`═══\` 分隔。结构：
+  \`\`\`
+  [感知引擎]规则提醒：
+  时间：HH:MM:SS                              ← fire 时刻
+  来源：房间的设备(did=xxx)                    ← 触发设备身份
+  画面描述：场景                                ← 可选，有摄像头画面时
+  触发条件：rule 条件文本
+  触发原因：原因
+
+  **意图**：
+  <业务文案：本次 fire 要做什么，可能多行>
+
+  ---
+
+  **处理流程**：                               ← 仅 record-bound rule（task 绑了 record）出现，按时间序 1→2→3 执行：
+  1. 前置闸门——fire 前 get record，若 status=completed → 跳过 step 2 和所有通知；意图里的设备动作不受影响
+  2. record 写操作纪律——按 JSON 字段名选对应 CLI（actual_started_at/exited_at → session-start/end；意图首句 计数加一 → progress-inc / 事件追加 → event-append），先于通知 / 设备动作执行
+  3. 后置判定——按 mutate 响应：status 首次翻 completed → 本次通知达标；noop=true+task_paused → 静默
+  细节按段内具体指引执行，不要心算。
+
+  ---
+
+  **额外信息**：
+  {"task_id": "...", "actual_started_at": "ISO", ...}
+  \`\`\`
+  **意图** = 业务文案；**额外信息** = 单行 JSON，task_id / 时间戳等 fire-time 参数从这里取，别扫文本。`,
+} as const;
+
+function buildPerception(profile: "full" | "suggestion" | "rule"): string {
+  const formats =
+    profile === "full"
+      ? [PERCEPTION_FORMAT.voice, PERCEPTION_FORMAT.suggestion, PERCEPTION_FORMAT.rule]
+      : profile === "suggestion"
+        ? [PERCEPTION_FORMAT.suggestion]
+        : [PERCEPTION_FORMAT.rule];
+  return `## 感知
+家中的事件由感知引擎推送给你，按类型分节（语音提醒 / 事件提醒 / 规则提醒），每节以对应 header 开头。三类条目都按 key:value 多段竖排，多条同类用 \`═══\` 分隔；规则提醒在元信息段之后再有意图 / 处理流程 / 额外信息三段，段间用 \`---\` 分隔。画面描述字段在有摄像头画面时出现。格式：
+${formats.join("\n")}
+
+字段：**来源** = 设备注册的真实房间（判断房间以它为准，别从文本里猜）；括号 \`did\` 是回控设备的唯一标识；**时间**（\`HH:MM:SS\`）= 画面捕获时刻。
+
+收到多条时，先合并再响应：
+- **去重**：短时间内可能有多条语义相近的推送，当作同一件事，取信息最全的只响应一次。
+- **跨相机融合理解**：可能同时推来多达 4 个摄像头的画面；不同摄像头或是同一房间的不同视角、或是同一家不同房间。要融合起来理解，既看清各房间在发生什么，也判断事件之间可能的关联。`;
+}
+
+const B_MEMORY = `## 家庭记忆
+做任何事（控设备、给建议、写通知）之前，先结合这两份记忆，让动作更精准、更合成员心意：
+- **感知记忆**——家里发生了什么。**若下方有「今日感知日志」或「最近感知日志」段，直接读它拿最新情况**；没有该段或要看更早的日子，用 \`memory_search\` 查。
+- **家庭档案**——成员的偏好、习惯、家庭规则、设备使用经验，用 \`miloco-cli home-profile list\` 按需查（不再随上下文注入）。
+
+用户实时指令 > 档案规则（除非档案明确标注为底线 / 红线）。对话中出现成员喜好 / 家人信息 / 作息规律时，即使没说"记录"，也静默写入档案（先 \`home-profile list\` 看全量再写）。`;
+
+// 留空占位：后续把 isolated 输出约束定稿后填入此处。
+const B_RULE_EXEC = "";
+
+// 预留占位：将来若要重新常驻硬约束，在此填入并决定作用域。
+const B_CONSTRAINTS = "";
+
+const B_NOTIFY = `## 通知用户
+**要主动找人时——而不是当面回答用户此刻的提问——动手前必须先读 \`miloco-notify\` skill。** 典型场景：处理完感知 / 定时 / 规则等系统推送后要告知用户，以及危险预警、任务到期 / 达成、定时播报、设备反馈、关怀提醒、用户要配置通知渠道。
+为什么是硬性前置、不能跳过：
+- **处理系统推送时你的回话对用户不可见**——光把结论写进回复，没有任何人收到，等于没通知。必须经本 skill 决策并交付渠道才算送达。
+- 通知要决策「给谁 → 走哪个渠道（TTS / IM / 米家推送）→ 说什么」，这套判断只在 skill 里；别绕过它直接裸调 \`miloco_im_push\` / \`miloco-cli notify push\` / TTS，否则容易选错人、选错渠道、说错话。`;
+
+function buildOnboardingSessionBlock(
+  sessionKey: string | undefined,
+  prompt: string | undefined,
+): string {
+  const key = sessionKey?.trim();
+  // 广播首邀正文以 [系统事件] 开头（见 backend onboarding_trigger._INSTRUCTION），
+  // 借此排除「广播 turn 自身」触发锁定——只有用户真实回复才会锁定 onboarding 会话。
+  // 若改动该前缀约定，需同步调整这里的守卫逻辑。
+  if (!key || !prompt || prompt.startsWith("[系统事件]")) return "";
+  const currentState = readOnboardingState();
+  if (!currentState?.invitedSessionKeys.includes(key)) return "";
+
+  const hasLock = Boolean(currentState.lockedSessionKey);
+  const isOnboardingReply = hasLock
+    ? isOnboardingContinuationReply(prompt)
+    : isOnboardingInviteReply(prompt);
+  if (!isOnboardingReply) return "";
+
+  const state = hasLock ? currentState : lockOnboardingSession(key);
+  if (!state || !state.invitedSessionKeys.includes(key)) return "";
+  if (state.lockedSessionKey && state.lockedSessionKey !== key) {
+    return `## Onboarding 会话收敛
+检测到 onboarding 可能已在另一条 IM 会话中开始（锁定会话：${state.lockedSessionKey}）。
+若用户明确是在本会话回应初始化邀请、且确有继续意愿，可直接在本会话继续；否则简短提示曾在另一条会话发起过，交由用户选择，不要强行要求切回。`;
+  }
+  if (state.lockedSessionKey === key) {
+    return `## Onboarding 会话收敛
+当前会话已被锁定为正在继续的 onboarding 会话。若用户是在回应之前收到的初始化邀请，就继续同一条 onboarding 流程；不要让用户跳到别的会话重复做一遍。`;
+  }
+  return "";
+}
+
+function isOnboardingInviteReply(prompt: string): boolean {
+  const text = prompt.trim().toLowerCase();
+  if (!text) return false;
+  if (/[?？]/.test(text)) return false;
+
+  if (hasExplicitOnboardingIntent(text)) return true;
+  if (hasControlIntent(text)) return false;
+
+  return /^(好|好的|可以|行|嗯|嗯嗯|是|对|开始吧|开始|继续吧|继续|来吧|ok|okay|yes|yep|sure)[。.!！\s]*$/i.test(
+    text,
+  );
+}
+
+function isOnboardingContinuationReply(prompt: string): boolean {
+  const text = prompt.trim().toLowerCase();
+  if (!text) return false;
+  // 首次抢锁需要兼容“好的”这类自然回复；锁定后只接受明确 onboarding 意图，
+  // 避免 onboarding 完成前后的一句裸肯定在 TTL 内重新注入收敛指令。
+  return hasExplicitOnboardingIntent(text);
+}
+
+function hasExplicitOnboardingIntent(text: string): boolean {
+  const onboardingIntent =
+    /(onboarding|初始化|入门|引导|登记|注册|家庭档案|家庭信息|成员信息|家庭成员|开始登记|开始初始化|继续登记|继续初始化)/i;
+  return onboardingIntent.test(text);
+}
+
+function hasControlIntent(text: string): boolean {
+  const controlIntent =
+    /(打开|关闭|开灯|关灯|开空调|关空调|空调|窗帘|灯|插座|电视|查询|查看|提醒|闹钟|定时|执行|控制|调到|设置|播放)/;
+  return controlIntent.test(text);
+}
+
+const B_LANGUAGE = `## 输出语言
+用用户使用的语言回复用户（设备名、人名、专有名词保持原样）。`;
+
+// 时区锚点：感知事件 / 日志 / CLI 返回里的所有时刻都是部署时区（家庭时区）。缺了它，
+// webhook 拉起的会话（含 cron / suggestion lane）无从校正宿主机时钟标错的时段，
+// 曾把北京 10:52 当成"凌晨"误发早睡提醒。所有 profile（含 minimal）都注入。
+function buildTimezoneBlock(): string {
+  return `## 时间与时区
+家庭所在时区为 ${deployTimezone()}。感知事件、日志与 CLI 返回中的所有时刻（如 \`HH:MM:SS\`）均已按此时区表示；创建定时任务也一律以此时区为准。对话或系统消息中明确标注为 UTC / 其他时区的时刻，先换算到家庭时区再理解与表达；向用户表达时间一律用家庭时区。
+若上方家庭时区显示为 UTC，大概率是服务器未配置时区（没有家庭真住在 UTC）；应与用户确认真实时区，并通过 \`miloco-cli config set timezone <IANA>\` 写入配置。`;
+}
+
+// ===== append 数据块（动态） =====
+
+const DEVICE_CATALOG_INTRO = `## 设备目录
+下方 \`# devices catalog\` 是预注入的高频设备子集（≤50 台，非全量），字段规则见下方目录头部的注释。它**只用于快速拿到已点名单台设备的 did / spec_name**，不是全屋设备的全集。凡涉及设备**集合 / 多台 / 不确定数量**（无论查询还是控制），或目录里找不到目标，**必须先 \`device list\` 拉全量**再逐台处理，别拿子集当全部。
+**任何 \`device control / props / action\` 或 \`scene\` 命令前（含查询），必须先读 \`miloco-devices\` skill**——命令选择、集合判定、安全确认、补 on、错误处理等都在其中，别只凭本目录裸发。`;
+
+// 感知日志逐轮全量注入、随一天增长会挤占上下文（它替换掉的家庭档案块原本按 token 截断），
+// 故设一个字符上限；超限时保留末尾（日志按时间追加，尾部即最近），并提示用 memory_search 查全量。
+const PERCEPTION_LOG_MAX_CHARS = 2000;
+
+let warnedMissingWorkspace = false;
+// workspaceDir 是让整个 feature 生效的唯一外部耦合点，缺失时会静默走「不出现」分支、
+// agent 同时失去感知日志与家庭档案两份上下文。打一条 warn（一次即可）让失败可观测。
+function warnMissingWorkspaceOnce(): void {
+  if (warnedMissingWorkspace) return;
+  warnedMissingWorkspace = true;
+  logger.warn(
+    "before_prompt_build 未拿到 workspaceDir：今日感知日志无法注入，" +
+      "agent 将同时缺少感知日志与家庭档案上下文。",
+  );
+}
+
+/** 超出上限时保留末尾（最近），从行首切齐，并加省略提示。 */
+function capPerceptionLog(text: string): string {
+  if (text.length <= PERCEPTION_LOG_MAX_CHARS) return text;
+  const tail = text.slice(text.length - PERCEPTION_LOG_MAX_CHARS);
+  const nl = tail.indexOf("\n");
+  const trimmed = nl >= 0 ? tail.slice(nl + 1) : tail;
+  return `…（更早的记录已省略，需要时用 \`memory_search\` 查全量）\n${trimmed}`;
+}
+
+/**
+ * 读工作区某日感知日志正文（剥掉首行冗余 H1）；不存在 / 空文件 / 仅 H1 → 返回空串。
+ *
+ * 在读取处就剥 H1 并判空，是为了让昨日回退在「digest 建了当天文件、写下 H1，却把这批日志
+ * 全判为该丢弃、正文为空」这种 LLM 偏差下也能触发——否则仅 H1 的文件会被当成"有内容"，
+ * 顶掉回退并注入一个空段。
+ */
+function readPerceptionBody(workspaceDir: string, date: string): string {
+  const file = path.join(workspaceDir, "memory", `${date}-miloco-perception.md`);
+  const md = readFileSafe(file).trim();
+  if (!md) return "";
+  // digest 首行写 `# <date> 感知记忆`（H1）；本段段头已含日期 / 时区语境，该 H1 冗余，剥掉。
+  // 用字面空格 `^# +` 而非 `^#\s+`：`\s` 含换行且贪婪，遇到畸形首行 `#\n` 会一路吃进真正的 H1 + 正文。
+  // 尾部换行用 `*`（可零个）：仅 H1、无正文的文件（trim 后无尾换行）也要能整行剥净 → 正文判空 → 触发回退。
+  return md.replace(/^# +.*(?:\r?\n)*/, "").trim();
+}
+
+// 今日感知日志：把当天的感知记忆整段注入 agent 全局上下文，替代过去注入的家庭档案摘要——
+// 家庭管家更需要"家里今天发生了什么"这样的活上下文；家庭档案改由 agent 用 `home-profile list`
+// 按需自取。文件由 miloco-perception-digest cron 写在工作区 `memory/<date>-miloco-perception.md`，
+// 文件名日期按部署时区。工作区路径由宿主经 ctx.workspaceDir 提供，拿不到时整段不出现并 warn。
+//
+// 日期匹配：消费端按部署时区确定性拼文件名，生产端由 LLM 按家庭时区命名，两者只是**约定对齐**、
+// 并非严格同源——午夜窗口 / 清晨当天首个 digest 未落盘 / LLM 偶发命名偏差都可能让当天文件缺失。
+// 故当天缺失时回退到昨天的日志，且如实标注为「最近感知日志（<date>）」而非谎称今日。
+function buildPerceptionLogBlock(workspaceDir: string | undefined): string {
+  if (!workspaceDir) {
+    warnMissingWorkspaceOnce();
+    return "";
+  }
+  const now = toLocalParts(new Date().toISOString());
+  if (!now) return "";
+  const pad2 = (n: number) => String(n).padStart(2, "0");
+  const today = `${now.y}-${pad2(now.m)}-${pad2(now.d)}`;
+
+  let body = readPerceptionBody(workspaceDir, today);
+  let heading = "今日感知日志";
+  let lead = "下面是今天家里发生的事";
+  if (!body) {
+    const y = toLocalParts(new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString());
+    if (y) {
+      const yDate = `${y.y}-${pad2(y.m)}-${pad2(y.d)}`;
+      const yBody = readPerceptionBody(workspaceDir, yDate);
+      if (yBody) {
+        body = yBody;
+        heading = "最近感知日志";
+        lead = `今天还没有感知记录，下面是最近一次（${yDate}）家里发生的事`;
+      }
+    }
+  }
+  if (!body) return "";
+  // 把余下标题各降一级，真正嵌进本段 H2 之下（否则降级后的 H2 会与段头同级）。
+  const demoted = capPerceptionLog(body.replace(/^(#{1,5}) /gm, "#$1 "));
+  return `## ${heading}\n${lead}（感知引擎自动归档，按家庭时区记录）。做判断 / 给建议前先读它；更早的日子用 \`memory_search\` 查。\n\n${demoted}`;
+}
+
+// ===== 组装 =====
+
+export const registerBeforePromptBuildHook: HookRegister = (api) => {
+  api.on(
+    "before_prompt_build",
+    async (
+      event?: { prompt?: string },
+      ctx?: { sessionKey?: string; trigger?: string; workspaceDir?: string },
+    ) => {
+    const profile = resolveProfile(ctx?.sessionKey, {
+      prompt: event?.prompt,
+      trigger: ctx?.trigger,
+    });
+
+    // ---- prepend：指令块，按 §3 序 ----
+    // 时区块紧随身份、置于所有 profile（含 minimal）——cron/suggestion lane 也须锚定家庭时区。
+    const prepend: string[] = [B_IDENTITY, buildTimezoneBlock()];
+    if (profile === "full") prepend.push(B_CAPABILITIES);
+    if (profile !== "minimal") prepend.push(buildPerception(profile));
+    if (profile === "rule" && B_RULE_EXEC) prepend.push(B_RULE_EXEC);
+    if (profile !== "minimal") prepend.push(B_MEMORY);
+    if (B_CONSTRAINTS) prepend.push(B_CONSTRAINTS);
+    prepend.push(B_NOTIFY, B_LANGUAGE);
+
+    // ---- append：数据块（今日感知日志 → 待回应 → 目录），minimal 不带 ----
+    const append: string[] = [];
+    if (profile !== "minimal") {
+      const onboardingBlock = buildOnboardingSessionBlock(
+        ctx?.sessionKey,
+        event?.prompt,
+      );
+      if (onboardingBlock) append.push(onboardingBlock);
+
+      const perceptionBlock = buildPerceptionLogBlock(ctx?.workspaceDir);
+      if (perceptionBlock) append.push(perceptionBlock);
+
+      if (profile === "full") {
+        const pending = buildPendingSuggestionBlock();
+        if (pending) append.push(pending);
+      }
+
+      // catalog 放最末（最易变）；CLI 失败回退空串则整段不出现。
+      // 套 ```text 围栏：catalog 是类 TSV 数据块，行首 `#` 是注释前缀而非 markdown
+      // 标题，裸贴会让 `# devices catalog` 在 `## 设备目录`(H2) 下被解析成 H1 倒挂。
+      const catalog = await getCatalog();
+      if (catalog) append.push(`${DEVICE_CATALOG_INTRO}\n\n\`\`\`text\n${catalog}\n\`\`\``);
+    }
+
+    return {
+      prependSystemContext: prepend.join("\n\n"),
+      appendSystemContext: append.length ? append.join("\n\n") : undefined,
+    };
+  });
+};

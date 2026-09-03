@@ -1,0 +1,95 @@
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+# Dependencies
+node_modules
+.pnp
+.pnp.js
+
+# Local env files
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Testing
+coverage
+temp
+
+# Turbo
+.turbo
+
+# Vercel
+.vercel
+
+# Build Outputs
+.next/
+out/
+build
+dist
+target
+# 前端构建产物落地目录（scripts/build.sh 打 wheel 时生成并拷入，不进 git）
+backend/miloco/src/miloco/static/
+
+# Build-time generated skills copy
+plugins/openclaw/skills/
+plugins/hermes/skills/
+
+
+# Debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Python
+.venv
+.mypy_cache
+__pycache__
+*.egg-info
+*.py[oc]
+.pytest_cache/
+.ruff_cache/
+
+# Backend test artifacts
+.test_cache
+/test_results/
+testcases
+
+# Large media test files
+*.mp4
+*.mkv
+*.avi
+*.wav
+
+# SQLite databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Misc
+.DS_Store
+*.pem
+*.key
+temp
+.temp
+
+# IDE
+.vscode
+.claude/*
+.mimocode
+CLAUDE.md
+openspec
+_workspace
+_local/
+xaf/
+
+# 离线评测产物：真实家庭场景抽帧 / 视频，文件名还带被摄对象标签，只在本地留档，
+# 绝不入库（本仓库 remote 是公开的，一次 `git add -A` 就没法从历史里摘干净）。
+# 不挡 eval/ 下的脚本与结论文本——那些将来若要入库仍可正常 add。
+eval/results/
+# 数据集抽样清单：不是"产物目录"却同样带标签（文件名里直接带被摄对象的性别与年龄段），
+# 只挡 results/ 会从这条缝里漏出去。
+eval/sampled_*.json
+
+# opengrep / semgrep 本地扫描产物（含全量命中片段与绝对路径），只在本地看，不入库。
+.opengrep-out/

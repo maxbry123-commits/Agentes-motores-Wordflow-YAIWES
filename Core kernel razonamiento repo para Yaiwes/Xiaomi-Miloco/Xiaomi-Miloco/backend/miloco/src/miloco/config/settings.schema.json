@@ -1,0 +1,173 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MilocoSettings",
+  "description": "miloco 用户可配置项契约（对应 ~/.openclaw/miloco/config.json）",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "debug": {
+      "type": "boolean",
+      "default": false,
+      "description": "是否启用调试模式：为 true 时 CLI / backend / openclaw 插件都会输出更详细的日志"
+    },
+    "timezone": {
+      "anyOf": [{ "type": "string" }, { "type": "null" }],
+      "default": null,
+      "description": "部署时区（IANA 名，如 Asia/Shanghai / America/Los_Angeles）；null = 跟随系统时区。影响感知推送与 omni 注入的时刻、\"今天/本周\"等业务概念、API 出口 ISO 偏移；DB 存储始终 UTC 绝对时刻，不受影响"
+    },
+    "server": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "miloco 后端服务相关配置（HTTP 访问、token、启动用 Python 解释器）",
+      "properties": {
+        "url": {
+          "type": "string",
+          "default": "http://127.0.0.1:1810",
+          "description": "CLI 与插件访问 miloco 后端的 HTTP Base URL（永远 HTTP；跨网加密走反代）"
+        },
+        "token": {
+          "type": "string",
+          "default": "",
+          "description": "CLI 与插件访问后端时使用的 Bearer Token；为空时由后端首次启动自动生成"
+        },
+        "tls_verify": {
+          "type": "boolean",
+          "default": false,
+          "description": "CLI 访问后端时是否校验 TLS 证书；当前 backend 永远 HTTP 故无作用，保留供未来反代场景"
+        },
+        "python_bin": {
+          "type": "string",
+          "default": "",
+          "description": "用于启动 miloco-backend 的 Python 解释器绝对路径（install.sh 探测后写入）"
+        },
+        "tls_certfile": {
+          "type": "string",
+          "default": "",
+          "deprecated": true,
+          "description": "【已废弃】backend 永远 HTTP，跨网加密走反代+真证书；写了不生效，仅启动 warning"
+        },
+        "tls_keyfile": {
+          "type": "string",
+          "default": "",
+          "deprecated": true,
+          "description": "【已废弃】见 tls_certfile"
+        }
+      },
+      "required": ["url", "token", "tls_verify", "python_bin"]
+    },
+    "agent": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "agent webhook 出站调用配置（webhook 地址 + 鉴权凭据）",
+      "properties": {
+        "webhook_url": {
+          "type": "string",
+          "default": "http://127.0.0.1:18789/miloco/webhook",
+          "description": "agent webhook 回调地址"
+        },
+        "auth_bearer": {
+          "type": "string",
+          "default": "",
+          "description": "agent webhook 鉴权 Bearer 值；为空时不发送 Authorization 头"
+        }
+      },
+      "required": ["webhook_url", "auth_bearer"]
+    },
+    "model": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "miloco 使用的第三方多模态模型配置",
+      "properties": {
+        "omni": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "多模态大模型（omni）配置，默认使用小米 MiMo",
+          "properties": {
+            "model": {
+              "type": "string",
+              "default": "xiaomi/mimo-v2.5",
+              "description": "多模态模型标识（provider/model）"
+            },
+            "base_url": {
+              "type": "string",
+              "default": "https://api.xiaomimimo.com/v1",
+              "description": "多模态模型服务 Base URL（需兼容 OpenAI-compatible 协议）"
+            },
+            "api_key": {
+              "type": "string",
+              "default": "",
+              "description": "多模态模型 API Key；为空时视为未配置，插件与后端启动前校验"
+            }
+          },
+          "required": ["model", "base_url", "api_key"]
+        }
+      },
+      "required": ["omni"]
+    },
+    "features": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "产品级实验性功能开关（默认关，住户在 web 显式开启）",
+      "properties": {
+        "pet_recognition": {
+          "type": "boolean",
+          "default": false,
+          "description": "宠物识别（实验性）总开关：开启后启用宠物作为家庭成员的注册与基于外观描述的命名识别；默认关，关闭时前端隐藏入口、后端不注入宠物命名规则，已录数据保留"
+        },
+        "pet_head_grounding": {
+          "type": "boolean",
+          "default": true,
+          "description": "宠物头像头部定位子开关（默认开）：开启后注册时由 omni 输出头部区域坐标作头像默认裁剪框；关闭则用全身 crop。仅在 pet_recognition 开启时有意义；内部调优参数，一般无需改动"
+        },
+        "pet_body_grounding": {
+          "type": "boolean",
+          "default": true,
+          "description": "宠物本体定位子开关（默认开）：仅作用于检测器框不到猫/狗的回退路径——开启后由 omni 在整幅画面输出目标动物本体坐标、裁本体作参考 crop（兼容非猫狗物种）；关闭则回退路径不产参考 crop。仅在 pet_recognition 开启时有意义；内部调优参数，一般无需改动"
+        },
+        "pet_reid_diverse": {
+          "type": "boolean",
+          "default": true,
+          "description": "宠物参考图多样性选择（默认开）：视频注册时用人体 ReID 特征距离在同一只候选里贪心选最不相似的 ≤3 张多姿态（第 1 张取质量分最高，第 2/3 张依次选特征距离最远者）；关闭或模型不可用时回退感知哈希 dHash。仅在 pet_recognition 开启时有意义；内部调优参数，一般无需改动"
+        }
+      }
+    },
+    "scheduler": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "miloco 内置定时任务自动管理开关（由 openclaw 插件在网关启动时消费）",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "是否由 miloco 自动管理内置定时任务（感知摘要 / 家庭巡检 / Dreaming / 习惯洞察）；关闭后 agent 网关启动时会清除这些自动任务且不再重建"
+        }
+      }
+    },
+    "notify": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "通知发送运行参数（去重窗口等）",
+      "properties": {
+        "dedup_window_sec": {
+          "type": "number",
+          "default": 60.0,
+          "description": "相同通知文案在此窗口（秒）内只发一次；<=0 = 关闭去重"
+        }
+      }
+    },
+    "perception": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "感知管线相关配置",
+      "properties": {
+        "min_suggestion_urgency": {
+          "type": "string",
+          "enum": ["low", "medium", "high"],
+          "default": "low",
+          "description": "把 urgency 低于该阈值的 suggestion 从 dispatch→agent 通路丢弃；low=不过滤（默认，向后兼容），medium=丢弃 low，high=只保留 high。result.suggestions 保留完整，仅 agent 派发受限"
+        }
+      }
+    }
+  },
+  "required": ["debug", "server", "agent", "model"]
+}

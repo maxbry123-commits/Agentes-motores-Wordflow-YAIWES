@@ -1,0 +1,12 @@
+*
+
+!Dockerfile
+!src/
+!src/tool_source_code/
+!src/tool_source_code/pymatgen/
+!src/tool_source_code/pymatgen/src/
+!src/tool_source_code/pymatgen/src/**
+!src/tool_source_code/pymatgen-analysis-defects/
+!src/tool_source_code/pymatgen-analysis-defects/tests/
+!src/tool_source_code/pymatgen-analysis-defects/tests/test_files/
+!src/tool_source_code/pymatgen-analysis-defects/tests/test_files/**

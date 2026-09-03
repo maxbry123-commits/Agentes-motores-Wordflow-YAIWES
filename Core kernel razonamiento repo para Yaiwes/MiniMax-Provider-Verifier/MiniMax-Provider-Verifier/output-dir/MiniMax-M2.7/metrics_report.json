@@ -1,0 +1,135 @@
+{
+    "summary": {
+        "total_files": 10,
+        "average_metrics": {
+            "1. Query-Success-Rate": 1.0,
+            "2. ToolCalls-Match-Rate": 0.9879999999999999,
+            "4. ToolCalls-Schema-Accuracy": 0.9976190476190476,
+            "5. Error-Only-Reasoning-Rate": 0.0,
+            "6. Language-Following-Success-Rate": 0.75,
+            "7. Scenario-Check-Pass-Rate": 1.0
+        }
+    },
+    "results": [
+        {
+            "file": "output-dir/batch_20260502_175306/loop_01/MiniMax-M2.7/MiniMax-M2.7_summary.json",
+            "model": "minimax-m2.7",
+            "metrics": {
+                "1. Query-Success-Rate": 1.0,
+                "2. ToolCalls-Match-Rate": 0.99,
+                "4. ToolCalls-Schema-Accuracy": 1.0,
+                "5. Error-Only-Reasoning-Rate": 0.0,
+                "6. Language-Following-Success-Rate": 0.0,
+                "7. Scenario-Check-Pass-Rate": 1.0
+            }
+        },
+        {
+            "file": "output-dir/batch_20260502_175306/loop_02/MiniMax-M2.7/MiniMax-M2.7_summary.json",
+            "model": "minimax-m2.7",
+            "metrics": {
+                "1. Query-Success-Rate": 1.0,
+                "2. ToolCalls-Match-Rate": 0.99,
+                "4. ToolCalls-Schema-Accuracy": 1.0,
+                "5. Error-Only-Reasoning-Rate": 0.0,
+                "6. Language-Following-Success-Rate": 1.0,
+                "7. Scenario-Check-Pass-Rate": 1.0
+            }
+        },
+        {
+            "file": "output-dir/batch_20260502_175306/loop_03/MiniMax-M2.7/MiniMax-M2.7_summary.json",
+            "model": "minimax-m2.7",
+            "metrics": {
+                "1. Query-Success-Rate": 1.0,
+                "2. ToolCalls-Match-Rate": 0.99,
+                "4. ToolCalls-Schema-Accuracy": 0.9880952380952381,
+                "5. Error-Only-Reasoning-Rate": 0.0,
+                "6. Language-Following-Success-Rate": 1.0,
+                "7. Scenario-Check-Pass-Rate": 1.0
+            }
+        },
+        {
+            "file": "output-dir/batch_20260502_175306/loop_04/MiniMax-M2.7/MiniMax-M2.7_summary.json",
+            "model": "minimax-m2.7",
+            "metrics": {
+                "1. Query-Success-Rate": 1.0,
+                "2. ToolCalls-Match-Rate": 0.99,
+                "4. ToolCalls-Schema-Accuracy": 1.0,
+                "5. Error-Only-Reasoning-Rate": 0.0,
+                "6. Language-Following-Success-Rate": 0.5,
+                "7. Scenario-Check-Pass-Rate": 1.0
+            }
+        },
+        {
+            "file": "output-dir/batch_20260502_175306/loop_05/MiniMax-M2.7/MiniMax-M2.7_summary.json",
+            "model": "minimax-m2.7",
+            "metrics": {
+                "1. Query-Success-Rate": 1.0,
+                "2. ToolCalls-Match-Rate": 0.99,
+                "4. ToolCalls-Schema-Accuracy": 1.0,
+                "5. Error-Only-Reasoning-Rate": 0.0,
+                "6. Language-Following-Success-Rate": 0.5,
+                "7. Scenario-Check-Pass-Rate": 1.0
+            }
+        },
+        {
+            "file": "output-dir/batch_20260502_175306/loop_06/MiniMax-M2.7/MiniMax-M2.7_summary.json",
+            "model": "minimax-m2.7",
+            "metrics": {
+                "1. Query-Success-Rate": 1.0,
+                "2. ToolCalls-Match-Rate": 0.99,
+                "4. ToolCalls-Schema-Accuracy": 1.0,
+                "5. Error-Only-Reasoning-Rate": 0.0,
+                "6. Language-Following-Success-Rate": 1.0,
+                "7. Scenario-Check-Pass-Rate": 1.0
+            }
+        },
+        {
+            "file": "output-dir/batch_20260502_175306/loop_07/MiniMax-M2.7/MiniMax-M2.7_summary.json",
+            "model": "minimax-m2.7",
+            "metrics": {
+                "1. Query-Success-Rate": 1.0,
+                "2. ToolCalls-Match-Rate": 0.99,
+                "4. ToolCalls-Schema-Accuracy": 0.9880952380952381,
+                "5. Error-Only-Reasoning-Rate": 0.0,
+                "6. Language-Following-Success-Rate": 1.0,
+                "7. Scenario-Check-Pass-Rate": 1.0
+            }
+        },
+        {
+            "file": "output-dir/batch_20260502_175306/loop_08/MiniMax-M2.7/MiniMax-M2.7_summary.json",
+            "model": "minimax-m2.7",
+            "metrics": {
+                "1. Query-Success-Rate": 1.0,
+                "2. ToolCalls-Match-Rate": 0.98,
+                "4. ToolCalls-Schema-Accuracy": 1.0,
+                "5. Error-Only-Reasoning-Rate": 0.0,
+                "6. Language-Following-Success-Rate": 0.5,
+                "7. Scenario-Check-Pass-Rate": 1.0
+            }
+        },
+        {
+            "file": "output-dir/batch_20260502_175306/loop_09/MiniMax-M2.7/MiniMax-M2.7_summary.json",
+            "model": "minimax-m2.7",
+            "metrics": {
+                "1. Query-Success-Rate": 1.0,
+                "2. ToolCalls-Match-Rate": 0.98,
+                "4. ToolCalls-Schema-Accuracy": 1.0,
+                "5. Error-Only-Reasoning-Rate": 0.0,
+                "6. Language-Following-Success-Rate": 1.0,
+                "7. Scenario-Check-Pass-Rate": 1.0
+            }
+        },
+        {
+            "file": "output-dir/batch_20260502_175306/loop_10/MiniMax-M2.7/MiniMax-M2.7_summary.json",
+            "model": "minimax-m2.7",
+            "metrics": {
+                "1. Query-Success-Rate": 1.0,
+                "2. ToolCalls-Match-Rate": 0.99,
+                "4. ToolCalls-Schema-Accuracy": 1.0,
+                "5. Error-Only-Reasoning-Rate": 0.0,
+                "6. Language-Following-Success-Rate": 1.0,
+                "7. Scenario-Check-Pass-Rate": 1.0
+            }
+        }
+    ]
+}
