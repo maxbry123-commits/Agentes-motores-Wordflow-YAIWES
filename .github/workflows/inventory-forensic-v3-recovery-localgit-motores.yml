@@ -1,0 +1,180 @@
+name: inventory-forensic-v3-recovery-localgit-motores
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/inventory-forensic-v3-recovery-localgit-motores.yml'
+
+permissions:
+  contents: read
+
+env:
+  AUDIT_DIR: audit-v3-recovery
+
+jobs:
+  forensic_inventory_recovery:
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Checkout main metadata
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+          filter: blob:none
+
+      - name: Enumerate and audit with local git only
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$AUDIT_DIR"
+          python3 - <<'PY'
+          import json, os, re, subprocess
+          from collections import Counter, defaultdict
+
+          repo = os.environ['GITHUB_REPOSITORY']
+          run_id = os.environ['GITHUB_RUN_ID']
+          server = os.environ['GITHUB_SERVER_URL']
+          outdir = os.environ['AUDIT_DIR']
+          head_sha = subprocess.check_output(['git','rev-parse','HEAD'], text=True).strip()
+
+          raw = subprocess.check_output(['git','ls-tree','-r','-l','HEAD'], text=True, errors='replace')
+          files=[]
+          for line in raw.splitlines():
+              m=re.match(r'^(\d+)\s+(\w+)\s+([0-9a-f]+)\s+(-|\d+)\t(.*)$', line)
+              if not m or m.group(2) != 'blob':
+                  continue
+              size = 0 if m.group(4) == '-' else int(m.group(4))
+              files.append({'path':m.group(5),'size':size,'sha':m.group(3)})
+
+          paths={f['path'] for f in files}
+          lower_paths={p.lower():p for p in paths}
+          directories=set()
+          for p in paths:
+              parts=p.split('/')[:-1]
+              for i in range(1,len(parts)+1):
+                  directories.add('/'.join(parts[:i]))
+
+          manifests=[f for f in files if f['path'].lower().endswith('research_download_manifest.jsonl')]
+          zip_re=re.compile(r'(?i)(\.zip$|\.z\d\d$|\.zip\.\d+$|\.part\d+$)')
+          zip_files=[f for f in files if zip_re.search(f['path'])]
+          zip_groups=defaultdict(list)
+          for f in zip_files:
+              p=f['path']
+              base=re.sub(r'(?i)(\.z\d\d$|\.zip\.\d+$|\.part\d+$)','',p)
+              if base.lower().endswith('.zip'):
+                  base=base[:-4]
+              zip_groups[base].append(f)
+
+          url_keys=['source_url','repo_url','repository_url','url','source','repo','repository']
+          sha_keys=['source_commit','commit_sha','commit','sha','source_sha']
+          name_keys=['canonical_name','component_name','name','slug','id']
+          path_keys=['exact_path','destination','destination_path','target_path','path','output_path']
+          def first_str(d, keys):
+              for k in keys:
+                  v=d.get(k)
+                  if isinstance(v,str) and v.strip(): return v.strip()
+              return None
+          def norm_url(u):
+              if not u: return None
+              x=u.strip().lower()
+              if x.endswith('.git'): x=x[:-4]
+              return x.rstrip('/')
+          def git_show(path):
+              return subprocess.check_output(['git','show','HEAD:'+path], text=True, errors='replace')
+
+          raw_entries=[]; manifest_errors=[]
+          for mf in manifests:
+              try:
+                  txt=git_show(mf['path'])
+              except Exception as e:
+                  manifest_errors.append({'path':mf['path'],'error':type(e).__name__})
+                  continue
+              for line_no,line in enumerate(txt.splitlines(),1):
+                  line=line.strip()
+                  if not line: continue
+                  try:
+                      d=json.loads(line)
+                  except Exception:
+                      manifest_errors.append({'path':mf['path'],'line':line_no,'error':'invalid_jsonl'})
+                      continue
+                  if not isinstance(d,dict): continue
+                  u=first_str(d,url_keys); s=first_str(d,sha_keys); nm=first_str(d,name_keys); dp=first_str(d,path_keys)
+                  if any([u,s,nm,dp]):
+                      raw_entries.append({'manifest_path':mf['path'],'manifest_line':line_no,'canonical_name':nm,'source_url':u,'source_commit':s,'declared_path':dp})
+
+          components=[]
+          for idx,e in enumerate(raw_entries,1):
+              declared=e.get('declared_path'); exact=None; path_verified=False
+              if declared:
+                  d=declared.strip().lstrip('./')
+                  if d in paths or d in directories:
+                      exact=d; path_verified=True
+                  elif d.lower() in lower_paths:
+                      exact=lower_paths[d.lower()]; path_verified=True
+                  else:
+                      pref=d.rstrip('/')+'/'
+                      if any(p.startswith(pref) for p in paths): exact=d; path_verified=True
+              sha=e.get('source_commit')
+              sha_valid=bool(sha and re.fullmatch(r'[0-9a-fA-F]{40}',sha))
+              cid=norm_url(e.get('source_url')) or f"manifest:{e['manifest_path']}:{e['manifest_line']}"
+
+              # Associate ZIP groups conservatively by declared path/name substring only.
+              tokens=[x.lower() for x in [e.get('canonical_name'), exact, declared] if isinstance(x,str) and x]
+              matched=[]
+              for base, group in zip_groups.items():
+                  b=base.lower()
+                  if any(t in b or b.endswith('/'+t) for t in tokens if len(t)>=3):
+                      matched.extend(group)
+              uniq={x['path']:x for x in matched}
+              zip_verified=bool(uniq)
+              components.append({
+                  'canonical_id':cid,'number':idx,'canonical_name':e.get('canonical_name') or cid.rsplit('/',1)[-1],
+                  'source_url':e.get('source_url') or 'INSUFFICIENT_EVIDENCE',
+                  'source_commit':sha if sha_valid else 'INSUFFICIENT_EVIDENCE',
+                  'repository':repo,'branch':'main','exact_path':exact or declared or 'INSUFFICIENT_EVIDENCE',
+                  'manifest_path':e['manifest_path'],'zip_parts':len(uniq) if uniq else 'INSUFFICIENT_EVIDENCE',
+                  'maximum_part_size':max((x['size'] for x in uniq.values()),default=0) if uniq else 'INSUFFICIENT_EVIDENCE',
+                  'workflow_run_url':f'{server}/{repo}/actions/runs/{run_id}',
+                  'status':'COMPLETE' if path_verified and e.get('source_url') and sha_valid and zip_verified else 'INSUFFICIENT_EVIDENCE',
+                  'evidence':{'tree_verified':True,'manifest_verified':True,'sha_verified':sha_valid,'zip_verified':zip_verified,'destination_verified':path_verified,'workflow_verified':True}
+              })
+
+          ids=Counter(c['canonical_id'] for c in components)
+          duplicates=[{'canonical_id':k,'count':v} for k,v in ids.items() if v>1]
+          evidence={
+              'schema':'YAIWES-INVENTORY-INDEXES-V3','recovery_for':'HTTP_403_API_TRAVERSAL',
+              'repository':repo,'branch':'main','main_commit':head_sha,
+              'workflow_run_url':f'{server}/{repo}/actions/runs/{run_id}',
+              'tree':{'files':len(files),'directories':len(directories)},
+              'manifests':[{'path':x['path'],'size':x['size'],'git_blob_sha':x['sha']} for x in manifests],
+              'manifest_errors':manifest_errors,
+              'zip_parts':{'file_count':len(zip_files),'groups':[{'base':k,'parts':len(v),'maximum_part_size':max((x['size'] for x in v),default=0),'files':[{'path':x['path'],'size':x['size']} for x in v]} for k,v in sorted(zip_groups.items())]},
+              'components':components,'duplicates':duplicates,
+              'counts':{'manifest_entries':len(raw_entries),'components':len(components),'complete':sum(c['status']=='COMPLETE' for c in components),'insufficient_evidence':sum(c['status']=='INSUFFICIENT_EVIDENCE' for c in components),'duplicate_ids':len(duplicates)}
+          }
+          with open(outdir+'/inventory-evidence-v3-recovery.json','w',encoding='utf-8') as f: json.dump(evidence,f,ensure_ascii=False,indent=2)
+          with open(outdir+'/inventory-evidence-v3-recovery.md','w',encoding='utf-8') as f:
+              f.write(f"# Auditoría forense V3 recovery — {repo}\n\n")
+              f.write(f"- Branch: main\n- Main commit: {head_sha}\n- Run: {evidence['workflow_run_url']}\n")
+              f.write(f"- Manifests RESEARCH_DOWNLOAD: {len(manifests)}\n- ZIP/parts: {len(zip_files)}\n- Components: {len(components)}\n")
+              f.write(f"- COMPLETE: {evidence['counts']['complete']}\n- INSUFFICIENT_EVIDENCE: {evidence['counts']['insufficient_evidence']}\n- Duplicate canonical IDs: {len(duplicates)}\n")
+          PY
+
+      - name: Validate evidence exists
+        if: always()
+        shell: bash
+        run: |
+          test -s "$AUDIT_DIR/inventory-evidence-v3-recovery.json"
+          test -s "$AUDIT_DIR/inventory-evidence-v3-recovery.md"
+
+      - name: Upload isolated forensic evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: inventory-forensic-v3-recovery-localgit-motores
+          path: audit-v3-recovery/
+          if-no-files-found: error
+          retention-days: 30
