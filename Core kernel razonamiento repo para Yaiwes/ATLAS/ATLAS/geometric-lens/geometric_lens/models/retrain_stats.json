@@ -1,0 +1,11 @@
+{
+    "val_auc": 0.7322,
+    "pass_energy_mean": 9.25320082537982,
+    "fail_energy_mean": 11.808575226710392,
+    "n_samples": 287,
+    "n_pass": 196,
+    "n_fail": 91,
+    "dim": 3840,
+    "model": "gemma-4-12b-it-Q4_K_M",
+    "timestamp": "2026-07-02T17:55:00"
+}
