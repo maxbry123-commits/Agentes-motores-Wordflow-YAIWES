@@ -1,0 +1,155 @@
+{
+  "schema": "yaiwes.extraction.guardian.v2",
+  "run_id": "33800537622",
+  "archive_groups": 167,
+  "processed": [
+    {
+      "slug": "Oh-My-Agents",
+      "target": "Core kernel razonamiento repo para Yaiwes/Oh-My-Agents",
+      "status": "EXTRACTED_VERIFIED",
+      "parts": 1,
+      "part_sha256": {
+        "Download code/archivos/Oh-My-Agents_0001.zip": "5f5f25dbfbbc367514215cc476542cc07ea1ba37b8f6994736c66d9a1cde20e7"
+      },
+      "copied": 72,
+      "mirrors": [],
+      "files": 72,
+      "bytes": 498252,
+      "tree_sha256": "183ff37f59815c914bfa1204e5855807156c22d2150d3128a3eb0cd8052e15ec"
+    },
+    {
+      "slug": "Zuora-Coding-Agent",
+      "target": "Core kernel razonamiento repo para Yaiwes/Zuora-Coding-Agent",
+      "status": "EXTRACTED_VERIFIED",
+      "parts": 1,
+      "part_sha256": {
+        "Download code/archivos/Zuora-Coding-Agent_0001.zip": "a5c2beed0d6f85376bfcf1dc8fd2611d2a911eb474d72f79fb743c2e123fe7d3"
+      },
+      "copied": 197,
+      "mirrors": [],
+      "files": 197,
+      "bytes": 2209123,
+      "tree_sha256": "65b0fbd8d7e320a573e145ea6c6d57e7d3c943072e0ce8788be999b11ecd7252"
+    },
+    {
+      "slug": "Agent-Checkpoint",
+      "target": "Core kernel razonamiento repo para Yaiwes/Agent-Checkpoint",
+      "status": "EXTRACTED_VERIFIED",
+      "parts": 1,
+      "part_sha256": {
+        "Download code/archivos/Agent-Checkpoint_0001.zip": "5f9d16af9f46f4021451f57b571d00f45434d2ae6b4076b0e1fe5182b95dcc86"
+      },
+      "copied": 9,
+      "mirrors": [],
+      "files": 9,
+      "bytes": 29222,
+      "tree_sha256": "d4f33d1c12e3442387a6ac030a44f2d39bd941bf9af2802e640f6949c52f1cb7"
+    },
+    {
+      "slug": "Kimi-CLI",
+      "target": "Core kernel razonamiento repo para Yaiwes/Kimi-CLI",
+      "status": "EXTRACTED_VERIFIED",
+      "parts": 1,
+      "part_sha256": {
+        "Download code/archivos/Kimi-CLI_0001.zip": "9092d3ad8f09b9c0ab198b593c9c3d3187a8855e60c1fcc5077a4ba33c0cc50a"
+      },
+      "copied": 988,
+      "mirrors": [],
+      "files": 988,
+      "bytes": 17824637,
+      "tree_sha256": "1cf78d53b92b4f9c4f8b8e7c55070a5186bf378c5a1bfe3de4446fd1976b785d"
+    },
+    {
+      "slug": "Loop-Engineer",
+      "target": "Core kernel razonamiento repo para Yaiwes/Loop-Engineer",
+      "status": "EXTRACTED_VERIFIED",
+      "parts": 1,
+      "part_sha256": {
+        "Download code/archivos/Loop-Engineer_0001.zip": "cd4e68d7e06fdf6eea93982b9a9d0519b0c5611ddf87580da1739b04ad3263c0"
+      },
+      "copied": 404,
+      "mirrors": [],
+      "files": 404,
+      "bytes": 3300272,
+      "tree_sha256": "cd7274cb58f08e56d6dc579f6452c9298e85cb0c4bd08d6fccbd039848ae6c08"
+    }
+  ],
+  "failures": [],
+  "remaining_gaps": [
+    {
+      "slug": "AutoGen",
+      "target": "Core kernel razonamiento repo para Yaiwes/AutoGen",
+      "mirror": null
+    },
+    {
+      "slug": "Shofer",
+      "target": "Core kernel razonamiento repo para Yaiwes/Shofer",
+      "mirror": null
+    },
+    {
+      "slug": "NVIDIA-NeMo-Agent-Toolkit",
+      "target": "Core kernel razonamiento repo para Yaiwes/NVIDIA-NeMo-Agent-Toolkit",
+      "mirror": null
+    },
+    {
+      "slug": "Microsoft-Agent-Framework",
+      "target": "Core kernel razonamiento repo para Yaiwes/Microsoft-Agent-Framework",
+      "mirror": null
+    },
+    {
+      "slug": "ToolOrchestra",
+      "target": "Core kernel razonamiento repo para Yaiwes/ToolOrchestra",
+      "mirror": null
+    }
+  ],
+  "retryable_gaps": [],
+  "blocked_gaps": [
+    {
+      "slug": "AutoGen",
+      "target": "Core kernel razonamiento repo para Yaiwes/AutoGen",
+      "mirror": null,
+      "code": "SOURCE_LFS_POINTER_GAP",
+      "detail": "SOURCE_LFS_POINTER_GAP:AutoGen/dotnet/website/images/articles/DynamicGroupChat/dynamicChat.gif,AutoGen/dotnet/website/images/articles/PrintMessageMiddleware/streamingoutput.gif,AutoGen/dotnet/website/images/articles/SequentialGroupChat/SearcherSummarizer.gif",
+      "evidence": "forensics/extraction/repair-33790627875.json"
+    },
+    {
+      "slug": "Shofer",
+      "target": "Core kernel razonamiento repo para Yaiwes/Shofer",
+      "mirror": null,
+      "code": "SOURCE_LFS_POINTER_GAP",
+      "detail": "SOURCE_LFS_POINTER_GAP:src/assets/docs/demo.gif",
+      "evidence": "forensics/extraction/repair-33791739225.json"
+    },
+    {
+      "slug": "NVIDIA-NeMo-Agent-Toolkit",
+      "target": "Core kernel razonamiento repo para Yaiwes/NVIDIA-NeMo-Agent-Toolkit",
+      "mirror": null,
+      "code": "SOURCE_LFS_POINTER_GAP",
+      "detail": "SOURCE_LFS_POINTER_GAP:docs/source/_static/a2a_agent_card.png,docs/source/_static/agent_with_reasoning_wrapper.png,docs/source/_static/agent_without_reasoning_wrapper.png,docs/source/_static/banner.png,docs/source/_static/concurrency_vs_p95_analysis.png,docs/source/_static/concurrency_vs_p95_simple.png,docs/source/_static/config_to_workflow.png,docs/source/_static/cursor_rules_demo/add_tool.gif,docs/source/_static/cursor_rules_demo/create_workflow.gif,docs/source/_static/cursor_rules_demo/find_tool.gif,docs/source/_static/cursor_rules_demo/install.gif,docs/source/_static/cursor_rules_demo/react_agent.gif,docs/source/_static/cursor_rules_demo/run_workflow.gif,docs/source/_static/dual_node_agent.png,docs/source/_static/dynatrace-trace.png,docs/source/_static/hitl_prompt.png,docs/source/_static/hitl_result.png,docs/source/_static/hitl_settings.png,docs/source/_static/hybrid_control_flow.png,docs/source/_static/main_nv_logo_square.png",
+      "evidence": "forensics/extraction/repair-33791739225.json"
+    },
+    {
+      "slug": "Microsoft-Agent-Framework",
+      "target": "Core kernel razonamiento repo para Yaiwes/Microsoft-Agent-Framework",
+      "mirror": null,
+      "code": "SOURCE_LFS_POINTER_GAP",
+      "detail": "SOURCE_LFS_POINTER_GAP:existing:python/packages/lab/lightning/assets/train_math_agent.png,python/packages/lab/lightning/assets/train_tau2_agent.png",
+      "evidence": "forensics/extraction/repair-33796547187.json"
+    },
+    {
+      "slug": "ToolOrchestra",
+      "target": "Core kernel razonamiento repo para Yaiwes/ToolOrchestra",
+      "mirror": null,
+      "code": "SOURCE_LFS_POINTER_GAP",
+      "detail": "SOURCE_LFS_POINTER_GAP:ToolOrchestra/evaluation/hle.jsonl,ToolOrchestra/training/data.jsonl",
+      "evidence": "forensics/extraction/repair-33795302926.json"
+    }
+  ],
+  "counts": {
+    "remaining": 5,
+    "retryable": 0,
+    "blocked": 5,
+    "processed": 5
+  },
+  "verdict": "GAPS_PENDING"
+}

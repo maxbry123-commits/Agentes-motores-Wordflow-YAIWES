@@ -1,0 +1,51 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "loop-engineer"
+version = "0.12.0"
+description = "Portable Loop Contract Core: validate and inspect repo-native operating contracts for agent loops."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "Sollan Systems" }]
+keywords = ["agent", "loop", "agentic", "verification", "harness", "orchestration", "self-improvement", "claude-code", "eval", "repair"]
+
+# The core is pure-stdlib. Two optional extras enrich validation when present:
+#   yaml     — PyYAML parses the manifest; absent, loop/contract.py falls back to
+#              a stdlib subset parser.
+#   schemas  — jsonschema runs real JSON-Schema validation against schemas/*.json;
+#              absent, loop/contract.py falls back to structural hand checks.
+# So `pip install -e .` pulls in zero third-party runtime dependencies.
+# The `dev` extra supplies contributor-only test tooling; it never affects runtime, doctor, or validate behavior.
+[project.optional-dependencies]
+yaml = ["pyyaml>=6"]
+schemas = ["jsonschema>=4"]
+dev = ["hypothesis>=6"]
+
+# Console entry points. Both install modes work: `loop.__main__:main` resolves
+# schemas/templates/tool-scripts bundle-first via loop/_resources.py (wheel
+# package data under loop/_bundle/), with the repo checkout as the editable
+# fallback. `loop-engineer` is the uvx-visible alias matching the PyPI project.
+[project.scripts]
+loop = "loop.__main__:main"
+loop-engineer = "loop.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/SollanSystems/loop-engineer"
+Repository = "https://github.com/SollanSystems/loop-engineer"
+
+# The wheel is self-contained: schemas/, templates/, and the CLI-needed tool
+# scripts ship as package data under loop/_bundle/ (resolved by loop/_resources.py,
+# importlib.resources-first with the repo checkout as editable-install fallback).
+[tool.hatch.build.targets.wheel]
+packages = ["loop"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"schemas" = "loop/_bundle/schemas"
+"templates" = "loop/_bundle/templates"
+"scripts/inspect_loop.py" = "loop/_bundle/tools/inspect_loop.py"
+"scripts/metrics.py" = "loop/_bundle/tools/metrics.py"
+"scripts/holdout_gate.py" = "loop/_bundle/tools/holdout_gate.py"
+"scripts/anticheat_scan.py" = "loop/_bundle/tools/anticheat_scan.py"

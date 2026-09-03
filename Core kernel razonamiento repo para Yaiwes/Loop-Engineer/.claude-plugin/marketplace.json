@@ -1,0 +1,7 @@
+{
+  "name": "loop-engineer",
+  "owner": { "name": "SollanSystems", "url": "https://github.com/SollanSystems" },
+  "plugins": [
+    { "name": "loop-engineer", "source": "./", "description": "Agent-loop architect+operator skill suite — design, run, verify, repair, and improve agentic coding loops." }
+  ]
+}
