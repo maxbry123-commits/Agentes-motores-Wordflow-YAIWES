@@ -1,0 +1,9 @@
+[
+  {
+    "repo": "Qwen-Agent",
+    "path": "qwen_agent/tools/resource/AlibabaPuHuiTi-3-45-Light.ttf",
+    "chunks_dir": "Qwen-Agent/qwen_agent/tools/resource/AlibabaPuHuiTi-3-45-Light.ttf.chunks",
+    "bytes": 8559848,
+    "chunk_bytes": 8388608
+  }
+]

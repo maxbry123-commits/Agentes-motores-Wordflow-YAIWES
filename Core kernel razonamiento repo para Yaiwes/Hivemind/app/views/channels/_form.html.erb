@@ -1,0 +1,596 @@
+<div class="max-w-2xl mx-auto px-6 py-8">
+  <%= link_to "← Channels", channels_path, class: "text-brand-light hover:text-brand-light text-sm" %>
+
+  <h1 class="text-2xl font-bold text-white mt-4 mb-8">
+    <%= channel.new_record? ? "Add Channel" : "Edit #{channel.name}" %>
+  </h1>
+
+  <%= form_with model: channel, class: "space-y-6", data: { controller: "channel-fields", channel_fields_type_value: channel.channel_type } do |f| %>
+    <% if channel.errors.any? %>
+      <div class="bg-red-900/30 border border-red-600 rounded-lg p-4">
+        <% channel.errors.full_messages.each do |msg| %>
+          <p class="text-red-300 text-sm"><%= msg %></p>
+        <% end %>
+      </div>
+    <% end %>
+
+    <div>
+      <%= f.label :name, class: "block text-text-primary text-sm font-medium mb-1" %>
+      <%= f.text_field :name, placeholder: "My Discord Server",
+          class: "w-full px-4 py-3 bg-surface-card border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand" %>
+    </div>
+
+    <div>
+      <%= f.label :channel_type, "Platform", class: "block text-text-primary text-sm font-medium mb-1" %>
+      <%= f.select :channel_type,
+          [["Discord", "discord"], ["Slack", "slack"], ["Telegram", "telegram"], ["WhatsApp", "whatsapp"], ["Signal", "signal"], ["Matrix", "matrix"], ["Email", "email"], ["Mattermost", "mattermost"], ["LINE", "line"], ["Feishu / Lark", "feishu"], ["Google Chat", "google_chat"], ["Microsoft Teams", "msteams"], ["iMessage (BlueBubbles)", "imessage"]],
+          { prompt: "Select platform..." },
+          class: "w-full px-4 py-3 bg-surface-card border border-border-default rounded-lg text-white focus:outline-none focus:ring-2 focus:ring-brand" %>
+    </div>
+
+    <div>
+      <%= f.label :enabled, class: "flex items-center gap-3 cursor-pointer" do %>
+        <%= f.check_box :enabled, class: "w-5 h-5 rounded bg-surface-raised border-border-default text-brand focus:ring-brand" %>
+        <span class="text-text-primary">Enabled</span>
+      <% end %>
+    </div>
+
+    <hr class="border-border-default">
+
+    <div>
+      <h3 class="text-white font-semibold mb-3">📨 Message Routing</h3>
+      <p class="text-text-faint text-sm mb-4">Where should incoming messages go?</p>
+
+      <div class="space-y-4">
+        <div>
+          <label class="block text-text-muted text-sm mb-1">Default Team</label>
+          <select name="channel[config][default_team_id]"
+                  class="w-full px-4 py-3 bg-surface-card border border-border-default rounded-lg text-white focus:outline-none focus:ring-2 focus:ring-brand">
+            <option value="">No default team</option>
+            <% Team.order(:name).each do |team| %>
+              <option value="<%= team.id %>" <%= 'selected' if channel.config&.dig("default_team_id").to_s == team.id.to_s %>>
+                <%= team.name %> (<%= team.agents.count %> agents)
+              </option>
+            <% end %>
+          </select>
+          <p class="text-gray-600 text-xs mt-1">All agents on this team will see and respond to messages</p>
+        </div>
+
+        <div>
+          <label class="block text-text-muted text-sm mb-1">Or Default Agent (if no team)</label>
+          <select name="channel[config][default_agent_id]"
+                  class="w-full px-4 py-3 bg-surface-card border border-border-default rounded-lg text-white focus:outline-none focus:ring-2 focus:ring-brand">
+            <option value="">No default agent</option>
+            <% Agent.visible.enabled.order(:name).each do |agent| %>
+              <option value="<%= agent.id %>" <%= 'selected' if channel.config&.dig("default_agent_id").to_s == agent.id.to_s %>>
+                <%= agent.name %> — <%= agent.role %>
+              </option>
+            <% end %>
+          </select>
+          <p class="text-gray-600 text-xs mt-1">Used only if no default team is set</p>
+        </div>
+      </div>
+    </div>
+
+    <hr class="border-border-default">
+
+    <div>
+      <h3 class="text-white font-semibold mb-3">Per-Peer Routing Rules</h3>
+      <p class="text-text-faint text-sm mb-4">Route messages to specific agents based on who sent them. Patterns use glob matching (e.g. <code class="text-text-muted">*@example.com</code>, <code class="text-text-muted">support-*</code>). Rules are checked in order; first match wins.</p>
+
+      <% rules = channel.routing_rules.presence || [] %>
+      <div id="routing-rules" class="space-y-2 mb-4">
+        <% rules.each_with_index do |rule, i| %>
+          <div class="flex items-center gap-2">
+            <input type="text" name="channel[routing_rules][][pattern]" value="<%= rule["pattern"] %>"
+                   placeholder="sender pattern (e.g. *@example.com)"
+                   class="flex-1 px-3 py-2 bg-surface-card border border-border-default rounded-lg text-white placeholder-text-faint text-sm focus:outline-none focus:ring-2 focus:ring-brand">
+            <select name="channel[routing_rules][][agent_id]"
+                    class="flex-1 px-3 py-2 bg-surface-card border border-border-default rounded-lg text-white text-sm focus:outline-none focus:ring-2 focus:ring-brand">
+              <option value="">Select agent...</option>
+              <% Agent.visible.enabled.order(:name).each do |agent| %>
+                <option value="<%= agent.id %>" <%= 'selected' if rule["agent_id"].to_s == agent.id.to_s %>><%= agent.name %></option>
+              <% end %>
+            </select>
+          </div>
+        <% end %>
+      </div>
+
+      <template id="routing-rule-template">
+        <div class="flex items-center gap-2">
+          <input type="text" name="channel[routing_rules][][pattern]" value=""
+                 placeholder="sender pattern (e.g. *@example.com)"
+                 class="flex-1 px-3 py-2 bg-surface-card border border-border-default rounded-lg text-white placeholder-text-faint text-sm focus:outline-none focus:ring-2 focus:ring-brand">
+          <select name="channel[routing_rules][][agent_id]"
+                  class="flex-1 px-3 py-2 bg-surface-card border border-border-default rounded-lg text-white text-sm focus:outline-none focus:ring-2 focus:ring-brand">
+            <option value="">Select agent...</option>
+            <% Agent.visible.enabled.order(:name).each do |agent| %>
+              <option value="<%= agent.id %>"><%= agent.name %></option>
+            <% end %>
+          </select>
+        </div>
+      </template>
+
+      <button type="button" onclick="document.getElementById('routing-rules').appendChild(document.getElementById('routing-rule-template').content.cloneNode(true))"
+              class="text-brand-light text-sm hover:underline">+ Add rule</button>
+    </div>
+
+    <hr class="border-border-default">
+
+    <div>
+      <h3 class="text-white font-semibold mb-3">Credentials</h3>
+      <p class="text-text-faint text-sm mb-4">Stored encrypted in the vault. Leave blank to keep existing.</p>
+
+      <% creds = @credentials || {} %>
+
+      <!-- Discord -->
+      <div class="space-y-4" data-channel-fields-target="discord" style="display: none;">
+        <!-- Setup Guide -->
+        <div class="bg-surface-base rounded-lg border border-border-default p-5">
+          <h4 class="text-white font-medium mb-3">🤖 Discord Bot Setup</h4>
+          <p class="text-text-muted text-sm mb-3">Each Discord bot connects to <strong class="text-white">one agent</strong>. To add more agents, create a separate Discord application and channel for each.</p>
+          <ol class="text-text-muted text-sm space-y-2 list-decimal list-inside">
+            <li>Go to <a href="https://discord.com/developers/applications" target="_blank" class="text-brand-light hover:underline">discord.com/developers/applications</a> → <strong class="text-white">New Application</strong></li>
+            <li>Name the application after your agent (e.g. "Bobby") and click <strong class="text-white">Create</strong></li>
+            <li>Go to <strong class="text-white">Bot</strong> in the sidebar</li>
+            <li>Click <strong class="text-white">Reset Token</strong> to generate a bot token — copy it into the <strong class="text-white">Bot Token</strong> field below</li>
+            <li>Under <strong class="text-white">Privileged Gateway Intents</strong>, enable these intents:
+              <div class="mt-1 ml-4 flex flex-wrap gap-1.5">
+                <% %w[MESSAGE_CONTENT SERVER_MEMBERS PRESENCE].each do |intent| %>
+                  <code class="px-1.5 py-0.5 bg-surface-card rounded text-xs text-amber-300"><%= intent %></code>
+                <% end %>
+              </div>
+              <p class="text-text-faint text-xs mt-1 ml-4"><strong class="text-white">MESSAGE CONTENT</strong> is required for the bot to read messages</p>
+            </li>
+            <li>Go to <strong class="text-white">OAuth2</strong> in the sidebar</li>
+            <li>Under <strong class="text-white">OAuth2 URL Generator</strong>, select the <code class="text-amber-300">bot</code> scope</li>
+            <li>Under <strong class="text-white">Bot Permissions</strong>, select:
+              <div class="mt-1 ml-4 flex flex-wrap gap-1.5">
+                <% ["Send Messages", "Read Message History", "View Channels", "Add Reactions", "Use Slash Commands"].each do |perm| %>
+                  <code class="px-1.5 py-0.5 bg-surface-card rounded text-xs text-amber-300"><%= perm %></code>
+                <% end %>
+              </div>
+            </li>
+            <li>Copy the generated URL at the bottom and <strong class="text-white">open it in your browser</strong> to invite the bot to your server</li>
+            <li>Select your Discord server and click <strong class="text-white">Authorize</strong></li>
+          </ol>
+          <div class="mt-4 bg-surface-card rounded-lg px-4 py-3 border border-border-default">
+            <p class="text-text-muted text-sm">
+              <strong class="text-white">💡 Multiple agents?</strong>
+              Each agent needs its own Discord application and bot. Just repeat these steps for each agent and create a new channel here for each bot.
+            </p>
+          </div>
+        </div>
+
+        <div>
+          <label class="block text-text-muted text-sm mb-1">Bot Token</label>
+          <%= text_field_tag "credentials[discord_bot_token]", creds["discord_bot_token"], placeholder: "Paste your Discord bot token...",
+              class: "w-full px-4 py-3 bg-surface-card border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand font-mono text-sm",
+              autocomplete: "off" %>
+          <p class="text-text-faint text-xs mt-1">From <a href="https://discord.com/developers/applications" target="_blank" class="text-brand-light hover:underline">Discord Developer Portal</a> → Bot → Token</p>
+        </div>
+      </div>
+
+      <!-- Slack -->
+      <div class="space-y-4" data-channel-fields-target="slack" style="display: none;">
+        <!-- Setup Guide -->
+        <div class="bg-surface-base rounded-lg border border-border-default p-5">
+          <h4 class="text-white font-medium mb-3">🤖 Slack Bot Setup</h4>
+          <p class="text-text-muted text-sm mb-3">Each Slack bot connects to <strong class="text-white">one agent</strong>. To add more agents, create a separate Slack app and channel for each.</p>
+          <ol class="text-text-muted text-sm space-y-2 list-decimal list-inside">
+            <li>Go to <a href="https://api.slack.com/apps" target="_blank" class="text-brand-light hover:underline">api.slack.com/apps</a> → <strong class="text-white">Create New App</strong> → <strong class="text-white">From scratch</strong></li>
+            <li>Name the app after your agent (e.g. "Bobby") and select your workspace</li>
+            <li>Go to <strong class="text-white">Socket Mode</strong> in the sidebar and <strong class="text-white">enable it</strong></li>
+            <li>When prompted, generate an <strong class="text-white">App-Level Token</strong> with the <code class="text-amber-300">connections:write</code> scope — copy it into the <strong class="text-white">App Token</strong> field below</li>
+            <li>Go to <strong class="text-white">OAuth & Permissions</strong> and add these <strong class="text-white">Bot Token Scopes</strong>:
+              <div class="mt-1 ml-4 flex flex-wrap gap-1.5">
+                <% %w[app_mentions:read channels:history channels:read chat:write groups:history im:history im:read im:write reactions:write users:read].each do |scope| %>
+                  <code class="px-1.5 py-0.5 bg-surface-card rounded text-xs text-amber-300"><%= scope %></code>
+                <% end %>
+              </div>
+            </li>
+            <li>Click <strong class="text-white">Install to Workspace</strong> and authorize</li>
+            <li>Copy the <strong class="text-white">Bot User OAuth Token</strong> (<code class="text-amber-300">xoxb-...</code>) into the <strong class="text-white">Bot Token</strong> field below</li>
+            <li>Go to <strong class="text-white">Event Subscriptions</strong>, toggle it on, and subscribe to these bot events:
+              <div class="mt-1 ml-4 flex flex-wrap gap-1.5">
+                <% %w[message.channels message.groups message.im app_mention].each do |event| %>
+                  <code class="px-1.5 py-0.5 bg-surface-card rounded text-xs text-amber-300"><%= event %></code>
+                <% end %>
+              </div>
+              <p class="text-text-faint text-xs mt-1 ml-4">No Request URL needed — Socket Mode handles delivery via WebSocket</p>
+            </li>
+            <li>Click <strong class="text-white">Save Changes</strong></li>
+            <li>Invite the bot to your channels: <code class="text-amber-300">/invite @YourBot</code></li>
+          </ol>
+          <div class="mt-4 bg-surface-card rounded-lg px-4 py-3 border border-border-default">
+            <p class="text-text-muted text-sm">
+              <strong class="text-white">💡 Multiple agents?</strong>
+              Slack doesn't support multiple bots per app, but adding each one is easy — just repeat these steps for each agent and create a new channel here for each bot.
+            </p>
+          </div>
+        </div>
+
+        <div>
+          <label class="block text-text-muted text-sm mb-1">App Token</label>
+          <%= text_field_tag "credentials[slack_app_token]", creds["slack_app_token"], placeholder: "xapp-...",
+              class: "w-full px-4 py-3 bg-surface-card border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand font-mono text-sm",
+              autocomplete: "off" %>
+          <p class="text-text-faint text-xs mt-1">App-Level Token with <code class="text-amber-300">connections:write</code> scope — enables Socket Mode (no public URL needed)</p>
+        </div>
+        <div>
+          <label class="block text-text-muted text-sm mb-1">Bot Token</label>
+          <%= text_field_tag "credentials[slack_bot_token]", creds["slack_bot_token"], placeholder: "xoxb-...",
+              class: "w-full px-4 py-3 bg-surface-card border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand font-mono text-sm",
+              autocomplete: "off" %>
+        </div>
+      </div>
+
+      <!-- Telegram -->
+      <div class="space-y-4" data-channel-fields-target="telegram" style="display: none;">
+        <div class="bg-surface-base rounded-lg border border-border-default p-5">
+          <h4 class="text-white font-medium mb-3">Telegram Bot Setup</h4>
+          <ol class="text-text-muted text-sm space-y-2 list-decimal list-inside">
+            <li>Open <a href="https://t.me/BotFather" target="_blank" class="text-brand-light hover:underline">@BotFather</a> on Telegram</li>
+            <li>Send <code class="text-amber-300">/newbot</code> and follow the prompts to name your bot</li>
+            <li>Copy the <strong class="text-white">bot token</strong> and paste it below</li>
+            <li>Send <code class="text-amber-300">/setprivacy</code> to @BotFather, select your bot, then choose <strong class="text-white">Disable</strong> so it can read group messages</li>
+            <li>Add the bot to your Telegram group or start a direct chat with it</li>
+          </ol>
+          <div class="mt-4 bg-surface-card rounded-lg px-4 py-3 border border-border-default">
+            <p class="text-text-muted text-sm">
+              <strong class="text-white">Delivery:</strong>
+              The connector uses long polling — no public URL or webhook setup required.
+            </p>
+          </div>
+        </div>
+
+        <div>
+          <label class="block text-text-muted text-sm mb-1">Bot Token</label>
+          <%= text_field_tag "credentials[telegram_bot_token]", creds["telegram_bot_token"], placeholder: "123456789:ABCdef...",
+              class: "w-full px-4 py-3 bg-surface-card border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand font-mono text-sm",
+              autocomplete: "off" %>
+          <p class="text-text-faint text-xs mt-1">From <a href="https://t.me/BotFather" target="_blank" class="text-brand-light hover:underline">@BotFather</a> on Telegram</p>
+        </div>
+        <div>
+          <label class="block text-text-muted text-sm mb-1">Webhook Secret <span class="text-text-faint">(optional)</span></label>
+          <%= text_field_tag "channel[config][webhook_secret]", channel.config&.dig("webhook_secret"),
+              placeholder: "random-secret-string",
+              class: "w-full px-4 py-3 bg-surface-card border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand font-mono text-sm",
+              autocomplete: "off" %>
+          <p class="text-text-faint text-xs mt-1">If set, used to verify inbound Telegram webhooks</p>
+        </div>
+      </div>
+
+      <!-- WhatsApp -->
+      <div class="space-y-4" data-channel-fields-target="whatsapp" style="display: none;">
+        <div class="bg-surface-base rounded-lg border border-border-default p-6 text-center">
+          <div class="mb-4">
+            <svg class="w-12 h-12 text-green-500 mx-auto mb-3" fill="currentColor" viewBox="0 0 24 24">
+              <path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347z"/>
+            </svg>
+            <h4 class="text-white font-medium text-lg">WhatsApp via QR Code</h4>
+            <p class="text-text-muted text-sm mt-1">Link your WhatsApp by scanning a QR code — no API keys needed.</p>
+          </div>
+
+          <% if channel.persisted? %>
+            <%= link_to connect_channel_path(channel), class: "inline-flex items-center gap-2 px-6 py-3 bg-green-600 hover:bg-green-700 text-white font-medium rounded-lg transition" do %>
+              <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v1m6 11h2m-6 0h-2v4m0-11v3m0 0h.01M12 12h4.01M16 20h4M4 12h4m12 0h.01M5 8h2a1 1 0 001-1V5a1 1 0 00-1-1H5a1 1 0 00-1 1v2a1 1 0 001 1zm12 0h2a1 1 0 001-1V5a1 1 0 00-1-1h-2a1 1 0 00-1 1v2a1 1 0 001 1zM5 20h2a1 1 0 001-1v-2a1 1 0 00-1-1H5a1 1 0 00-1 1v2a1 1 0 001 1z" />
+              </svg>
+              Generate QR Code
+            <% end %>
+          <% else %>
+            <p class="text-text-faint text-sm italic">Save the channel first, then you'll be able to generate a QR code to link your WhatsApp.</p>
+          <% end %>
+        </div>
+      </div>
+
+      <!-- Signal -->
+      <div class="space-y-4" data-channel-fields-target="signal" style="display: none;">
+        <div class="bg-surface-base rounded-lg border border-border-default p-5">
+          <h4 class="text-white font-medium mb-3">Signal Setup</h4>
+          <p class="text-text-muted text-sm mb-3">The signal-cli sidecar is included and starts automatically with Hivemind.</p>
+          <ol class="text-text-muted text-sm space-y-2 list-decimal list-inside">
+            <li>Save this channel, then click <strong class="text-white">Connect</strong> to get a QR code</li>
+            <li>On your phone: <strong class="text-white">Signal → Settings → Linked Devices → Link New Device</strong>, then scan it</li>
+            <li>That links Hivemind as a secondary device — no manual registration needed</li>
+          </ol>
+          <p class="text-text-faint text-xs mt-3">Phone number is optional — it's auto-detected after linking. Only set it if you registered a number directly with signal-cli.</p>
+          <div class="mt-4 bg-amber-900/20 rounded-lg px-4 py-3 border border-amber-700/50">
+            <p class="text-amber-200 text-sm">
+              <strong class="text-white">What this is:</strong>
+              a Signal inbox others can message to reach your agent — not a way to text your agent from your own number.
+              Messages you send from the linked account (including <strong class="text-white">“Note to Self”</strong>) are dropped as loop protection. Test it from a different phone.
+            </p>
+          </div>
+          <div class="mt-3 bg-surface-card rounded-lg px-4 py-3 border border-border-default">
+            <p class="text-text-muted text-sm">
+              <strong class="text-white">Delivery:</strong>
+              The connector polls signal-cli for new messages — no public URL needed.
+            </p>
+          </div>
+        </div>
+
+        <div>
+          <label class="block text-text-muted text-sm mb-1">Phone Number <span class="text-text-faint">(optional)</span></label>
+          <%= text_field_tag "channel[config][phone_number]", channel.config&.dig("phone_number"),
+              placeholder: "+1234567890",
+              class: "w-full px-4 py-3 bg-surface-card border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand font-mono text-sm" %>
+          <p class="text-text-faint text-xs mt-1">Auto-detected after linking. Only required if you registered a number directly with signal-cli.</p>
+        </div>
+        <div>
+          <label class="block text-text-muted text-sm mb-1">Signal CLI API URL</label>
+          <%= text_field_tag "channel[config][signal_api_url]", channel.config&.dig("signal_api_url"),
+              placeholder: "http://signal-cli:8080",
+              class: "w-full px-4 py-3 bg-surface-card border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand font-mono text-sm" %>
+          <p class="text-text-faint text-xs mt-1">URL of the signal-cli-rest-api container</p>
+        </div>
+        <div>
+          <label class="block text-text-muted text-sm mb-1">Webhook Secret <span class="text-text-faint">(optional)</span></label>
+          <%= text_field_tag "channel[config][webhook_secret]", channel.config&.dig("webhook_secret"),
+              placeholder: "random-secret-string",
+              class: "w-full px-4 py-3 bg-surface-card border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand font-mono text-sm",
+              autocomplete: "off" %>
+          <p class="text-text-faint text-xs mt-1">If set, inbound webhooks must include <code class="text-amber-300">X-Signal-Webhook-Token: &lt;secret&gt;</code></p>
+        </div>
+      </div>
+
+      <!-- Matrix -->
+      <div class="space-y-4" data-channel-fields-target="matrix" style="display: none;">
+        <div class="bg-surface-base rounded-lg border border-border-default p-5">
+          <h4 class="text-white font-medium mb-3">Matrix Setup (Application Service)</h4>
+          <p class="text-text-muted text-sm mb-3">Connect a Matrix bot on any homeserver (matrix.org, Synapse, etc.) via the Application Service API.</p>
+          <ol class="text-text-muted text-sm space-y-2 list-decimal list-inside">
+            <li>On your homeserver, register an Application Service with a YAML file. Set <code class="text-amber-300">url</code> to <code class="text-amber-300"><%= request.base_url rescue "https://your-host" %></code> and pick two random tokens for <code class="text-amber-300">as_token</code> and <code class="text-amber-300">hs_token</code>.</li>
+            <li>Restart the homeserver so it loads the registration.</li>
+            <li>Below: set <strong class="text-white">Homeserver URL</strong>, the bot <strong class="text-white">User ID</strong>, the <strong class="text-white">HS Token</strong> (must match the registration), and the bot <strong class="text-white">Access Token</strong> (the <code class="text-amber-300">as_token</code>).</li>
+            <li>Invite the bot to a room — it replies there.</li>
+          </ol>
+        </div>
+        <div>
+          <label class="block text-text-muted text-sm mb-1">Homeserver URL</label>
+          <%= text_field_tag "channel[config][homeserver_url]", channel.config&.dig("homeserver_url"), placeholder: "https://matrix.org",
+              class: "w-full px-4 py-3 bg-surface-card border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand font-mono text-sm" %>
+        </div>
+        <div>
+          <label class="block text-text-muted text-sm mb-1">Bot User ID</label>
+          <%= text_field_tag "channel[config][user_id]", channel.config&.dig("user_id"), placeholder: "@hivemind:matrix.org",
+              class: "w-full px-4 py-3 bg-surface-card border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand font-mono text-sm" %>
+        </div>
+        <div>
+          <label class="block text-text-muted text-sm mb-1">HS Token</label>
+          <%= text_field_tag "channel[config][hs_token]", channel.config&.dig("hs_token"), placeholder: "homeserver → app token",
+              class: "w-full px-4 py-3 bg-surface-card border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand font-mono text-sm", autocomplete: "off" %>
+          <p class="text-text-faint text-xs mt-1">Must match <code class="text-amber-300">hs_token</code> in the AS registration. Used to verify inbound pushes.</p>
+        </div>
+        <div>
+          <label class="block text-text-muted text-sm mb-1">Access Token (as_token)</label>
+          <%= text_field_tag "credentials[matrix_access_token]", creds["matrix_access_token"], placeholder: "syt_...",
+              class: "w-full px-4 py-3 bg-surface-card border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand font-mono text-sm", autocomplete: "off" %>
+          <p class="text-text-faint text-xs mt-1">Stored encrypted in the vault. The AS <code class="text-amber-300">as_token</code> authenticates the bot to the homeserver.</p>
+        </div>
+      </div>
+
+      <!-- Email -->
+      <div class="space-y-4" data-channel-fields-target="email" style="display: none;">
+        <div class="bg-surface-base rounded-lg border border-border-default p-5">
+          <h4 class="text-white font-medium mb-3">Email Setup</h4>
+          <p class="text-text-muted text-sm mb-3">Talk to an agent over email. Inbound uses your mail provider's "inbound parse" webhook; replies are sent over SMTP.</p>
+          <ol class="text-text-muted text-sm space-y-2 list-decimal list-inside">
+            <li>In your provider (Mailgun, SendGrid, Postmark…), route an address to an inbound-parse webhook pointed at <code class="text-amber-300"><%= (request.base_url rescue "https://your-host") %>/webhooks/email</code>.</li>
+            <li>Set the <strong class="text-white">From Address</strong> below — replies are sent from it (configure SMTP in your environment).</li>
+            <li>Optionally set a <strong class="text-white">Webhook Secret</strong> and append <code class="text-amber-300">?secret=...</code> to the webhook URL to reject forged inbound mail.</li>
+          </ol>
+        </div>
+        <div>
+          <label class="block text-text-muted text-sm mb-1">From Address</label>
+          <%= text_field_tag "channel[config][from_email]", channel.config&.dig("from_email"), placeholder: "agent@yourdomain.com",
+              class: "w-full px-4 py-3 bg-surface-card border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand font-mono text-sm" %>
+        </div>
+        <div>
+          <label class="block text-text-muted text-sm mb-1">Reply Subject <span class="text-text-faint">(optional)</span></label>
+          <%= text_field_tag "channel[config][reply_subject]", channel.config&.dig("reply_subject"), placeholder: "Message from your Hivemind agent",
+              class: "w-full px-4 py-3 bg-surface-card border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand text-sm" %>
+        </div>
+        <div>
+          <label class="block text-text-muted text-sm mb-1">Webhook Secret <span class="text-text-faint">(optional)</span></label>
+          <%= text_field_tag "channel[config][webhook_secret]", channel.config&.dig("webhook_secret"), placeholder: "random-secret-string",
+              class: "w-full px-4 py-3 bg-surface-card border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand font-mono text-sm", autocomplete: "off" %>
+        </div>
+      </div>
+
+      <!-- iMessage (BlueBubbles) -->
+      <div class="space-y-4" data-channel-fields-target="imessage" style="display: none;">
+        <div class="bg-surface-base rounded-lg border border-border-default p-5">
+          <h4 class="text-white font-medium mb-3">iMessage Setup (BlueBubbles)</h4>
+          <p class="text-text-muted text-sm mb-3">Talk to an agent over iMessage via a self-hosted <a href="https://bluebubbles.app" class="text-amber-300" target="_blank" rel="noopener">BlueBubbles</a> server. Requires a Mac running the BlueBubbles server.</p>
+          <ol class="text-text-muted text-sm space-y-2 list-decimal list-inside">
+            <li>Install the <strong class="text-white">BlueBubbles Server</strong> on a Mac signed into iMessage and set a <strong class="text-white">server password</strong>.</li>
+            <li>Expose the server's URL (LAN, ngrok, or Tailscale) and enter it as the <strong class="text-white">Server URL</strong> below, plus the <strong class="text-white">Server Password</strong>.</li>
+            <li>In BlueBubbles, add a webhook pointing at <code class="text-amber-300"><%= (request.base_url rescue "https://your-host") %>/webhooks/imessage</code> subscribed to the <code class="text-amber-300">new-message</code> event.</li>
+            <li>Optionally set a <strong class="text-white">Webhook Secret</strong> and append <code class="text-amber-300">?secret=...</code> to the webhook URL to reject forged inbound messages.</li>
+          </ol>
+        </div>
+        <div>
+          <label class="block text-text-muted text-sm mb-1">BlueBubbles Server URL</label>
+          <%= text_field_tag "channel[config][server_url]", channel.config&.dig("server_url"), placeholder: "http://localhost:1234",
+              class: "w-full px-4 py-3 bg-surface-card border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand font-mono text-sm" %>
+        </div>
+        <div>
+          <label class="block text-text-muted text-sm mb-1">Server Password</label>
+          <%= text_field_tag "credentials[bluebubbles_password]", creds["bluebubbles_password"], placeholder: "BlueBubbles server password",
+              class: "w-full px-4 py-3 bg-surface-card border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand font-mono text-sm", autocomplete: "off" %>
+          <p class="text-text-faint text-xs mt-1">Stored encrypted in the vault. Used to authenticate to your BlueBubbles server.</p>
+        </div>
+        <div>
+          <label class="block text-text-muted text-sm mb-1">Webhook Secret <span class="text-text-faint">(optional)</span></label>
+          <%= text_field_tag "channel[config][webhook_secret]", channel.config&.dig("webhook_secret"), placeholder: "random-secret-string",
+              class: "w-full px-4 py-3 bg-surface-card border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand font-mono text-sm", autocomplete: "off" %>
+        </div>
+      </div>
+
+      <!-- Microsoft Teams -->
+      <div class="space-y-4" data-channel-fields-target="msteams" style="display: none;">
+        <div class="bg-surface-base rounded-lg border border-border-default p-5">
+          <h4 class="text-white font-medium mb-3">Microsoft Teams Setup (Bot Framework)</h4>
+          <p class="text-text-muted text-sm mb-3">Connect a Teams bot via the Azure Bot Framework. Inbound activities are POSTed to your messaging endpoint; replies go back through the Bot Connector.</p>
+          <ol class="text-text-muted text-sm space-y-2 list-decimal list-inside">
+            <li>In the Azure portal, create an <strong class="text-white">Azure Bot</strong> resource (or an App Registration) — note its <code class="text-amber-300">Microsoft App ID</code> and create a client secret.</li>
+            <li>Set the bot's <strong class="text-white">Messaging endpoint</strong> to <code class="text-amber-300"><%= (request.base_url rescue "https://your-host") %>/webhooks/msteams</code>.</li>
+            <li>Enable the <strong class="text-white">Microsoft Teams</strong> channel on the bot, then add it to a team or chat.</li>
+            <li>Below: paste the <strong class="text-white">App ID</strong> and <strong class="text-white">App Password</strong> (client secret).</li>
+          </ol>
+        </div>
+        <div>
+          <label class="block text-text-muted text-sm mb-1">App ID (client_id)</label>
+          <%= text_field_tag "channel[config][app_id]", channel.config&.dig("app_id"), placeholder: "00000000-0000-0000-0000-000000000000",
+              class: "w-full px-4 py-3 bg-surface-card border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand font-mono text-sm" %>
+        </div>
+        <div>
+          <label class="block text-text-muted text-sm mb-1">App Password (client secret)</label>
+          <%= text_field_tag "credentials[msteams_app_password]", creds["msteams_app_password"], placeholder: "client secret value",
+              class: "w-full px-4 py-3 bg-surface-card border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand font-mono text-sm", autocomplete: "off" %>
+          <p class="text-text-faint text-xs mt-1">Stored encrypted in the vault. Used to fetch an AAD client-credentials token for outbound replies.</p>
+        </div>
+      </div>
+
+      <!-- Google Chat -->
+      <div class="space-y-4" data-channel-fields-target="google_chat" style="display: none;">
+        <div class="bg-surface-base rounded-lg border border-border-default p-5">
+          <h4 class="text-white font-medium mb-3">Google Chat Setup</h4>
+          <p class="text-text-muted text-sm mb-3">Connect a Google Chat app. Google pushes messages to a webhook; replies are sent over the Chat REST API using a service account.</p>
+          <ol class="text-text-muted text-sm space-y-2 list-decimal list-inside">
+            <li>In Google Cloud → enable the <strong class="text-white">Google Chat API</strong>, then open its <strong class="text-white">Configuration</strong> page.</li>
+            <li>Under <strong class="text-white">Connection settings</strong> choose HTTP endpoint and set the URL to <code class="text-amber-300"><%= (request.base_url rescue "https://your-host") %>/webhooks/google_chat</code>.</li>
+            <li>Create a <strong class="text-white">service account</strong> for the app, download its JSON key, and paste it below.</li>
+            <li>Optionally set a <strong class="text-white">Verification Token</strong> and require it on the bearer header to reject forged inbound events.</li>
+          </ol>
+        </div>
+        <div>
+          <label class="block text-text-muted text-sm mb-1">Service Account JSON</label>
+          <%= text_area_tag "credentials[google_chat_sa_json]", creds["google_chat_sa_json"], rows: 8, placeholder: '{ "type": "service_account", "client_email": "...", "private_key": "-----BEGIN PRIVATE KEY-----\n..." }',
+              class: "w-full px-4 py-3 bg-surface-card border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand font-mono text-sm", autocomplete: "off" %>
+          <p class="text-text-faint text-xs mt-1">Stored encrypted in the vault. The full service-account key JSON; used to mint OAuth tokens for outbound replies.</p>
+        </div>
+        <div>
+          <label class="block text-text-muted text-sm mb-1">Verification Token <span class="text-text-faint">(optional)</span></label>
+          <%= text_field_tag "channel[config][verification_token]", channel.config&.dig("verification_token"), placeholder: "token from the Chat app config",
+              class: "w-full px-4 py-3 bg-surface-card border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand font-mono text-sm", autocomplete: "off" %>
+          <p class="text-text-faint text-xs mt-1">If set, inbound requests must carry it as the bearer token. (Full JWT verification is a follow-up.)</p>
+        </div>
+      </div>
+
+      <!-- Feishu / Lark -->
+      <div class="space-y-4" data-channel-fields-target="feishu" style="display: none;">
+        <div class="bg-surface-base rounded-lg border border-border-default p-5">
+          <h4 class="text-white font-medium mb-3">Feishu / Lark Setup</h4>
+          <p class="text-text-muted text-sm mb-3">Connect a Feishu (China) or Lark (international) custom app via the Open Platform event subscription.</p>
+          <ol class="text-text-muted text-sm space-y-2 list-decimal list-inside">
+            <li>Create a custom app on the <strong class="text-white">Feishu/Lark Open Platform</strong> and copy its <strong class="text-white">App ID</strong> and <strong class="text-white">App Secret</strong>.</li>
+            <li>Under <strong class="text-white">Event Subscription</strong>, set the request URL to <code class="text-amber-300"><%= (request.base_url rescue "https://your-host") %>/webhooks/feishu</code> and subscribe to <code class="text-amber-300">im.message.receive_v1</code>.</li>
+            <li>Copy the <strong class="text-white">Verification Token</strong> below so inbound events can be validated.</li>
+            <li>Set <strong class="text-white">Base URL</strong> to <code class="text-amber-300">https://open.feishu.cn</code> (China) or <code class="text-amber-300">https://open.larksuite.com</code> (international).</li>
+          </ol>
+        </div>
+        <div>
+          <label class="block text-text-muted text-sm mb-1">App ID</label>
+          <%= text_field_tag "channel[config][app_id]", channel.config&.dig("app_id"), placeholder: "cli_...",
+              class: "w-full px-4 py-3 bg-surface-card border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand font-mono text-sm" %>
+        </div>
+        <div>
+          <label class="block text-text-muted text-sm mb-1">App Secret</label>
+          <%= text_field_tag "credentials[feishu_app_secret]", creds["feishu_app_secret"], placeholder: "app secret",
+              class: "w-full px-4 py-3 bg-surface-card border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand font-mono text-sm", autocomplete: "off" %>
+          <p class="text-text-faint text-xs mt-1">Stored encrypted in the vault. Used to mint a tenant_access_token for outbound replies.</p>
+        </div>
+        <div>
+          <label class="block text-text-muted text-sm mb-1">Verification Token</label>
+          <%= text_field_tag "channel[config][verification_token]", channel.config&.dig("verification_token"), placeholder: "event subscription token",
+              class: "w-full px-4 py-3 bg-surface-card border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand font-mono text-sm", autocomplete: "off" %>
+          <p class="text-text-faint text-xs mt-1">Validates inbound events. Leave blank to accept all (dev only).</p>
+        </div>
+        <div>
+          <label class="block text-text-muted text-sm mb-1">Base URL</label>
+          <%= text_field_tag "channel[config][base_url]", channel.config&.dig("base_url"), placeholder: "https://open.feishu.cn",
+              class: "w-full px-4 py-3 bg-surface-card border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand font-mono text-sm" %>
+          <p class="text-text-faint text-xs mt-1"><code class="text-amber-300">open.feishu.cn</code> for China, <code class="text-amber-300">open.larksuite.com</code> for international.</p>
+        </div>
+      </div>
+
+      <!-- LINE -->
+      <div class="space-y-4" data-channel-fields-target="line" style="display: none;">
+        <div class="bg-surface-base rounded-lg border border-border-default p-5">
+          <h4 class="text-white font-medium mb-3">LINE Setup (Messaging API)</h4>
+          <p class="text-text-muted text-sm mb-3">Connect a LINE Official Account bot via the Messaging API. Inbound uses a webhook; replies use the push API.</p>
+          <ol class="text-text-muted text-sm space-y-2 list-decimal list-inside">
+            <li>In the <a href="https://developers.line.biz/console/" target="_blank" rel="noopener" class="text-brand-light underline">LINE Developers console</a>, create a provider and a <strong class="text-white">Messaging API</strong> channel.</li>
+            <li>Under <strong class="text-white">Messaging API</strong>, set the webhook URL to <code class="text-amber-300"><%= (request.base_url rescue "https://your-host") %>/webhooks/line</code> and enable "Use webhook".</li>
+            <li>Copy the <strong class="text-white">Channel access token</strong> and <strong class="text-white">Channel secret</strong> below. Both are stored encrypted in the vault.</li>
+          </ol>
+        </div>
+        <div>
+          <label class="block text-text-muted text-sm mb-1">Channel Access Token</label>
+          <%= text_field_tag "credentials[line_channel_access_token]", creds["line_channel_access_token"], placeholder: "long-lived token",
+              class: "w-full px-4 py-3 bg-surface-card border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand font-mono text-sm", autocomplete: "off" %>
+          <p class="text-text-faint text-xs mt-1">Used to send replies and download audio messages.</p>
+        </div>
+        <div>
+          <label class="block text-text-muted text-sm mb-1">Channel Secret</label>
+          <%= text_field_tag "credentials[line_channel_secret]", creds["line_channel_secret"], placeholder: "channel secret",
+              class: "w-full px-4 py-3 bg-surface-card border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand font-mono text-sm", autocomplete: "off" %>
+          <p class="text-text-faint text-xs mt-1">Verifies the <code class="text-amber-300">X-Line-Signature</code> header on inbound webhooks.</p>
+        </div>
+      </div>
+
+      <!-- Mattermost -->
+      <div class="space-y-4" data-channel-fields-target="mattermost" style="display: none;">
+        <div class="bg-surface-base rounded-lg border border-border-default p-5">
+          <h4 class="text-white font-medium mb-3">Mattermost Setup</h4>
+          <p class="text-text-muted text-sm mb-3">Inbound via an Outgoing Webhook; replies via the REST API v4 with a bot access token.</p>
+          <ol class="text-text-muted text-sm space-y-2 list-decimal list-inside">
+            <li>In Mattermost, create a <strong class="text-white">Bot Account</strong> (Integrations → Bot Accounts) and copy its access token into <strong class="text-white">Bot Token</strong> below.</li>
+            <li>Create an <strong class="text-white">Outgoing Webhook</strong> (Integrations → Outgoing Webhooks). Set the Callback URL to <code class="text-amber-300"><%= (request.base_url rescue "https://your-host") %>/webhooks/mattermost</code> and add a trigger word. Copy its token into <strong class="text-white">Outgoing Token</strong>.</li>
+            <li>Set <strong class="text-white">Base URL</strong> to your Mattermost server. Optionally set <strong class="text-white">Bot User ID</strong> so the bot ignores its own posts.</li>
+          </ol>
+        </div>
+        <div>
+          <label class="block text-text-muted text-sm mb-1">Base URL</label>
+          <%= text_field_tag "channel[config][base_url]", channel.config&.dig("base_url"), placeholder: "https://mattermost.example.com",
+              class: "w-full px-4 py-3 bg-surface-card border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand font-mono text-sm" %>
+        </div>
+        <div>
+          <label class="block text-text-muted text-sm mb-1">Bot Token</label>
+          <%= text_field_tag "credentials[mattermost_bot_token]", creds["mattermost_bot_token"], placeholder: "bot access token",
+              class: "w-full px-4 py-3 bg-surface-card border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand font-mono text-sm", autocomplete: "off" %>
+          <p class="text-text-faint text-xs mt-1">Stored encrypted in the vault. Used to post replies via the v4 API.</p>
+        </div>
+        <div>
+          <label class="block text-text-muted text-sm mb-1">Outgoing Token</label>
+          <%= text_field_tag "channel[config][outgoing_token]", channel.config&.dig("outgoing_token"), placeholder: "outgoing webhook token",
+              class: "w-full px-4 py-3 bg-surface-card border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand font-mono text-sm", autocomplete: "off" %>
+          <p class="text-text-faint text-xs mt-1">Verifies inbound webhook posts came from your Mattermost server.</p>
+        </div>
+        <div>
+          <label class="block text-text-muted text-sm mb-1">Bot User ID <span class="text-text-faint">(optional)</span></label>
+          <%= text_field_tag "channel[config][bot_user_id]", channel.config&.dig("bot_user_id"), placeholder: "the bot's user id",
+              class: "w-full px-4 py-3 bg-surface-card border border-border-default rounded-lg text-white placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-brand font-mono text-sm" %>
+          <p class="text-text-faint text-xs mt-1">If set, the bot ignores its own posts to avoid reply loops.</p>
+        </div>
+      </div>
+
+      <!-- Fallback: no platform selected -->
+      <div data-channel-fields-target="none">
+        <p class="text-text-faint text-sm italic">Select a platform above to see required credentials.</p>
+      </div>
+    </div>
+
+    <!-- Agent assignments removed — Discord and Slack both require one app/bot per agent.
+         Each Hivemind channel = one bot = one agent. Use Message Routing above to assign the agent. -->
+
+    <div class="flex justify-end gap-3 pt-4">
+      <%= link_to "Cancel", channels_path, class: "px-6 py-3 bg-surface-raised hover:bg-surface-overlay text-white rounded-lg transition" %>
+      <%= f.submit channel.new_record? ? "Create Channel" : "Update Channel",
+          class: "px-6 py-3 bg-brand hover:bg-brand-dark text-white font-medium rounded-lg transition cursor-pointer" %>
+    </div>
+  <% end %>
+</div>

@@ -1,0 +1,640 @@
+"""Shared CLI helpers: logging, tmux, coral_dir discovery."""
+
+from __future__ import annotations
+
+import logging
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+from coral.workspace.breadcrumbs import (
+    find_breadcrumb_file,
+    find_coral_breadcrumb,
+    read_island_breadcrumb,
+)
+
+
+def setup_logging(verbose: bool = False) -> None:
+    """Configure logging. Verbose mode logs to stderr at DEBUG level."""
+    level = logging.DEBUG if verbose else logging.WARNING
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+        datefmt="%H:%M:%S",
+        stream=sys.stderr,
+    )
+
+
+def has_tmux() -> bool:
+    """Check if tmux is available on the system."""
+    import shutil
+
+    return shutil.which("tmux") is not None
+
+
+def in_tmux() -> bool:
+    """Check if we're already running inside a tmux session."""
+    return bool(os.environ.get("TMUX"))
+
+
+def save_tmux_session_name(save_dir: Path, session_name: str, *, owned: bool = True) -> None:
+    """Save the tmux session name for coral stop to find.
+
+    Args:
+        save_dir: Directory to write marker files (typically coral_dir / "public").
+        owned: If True, coral created this session and can kill it on stop.
+               If False, coral is running inside a pre-existing session.
+    """
+    tmux_file = save_dir / ".coral_tmux_session"
+    tmux_file.write_text(session_name, encoding="utf-8")
+    owned_file = save_dir / ".coral_tmux_owned"
+    if owned:
+        owned_file.write_text("1", encoding="utf-8")
+    else:
+        owned_file.unlink(missing_ok=True)
+
+
+def find_tmux_session(coral_dir: Path) -> str | None:
+    """Find an existing tmux session for this CORAL run."""
+    for search_dir in [coral_dir / "public", coral_dir.parent]:
+        tmux_file = search_dir / ".coral_tmux_session"
+        if tmux_file.exists():
+            session_name = tmux_file.read_text(encoding="utf-8").strip()
+            if session_name:
+                result = subprocess.run(
+                    ["tmux", "has-session", "-t", session_name],
+                    capture_output=True,
+                )
+                if result.returncode == 0:
+                    return session_name
+    return None
+
+
+def _is_tmux_owned(search_dir: Path) -> bool:
+    """Check if coral created (owns) the tmux session in this directory."""
+    owned_file = search_dir / ".coral_tmux_owned"
+    return owned_file.exists()
+
+
+def kill_tmux_session(coral_dir: Path) -> None:
+    """Kill the tmux session associated with this run, if coral owns it.
+
+    If coral is running inside a pre-existing tmux session (not one it created),
+    only clean up the marker files without killing the session.
+    """
+    for search_dir in [coral_dir / "public", coral_dir.parent]:
+        tmux_file = search_dir / ".coral_tmux_session"
+        if tmux_file.exists():
+            session_name = tmux_file.read_text(encoding="utf-8").strip()
+            owned = _is_tmux_owned(search_dir)
+            if session_name and owned:
+                result = subprocess.run(
+                    ["tmux", "kill-session", "-t", session_name],
+                    capture_output=True,
+                    text=True,
+                )
+                if result.returncode == 0:
+                    print(f"Killed tmux session: {session_name}")
+            elif session_name and not owned:
+                print(f"Left tmux session '{session_name}' running (not created by coral).")
+            tmux_file.unlink(missing_ok=True)
+            (search_dir / ".coral_tmux_owned").unlink(missing_ok=True)
+            return
+
+    # Also check in the task config dir
+    config_file = coral_dir / "config.yaml"
+    if config_file.exists():
+        import yaml
+
+        try:
+            with open(config_file, encoding="utf-8") as f:
+                cfg = yaml.safe_load(f) or {}
+            task_dir = cfg.get("_task_dir")
+            if task_dir:
+                task_path = Path(task_dir)
+                tmux_file = task_path / ".coral_tmux_session"
+                if tmux_file.exists():
+                    session_name = tmux_file.read_text(encoding="utf-8").strip()
+                    owned = _is_tmux_owned(task_path)
+                    if session_name and owned:
+                        subprocess.run(
+                            ["tmux", "kill-session", "-t", session_name],
+                            capture_output=True,
+                            text=True,
+                        )
+                        print(f"Killed tmux session: {session_name}")
+                    elif session_name and not owned:
+                        print(f"Left tmux session '{session_name}' running (not created by coral).")
+                    tmux_file.unlink(missing_ok=True)
+                    (task_path / ".coral_tmux_owned").unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def has_docker() -> bool:
+    """Check if docker is available on the system."""
+    import shutil
+
+    return shutil.which("docker") is not None
+
+
+def _probe_docker_sudo() -> bool | None:
+    """Return Docker sudo mode, or None if Docker cannot be queried.
+
+    Returns False if docker works without sudo. Returns True if Docker
+    requires sudo and passwordless sudo is available.
+    """
+    try:
+        result = subprocess.run(
+            ["docker", "info"],
+            capture_output=True,
+            timeout=10,
+        )
+        if result.returncode == 0:
+            return False
+    except (subprocess.SubprocessError, FileNotFoundError):
+        pass
+
+    # Docker without sudo failed — try non-interactive sudo
+    try:
+        result = subprocess.run(
+            ["sudo", "-n", "docker", "info"],
+            capture_output=True,
+            timeout=10,
+        )
+        if result.returncode == 0:
+            return True
+    except (subprocess.SubprocessError, FileNotFoundError):
+        pass
+
+    return None
+
+
+def _docker_needs_sudo() -> bool:
+    """Return True if docker requires sudo to run.
+
+    Exits with an error if Docker cannot be queried without an interactive
+    sudo password.
+    """
+    needs_sudo = _probe_docker_sudo()
+    if needs_sudo is not None:
+        return needs_sudo
+
+    print(
+        "Error: Docker requires sudo, but sudo requires a password.\n"
+        "Either run with passwordless sudo or add your user to the docker group:\n"
+        "  sudo usermod -aG docker $USER\n"
+        "Then log out and back in for the change to take effect.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
+def docker_cmd() -> list[str]:
+    """Return the base docker command, prefixed with sudo if needed."""
+    if _docker_needs_sudo():
+        return ["sudo", "docker"]
+    return ["docker"]
+
+
+def docker_cmd_or_none() -> list[str] | None:
+    """Return the Docker command if usable without interaction, else None."""
+    needs_sudo = _probe_docker_sudo()
+    if needs_sudo is None:
+        return None
+    if needs_sudo:
+        return ["sudo", "docker"]
+    return ["docker"]
+
+
+def in_docker() -> bool:
+    """Check if we're already running inside a Docker container."""
+    if os.environ.get("CORAL_IN_DOCKER") == "1":
+        return True
+    return Path("/.dockerenv").exists()
+
+
+def in_coral_docker_session() -> bool:
+    """True only inside CORAL's own Docker session, not any container.
+
+    Set by ``_build_docker_cmd`` via ``-e CORAL_IN_DOCKER=1``. Unlike
+    ``in_docker()``, this excludes generic containers (a plain ``/.dockerenv``)
+    that lack the baked-in ``agent`` user — so mandatory OS-user isolation is
+    forced only where the image guarantees it can be honored.
+    """
+    return os.environ.get("CORAL_IN_DOCKER") == "1"
+
+
+def _is_process_alive_windows(pid: int) -> bool:
+    """Windows backend for :func:`is_process_alive`.
+
+    Windows has no signal 0, so liveness has to be read off a process handle.
+    A handle stays valid after the process exits (until every reference is
+    closed), which is why the handle alone does not mean "running" — the
+    kernel object is *signalled* once the process terminates, so a zero
+    timeout wait separates a live process from an exited-but-unreaped one.
+    """
+    if sys.platform != "win32":  # pragma: no cover - narrows the type checker
+        return False
+
+    import ctypes
+    from ctypes import wintypes
+
+    error_access_denied = 5
+    synchronize = 0x00100000
+    wait_timeout = 0x00000102
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    handle = kernel32.OpenProcess(synchronize, False, pid)
+    if not handle:
+        # A running process owned by another user denies access; every other
+        # failure (notably ERROR_INVALID_PARAMETER for an unknown PID) is dead.
+        return ctypes.get_last_error() == error_access_denied
+    try:
+        return kernel32.WaitForSingleObject(handle, 0) == wait_timeout
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def is_process_alive(pid: int) -> bool:
+    """Check whether a PID belongs to a running process, without signalling it.
+
+    Wraps the platform differences that ``os.kill(pid, 0)`` leaks to callers:
+
+    - POSIX raises ``ProcessLookupError`` for an unknown PID and
+      ``PermissionError`` for a live process owned by another user.
+    - Windows has no signal 0 at all, so ``os.kill(pid, 0)`` raises
+      ``OSError: [WinError 87] The parameter is incorrect`` for *every* PID,
+      live or not. Callers that only catch ``ProcessLookupError`` therefore
+      crash instead of reporting a stopped run.
+
+    Non-positive PIDs are rejected: ``os.kill`` treats 0 and negatives as
+    process-group selectors, so a truncated ``manager.pid`` would otherwise
+    probe the caller's own group and report a dead run as running.
+    """
+    if pid <= 0:
+        return False
+    if sys.platform == "win32":
+        return _is_process_alive_windows(pid)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def is_docker_container_running(container_name: str, *, quiet: bool = False) -> bool:
+    """Check if a Docker container is currently running."""
+    cmd = docker_cmd_or_none() if quiet else docker_cmd()
+    if cmd is None:
+        return False
+    result = subprocess.run(
+        [*cmd, "inspect", "-f", "{{.State.Running}}", container_name],
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0 and result.stdout.strip() == "true"
+
+
+def has_docker_marker(coral_dir: Path) -> bool:
+    """Check if this run is managed by a Docker container."""
+    for search_dir in [coral_dir / "public", coral_dir.parent]:
+        if (search_dir / ".coral_docker_container").exists():
+            return True
+    return False
+
+
+def is_docker_run_alive(coral_dir: Path, *, quiet: bool = False) -> bool:
+    """Check if this run is managed by a live Docker container."""
+    run_dir = coral_dir.resolve().parent
+    marker = run_dir / ".coral_docker_container"
+    if marker.exists():
+        name = marker.read_text(encoding="utf-8").strip()
+        if name:
+            return is_docker_container_running(name, quiet=quiet)
+    return False
+
+
+def save_docker_container_name(save_dir: Path, container_name: str) -> None:
+    """Save the Docker container name for coral stop to find."""
+    marker = save_dir / ".coral_docker_container"
+    marker.write_text(container_name, encoding="utf-8")
+
+
+def docker_private_volume_name(host_run_dir: Path) -> str:
+    """Stable Docker volume name backing this run's ``.coral/private/``.
+
+    Keyed to the run dir so it survives start→resume of the same run. The volume
+    holds the grader venv + answer keys on a container-local Linux fs (not the
+    host bind mount), so its root:root 700 permissions are enforced even where
+    the host share fakes ownership (macOS Docker Desktop).
+    """
+    import hashlib
+
+    digest = hashlib.md5(str(host_run_dir.resolve()).encode()).hexdigest()[:12]
+    return f"coral-priv-{digest}"
+
+
+def kill_docker_container(coral_dir: Path) -> None:
+    """Stop and remove the Docker container associated with this run."""
+    for search_dir in [coral_dir / "public", coral_dir.parent]:
+        marker = search_dir / ".coral_docker_container"
+        if marker.exists():
+            container_name = marker.read_text(encoding="utf-8").strip()
+            if container_name:
+                stopped = (
+                    subprocess.run(
+                        [*docker_cmd(), "stop", container_name],
+                        capture_output=True,
+                    ).returncode
+                    == 0
+                )
+                # Always try rm (container may already be stopped)
+                subprocess.run(
+                    [*docker_cmd(), "rm", container_name],
+                    capture_output=True,
+                )
+                if stopped:
+                    print(f"Stopped Docker container: {container_name}")
+            # Remove the private-state volume backing this run (best-effort;
+            # absent on non-isolated / older runs).
+            subprocess.run(
+                [*docker_cmd(), "volume", "rm", docker_private_volume_name(coral_dir.parent)],
+                capture_output=True,
+            )
+            marker.unlink(missing_ok=True)
+            return
+
+
+def kill_ui(coral_dir: Path) -> None:
+    """Stop a standalone UI process if running."""
+    import signal
+
+    ui_pid_file = coral_dir / "public" / "ui.pid"
+    ui_url_file = coral_dir / "public" / "ui.url"
+    if not ui_pid_file.exists():
+        ui_url_file.unlink(missing_ok=True)
+        return
+    try:
+        pid = int(ui_pid_file.read_text(encoding="utf-8").strip())
+        os.kill(pid, signal.SIGKILL)
+        print(f"Stopped dashboard (PID {pid}).")
+    except (ProcessLookupError, ValueError):
+        pass
+    ui_pid_file.unlink(missing_ok=True)
+    ui_url_file.unlink(missing_ok=True)
+
+
+def kill_orphaned_agents(agent_pids_file: Path) -> None:
+    """Kill agent processes that survived the manager."""
+    import signal
+
+    if not agent_pids_file.exists():
+        return
+    killed = 0
+    for line in agent_pids_file.read_text(encoding="utf-8").strip().splitlines():
+        try:
+            pid = int(line.strip())
+            os.killpg(os.getpgid(pid), signal.SIGKILL)
+            killed += 1
+        except (ProcessLookupError, PermissionError, ValueError, OSError):
+            pass
+    if killed:
+        print(f"Killed {killed} orphaned agent process(es).")
+    agent_pids_file.unlink(missing_ok=True)
+
+
+def read_agent_id(start: str | Path | None = None) -> str:
+    """Read agent ID from the nearest .coral_agent_id breadcrumb."""
+    agent_id_file = find_breadcrumb_file(".coral_agent_id", start)
+    if agent_id_file is not None:
+        return agent_id_file.read_text(encoding="utf-8").strip()
+    return "unknown"
+
+
+def find_worktree_coral_dir_and_island(
+    start: str | Path | None = None,
+) -> tuple[Path, str | None] | None:
+    """Find the current worktree's run and island without falling back or exiting."""
+    found = find_coral_breadcrumb(start)
+    if found is None:
+        return None
+    coral_dir, breadcrumb_dir = found
+    return coral_dir, read_island_breadcrumb(coral_dir, breadcrumb_dir)
+
+
+def read_direction(coral_dir: Path) -> str:
+    """Read grader direction from config. Returns 'maximize' or 'minimize'."""
+    config_path = coral_dir / "config.yaml"
+    if config_path.exists():
+        import yaml
+
+        with open(config_path, encoding="utf-8") as f:
+            config = yaml.safe_load(f) or {}
+        return (config.get("grader") or {}).get("direction", "maximize")
+    return "maximize"
+
+
+def find_coral_dir_and_island(
+    task: str | None = None,
+    run: str | None = None,
+) -> tuple[Path, str | None]:
+    """Find the .coral directory and the current agent's island_id, if any.
+
+    Search order:
+    1. Walk up from cwd looking for a ``.coral_dir`` breadcrumb. If found,
+       pair it with a ``.coral_island`` breadcrumb in the same directory.
+       ``island_id`` is the breadcrumb's contents when:
+         - the file exists, AND
+         - its value is non-empty, AND
+         - ``coral_dir / "islands" / <value>`` is a real directory.
+       Otherwise ``island_id`` is None (single-island run, or stale
+       breadcrumb pointing at a deleted island).
+    2. Fall back to :func:`find_coral_dir`'s ``--task``/``--run`` logic and
+       return ``(coral_dir, None)`` — an explicit ``--task`` must override
+       the worktree scope, never silently keep it.
+
+    Returns:
+        (coral_dir, island_id) — island_id is None unless the caller is
+        inside an agent worktree that advertises a valid island.
+    """
+    if not task and not run:
+        found = find_worktree_coral_dir_and_island()
+        if found is not None:
+            return found
+
+    # Fall through to --task/--run discovery; explicit --task/--run wins
+    # and we never silently scope by island in that mode.
+    return find_coral_dir(task, run), None
+
+
+def find_coral_dir(task: str | None = None, run: str | None = None) -> Path:
+    """Find the .coral directory for a task run.
+
+    Search order:
+    1. .coral_dir breadcrumb in cwd (always correct for agents in worktrees)
+    2. If --task and --run given: results/<task>/<run>/.coral
+    3. If --task given: results/<task>/latest (symlink)
+    4. Walk up from cwd looking for results/ dir, pick the sole task or latest
+    """
+    # Priority 1: read .coral_dir breadcrumb from cwd (agents always have this)
+    if not task and not run:
+        found = find_coral_breadcrumb()
+        if found is not None:
+            coral_dir, _breadcrumb_dir = found
+            return coral_dir
+
+    # Docker shortcut: run dir is mounted at /run, no results/ tree exists
+    if in_docker():
+        docker_coral = Path("/app/run/.coral")
+        if docker_coral.is_dir():
+            return docker_coral
+
+    # Find results dir by walking up
+    results_dir = None
+    current = Path.cwd()
+    while True:
+        candidate = current / "results"
+        if candidate.is_dir():
+            results_dir = candidate
+            break
+        if current.parent == current:
+            break
+        current = current.parent
+
+    if results_dir:
+        if task and run:
+            coral = results_dir / task / run / ".coral"
+            if coral.is_dir():
+                return coral
+            print(f"Error: Run '{run}' not found for task '{task}'.", file=sys.stderr)
+            sys.exit(1)
+
+        if task:
+            latest = results_dir / task / "latest"
+            if latest.exists():
+                resolved = latest.resolve() if latest.is_symlink() else latest
+                coral = resolved / ".coral" if (resolved / ".coral").is_dir() else resolved
+                return coral
+            print(f"Error: Task '{task}' not found in {results_dir}.", file=sys.stderr)
+            sys.exit(1)
+
+        # No task specified — auto-detect
+        task_dirs = [d for d in results_dir.iterdir() if d.is_dir()]
+        if len(task_dirs) == 1:
+            task_dir = task_dirs[0]
+        elif len(task_dirs) > 1:
+            task_dir = max(
+                task_dirs,
+                key=lambda d: (d / "latest").stat().st_mtime if (d / "latest").exists() else 0,
+            )
+        else:
+            task_dir = None
+
+        if task_dir:
+            if run:
+                coral = task_dir / run / ".coral"
+                if coral.is_dir():
+                    return coral
+                print(f"Error: Run '{run}' not found in {task_dir}.", file=sys.stderr)
+                sys.exit(1)
+            latest = task_dir / "latest"
+            if latest.exists():
+                resolved = latest.resolve() if latest.is_symlink() else latest
+                coral = resolved / ".coral" if (resolved / ".coral").is_dir() else resolved
+                return coral
+
+    print(
+        "Error: No results directory found. Run 'coral start' first, "
+        "or use --task to specify the task name.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
+def pick_run(status_filter: str | None = None, allow_cancel: bool = False) -> Path | None:
+    """Interactively pick a run from the results directory.
+
+    Args:
+        status_filter: If set, only show runs with this status ("running" or "stopped").
+        allow_cancel: If True, show a cancel option and return None if chosen.
+
+    Returns:
+        Path to the selected run's .coral directory, or None if cancelled.
+    """
+    from coral.cli.query import _collect_runs, _find_results_dir, _relative_time
+
+    results_dir = _find_results_dir()
+    runs = _collect_runs(results_dir)
+
+    if status_filter:
+        runs = [r for r in runs if r["status"] == status_filter]
+
+    # Sort: running first, then most recent first
+    running = [r for r in runs if r["status"] == "running"]
+    stopped = [r for r in runs if r["status"] != "running"]
+    running.sort(key=lambda r: r["run"], reverse=True)
+    stopped.sort(key=lambda r: r["run"], reverse=True)
+    runs = running + stopped
+
+    if not runs:
+        label = status_filter or "available"
+        print(f"No {label} runs found.", file=sys.stderr)
+        sys.exit(1)
+
+    if len(runs) == 1:
+        r = runs[0]
+        print(f"Auto-selected: {r['task']} / {r['run']}")
+        return Path(r["path"]) / ".coral"
+
+    # Display table
+    tw = max(len("TASK"), max(len(r["task"]) for r in runs)) + 2
+    rw = max(len("RUN"), max(len(r["run"]) for r in runs)) + 2
+    sw = max(len("STATUS"), 10) + 2
+
+    # BEST width 12 leaves a 2-char gap after EVALS so multi-digit scores
+    # (e.g. 4838.0000) don't visually fuse with the EVALS column.
+    header = f"{'#':>3}  {'TASK':<{tw}}{'RUN':<{rw}}{'STATUS':<{sw}}{'AGENTS':>7}{'EVALS':>7}{'BEST':>12}"
+    print(header)
+    print("-" * len(header))
+
+    for i, r in enumerate(runs, 1):
+        if r["status"] == "running":
+            status_str = "running"
+        else:
+            status_str = f"stopped {_relative_time(r['run'])}"
+        best_str = f"{r['best']:.4f}" if r["best"] is not None else "-"
+        print(
+            f"{i:>3}  {r['task']:<{tw}}{r['run']:<{rw}}{status_str:<{sw}}"
+            f"{r['agents']:>7}{r['attempts']:>7}{best_str:>12}"
+        )
+
+    print()
+    cancel_hint = ", 0 to cancel" if allow_cancel else ""
+    while True:
+        try:
+            choice = input(f"Select run [1-{len(runs)}{cancel_hint}]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            sys.exit(1)
+        if allow_cancel and choice == "0":
+            return None
+        try:
+            idx = int(choice)
+            if 1 <= idx <= len(runs):
+                return Path(runs[idx - 1]["path"]) / ".coral"
+        except ValueError:
+            pass
+        print(f"Invalid choice. Enter a number between 1 and {len(runs)}.")

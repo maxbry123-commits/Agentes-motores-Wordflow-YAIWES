@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [ main ]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          bundler-cache: true
+
+      - name: RuboCop
+        run: bundle exec rubocop -A
+
+      - name: Brakeman security scan
+        run: bundle exec brakeman --no-pager -i config/brakeman.ignore -q
+
+  sdk-proxy-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # Pure-unit tests for the outbound resource-discipline pipeline
+      # (error classification, circuit breaker, concurrency ceiling).
+      # No dependencies needed — they stub the provider entirely.
+      - name: Run sdk-proxy tests
+        working-directory: ./sdk-proxy
+        run: npm test
+
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: hivemind
+          POSTGRES_PASSWORD: hivemind
+          POSTGRES_DB: hivemind_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      RAILS_ENV: test
+      DATABASE_URL: postgres://hivemind:hivemind@localhost:5432/hivemind_test
+      REDIS_URL: redis://localhost:6379/0
+      ACTIVE_RECORD_ENCRYPTION_PRIMARY_KEY: test_primary_key_000000000000000000
+      ACTIVE_RECORD_ENCRYPTION_DETERMINISTIC_KEY: test_deterministic_key_0000000000000
+      ACTIVE_RECORD_ENCRYPTION_KEY_DERIVATION_SALT: test_salt_0000000000000000000000000
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          bundler-cache: true
+
+      - name: Setup database
+        run: bin/rails db:prepare
+
+      - name: Run tests
+        run: bundle exec rspec --exclude-pattern "spec/system/**/*_spec.rb"
+
+      - name: Upload coverage to Codecov
+        if: always()
+        uses: codecov/codecov-action@v7
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: coverage/.resultset.json
+          fail_ci_if_error: false
