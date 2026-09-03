@@ -1,0 +1,320 @@
+"""Tier 2: Agent routing logic for intervention requests (issue #254 Phase 4).
+
+Pins the 3-way routing decision the Agent makes in
+``Session.handle_intervention(iv)``:
+
+  1. ``self_answer`` (= ``try_self_answer`` hook returns non-None)
+  2. ``parent_agent.delegate`` (= ``resolve_parent_agent`` hook returns
+     a Session)
+  3. ``user_channel.deliver`` (= default, falls through to
+     ``_dispatch_intervention``)
+
+Phase 4 ships the routing **scaffold**: hooks return None by default,
+so all requests go to the user_channel branch (= behaviour parity with
+Phase 3). Subclasses override the hooks to enable per-kind / per-context
+policies — Phase 4 verifies the wire works, not specific policies.
+
+Each branch emits an ``intervention_routed`` event for observability;
+the Phase 4 sub-issue (= dispatched by tui-coder) will surface the
+event in the TUI events tab.
+
+No mocks. Real Session + subclass overrides for the hook tests.
+"""
+from __future__ import annotations
+
+import asyncio
+import inspect
+from pathlib import Path
+
+from reyn.runtime.agent import Agent
+from reyn.runtime.services.recovery import build_recovery, default_snapshot_path
+from reyn.runtime.session import Session
+from reyn.runtime.session_buses import AgentRequestBus
+from reyn.runtime.session_params import ReactivityConfig
+from reyn.user_intervention import InterventionAnswer, UserIntervention
+from tests._support.agent_session import make_session
+from tests._support.events import collect_events, settle
+
+
+async def _run_and_settle(coro, log):
+    result = await coro
+    await settle(log)
+    return result
+
+
+def _recovery_kwargs(agent_name: str) -> dict:
+    """Build the ``generation_store`` / ``journal`` kwargs Session now
+    requires — the direct-subclass constructions below bypass
+    ``make_session`` (they instantiate ``Session`` subclasses, not
+    ``Session`` itself), so they build the recovery pair the same way
+    ``Session.__init__`` used to internally, matching its prior defaults
+    (``state_log=None``, ``session_id="main"``)."""
+    generation_store, journal = build_recovery(
+        agent_name, default_snapshot_path(agent_name), None, "main",
+    )
+    return {
+        "generation_store": generation_store,
+        "journal": journal,
+        "reactivity": ReactivityConfig(),
+    }
+
+# ── 1. Hook methods exist with the canonical signatures ────────────────
+
+
+def test_try_self_answer_hook_exists() -> None:
+    """Tier 2: Session exposes ``try_self_answer(iv) -> Answer|None``
+    as the self-answer routing hook.
+    """
+    assert hasattr(Session, "try_self_answer")
+    assert inspect.iscoroutinefunction(Session.try_self_answer)
+    sig = inspect.signature(Session.try_self_answer)
+    assert list(sig.parameters.keys()) == ["self", "iv"]
+
+
+def test_resolve_parent_agent_hook_exists() -> None:
+    """Tier 2: Session exposes ``resolve_parent_agent(iv) -> Session|None``
+    as the parent-delegate routing hook.
+
+    Synchronous (not async) — chain-walk lookups don't need to await.
+    """
+    assert hasattr(Session, "resolve_parent_agent")
+    assert not inspect.iscoroutinefunction(Session.resolve_parent_agent)
+    sig = inspect.signature(Session.resolve_parent_agent)
+    assert list(sig.parameters.keys()) == ["self", "iv"]
+
+
+def test_default_hooks_return_none() -> None:
+    """Tier 2: default implementations return None — Phase 4 ships pure
+    scaffold, no kind-specific policies enabled out-of-the-box.
+    """
+    session = make_session(agent_name="t")
+    iv = UserIntervention(kind="ask_user", prompt="Q?")
+
+    async def _check_self_answer() -> InterventionAnswer | None:
+        return await session.try_self_answer(iv)
+
+    assert asyncio.run(_check_self_answer()) is None
+    assert session.resolve_parent_agent(iv) is None
+
+
+# ── 2. Default routing — user_channel branch fires ─────────────────────
+
+
+def test_default_routing_fires_user_channel_branch(tmp_path: Path) -> None:
+    """Tier 2: with default hooks (= both return None), an unhandled
+    intervention falls through to ``_dispatch_intervention``.
+
+    The Phase 1 subscriber guard short-circuits when no listener is
+    registered, so the round-trip returns an empty answer — used here
+    to verify the branch was actually taken (= the answer's emptiness
+    is observable only if dispatch was reached).
+    """
+    session = make_session(agent_name="t")
+    iv = UserIntervention(kind="ask_user", prompt="Q?")
+
+    answer = asyncio.run(session.handle_intervention(iv))
+    # Phase 1 guard short-circuit reached → user_channel branch fired.
+    assert answer.text == ""
+    assert answer.choice_id is None
+
+
+def test_default_routing_emits_user_channel_event(tmp_path: Path) -> None:
+    """Tier 2: the user_channel branch emits ``intervention_routed`` with
+    ``route="user_channel"`` so observers (= TUI events tab, debug
+    traces, future routing-policy analysis) can see the decision.
+    """
+    session = make_session(agent_name="t")
+    collected = collect_events(session._audit_events)
+    iv = UserIntervention(kind="ask_user", prompt="Q?")
+
+    asyncio.run(_run_and_settle(session.handle_intervention(iv), session._audit_events))
+
+    # session._audit_events is the EventLog used for chat-side events.
+    events = [
+        e for e in [e.model_dump(mode="json") for e in collected]
+        if e.get("type") == "intervention_routed"
+    ]
+    assert events, "intervention_routed event must fire on each handle_intervention call"
+    payload = events[-1]["data"]
+    assert payload["route"] == "user_channel"
+    assert payload["iv_kind"] == "ask_user"
+    assert payload["iv_id"] == iv.id
+
+
+# ── 3. self_answer branch — fires when _try_self_answer returns answer ──
+
+
+class _SelfAnsweringSession(Session):
+    """Subclass that always self-answers with a fixed answer."""
+
+    async def try_self_answer(self, iv: UserIntervention) -> InterventionAnswer | None:
+        return InterventionAnswer(text="self-policy", choice_id="self")
+
+
+def test_self_answer_branch_returns_directly_without_dispatch() -> None:
+    """Tier 2: when ``try_self_answer`` returns a non-None answer, the
+    handler returns it immediately without invoking
+    ``_dispatch_intervention`` — the user surface is never touched.
+    """
+    session = _SelfAnsweringSession(agent=Agent(agent_name="t"), **_recovery_kwargs("t"))
+    iv = UserIntervention(kind="permission.shell", prompt="Run ls?")
+
+    answer = asyncio.run(session.handle_intervention(iv))
+    assert answer.text == "self-policy"
+    assert answer.choice_id == "self"
+
+    # And the registry queue must be untouched — no prompt was enqueued.
+    assert session.interventions.queued_count() == 0
+
+
+def test_self_answer_branch_emits_self_answer_event() -> None:
+    """Tier 2: the self_answer branch emits ``intervention_routed`` with
+    ``route="self_answer"``.
+    """
+    session = _SelfAnsweringSession(agent=Agent(agent_name="t"), **_recovery_kwargs("t"))
+    collected = collect_events(session._audit_events)
+    iv = UserIntervention(kind="permission.shell", prompt="Run ls?")
+
+    asyncio.run(_run_and_settle(session.handle_intervention(iv), session._audit_events))
+
+    events = [
+        e for e in [e.model_dump(mode="json") for e in collected]
+        if e.get("type") == "intervention_routed"
+    ]
+    assert events
+    payload = events[-1]["data"]
+    assert payload["route"] == "self_answer"
+    assert payload["iv_kind"] == "permission.shell"
+
+
+# ── 4. parent_delegate branch — fires when _resolve_parent_agent
+#      returns a session ─────────────────────────────────────────────────
+
+
+class _DelegatingSession(Session):
+    """Subclass that delegates all interventions to a designated parent
+    session. Used to verify the parent_delegate routing branch.
+    """
+
+    def set_parent(self, parent: Session) -> None:
+        self._parent_session = parent
+
+    def resolve_parent_agent(self, iv: UserIntervention) -> Session | None:
+        return getattr(self, "_parent_session", None)
+
+
+def test_parent_delegate_branch_forwards_to_parent() -> None:
+    """Tier 2: when ``resolve_parent_agent`` returns a parent session,
+    the handler forwards the intervention to ``parent.handle_intervention``
+    and returns the parent's decision verbatim.
+
+    Verified via a parent that self-answers — the chain is
+    child.handle_intervention → parent.handle_intervention →
+    parent._try_self_answer.
+    """
+    parent = _SelfAnsweringSession(agent=Agent(agent_name="parent"), **_recovery_kwargs("parent"))
+    child = _DelegatingSession(agent=Agent(agent_name="child"), **_recovery_kwargs("child"))
+    child.set_parent(parent)
+
+    iv = UserIntervention(kind="ask_user", prompt="Q?")
+    answer = asyncio.run(child.handle_intervention(iv))
+
+    # Parent self-answered, child received that answer back.
+    assert answer.text == "self-policy"
+    assert answer.choice_id == "self"
+
+
+def test_parent_delegate_branch_emits_parent_delegate_event() -> None:
+    """Tier 2: the parent_delegate branch on the child emits
+    ``intervention_routed`` with ``route="parent_delegate"`` BEFORE
+    forwarding. The parent's own routing decision generates a separate
+    event on the parent's audit_events log.
+    """
+    parent = _SelfAnsweringSession(agent=Agent(agent_name="parent"), **_recovery_kwargs("parent"))
+    parent_collected = collect_events(parent._audit_events)
+    child = _DelegatingSession(agent=Agent(agent_name="child"), **_recovery_kwargs("child"))
+    child_collected = collect_events(child._audit_events)
+    child.set_parent(parent)
+
+    iv = UserIntervention(kind="ask_user", prompt="Q?")
+
+    async def _drive():
+        await child.handle_intervention(iv)
+        await settle(child._audit_events)
+        await settle(parent._audit_events)
+
+    asyncio.run(_drive())
+
+    child_events = [
+        e for e in [e.model_dump(mode="json") for e in child_collected]
+        if e.get("type") == "intervention_routed"
+    ]
+    assert child_events
+    assert child_events[-1]["data"]["route"] == "parent_delegate"
+
+    parent_events = [
+        e for e in [e.model_dump(mode="json") for e in parent_collected]
+        if e.get("type") == "intervention_routed"
+    ]
+    assert parent_events
+    # Parent's self_answer hook fired on its own intervention_routed event.
+    assert parent_events[-1]["data"]["route"] == "self_answer"
+
+
+# ── 5. Branch precedence: self_answer > parent_delegate > user_channel ──
+
+
+class _SelfAndParentSession(_DelegatingSession):
+    """Subclass that BOTH self-answers AND has a parent. Used to verify
+    self_answer takes precedence (= the agent decides itself before
+    consulting upstream).
+    """
+
+    async def try_self_answer(self, iv: UserIntervention) -> InterventionAnswer | None:
+        return InterventionAnswer(text="child-self", choice_id="child")
+
+
+def test_self_answer_takes_precedence_over_parent_delegate() -> None:
+    """Tier 2: when both hooks could fire, ``try_self_answer`` runs
+    first — the agent decides itself rather than consulting upstream.
+    This encodes "the agent has its own will" per the Reyn peer-to-peer
+    design (issue #254 design discussion log).
+    """
+    parent = _SelfAnsweringSession(agent=Agent(agent_name="parent"), **_recovery_kwargs("parent"))
+    parent_collected = collect_events(parent._audit_events)
+    child = _SelfAndParentSession(agent=Agent(agent_name="child"), **_recovery_kwargs("child"))
+    child.set_parent(parent)
+
+    iv = UserIntervention(kind="ask_user", prompt="Q?")
+    answer = asyncio.run(_run_and_settle(child.handle_intervention(iv), parent._audit_events))
+
+    # Child self-answered, parent was never consulted.
+    assert answer.text == "child-self"
+    assert answer.choice_id == "child"
+
+    # And the parent's audit_events has NO intervention_routed event
+    # (= parent's handle_intervention was never invoked).
+    parent_events = [
+        e for e in [e.model_dump(mode="json") for e in parent_collected]
+        if e.get("type") == "intervention_routed"
+    ]
+    assert not parent_events
+
+
+# ── 7. RequestBus adapter — Phase 4 routing visible through the adapter ──
+
+
+def test_self_answer_visible_through_request_bus_adapter() -> None:
+    """Tier 2: an OS caller that holds the ``RequestBus`` adapter sees
+    the self_answer policy fire — the adapter is fully transparent to
+    the routing decision happening behind it.
+    """
+    session = _SelfAnsweringSession(agent=Agent(agent_name="t"), **_recovery_kwargs("t"))
+    bus = session.as_request_bus()
+    assert isinstance(bus, AgentRequestBus)
+
+    iv = UserIntervention(kind="ask_user", prompt="Q?")
+    answer = asyncio.run(bus.request(iv))
+
+    assert answer.text == "self-policy"
+    assert answer.choice_id == "self"

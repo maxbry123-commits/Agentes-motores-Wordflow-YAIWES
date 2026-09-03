@@ -1,0 +1,411 @@
+"""Tier 2: web_fetch SSL config — declarative SSL via reyn.yaml (FP-0022 follow-up).
+
+Verifies that handle_web_fetch and RegistryClient route the correct ``verify``
+value to httpx's TLS layer, based on the priority order:
+  1. web_fetch.ca_bundle (str path) → verify=<path>
+  2. web_fetch.verify_ssl: false    → verify=False
+  3. web_fetch.verify_ssl: true     → verify=True
+  4. neither set (None)             → litellm.get_ssl_verify() env-var fallback
+
+#1972: SSL now flows through ``httpx.AsyncClient(transport=PinnedAsyncHTTPTransport
+(verify=...))`` (the connect-time IP-pinning transport owns TLS), not
+``AsyncClient(verify=...)``. So the invariant is captured at the transport: the
+``PinnedAsyncHTTPTransport`` is monkeypatched to a real recorder
+(``_RecordVerifyTransport``) that captures ``verify`` without eagerly building the
+real httpx transport (which would load a fake CA path). ``httpx.AsyncClient`` is
+still monkeypatched to capture constructor kwargs (now ``transport=``).
+
+#3075: both call sites now build their client via
+``reyn._network.build_async_http_client(pin_ssrf=True, ...)``, which delegates
+transport construction to ``reyn._ssrf_pin.ssrf_aware_client_kwargs`` — the
+``PinnedAsyncHTTPTransport`` symbol used at construction time is therefore
+``reyn._ssrf_pin.PinnedAsyncHTTPTransport`` regardless of which production
+module (``web.py`` / ``registry/client.py``) triggered the construction, so
+every monkeypatch below targets that one definition site.
+
+No unittest.mock. All helpers are real instances / recording stand-ins — a
+structural invariant (the right layer receives the verify value), not a
+behavioral assertion on httpx internals.
+"""
+from __future__ import annotations
+
+import asyncio
+from pathlib import Path
+from typing import Any
+
+import httpx
+import pytest
+
+from reyn.config import WebFetchConfig, _build_web_fetch_config
+
+# ---------------------------------------------------------------------------
+# Helpers to build a minimal OpContext for web_fetch handler tests
+# ---------------------------------------------------------------------------
+
+def _make_ctx(web_fetch_config: WebFetchConfig | None = None, tmp_path: Path | None = None):
+    """Build a minimal OpContext for testing handle_web_fetch.
+
+    Uses real EventLog and Workspace stubs — no mock collaborators.
+    """
+
+    from reyn.core.op_runtime.context import OpContext
+    from reyn.security.permissions.permissions import PermissionDecl
+
+    # EventLog stub — only needs emit().
+    class _FakeEventLog:
+        subscribers: list = []
+        def emit(self, *args, **kwargs) -> None:
+            pass
+
+    # Workspace stub — handle_web_fetch does not call workspace methods.
+    class _FakeWorkspace:
+        pass
+
+    return OpContext(
+        workspace=_FakeWorkspace(),  # type: ignore[arg-type]
+        events=_FakeEventLog(),      # type: ignore[arg-type]
+        permission_decl=PermissionDecl(),
+        permission_resolver=None,    # no permission gate in these tests
+        web_fetch_config=web_fetch_config,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Helper: capture the verify kwarg passed to httpx.AsyncClient.__init__
+# ---------------------------------------------------------------------------
+
+class _CaptureAsyncClient:
+    """Drop-in replacement for httpx.AsyncClient that records __init__ kwargs
+    and returns a canned success response.
+
+    Used as a context manager to match the ``async with httpx.AsyncClient(...)``
+    pattern in handle_web_fetch.
+    """
+
+    captured_kwargs: dict[str, Any] = {}
+
+    def __init__(self, **kwargs: Any) -> None:
+        _CaptureAsyncClient.captured_kwargs = dict(kwargs)
+        self._response = httpx.Response(
+            200,
+            headers={"content-type": "text/plain"},
+            content=b"hello",
+            request=httpx.Request("GET", "https://example.com"),
+        )
+
+    async def __aenter__(self) -> "_CaptureAsyncClient":
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        pass
+
+    async def get(self, url: str) -> httpx.Response:
+        return self._response
+
+    def stream(self, method: str, url: str) -> "_ResponseStreamCtx":
+        # #1913: production now streams (client.stream) instead of client.get.
+        return _ResponseStreamCtx(self._response)
+
+
+class _ResponseStreamCtx:
+    """Async-CM mirroring ``client.stream(...)``. A canned ``httpx.Response``
+    built with ``content=`` already supports ``aiter_bytes()`` / ``headers`` /
+    ``charset_encoding`` / ``status_code``, so it is yielded as-is."""
+
+    def __init__(self, response: httpx.Response) -> None:
+        self._response = response
+
+    async def __aenter__(self) -> httpx.Response:
+        return self._response
+
+    async def __aexit__(self, *args: object) -> None:
+        return None
+
+
+class _RecordVerifyTransport:
+    """#1972: a real recording stand-in for ``PinnedAsyncHTTPTransport`` that
+    captures the ``verify`` value WITHOUT constructing the real httpx transport
+    (so a fake CA-bundle path isn't eagerly loaded → no FileNotFoundError).
+
+    Since #1972 routes SSL through ``httpx.AsyncClient(transport=Pinned(verify=...))``
+    instead of ``AsyncClient(verify=...)``, the SSL-config invariant is now ‘the
+    verify value reaches the transport’ — captured here per-instance via
+    ``captured_kwargs['transport'].verify``."""
+
+    def __init__(self, verify: Any = True) -> None:
+        self.verify = verify
+
+    async def __aenter__(self) -> "_RecordVerifyTransport":
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        return None
+
+    async def aclose(self) -> None:
+        return None
+
+    async def handle_async_request(self, request: Any) -> Any:  # pragma: no cover
+        raise AssertionError("recorder transport must not handle a real request")
+
+
+# ---------------------------------------------------------------------------
+# 1. ca_bundle config → verify=<path>
+# ---------------------------------------------------------------------------
+
+def test_verify_ssl_ca_bundle_in_config_passes_to_httpx(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Tier 2: web_fetch.ca_bundle set → handle_web_fetch passes verify=<path> to httpx.
+
+    Invariant: when reyn.yaml supplies web_fetch.ca_bundle, the CA bundle path
+    is forwarded to httpx.AsyncClient(verify=...) so requests are validated
+    against the custom CA (corporate MITM proxy / private PKI use case).
+    """
+    from reyn.core.op_runtime.web import handle_web_fetch
+    from reyn.schemas.models import WebFetchIROp
+
+    cfg = WebFetchConfig(ca_bundle="/etc/ssl/certs/corp-ca.pem")
+    ctx = _make_ctx(web_fetch_config=cfg)
+    op = WebFetchIROp(kind="web_fetch", url="https://example.com")
+
+    monkeypatch.setattr(httpx, "AsyncClient", _CaptureAsyncClient)
+    monkeypatch.setattr(
+        "reyn._ssrf_pin.PinnedAsyncHTTPTransport", _RecordVerifyTransport,
+    )
+    asyncio.run(handle_web_fetch(op=op, ctx=ctx))
+
+    assert _CaptureAsyncClient.captured_kwargs["transport"].verify == "/etc/ssl/certs/corp-ca.pem"
+
+
+# ---------------------------------------------------------------------------
+# 2. verify_ssl: false → verify=False
+# ---------------------------------------------------------------------------
+
+def test_verify_ssl_false_in_config_passes_to_httpx(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Tier 2: web_fetch.verify_ssl: false → handle_web_fetch passes verify=False to httpx.
+
+    Invariant: when reyn.yaml sets web_fetch.verify_ssl to False, SSL
+    certificate validation is disabled in httpx (controlled environment use).
+    ca_bundle takes priority over verify_ssl; this test has no ca_bundle set.
+    """
+    from reyn.core.op_runtime.web import handle_web_fetch
+    from reyn.schemas.models import WebFetchIROp
+
+    cfg = WebFetchConfig(verify_ssl=False)
+    ctx = _make_ctx(web_fetch_config=cfg)
+    op = WebFetchIROp(kind="web_fetch", url="https://example.com")
+
+    monkeypatch.setattr(httpx, "AsyncClient", _CaptureAsyncClient)
+    monkeypatch.setattr(
+        "reyn._ssrf_pin.PinnedAsyncHTTPTransport", _RecordVerifyTransport,
+    )
+    asyncio.run(handle_web_fetch(op=op, ctx=ctx))
+
+    assert _CaptureAsyncClient.captured_kwargs["transport"].verify is False
+
+
+# ---------------------------------------------------------------------------
+# 3. verify_ssl: true → verify=True
+# ---------------------------------------------------------------------------
+
+def test_verify_ssl_true_in_config_passes_to_httpx(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Tier 2: web_fetch.verify_ssl: true → handle_web_fetch passes verify=True to httpx.
+
+    Invariant: explicit true forces SSL verification regardless of env vars.
+    """
+    from reyn.core.op_runtime.web import handle_web_fetch
+    from reyn.schemas.models import WebFetchIROp
+
+    cfg = WebFetchConfig(verify_ssl=True)
+    ctx = _make_ctx(web_fetch_config=cfg)
+    op = WebFetchIROp(kind="web_fetch", url="https://example.com")
+
+    monkeypatch.setattr(httpx, "AsyncClient", _CaptureAsyncClient)
+    monkeypatch.setattr(
+        "reyn._ssrf_pin.PinnedAsyncHTTPTransport", _RecordVerifyTransport,
+    )
+    asyncio.run(handle_web_fetch(op=op, ctx=ctx))
+
+    assert _CaptureAsyncClient.captured_kwargs["transport"].verify is True
+
+
+# ---------------------------------------------------------------------------
+# 4. ca_bundle takes priority over verify_ssl when both are set
+# ---------------------------------------------------------------------------
+
+def test_ca_bundle_takes_priority_over_verify_ssl(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Tier 2: ca_bundle config takes priority over verify_ssl when both are set.
+
+    Invariant: the ca_bundle path is the highest-priority SSL knob. Setting
+    verify_ssl: false alongside ca_bundle must not override the bundle path.
+    """
+    from reyn.core.op_runtime.web import handle_web_fetch
+    from reyn.schemas.models import WebFetchIROp
+
+    cfg = WebFetchConfig(
+        ca_bundle="/corp/ca.pem",
+        verify_ssl=False,  # must NOT win — ca_bundle takes priority
+    )
+    ctx = _make_ctx(web_fetch_config=cfg)
+    op = WebFetchIROp(kind="web_fetch", url="https://example.com")
+
+    monkeypatch.setattr(httpx, "AsyncClient", _CaptureAsyncClient)
+    monkeypatch.setattr(
+        "reyn._ssrf_pin.PinnedAsyncHTTPTransport", _RecordVerifyTransport,
+    )
+    asyncio.run(handle_web_fetch(op=op, ctx=ctx))
+
+    assert _CaptureAsyncClient.captured_kwargs["transport"].verify == "/corp/ca.pem"
+
+
+# ---------------------------------------------------------------------------
+# 5. env-var fallback when config is unset (web_fetch_config=None)
+# ---------------------------------------------------------------------------
+
+def test_env_var_fallback_when_config_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Tier 2: SSL_VERIFY env var is respected when web_fetch_config is None.
+
+    Invariant: when no web config is supplied (config unset), the handler
+    falls through to litellm.get_ssl_verify() — which reads SSL_VERIFY from
+    the environment. This preserves the existing env-var behavior so there is
+    no behavioral regression for users who rely on SSL_VERIFY.
+
+    We verify that the verify value passed to httpx matches what
+    litellm.get_ssl_verify() returns directly — both must agree.
+    """
+    from litellm.llms.custom_httpx.http_handler import get_ssl_verify
+
+    from reyn.core.op_runtime.web import handle_web_fetch
+    from reyn.schemas.models import WebFetchIROp
+
+    # Set SSL_VERIFY=0 so get_ssl_verify() returns a non-True value.
+    monkeypatch.setenv("SSL_VERIFY", "0")
+
+    ctx = _make_ctx(web_fetch_config=None)  # no config → env-var fallback path
+    op = WebFetchIROp(kind="web_fetch", url="https://example.com")
+
+    monkeypatch.setattr(httpx, "AsyncClient", _CaptureAsyncClient)
+    monkeypatch.setattr(
+        "reyn._ssrf_pin.PinnedAsyncHTTPTransport", _RecordVerifyTransport,
+    )
+    asyncio.run(handle_web_fetch(op=op, ctx=ctx))
+
+    # The verify value forwarded to httpx must match what litellm.get_ssl_verify()
+    # returns in the same env. We do not pin the exact type/value here because
+    # litellm's return type (bool vs str) is an internal litellm detail.
+    expected = get_ssl_verify()
+    assert _CaptureAsyncClient.captured_kwargs["transport"].verify == expected
+
+
+# ---------------------------------------------------------------------------
+# 6. _build_web_fetch_config parses reyn.yaml web_fetch: section correctly
+# ---------------------------------------------------------------------------
+
+def test_build_web_fetch_config_ca_bundle_and_verify_ssl() -> None:
+    """Tier 2: _build_web_fetch_config() correctly parses web_fetch.ca_bundle
+    and verify_ssl (#4174 T4: renamed from web.fetch.*, flattened — the raw
+    dict IS the fetch section directly now, no more nested "fetch" key).
+
+    Invariant: the config parser produces the correct WebFetchConfig from a
+    raw YAML dict so that end-to-end config loading (reyn.yaml →
+    WebFetchConfig) is structurally correct.
+    """
+    raw = {
+        "ca_bundle": "/corp/ca.pem",
+        "verify_ssl": False,
+    }
+    cfg = _build_web_fetch_config(raw)
+    assert cfg.ca_bundle == "/corp/ca.pem"
+    assert cfg.verify_ssl is False
+
+
+def test_build_web_fetch_config_defaults_when_empty() -> None:
+    """Tier 2: _build_web_fetch_config() returns full defaults when section is absent."""
+    cfg = _build_web_fetch_config({})
+    assert cfg.ca_bundle is None
+    assert cfg.verify_ssl is None
+
+
+def test_build_web_fetch_config_defaults_when_none() -> None:
+    """Tier 2: _build_web_fetch_config() returns full defaults when raw is None."""
+    cfg = _build_web_fetch_config(None)
+    assert cfg.ca_bundle is None
+    assert cfg.verify_ssl is None
+
+
+# ---------------------------------------------------------------------------
+# 7. RegistryClient verify constructor arg
+# ---------------------------------------------------------------------------
+
+def test_registry_client_verify_false_passed_to_httpx(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Tier 2: RegistryClient(verify=False) passes verify=False to httpx.AsyncClient.
+
+    Invariant: the RegistryClient's verify constructor arg is forwarded to
+    httpx so MCP registry requests skip SSL validation when configured.
+    """
+    from reyn.core.registry.client import RegistryClient
+
+    captured: dict[str, Any] = {}
+
+    class _CapturingClient:
+        def __init__(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+        async def aclose(self) -> None:
+            pass
+
+        async def __aenter__(self) -> "_CapturingClient":
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            pass
+
+    monkeypatch.setattr(httpx, "AsyncClient", _CapturingClient)
+    monkeypatch.setattr(
+        "reyn._ssrf_pin.PinnedAsyncHTTPTransport", _RecordVerifyTransport,
+    )
+
+    async def _run() -> None:
+        client = RegistryClient(verify=False)
+        async with client:
+            pass
+
+    asyncio.run(_run())
+    assert captured["transport"].verify is False
+
+
+def test_registry_client_ca_bundle_passed_to_httpx(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Tier 2: RegistryClient(verify='/path/ca.pem') passes that path to httpx.
+
+    Invariant: string verify (= CA bundle path) flows from constructor to httpx
+    so registry requests use the corporate CA bundle.
+    """
+    from reyn.core.registry.client import RegistryClient
+
+    captured: dict[str, Any] = {}
+
+    class _CapturingClient:
+        def __init__(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+        async def aclose(self) -> None:
+            pass
+
+        async def __aenter__(self) -> "_CapturingClient":
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            pass
+
+    monkeypatch.setattr(httpx, "AsyncClient", _CapturingClient)
+    monkeypatch.setattr(
+        "reyn._ssrf_pin.PinnedAsyncHTTPTransport", _RecordVerifyTransport,
+    )
+
+    async def _run() -> None:
+        client = RegistryClient(verify="/corp/ca.pem")
+        async with client:
+            pass
+
+    asyncio.run(_run())
+    assert captured["transport"].verify == "/corp/ca.pem"

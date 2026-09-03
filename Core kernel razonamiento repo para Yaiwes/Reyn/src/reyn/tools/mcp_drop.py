@@ -1,0 +1,140 @@
+"""mcp_drop_server ToolDefinition (FP-0034 §D23).
+
+MCP_DROP_SERVER_OP is the destructor counterpart to MCP_INSTALL_OP:
+  - install adds an entry to ``mcp.servers.<short>``
+  - drop_server removes that entry, optionally cleans secrets
+
+Unlike mcp_install (which requires registry lookup + runtime detection
++ secret prompting across multiple op steps), drop is purely
+mechanical and can run as a single op invocation. Per
+FP-0034 §D23, this op lives in the universal catalog under
+``mcp.operation__drop_server`` and is reachable from both:
+
+  - Router context (= LLM-driven removal via
+    ``invoke_action("mcp.operation__drop_server", {server, ...})``)
+  - Phase context (= Control IR op with kind="mcp_drop_server")
+
+The handler delegates to op_runtime.mcp_drop_server.handle, which:
+  1. Resolves scope (= explicit or auto-detect)
+  2. Gates via require_file_write on the scope's config file (the bool-axis
+     ``require_mcp_drop_server`` was removed by the #571 arc, Phase 5)
+  3. Removes the YAML entry
+  4. Optionally cleans secrets
+  5. Emits mcp_server_removed P6 event
+"""
+from __future__ import annotations
+
+from typing import Any, Mapping
+
+from reyn.tools.descriptions import mcp as _mcp_descriptions
+from reyn.tools.types import ToolContext, ToolDefinition, ToolGates, ToolResult
+
+# Reviewable in src/reyn/tools/descriptions/mcp.py (Phase 2 of the
+# tool-description package refactor) — this alias keeps the call site
+# unchanged (byte-identical relocation, no LLM-facing text change).
+_MCP_DROP_SERVER_DESCRIPTION = _mcp_descriptions.mcp_drop_server.text
+
+
+_MCP_DROP_SERVER_PARAMETERS: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "server": {
+            "type": "string",
+            "description": _mcp_descriptions.PARAMS["mcp_drop_server"]["server"].text,
+        },
+        "scope": {
+            "type": "string",
+            "enum": ["local", "project", "user"],
+            "description": _mcp_descriptions.PARAMS["mcp_drop_server"]["scope"].text,
+        },
+        "clear_secrets": {
+            "type": "boolean",
+            "default": True,
+            "description": _mcp_descriptions.PARAMS["mcp_drop_server"]["clear_secrets"].text,
+        },
+    },
+    "required": ["server"],
+}
+
+
+async def _handle_mcp_drop_server_op(
+    args: Mapping[str, Any], ctx: ToolContext,
+) -> ToolResult:
+    """Adapter wrapping op_runtime.mcp_drop_server.handle.
+
+    Builds an MCPDropServerIROp from args and dispatches through
+    op_runtime, which owns the full lifecycle (= scope detection,
+    permission gate, yaml edit, secrets cleanup, P6 event emit).
+
+    OpContext resolution mirrors mcp_install:
+      - Router context: use ctx.router_state.op_context_factory when
+        bound (= RouterLoop wires this with permission_decl populated)
+      - Fallback: minimal OpContext with mcp_drop_server decl
+    """
+    from reyn.core.op_runtime.context import OpContext
+    from reyn.core.op_runtime.mcp_drop_server import handle as drop_handle
+    from reyn.schemas.models import MCPDropServerIROp
+    from reyn.security.permissions.permissions import PermissionDecl
+
+    server = str(args["server"])
+    scope_raw = args.get("scope")
+    scope = scope_raw if scope_raw in ("local", "project", "user") else None
+    clear_secrets = bool(args.get("clear_secrets", True))
+
+    op = MCPDropServerIROp(
+        kind="mcp_drop_server",
+        server=server,
+        scope=scope,
+        clear_secrets=clear_secrets,
+    )
+
+    # Resolve OpContext — prefer the router factory, fall back to minimal.
+    if (
+        ctx.router_state is not None
+        and ctx.router_state.op_context_factory is not None
+    ):
+        legacy_ctx = ctx.router_state.op_context_factory()
+    else:
+        # #571 collapse arc Phase 5: synthesize a PermissionDecl with
+        # the explicit file.write entry the op handler now requires.
+        canonical_config = ".reyn/config/mcp.yaml"
+        synth_decl = PermissionDecl(
+            file_write=[{"path": canonical_config, "scope": "just_path"}],
+        )
+        if ctx.permission_resolver is not None:
+            ctx.permission_resolver.session_approve_path(
+                canonical_config, "mcp_drop_server", "file.write",
+            )
+        legacy_ctx = OpContext(
+            workspace=ctx.workspace,
+            events=ctx.events,
+            permission_decl=synth_decl,
+            permission_resolver=ctx.permission_resolver,
+            actor="mcp_drop_server",
+            state_log=getattr(ctx, "state_log", None),  # #2259 PR-1: config generation emit
+            intervention_bus=None,
+            subscribers=getattr(ctx.events, "subscribers", []),
+        )
+
+    return await drop_handle(op=op, ctx=legacy_ctx)
+
+
+from reyn.core.offload.canonical import STRUCTURED_PASSTHROUGH  # noqa: E402
+
+MCP_DROP_SERVER_OP = ToolDefinition(
+    canonical=STRUCTURED_PASSTHROUGH,
+    name="mcp_drop_server",
+    # #3429: dispatched DIRECTLY by name. Before the qualified spelling was
+    # abolished this tool was reached only through ``invoke_action`` (the
+    # ``"__" in name`` arm of ``_invoke_router_tool``), so it never needed the
+    # flag; with one name, an advertised action that lacks it lands on the
+    # "unhandled tool" safety return. Pinned by
+    # ``test_universal_catalog.py::test_every_catalog_action_is_directly_dispatchable``.
+    router_dispatched=True,
+    description=_MCP_DROP_SERVER_DESCRIPTION,
+    parameters=_MCP_DROP_SERVER_PARAMETERS,
+    gates=ToolGates(router="allow"),
+    handler=_handle_mcp_drop_server_op,
+    category="io",
+    purity="side_effect",
+)

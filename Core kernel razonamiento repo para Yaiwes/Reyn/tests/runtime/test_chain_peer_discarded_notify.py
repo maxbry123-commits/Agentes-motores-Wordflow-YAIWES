@@ -1,0 +1,215 @@
+"""Tier 2/3: OS invariant — discard chain peer notification (R-D14).
+
+Background: long-timeout multi-agent delegation (e.g.
+``chain_timeout_seconds=1800`` for a 30-min research task) leaves the
+upstream waiter stuck for the full timeout if the downstream peer's
+skill_run is discarded by the user mid-flight. R-D14 plumbs an
+immediate notification so the waiter resolves within milliseconds.
+
+Layers exercised here:
+  - ``Session._on_chain_peer_discarded`` handler: pops the chain,
+    emits ``chain_peer_discarded`` audit event, sends synthesised
+    upstream agent_response (Tier 2)
+  - ``AgentRegistry.notify_chain_discarded``: scans every other
+    session, finds the matching chain, fires the handler (Tier 2)
+  - ``/skill discard`` slash integration: looks up the run's
+    chain_id from ``running_skills_chain`` and calls the registry
+    notify (Tier 3)
+
+Reference: PR-discard-chain-notify (R-D14) D14.3–D14.5 in the active plan.
+"""
+from __future__ import annotations
+
+import asyncio
+from pathlib import Path
+
+from reyn.core.events.state_log import StateLog
+from reyn.runtime.profile import AgentProfile
+from reyn.runtime.registry import AgentRegistry
+from reyn.runtime.session import Session
+from reyn.runtime.task_types import Requester
+from tests._support.agent_session import make_session
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_registry_with_two_agents(
+    tmp_path: Path,
+) -> tuple[AgentRegistry, Session, Session, StateLog]:
+    """Build a registry holding two real Sessions named A and B.
+
+    Both sessions share the same StateLog (single-process invariant).
+    The registry's ``_agents`` dict is populated by calling
+    ``get_or_load`` for each name. No background tasks are started —
+    the test drives the inboxes synchronously.
+    """
+    state_log = StateLog(tmp_path / ".reyn" / "wal.jsonl")
+
+    def factory(profile: AgentProfile) -> Session:
+        # Each session gets its own snapshot path under the agent's
+        # state dir so they don't collide.
+        agent_dir = tmp_path / ".reyn" / "agents" / profile.name
+        agent_dir.mkdir(parents=True, exist_ok=True)
+        return make_session(
+            agent_name=profile.name,
+            state_log=state_log,
+            snapshot_path=agent_dir / "state" / "snapshot.json",
+        )
+
+    registry = AgentRegistry(
+        project_root=tmp_path,
+        session_factory=factory,
+        state_log=state_log,
+    )
+    # Register both agents on disk so get_or_load can find them.
+    for name in ("A", "B"):
+        agent_dir = tmp_path / ".reyn" / "agents" / name
+        agent_dir.mkdir(parents=True, exist_ok=True)
+        AgentProfile.new(name, role="").save(agent_dir)
+
+    sess_a = registry.get_or_load("A")
+    sess_b = registry.get_or_load("B")
+    # Wire the back-reference so Session can call into registry.
+    sess_a._registry = registry
+    sess_b._registry = registry
+    return registry, sess_a, sess_b, state_log
+
+
+def _drain_outbox(session: Session) -> list:
+    out = []
+    while not session.outbox.empty():
+        out.append(session.outbox.get_nowait())
+    return out
+
+
+# ---------------------------------------------------------------------------
+# D14.4: _on_chain_peer_discarded handler
+# ---------------------------------------------------------------------------
+
+
+def test_handler_resolves_chain_and_emits_audit_event(tmp_path: Path):
+    """Tier 2: handler pops the chain, emits chain_peer_discarded, sends upstream response."""
+    registry, sess_a, _sess_b, state_log = _make_registry_with_two_agents(tmp_path)
+
+    async def go():
+        # A registers a chain waiting on B
+        await sess_a.chains.register(
+            chain_id="X-001",
+            depth=1,
+            original_text="please research X",
+            sender="user",
+            waiting_on={"B"},
+            requester=Requester(agent_name="user", session_id=""),
+            origin_depth=0,
+        )
+        assert sess_a.chains.find_chain("X-001") is not None
+        # Trigger the handler directly
+        await sess_a._on_chain_peer_discarded(
+            chain_id="X-001",
+            peer="B",
+            reason="user_discarded_skill_run",
+        )
+
+        await sess_a.journal.flush()  # #2259 PR-2b: drain async WAL in-context
+    asyncio.run(go())
+    # Chain is gone
+    assert sess_a.chains.find_chain("X-001") is None
+    # WAL has chain_resolve for X-001
+    events = list(state_log.iter_from(0))
+    resolve_events = [
+        e for e in events
+        if e["kind"] == "chain_resolve" and e.get("chain_id") == "X-001"
+    ]
+    (only_resolve,) = resolve_events
+    assert only_resolve["chain_id"] == "X-001"
+
+
+def test_handler_is_idempotent_when_chain_already_resolved(tmp_path: Path):
+    """Tier 2: handler returns silently if the chain has already been resolved."""
+    _registry, sess_a, _sess_b, _log = _make_registry_with_two_agents(tmp_path)
+
+    async def go():
+        # No chain registered → handler should no-op
+        await sess_a._on_chain_peer_discarded(
+            chain_id="never_registered", peer="B", reason="x",
+        )
+
+        await sess_a.journal.flush()  # #2259 PR-2b: drain async WAL in-context
+    asyncio.run(go())  # No exception is the assertion
+
+
+# ---------------------------------------------------------------------------
+# D14.3: AgentRegistry.notify_chain_discarded
+# ---------------------------------------------------------------------------
+
+
+def test_notify_finds_waiter_and_returns_true(tmp_path: Path):
+    """Tier 2: notify_chain_discarded scans agents and fires the matching handler."""
+    registry, sess_a, _sess_b, _log = _make_registry_with_two_agents(tmp_path)
+
+    async def go():
+        await sess_a.chains.register(
+            chain_id="X-002",
+            depth=1,
+            original_text="task",
+            sender="user",
+            waiting_on={"B"},
+            requester=Requester(agent_name="user", session_id=""),
+            origin_depth=0,
+        )
+        notified = await registry.notify_chain_discarded(
+            chain_id="X-002", by_agent_name="B",
+        )
+        return notified
+
+    notified = asyncio.run(go())
+    assert notified is True
+    # A's chain was force-resolved
+    assert sess_a.chains.find_chain("X-002") is None
+
+
+def test_notify_returns_false_when_no_waiter_tracks_chain(tmp_path: Path):
+    """Tier 2: an unknown chain returns False; no side effects."""
+    registry, _sess_a, _sess_b, _log = _make_registry_with_two_agents(tmp_path)
+
+    async def go():
+        return await registry.notify_chain_discarded(
+            chain_id="ghost-chain", by_agent_name="B",
+        )
+
+    assert asyncio.run(go()) is False
+
+
+def test_notify_excludes_self_from_scan(tmp_path: Path):
+    """Tier 2: the notifying agent's own chains are NOT touched.
+
+    Defensive: B might (rarely) register a chain X-003 of its own at
+    the same time it discards a skill_run that processes X-003 from A.
+    notify_chain_discarded must skip B's own ChainManager.
+    """
+    registry, _sess_a, sess_b, _log = _make_registry_with_two_agents(tmp_path)
+
+    async def go():
+        # B registers a chain (irrelevant to the discard)
+        await sess_b.chains.register(
+            chain_id="X-self",
+            depth=1,
+            original_text="t",
+            sender="caller",
+            waiting_on={"C"},
+            requester=Requester(agent_name="A", session_id=""),
+            origin_depth=1,
+        )
+        # B notifies for the same chain_id
+        notified = await registry.notify_chain_discarded(
+            chain_id="X-self", by_agent_name="B",
+        )
+        return notified
+
+    notified = asyncio.run(go())
+    # Not notified — only B tracks it, and we exclude B
+    assert notified is False
+    # B's own chain is intact
+    assert sess_b.chains.find_chain("X-self") is not None

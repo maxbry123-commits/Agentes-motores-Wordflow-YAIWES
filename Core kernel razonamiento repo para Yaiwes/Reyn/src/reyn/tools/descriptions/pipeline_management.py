@@ -1,0 +1,152 @@
+"""Tool descriptions for the ``pipeline_management`` bucket.
+
+Phase 3 of the tool-description package refactor (byte-identical
+relocation — no LLM-facing text change): the two pipeline install verbs
+from ``tools/pipeline_management_verbs.py`` — ``pipeline_install_local``
+(register a local DSL file) and ``pipeline_install_source`` (fetch +
+install from a git/GitHub URL). Each ``.text`` value is copied verbatim
+from its origin constant; the origin module now aliases its
+``_PIPELINE_INSTALL_*_DESCRIPTION`` constants to
+``pipeline_management.NAME.text``.
+
+Note: both carry ``ToolDefinition.category="io"`` — this module groups
+them by feature-area (pipeline management), matching the ``mcp`` / ``io``
+precedent set in Phase 2 (module grouping is conceptual, not a literal
+mirror of the ``category`` field).
+"""
+from __future__ import annotations
+
+from reyn.tools.descriptions._types import ParamDescription, ToolDescription
+
+pipeline_install_local = ToolDescription(
+    tool_name="pipeline_install_local",
+    surfaced="router (gates.router=allow)",
+    purpose=(
+        "Register a local pipeline DSL file into the project config so "
+        "sessions can launch it with run_pipeline after the next hot-reload."
+    ),
+    text=(
+        "Register a local pipeline DSL file into the project config "
+        "by writing an entry to .reyn/config/pipelines.yaml. The pipeline is "
+        "immediately available to sessions (run_pipeline with name "
+        "'<key>.<declared-name>') after the next hot-reload. Pass the direct path to the "
+        "pipeline's *.yaml DSL file (which may hold multiple '---'-separated "
+        "'pipeline:' documents). "
+        "Use 'name' to set the NAMESPACE KEY for the file; every pipeline in it "
+        "registers as '<name>.<declared-pipeline-name>'. 'name' need not match any "
+        "declared name and must not contain '.' (the reserved separator); it "
+        "defaults to the DSL file stem when omitted."
+    ),
+    ja=(
+        "ローカルのパイプライン DSL ファイルをプロジェクト設定に登録す"
+        "る（.reyn/config/pipelines.yaml へのエントリ書き込み）。次の"
+        "次のホットリロード後、run_pipeline（name = '<key>.<宣言名>'）で"
+        "セッションから即座に利用可能になる。"
+    ),
+)
+
+pipeline_install_source = ToolDescription(
+    tool_name="pipeline_install_source",
+    surfaced="router (gates.router=allow)",
+    purpose=(
+        "Fetch a pipeline from a git/GitHub URL, shallow-clone + "
+        "threat-scan it, and install it into the project config."
+    ),
+    text=(
+        "Fetch a pipeline from a git/GitHub URL and install it into the project. "
+        "The repo is shallow-cloned to .reyn/pipelines/<name>/, the DSL is parsed "
+        "+ threat-scanned, and an entry is written to .reyn/config/pipelines.yaml. "
+        "The pipeline is immediately available to sessions after the next "
+        "hot-reload. Requires http.get permission for the source host. "
+        "Source format: 'https://github.com/user/repo' (repo root must contain "
+        "exactly one *.yaml DSL file, or 'path' selects it) or "
+        "'https://github.com/user/repo//path/to/pipelines' (subdir form). "
+        "Use 'path' to select the DSL file inside the clone when the repo/subdir "
+        "contains more than one *.yaml file. "
+        "Use 'name' to set the NAMESPACE KEY; every pipeline in the file registers "
+        "as '<name>.<declared-pipeline-name>'. 'name' need not match any declared "
+        "name and must not contain '.'; it defaults to the source basename."
+    ),
+    ja=(
+        "git/GitHub の URL からパイプラインを取得しプロジェクトにインス"
+        "トールする。リポジトリは .reyn/pipelines/<name>/ に浅くクロー"
+        "ンされ、DSL はパース + 脅威スキャンされた上で "
+        ".reyn/config/pipelines.yaml にエントリが書き込まれる。ソースホ"
+        "ストへの http.get 権限が必要。"
+    ),
+)
+
+ALL: dict[str, ToolDescription] = {
+    "pipeline_install_local": pipeline_install_local,
+    "pipeline_install_source": pipeline_install_source,
+}
+
+
+# ── Phase 4: per-parameter descriptions (byte-identical relocation) ──────────
+
+PARAMS: dict[str, dict[str, ParamDescription]] = {
+    "pipeline_install_local": {
+        "path": ParamDescription(
+            text=(
+                "Direct path to the pipeline's *.yaml DSL file. May be "
+                "absolute or project-root-relative."
+            ),
+            ja="パイプラインの *.yaml DSL ファイルへの直接パス。絶対パスまたはプロジェクトルート相対。",
+        ),
+        "name": ParamDescription(
+            text=(
+                "Optional namespace key for the file. Every pipeline in it "
+                "registers as '<name>.<declared-pipeline-name>'. Need not "
+                "match any declared name; must not contain '.'. Defaults to "
+                "the DSL file stem when omitted."
+            ),
+            ja=(
+                "ファイルの任意の名前空間キー。ファイル内の各パイプラインは "
+                "'<name>.<declared-pipeline-name>' として登録される。宣言名"
+                "と一致する必要はなく '.' を含んではならない。省略時は DSL "
+                "ファイルの stem を使う。"
+            ),
+        ),
+    },
+    "pipeline_install_source": {
+        "source": ParamDescription(
+            text=(
+                "Git or GitHub URL of the pipeline repo. Examples: "
+                "'https://github.com/user/pipeline-repo' or "
+                "'https://github.com/user/monorepo//pipelines/my-pipeline'."
+            ),
+            ja=(
+                "パイプラインリポジトリの Git/GitHub URL。例 "
+                "'https://github.com/user/pipeline-repo' や "
+                "'https://github.com/user/monorepo//pipelines/my-pipeline'。"
+            ),
+        ),
+        "path": ParamDescription(
+            text=(
+                "Optional: path (relative to the repo root, or the subdir "
+                "when the source URL uses the '//' convention) to the DSL "
+                "*.yaml file. Required when the repo/subdir contains more "
+                "than one *.yaml file."
+            ),
+            ja=(
+                "任意: DSL *.yaml ファイルへのパス（リポジトリルート相対、"
+                "または source URL が '//' 規約を使う場合はサブディレクトリ"
+                "相対）。repo/subdir に *.yaml が複数ある場合は必須。"
+            ),
+        ),
+        "name": ParamDescription(
+            text=(
+                "Optional namespace key. Every pipeline in the file registers "
+                "as '<name>.<declared-pipeline-name>'. Need not match any "
+                "declared name; must not contain '.'. Defaults to the source "
+                "basename."
+            ),
+            ja=(
+                "任意の名前空間キー。ファイル内の各パイプラインは "
+                "'<name>.<declared-pipeline-name>' として登録される。宣言名"
+                "と一致する必要はなく '.' を含んではならない。省略時は "
+                "source のベース名を使う。"
+            ),
+        ),
+    },
+}

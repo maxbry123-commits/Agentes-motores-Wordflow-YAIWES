@@ -1,0 +1,349 @@
+# Popular local MCP servers — install + usage procedure
+
+A copy-paste-runnable procedure for 5 popular local MCP servers with
+Reyn. Each section shows:
+
+1. **Install** — one `reyn mcp install` command.
+   Produces a loader-ready config with no manual edits.
+2. **Direct smoke** — connectivity / tool-discovery / one tool call
+   via the `scripts/mcp_smoke.py` runner. Useful for "is the server
+   alive".
+3. **Usage from chat** — a real `reyn chat` conversation that
+   exercises the server through the chat router. The router signals catalog partiality so the LLM proactively calls
+   `list_actions` (or `search_actions` for keyword / semantic
+   queries) to discover capabilities it doesn't see in its function list.
+
+Servers covered:
+
+- [time](#time) — timezone-aware current time / conversion
+- [git](#git) — local repo operations (log / status / diff / branch)
+- [sequential-thinking](#sequential-thinking) — chain-of-thought scratchpad
+- [sqlite](#sqlite) — local DB queries (read + write + schema)
+- [everything](#everything) — demo kitchen-sink covering protocol primitives
+
+> **Why no filesystem / memory / fetch section?** All three MCP servers
+> structurally overlap with Reyn built-in ops:
+>
+> - filesystem ↔ `file__*` (= read / write / list / grep / glob)
+> - memory ↔ `memory_operation__*` (= remember_shared / forget)
+> - fetch ↔ `web_fetch` (= HTTP fetch with markdown extraction)
+>
+> With both available, the chat router consistently picks the
+> Reyn-internal op on natural prompts (10/10 in measurement,
+> 2026-05-21). The MCP servers don't get exercised through the
+> agent path.
+>
+> **Extraction parity**: install `pip install reyn[fetch]`
+> to add trafilatura as the `web_fetch` HTML extractor — at that
+> point, the Reyn op matches `mcp-server-fetch`'s extraction quality
+> for content-dense pages. The MCP server's remaining advantages are
+> `start_index` pagination and robots.txt
+> awareness. Use direct calls (`scripts/mcp_smoke.py`) or the MCP
+> server itself only if you specifically need those.
+
+> **Chat-history pollution caveat.** If your agent
+> has previously refused a capability (= the LLM said "I cannot
+> ..."), in-context learning may continue the refusal pattern on
+> subsequent turns even though the SP signal directs otherwise. If
+> the usage example below isn't producing the expected tool call,
+> clear the agent's history first:
+>
+> ```bash
+> echo -n > .reyn/agents/default/history.jsonl
+> ```
+>
+> Fresh-history clean-state success rate for the natural-prompt
+> usage examples below is ~90% (measured 2026-05-21 against
+> `gemini-2.5-flash-lite`). Polluted-history rate degrades sharply.
+> If the issue persists across sessions, check whether the agent's system prompt correctly exposes the tool.
+
+## Prerequisites
+
+- `node` + `npx` (most servers are npm packages)
+- `uv` + `uvx` (= Python servers; `brew install uv`)
+- Reyn installed (the MCP runtime ships in the core install — no extra needed)
+- For chat usage: pre-approve the per-server permission once per
+  server (= one-liner shown in each section).
+
+The smoke runner `scripts/mcp_smoke.py` goes straight to
+`reyn.mcp.client.MCPClient`, bypassing the chat router. Useful for
+connectivity sanity. For agent-driven usage (= the typical end-user
+shape), the chat router calls the server via the universal
+`mcp_call_tool` / `invoke_action` dispatch.
+
+> Each section's `reyn mcp install --source ...` shell command has an
+> equivalent chat-side verb: `mcp_install_package({kind, identifier,
+> version?})` (= same package channels: `npm` / `pypi` / `docker` /
+> `github`). Use whichever surface fits your workflow — both converge
+> on the same `.reyn/config/mcp.yaml` write. See
+> [`reyn mcp` CLI § Chat-side equivalents](../../reference/cli/mcp.md#chat-side-equivalents)
+> for the full mapping.
+
+---
+
+## time
+
+Timezone-aware time queries. Python-based (uvx), so requires `uv`.
+
+### Prerequisite
+
+```bash
+brew install uv
+```
+
+### Install
+
+```bash
+reyn mcp install --source pypi:mcp-server-time --non-interactive
+```
+
+### Direct smoke
+
+```bash
+python scripts/mcp_smoke.py time get_current_time '{"timezone": "Asia/Tokyo"}'
+```
+
+Expected: `content[0].text` carries `{"timezone": "Asia/Tokyo", "datetime": "<ISO 8601>", ...}`.
+
+### Usage from chat
+
+```bash
+reyn chat
+# first mcp_call_tool prompts for mcp.time -- choose [A]lways to persist
+# (writes to .reyn/approvals.jsonl, an append-only ledger -- #5153)
+> What time is it in Tokyo right now?
+```
+
+The agent calls `mcp_call_tool({tool: "time__get_current_time", tool_args:
+{timezone: "Asia/Tokyo"}})` and replies in natural language. For
+multi-timezone queries ("Tokyo, NYC, London"), the agent chains 3
+calls and synthesises one answer.
+
+### Tools surfaced
+
+`get_current_time` / `convert_time`.
+
+---
+
+## git
+
+Local git repo operations via `mcp-server-git` (Python / uvx).
+
+### Install
+
+```bash
+reyn mcp install --source pypi:mcp-server-git --non-interactive
+```
+
+### Direct smoke
+
+```bash
+python scripts/mcp_smoke.py git git_log "{\"repo_path\": \"$PWD\", \"max_count\": 3}"
+python scripts/mcp_smoke.py git git_branch "{\"repo_path\": \"$PWD\", \"branch_type\": \"local\"}"
+```
+
+Expected: 3 most-recent commits / local branches listed.
+
+### Usage from chat
+
+```bash
+reyn chat
+# first mcp_call_tool prompts for mcp.git -- choose [A]lways to persist
+# (writes to .reyn/approvals.jsonl, an append-only ledger -- #5153)
+> Summarise the last 3 commits in this repo.
+```
+
+The agent calls `mcp_call_tool({tool: "git__git_log", tool_args: {repo_path:
+"<session cwd>", max_count: 3}})` and produces a short summary.
+
+### Tools surfaced
+
+`git_status` / `git_diff_unstaged` / `git_diff_staged` / `git_diff` /
+`git_commit` / `git_add` / `git_reset` / `git_log` /
+`git_create_branch` / `git_checkout` / `git_show` / `git_branch`.
+
+---
+
+## sequential-thinking
+
+A meta tool for guided chain-of-thought reasoning. Useful as a demo
+of MCP servers that wrap *workflow patterns* rather than I/O.
+
+### Install
+
+```bash
+reyn mcp install --source npm:@modelcontextprotocol/server-sequential-thinking --non-interactive
+```
+
+### Direct smoke
+
+```bash
+python scripts/mcp_smoke.py sequential-thinking sequentialthinking '{
+  "thought": "Verify the smoke harness works for stateful tools.",
+  "thoughtNumber": 1,
+  "totalThoughts": 1,
+  "nextThoughtNeeded": false
+}'
+```
+
+Expected: `structuredContent` carries `{"thoughtNumber": 1, ...}`.
+
+### Usage from chat
+
+```bash
+reyn chat
+# first mcp_call_tool prompts for mcp.sequential-thinking -- choose [A]lways to persist
+# (writes to .reyn/approvals.jsonl, an append-only ledger -- #5153)
+> Use sequential-thinking to plan how to organise a personal task list.
+```
+
+The agent emits a series of `mcp_call_tool({tool:
+"sequential_thinking__sequentialthinking", args: {...}})` calls
+(typically 5-7 thoughts) and synthesises the chain into a
+natural-language plan. The server tracks the thought history
+internally; multiple calls build up a chain inside one server
+lifetime.
+
+> Note: the keyword "sequential-thinking" in the user prompt helps
+> the router pick this server over generic problem-solving paths
+> (= invoke_action with no clear target).
+
+### Tools surfaced
+
+`sequentialthinking` (single tool — chained calls build up the
+thought sequence).
+
+---
+
+## sqlite
+
+Local SQLite database via `mcp-server-sqlite` (Python / uvx).
+
+### Install
+
+```bash
+mkdir -p ./.mcp-sandbox && rm -f ./.mcp-sandbox/test.db
+
+reyn mcp install --source pypi:mcp-server-sqlite \
+    --args "--db-path $PWD/.mcp-sandbox/test.db" --non-interactive
+```
+
+### Direct smoke
+
+```bash
+python scripts/mcp_smoke.py sqlite create_table \
+    '{"query": "CREATE TABLE smoke (id INTEGER PRIMARY KEY, msg TEXT)"}'
+python scripts/mcp_smoke.py sqlite write_query \
+    '{"query": "INSERT INTO smoke (msg) VALUES (\"hello from sqlite mcp\")"}'
+python scripts/mcp_smoke.py sqlite read_query \
+    '{"query": "SELECT * FROM smoke"}'
+```
+
+Expected: third call returns `[{'id': 1, 'msg': 'hello from sqlite mcp'}]`.
+
+### Usage from chat
+
+```bash
+# first mcp_call_tool prompts for mcp.sqlite -- choose [A]lways to persist
+# (writes to .reyn/approvals.jsonl, an append-only ledger -- #5153)
+
+# (Optional) ensure clean history if you've previously interacted with sqlite:
+echo -n > .reyn/agents/default/history.jsonl
+
+reyn chat
+> Create a `notes` table in sqlite with columns id and body, then
+> insert a row with body "first note", and show me everything in the table.
+```
+
+The agent chains three `mcp_call_tool` calls (= `sqlite__create_table`
+→ `sqlite__write_query` → `sqlite__read_query`) within one turn.
+Success rate ≈ 90% on clean history; if the agent says "I cannot list
+tables...", wipe the history (line above) and retry.
+
+### Tools surfaced
+
+`read_query` / `write_query` / `create_table` / `list_tables` /
+`describe_table` / `append_insight`.
+
+---
+
+## everything
+
+Demo "kitchen sink" server covering most MCP protocol primitives.
+
+### Install
+
+```bash
+reyn mcp install --source npm:@modelcontextprotocol/server-everything --non-interactive
+```
+
+### Direct smoke
+
+```bash
+python scripts/mcp_smoke.py everything
+python scripts/mcp_smoke.py everything get-sum '{"a": 17, "b": 25}'
+python scripts/mcp_smoke.py everything echo '{"message": "hello"}'
+```
+
+Expected: 13 tools listed; sum returns "The sum of 17 and 25 is 42.".
+
+### Usage from chat
+
+```bash
+# first mcp_call_tool prompts for mcp.everything -- choose [A]lways to persist
+# (writes to .reyn/approvals.jsonl, an append-only ledger -- #5153)
+
+# Optional: clean history (= same caveat as sqlite)
+echo -n > .reyn/agents/default/history.jsonl
+
+reyn chat
+> Use the everything MCP server to compute 17 plus 25.
+```
+
+The agent calls `mcp_call_tool({tool: "everything__get-sum", tool_args:
+{a: 17, b: 25}})` and reports the result. Success rate ≈ 90% on clean history.
+
+> Note: explicitly mentioning "the everything MCP server" in the
+> prompt helps the router disambiguate; with a generic "compute 17
+> plus 25" the LLM may answer arithmetically without tool calls.
+
+### Tools surfaced
+
+`echo` / `get-sum` / `get-env` / `get-tiny-image` /
+`get-annotated-message` / `get-structured-content` /
+`get-resource-links` / `get-resource-reference` /
+`gzip-file-as-resource` / `toggle-simulated-logging` /
+`toggle-subscriber-updates` / `trigger-long-running-operation` /
+`simulate-research-query`.
+
+`trigger-long-running-operation` is especially useful for testing
+MCP progress callback wiring — it emits `notifications/progress` during execution.
+
+---
+
+## Adding more servers
+
+For any stdio-transport MCP server:
+
+```bash
+reyn mcp install --source npm:<package>           # or pypi:<package>
+# on the first tool call, choose [A]lways at the interactive prompt --
+# persists to .reyn/approvals.jsonl (an append-only ledger -- #5153),
+# no direct file edit needed
+reyn chat
+```
+
+The install command writes a loader-ready config automatically Servers
+requiring credentials: `reyn mcp set-secret <name> <KEY>` + reference
+`${KEY}` in the YAML `env:` block — see
+[Reference: `reyn.yaml` § MCP servers](../../reference/config/reyn-yaml.md#mcp-servers).
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Agent says "I cannot ..." even though the server is installed | History pollution (= prior refusal turn) | `echo -n > .reyn/agents/<name>/history.jsonl` then retry. See the history-pollution caveat above |
+| `MCP server <name> access denied` | Permission not pre-approved | Re-run and choose `[A]lways` at the prompt, or pre-approve via `reyn.yaml`'s `permissions.mcp: {<name>: allow}` |
+| `not found` errors after install | Server uses uvx (Python) but `uv` not installed | `brew install uv` |
+| Server config in YAML missing `type: stdio` or has `server-` prefix | Outdated install path | Re-install via `reyn mcp install` |
+| MCP fetch / filesystem / memory installed but agent uses Reyn op instead | Reyn internal op (`web_fetch` / `file__*` / `memory_operation__*`) wins on natural prompts | Use `scripts/mcp_smoke.py` direct call; the MCP server isn't exercised through the chat router |

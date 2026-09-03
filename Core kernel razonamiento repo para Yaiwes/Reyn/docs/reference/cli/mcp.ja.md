@@ -1,0 +1,372 @@
+---
+type: reference
+topic: cli
+audience: [human, agent]
+applies_to: [reyn mcp]
+---
+
+# `reyn mcp`
+
+MCP サーバーの設定を管理し、Reyn エージェントを外部の MCP 対応クライアントに公開します。
+
+## 概要
+
+```
+reyn mcp serve     [--project PATH] [--timeout SECONDS] [共通フラグ]
+reyn mcp search    <QUERY>
+reyn mcp install   <SERVER_ID> [--scope SCOPE] [--env KEY=VALUE ...] [--non-interactive]
+reyn mcp list      [--probe]
+reyn mcp remove    <NAME> [--scope SCOPE]
+reyn mcp set-secret <SERVER> <KEY>[=<VALUE>]
+reyn mcp clear-secret <SERVER> [<KEY>]
+```
+
+## 概要
+
+`reyn mcp` は 2 種類の操作をひとつのコマンドにまとめています：
+
+- **アウトバウンドサーバー管理** — `search`、`install`、`list`、`remove`、`set-secret`、`clear-secret` は reyn がクライアントとして呼び出す MCP サーバーを管理します。
+- **インバウンドサーバーモード** — `serve` は reyn 自身のエージェントを外部の MCP クライアントに公開します。
+
+概念モデルと Two roles フレーミングについては [コンセプト: MCP](../../concepts/tools-integrations/mcp.md) を参照してください。
+
+### Chat 側の対応 verb
+
+チャットルーターは同じ install 機能を source 軸で分割した 4 つの `mcp` verb として露出しています (= `list_actions(['mcp'])` で一覧)。 `reyn chat` セッション内で LLM に install を運用してもらう場合はこちらを使います:
+
+| CLI | Chat verb | 備考 |
+|---|---|---|
+| `reyn mcp search <QUERY>` | `mcp_search_registry({text})` | 同じ registry API 呼び出し |
+| `reyn mcp install <SERVER_ID>` | `mcp_install_registry({server_id})` | 同じ registry 経由 install |
+| `reyn mcp install --source npm:<pkg>[@v]` / `pypi:<pkg>[==v]` / `docker:<img>[:tag]` / GitHub URL | `mcp_install_package({kind, identifier, version?})` | LLM は構造化フィールドを渡し、 ハンドラ側で source 文字列を合成 |
+| _(CLI に対応無し; `.reyn/config/mcp.yaml` を手編集)_ | `mcp_install_local({name, command, args})` | チャット専用の新サーフェス: ローカル実行可能ファイル (LLM 生成 MCP スクリプト等) を stdio サーバーとして直接登録 |
+| `reyn mcp list` | `list_mcp_servers()` | |
+| `reyn mcp remove <NAME>` | `mcp_drop_server({server})` | |
+
+CLI とチャットは末端で `op_runtime/mcp_install.py` に合流するため、 permission gate、 シークレット検出、 audit event は同一です。
+
+**永続化の非対称性。** 2 つのパスは、サーバーに到達できない場合に新しい設定を書き込むかどうかという 1 点で異なります。
+
+- **チャット駆動の install、ターン途中、live な per-session reloader あり** — probe-then-commit: 何かを書き込む*前に*サーバーを probe します(spawn/connect + `list_tools`)。probe が失敗またはキャンセルされた場合、`.reyn/config/mcp.yaml` は変更されません(half-install なし)— LLM が同じターンでそのサーバーを使いたかったという immediate なユースケースに合っています。
+- **`reyn mcp install`(CLI)、または live reloader が attach されていない install** — probe せずに設定を書き込みます。サーバーが現在到達不能でも構いません — 後で立ち上がることを見込んで今のうちに設定しておく、という deferred なユースケースに合っています。
+
+書き込み(または非書き込み)の後は両パスとも再び合流します: permission gate、シークレット検出、audit event はどちらのパスが走ったかに影響されません。
+
+---
+
+## サブコマンド: `search`
+
+MCP サーバーレジストリで利用可能なサーバーを検索します。
+
+```
+reyn mcp search <QUERY>
+```
+
+MCP レジストリ API（`registry.modelcontextprotocol.io`）にクエリを送ります。オフライン耐性のためローカルキャッシュ（`~/.reyn/registry-cache/`、TTL 24h）を使用します。
+
+```bash
+reyn mcp search "github"
+reyn mcp search "filesystem"
+reyn mcp search "ファイル操作"
+```
+
+**出力：** 名前、説明、ランタイムヒント、インストールコマンドのプレビューを含むマッチしたサーバーの表形式リスト。この出力のサーバー識別子を `reyn mcp install` に渡して使用します。
+
+---
+
+## サブコマンド: `install`
+
+MCP サーバーを reyn の設定にインストールします。
+
+```
+reyn mcp install <SERVER_ID> [--scope SCOPE] [--env KEY=VALUE ...] [--non-interactive]
+reyn mcp install --source <SOURCE_SPEC> [--scope SCOPE] [--env KEY=VALUE ...] [--non-interactive]
+```
+
+`install` は新しい MCP サーバーへの推奨された最初のステップです。 2 つの path:
+
+**レジストリ path** (= default、 `<SERVER_ID>` を渡す):
+
+1. レジストリからサーバーの `server.json` を取得します（`registry.modelcontextprotocol.io`）。
+2. 必要なランタイム（`npx`、`uvx`、`docker` など）がインストールされているか確認します。
+3. `mcp_install` パーミッションゲートを適用します（[パーミッションとの連動: mcp_install](#permission-interaction) 参照）。
+4. 必要な認証情報（レジストリマニフェストで `isSecret` とマークされているもの）をプロンプトするか、`--env` フラグから読み取ります。
+5. 認証情報の値を `~/.reyn/secrets.env` に保存します（[コンセプト: シークレット管理](../../concepts/runtime/secret-handling.md) 参照）。
+6. 対象スコープの設定ファイルに `mcp.servers.<name>` エントリを書き込みます（シークレットは `${VAR}` 参照として記述されます）。
+7. `mcp_server_installed` 監査イベントを発行します。
+
+**ソース path** (= `--source <SOURCE_SPEC>`、 レジストリに未登録のサーバー向け、 Anthropic 公式 reference servers `@modelcontextprotocol/server-filesystem` 等):
+
+レジストリ取得を完全に skip し、 ソース指定子から install metadata を解決します。 パーミッションゲート / 認証情報 / 設定書込 / 監査 event はレジストリ path と同一。
+
+サポートする source scheme:
+
+| Scheme | 例 | 解決先 |
+|--------|---------|-------------|
+| `npm:<package>[@version]` | `npm:@modelcontextprotocol/server-filesystem` | `command: npx, args: ["-y", "<package>"]` |
+| `pypi:<package>[==version]` | `pypi:mcp-server-fetch` | `command: uvx, args: ["<package>"]` |
+| `docker:<image>[:tag]` | `docker:mcp/playwright:latest` | `command: docker, args: ["run", "--rm", "-i", "<image>"]` |
+| `https://github.com/<owner>/<repo>[/...]` | `https://github.com/modelcontextprotocol/servers/tree/main/src/filesystem` | ヒューリスティック: 既知 repo は `@scope/<package>` npm パッケージに解決、 未知 repo は `command` なしで設定書込 (= silent bad install を回避し、 ランタイム時に明示的失敗) |
+
+`<SERVER_ID>` と `--source` は相互排他です。
+
+### オプション
+
+| フラグ | デフォルト | 説明 |
+|------|---------|-------------|
+| `--scope SCOPE` | `local` | 書き込む設定スコープ: `local`（`reyn.local.yaml`、gitignored）、`project`（`reyn.yaml`、コミット対象）、または `user`（`~/.reyn/config.yaml`）。 |
+| `--source <SPEC>` | — | レジストリ経由でなく直接ソース指定子（`npm:`、`pypi:`、`docker:`、`https://github.com/...`）からインストール。`<SERVER_ID>` と相互排他。 |
+| `--env KEY=VALUE` | — | 環境変数をあらかじめ指定します（繰り返し可）。そのキーのインタラクティブプロンプトを抑制します。 |
+| `--non-interactive` | off | すべてのインタラクティブプロンプトを抑制します。必要な認証情報が不足している場合はゼロ以外で終了します。CI 用。 |
+
+### スコープのガイドライン
+
+| スコープ | ユースケース |
+|-------|----------|
+| `local`（デフォルト） | 個人/実験的 — チームメンバーに影響を与えずにサーバーを試す。 |
+| `project` | チーム共有 — 全チームメンバーがサーバーを利用できる。シークレットはコミットされた設定に `${VAR}` 参照として残り、実際の値は各開発者の `~/.reyn/secrets.env` に留まる。 |
+| `user` | プロジェクト横断 — すべてのプロジェクトで使いたいサーバー（例: `filesystem`）。 |
+
+### 例
+
+```bash
+# 利用可能なサーバーを検索
+reyn mcp search "github"
+
+# インタラクティブな認証情報プロンプトでインストール
+reyn mcp install io.github.modelcontextprotocol/server-github
+
+# 認証情報をインラインで指定してインストール（CI）
+reyn mcp install io.github.modelcontextprotocol/server-github \
+  --env GITHUB_PERSONAL_ACCESS_TOKEN=ghp_xxxx \
+  --non-interactive
+
+# プロジェクトスコープにインストール（チーム共有設定）
+reyn mcp install io.github.modelcontextprotocol/server-github --scope project
+
+# Anthropic 公式サーバー (= レジストリ未登録) を npm ソース経由で install
+reyn mcp install --source npm:@modelcontextprotocol/server-filesystem
+
+# PyPI ソース経由で install
+reyn mcp install --source pypi:mcp-server-fetch
+
+# Docker ソース経由で install
+reyn mcp install --source docker:mcp/playwright
+
+# GitHub URL 経由 (= heuristic resolver)
+reyn mcp install --source https://github.com/modelcontextprotocol/servers/tree/main/src/filesystem
+```
+
+### パーミッションとの連動: mcp_install {#permission-interaction}
+
+`mcp_install` 専用のパーミッション軸は存在しません — その bool 形式(`ask`/`allow`/`deny`)は #571 collapse arc Phase 5 で撤去済みです。今このキーを宣言しても実行時の権限は一切成立しません(`permissions.py` の `_LEGACY_BOOL_AXIS_KEYS` はこのキーに対して警告を出すだけ)。`install` は他の write-and-fetch アクションと同じ形でゲートされます:
+
+- `file.write`(install 対象 `.reyn/config/mcp.yaml` への書き込み)
+- `http.get`(レジストリホストへの manifest fetch)
+- `secret.write`(server が宣言する `isSecret` env var の永続化)
+
+それぞれが独自の ask/allow/deny 挙動と JIT インタラクティブプロンプトを持ちます — デフォルトスコープ外への `file.write` は、他の out-of-scope 書き込みと同様、初回インストール時にプロンプトが表示されます。エンタープライズチームは `reyn.yaml` で該当ターゲットに `file.write: deny` または `http.get: deny` を設定してプロジェクト全体で install をブロックするか、両方を `allow` にしてプロンプトを完全にスキップできます。完全なゲート形と worked example は [コンセプト: パーミッションモデル — `mcp_install`](../../concepts/runtime/permission-model.ja.md#mcp_install-パーミッション) と [Reference: `reyn.yaml` — MCP install](../config/reyn-yaml.ja.md) を参照してください。
+
+---
+
+## サブコマンド: `list`
+
+設定済み MCP サーバーとそのステータスを一覧表示します。
+
+```
+reyn mcp list [--probe]
+```
+
+デフォルトでは設定ファイルのみを読み取ります（ネットワーク呼び出しなし、サブプロセス起動なし）：
+
+```
+NAME         TRANSPORT  STATUS         CREDENTIALS
+filesystem   stdio      ready          (none)
+github       stdio      ready          GITHUB_PERSONAL_ACCESS_TOKEN ✓ (set)
+slack        stdio      missing-cred   SLACK_BOT_TOKEN ✗ (not set)
+```
+
+| フラグ | 説明 |
+|------|-------------|
+| `--probe` | 各サーバーとハンドシェイクして動作確認します。低速です。実際のサブプロセス起動とネットワーク呼び出しが発生します。監査イベントは発行されません(`MCPGateway.probe()` は監査対象の op-dispatch 経路を経由せず、クライアントを直接呼び出します)。 |
+
+---
+
+## サブコマンド: `remove`
+
+設定から MCP サーバーを削除します。
+
+```
+reyn mcp remove <NAME> [--scope SCOPE]
+```
+
+指定した（または推論した）スコープの設定ファイルから `mcp.servers.<name>` エントリを削除します。`~/.reyn/secrets.env` には**触れません**。同じキーを使用している他のサーバーのために認証情報は引き続き利用可能です。
+
+| フラグ | デフォルト | 説明 |
+|------|---------|-------------|
+| `--scope SCOPE` | 自動検出 | 削除するスコープ層。省略した場合、サーバーが存在するスコープから削除します（local を先に、次に project、次に user）。 |
+
+注: すでにサーバーに接続している実行中の `reyn chat` サブプロセスは、セッションが終了するまで継続します。変更は次の reyn プロセス起動時に有効になります。
+
+---
+
+## サブコマンド: `set-secret`
+
+設定済み MCP サーバーの認証情報を設定します。
+
+```
+reyn mcp set-secret <SERVER> <KEY>[=<VALUE>]
+```
+
+`set-secret` は `reyn secret set` の MCP-aware な薄いラッパーです。サーバーの `mcp.servers.<name>.env` 宣言（またはレジストリの `server.json`）を読んで適切なキー名を提案し、ユニバーサルシークレットストア経由で `~/.reyn/secrets.env` に値を保存します。
+
+`set-secret` を使う場面：
+
+- `install` 時にスキップした認証情報を追加する。
+- 特定のサーバーの既存認証情報をローテーションする。
+
+```bash
+# インタラクティブ（非表示入力）
+reyn mcp set-secret github GITHUB_PERSONAL_ACCESS_TOKEN
+
+# インラインの値
+reyn mcp set-secret github GITHUB_PERSONAL_ACCESS_TOKEN=ghp_new_token
+```
+
+ストレージはユニバーサルです。`reyn secret set GITHUB_PERSONAL_ACCESS_TOKEN=...` でも同じ結果になります。
+
+---
+
+## サブコマンド: `clear-secret`
+
+設定済み MCP サーバーの認証情報を削除します。
+
+```
+reyn mcp clear-secret <SERVER> [<KEY>]
+```
+
+| 引数 | 説明 |
+|----------|-------------|
+| `SERVER` | `mcp.servers.*` で宣言されているサーバー名。 |
+| `KEY` | 削除するシークレットキー。省略した場合、サーバーに宣言されているすべてのシークレットをクリアします。 |
+
+```bash
+# 特定の認証情報をクリア
+reyn mcp clear-secret github GITHUB_PERSONAL_ACCESS_TOKEN
+
+# サーバーのすべての認証情報をクリア
+reyn mcp clear-secret slack
+```
+
+---
+
+## サブコマンド: `serve`
+
+JSON-RPC stdio transport 経由で Reyn agents を外部の MCP 対応 client に公開します。
+
+```
+reyn mcp serve [--project PATH] [--timeout SECONDS] [共通フラグ]
+```
+
+`reyn mcp serve` は Reyn を MCP (Model Context Protocol) JSON-RPC server として起動します。Claude Code、Cursor、MCP 対応の OpenAI Agents SDK、その他 MCP プロトコルに対応した任意の外部 client は、`list_agents` と `send_to_agent` の 2 つのツールを使って Reyn agents にメッセージを送信できます。
+
+これは Reyn の MCP client ロール（Reyn がサードパーティの MCP server を呼び出す方向）の逆です。ここでは外部 client が Reyn に呼び込む形になります。`reyn chat` と同じ `reyn.yaml` および agent registry が MCP server のバックエンドとして使われます。Permission チェック、Event 出力、通常の OS バリデーションはすべて動作します。
+
+概念モデルと Two roles フレーミングについては [コンセプト: MCP](../../concepts/tools-integrations/mcp.md) の「ロール 2」セクションを参照してください。
+
+`reyn mcp serve` は stdio 上で JSON-RPC を話す server を起動します。Port は使いません。Claude Desktop、Cursor、Claude Code などの MCP client は通常 `cwd=/` で server プロセスを起動するため、client 設定の `args` リストに必ず `--project` を渡してください。それなしでは server が `reyn.yaml` を見つけられません。
+
+起動時の動作:
+
+1. Project root から `reyn.yaml` を読み込み、agent registry をロードします。
+2. WAL を per-agent スナップショットに replay し、実行中だった skill が再開できるようにします（`reyn chat` の起動と同じ動作）。
+3. MCP JSON-RPC ループに入り、tool 呼び出しを待ちます。
+
+stdin の EOF（MCP client が切断）を受け取ると、registry をクリーンにシャットダウンし、実行中のセッションをすべてドレインします。
+
+server は非インタラクティブに動作します。MCP transport が所有する stdin には人間がいないため、インタラクティブな Permission プロンプトは無期限にブロックします。server を接続する前に、`reyn.yaml` で `permissions: allow` を設定して Skill の Permission を事前承認してください。
+
+### `serve` オプション
+
+| フラグ | デフォルト | 説明 |
+|------|---------|-------------|
+| `--project PATH` | `reyn.yaml` を含む最も近い親ディレクトリ。見つからない場合は exit code 1 で失敗 | Project root。MCP client はプロセス起動時に `cwd` フィールドを無視するため、ほとんどの client 設定で必須です。 |
+| `--timeout SECONDS` | `60.0` | `send_to_agent` 呼び出しごとの最大ブロック時間。タイムアウト時は、それまでに蓄積した返信を返します。agent はバックグラウンドで作業を続け、次の `send_to_agent` 呼び出しで残りを受け取れます。 |
+
+共通フラグ（`--model`、`--output-language`、`--max-phase-visits` 等）も使用できます。[common-flags.md](common-flags.md) を参照してください。
+
+### 公開される Tools
+
+`reyn` という server 名で 2 つの MCP tool が登録されます。
+
+#### `list_agents()`
+
+`reyn.yaml` で宣言された agent ごとのオブジェクト配列を JSON で返します：
+
+```json
+[
+  {"name": "default", "role": "汎用アシスタント"},
+  {"name": "researcher", "role": "ドメイン調査と合成"}
+]
+```
+
+#### `send_to_agent(agent_name, message)`
+
+指定した agent にユーザーメッセージを送信し、最終返信まで（最大 `--timeout` 秒）ブロックします。
+
+返値：
+
+```json
+{"reply": "...", "partial": false, "agent": "default"}
+```
+
+`partial=true` の場合、agent がアイドルになる前にタイムアウトした状態です。再度呼び出すことで残りを受け取れます。マルチターンの継続性は保たれます。各 agent の `Session` は呼び出し間で `history.jsonl` を永続化します。
+
+### `serve` の例
+
+```bash
+# カレントディレクトリのプロジェクトに対して起動
+reyn mcp serve
+
+# 明示的な project パスを指定（ほとんどの MCP client 設定で必須）
+reyn mcp serve --project /path/to/your/project
+
+# 長時間の agent ターンに対応するためにタイムアウトを延長
+reyn mcp serve --project /path/to/your/project --timeout 180
+```
+
+Claude Code の `mcp.json` への組み込み（stdio transport）：
+
+```json
+{
+  "mcpServers": {
+    "reyn": {
+      "command": "/absolute/path/to/venv/bin/reyn",
+      "args": [
+        "mcp", "serve",
+        "--project", "/absolute/path/to/your/reyn-project"
+      ]
+    }
+  }
+}
+```
+
+---
+
+## Exit codes
+
+| コード | 意味 |
+|------|---------|
+| `0` | 成功 / クリーンなシャットダウン。 |
+| `1` | 設定エラー — `reyn.yaml` が見つからない、権限がない、WAL のスキーマバージョン不一致。 |
+| その他 | 予期しない例外。 |
+
+## 関連情報
+
+- [コンセプト: MCP](../../concepts/tools-integrations/mcp.md) — 概念モデル、2 つのロール、セキュリティモデル
+- [コンセプト: シークレット管理](../../concepts/runtime/secret-handling.md) — `~/.reyn/secrets.env` と `${VAR}` interpolation
+- [コンセプト: パーミッションモデル](../../concepts/runtime/permission-model.md) — `mcp_install` パーミッション
+- [Reference: `reyn secret`](secret.md) — ユニバーサルシークレット管理
+- [Reference: `reyn.yaml`](../config/reyn-yaml.md) — `mcp.servers:` スキーマと `file.write` + `http.get` install ゲート
+- [Reference: 共通フラグ](common-flags.md) — CLI コマンド共通フラグ
+

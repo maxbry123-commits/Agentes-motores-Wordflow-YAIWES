@@ -1,0 +1,92 @@
+"""Tier 2: python harness import does NOT load litellm (subprocess).
+
+OS invariant (FP-0008 C4):
+  Importing `reyn.core.kernel._python_harness` — the child-process entry point
+  for python preprocessor steps — must NOT trigger a transitive `import
+  litellm`. The litellm package takes ~8-14s to initialise; the sandboxed
+  preprocessor subprocess has a 5s timeout, so an eager litellm import
+  causes unconditional SIGKILL before any user code runs.
+
+  Verified in a fresh subprocess so that litellm already present in the
+  test process's sys.modules does not mask the bug.
+"""
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+
+
+def _run(src_root: str, code: str) -> subprocess.CompletedProcess:
+    env = {**os.environ, "PYTHONPATH": src_root}
+    # #4397: no timeout= — CI's own per-test pytest-timeout is the kill switch.
+    return subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+
+def test_harness_import_does_not_load_litellm(out_of_process_reyn):
+    """Tier 2: fresh subprocess import of harness leaves litellm out of sys.modules."""
+    code = (
+        "import reyn.core.kernel._python_harness; "
+        "import sys; "
+        "assert 'litellm' not in sys.modules, "
+        "'litellm was eagerly loaded by harness import: ' + str(sorted(k for k in sys.modules if k.startswith('litellm')))"
+    )
+    result = _run(out_of_process_reyn, code)
+    assert result.returncode == 0, (
+        f"harness import loaded litellm (or failed).\n"
+        f"stdout: {result.stdout}\n"
+        f"stderr: {result.stderr}"
+    )
+
+
+def test_harness_import_does_not_load_agent_llm_chain(out_of_process_reyn):
+    """Tier 2: fresh subprocess import of harness leaves the agent/llm/httpx chain out.
+
+    #1367 — the C4 lazy-litellm fix removed litellm from the harness path, but
+    ``reyn/__init__`` and ``reyn/kernel/__init__`` still eager-imported
+    ``Agent -> llm -> httpx`` (~0.5s), which under the in-container venv path on
+    an emulated host inflated past the ~5s step timeout. The package __init__s
+    are now PEP 562-lazy, so importing the harness must NOT transitively load
+    ``reyn.llm`` / ``httpx``. This is the structural invariant
+    (robust to host speed); the timing guard below is a coarse backstop.
+    """
+    code = (
+        "import reyn.core.kernel._python_harness; import sys; "
+        "leaked = [m for m in ('reyn.llm', 'reyn.llm.llm', 'httpx') "
+        "          if m in sys.modules]; "
+        "assert not leaked, 'harness import eagerly loaded heavy chain: ' + str(leaked)"
+    )
+    result = _run(out_of_process_reyn, code)
+    assert result.returncode == 0, (
+        f"harness import loaded the agent/llm/httpx chain (or failed).\n"
+        f"stdout: {result.stdout}\n"
+        f"stderr: {result.stderr}"
+    )
+
+
+def test_harness_import_time_is_below_ceiling(out_of_process_reyn):
+    """Tier 2: harness import completes well under the preprocessor timeout ceiling.
+
+    Ceiling is 3.0s — generous enough to avoid flake on slow CI, but well
+    below the pre-fix ~10s and well below the 5s preprocessor timeout.
+    A regression back to the eager litellm chain would produce ~8-14s and
+    fail this guard.
+    """
+    code = (
+        "import sys, time; "
+        "t = time.time(); "
+        "import reyn.core.kernel._python_harness; "
+        "elapsed = time.time() - t; "
+        "assert elapsed < 3.0, f'harness import took {elapsed:.2f}s (ceiling 3.0s)'"
+    )
+    result = _run(out_of_process_reyn, code)
+    assert result.returncode == 0, (
+        f"harness import exceeded ceiling.\n"
+        f"stdout: {result.stdout}\n"
+        f"stderr: {result.stderr}"
+    )

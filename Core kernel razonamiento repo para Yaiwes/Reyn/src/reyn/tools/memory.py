@@ -1,0 +1,673 @@
+"""memory ToolDefinitions — Wave 2 of M3 (ADR-0026).
+
+Five capabilities migrated from chat/router_tools.py ToolSpec literals:
+  LIST_MEMORY        — purity=read_only,  category=memory
+  READ_MEMORY_BODY   — purity=read_only,  category=memory
+  REMEMBER_SHARED    — purity=side_effect, category=memory
+  REMEMBER_AGENT     — purity=side_effect, category=memory
+  FORGET_MEMORY      — purity=side_effect, category=memory
+
+All five carry gates(router="allow").
+
+Status (post-FP-0039 audit, 2026-05-18): coarse-kind dispatch
+(= file / mcp / ask_user / web_fetch /
+web_search / mcp_install / sandboxed_exec) is wired through
+``invoke_tool(get_default_registry(), op.kind, ...)``.  #3226 Phase 3: the
+``sandboxed_exec`` op's ToolRegistry entry is now named ``exec`` (a
+tool/qualified-name-only rename — the op kind stays ``sandboxed_exec``), so
+this coarse-kind path is the one exception where ``op.kind`` and the
+``invoke_tool`` registry name now DIVERGE; every other coarse kind listed
+above still has registry name == op kind.  The fine-grained memory names
+(``list_memory`` / ``read_memory_body`` / ``remember_*`` / ``forget_memory``)
+are NOT in ``OP_KIND_MODEL_MAP``, so phase Control IR cannot emit them
+today — the phase=allow gate is reachable only if Control IR schema is
+later migrated to accept fine-grained ``op.kind`` values (= a separate
+future FP).  Until then these registrations function as documentation +
+defensive guards, not as live phase-dispatch paths.
+
+MemoryService access path:
+  Router-side, the handlers below delegate whole to
+  ``ctx.router_state.memory_service`` — the session's MemoryService, which
+  owns the memory operations and their domain rules (threat scan, YAML
+  frontmatter, listing-index regen, knowledge ingest/de-index).
+  Non-router callers (phase dispatch, tests) have no RouterCallerState, so
+  each handler keeps a fallback that reimplements the same sequence against
+  ``ctx.workspace.read_file`` / ``write_file`` / ``delete_file``:
+  ToolContext.workspace is a reyn.data.workspace.Workspace, which carries no
+  MemoryService. Closing that duplication means surfacing the capability on
+  ToolContext itself — the fallback is not a second design, it is the same
+  design missing a delivery route.
+"""
+from __future__ import annotations
+
+import re
+from pathlib import Path
+from typing import Any, Mapping
+
+from reyn.tools.descriptions import memory as _memory_descriptions
+from reyn.tools.types import ToolContext, ToolDefinition, ToolGates, ToolResult
+
+# ── Description literals — byte-identical to router_tools.py ToolSpec literals ─
+#
+# Reviewable in src/reyn/tools/descriptions/memory.py (Phase 2 of the
+# tool-description package refactor) — these aliases keep the call sites
+# unchanged (byte-identical relocation, no LLM-facing text change).
+
+_LIST_MEMORY_DESCRIPTION = _memory_descriptions.list_memory.text
+
+_READ_MEMORY_BODY_DESCRIPTION = _memory_descriptions.read_memory_body.text
+
+_REMEMBER_SHARED_DESCRIPTION = _memory_descriptions.remember_shared.text
+
+_REMEMBER_AGENT_DESCRIPTION = _memory_descriptions.remember_agent.text
+
+_FORGET_MEMORY_DESCRIPTION = _memory_descriptions.forget_memory.text
+
+
+
+# ── Parameter schemas — byte-identical to router_tools.py ToolSpec literals ────
+
+_LIST_MEMORY_PARAMETERS: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "path": {"type": "string"},
+    },
+    "required": ["path"],
+}
+
+_READ_MEMORY_BODY_PARAMETERS: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "layer": {
+            "type": "string",
+            "enum": ["shared", "agent"],
+        },
+        "slug": {"type": "string"},
+        "offset": {
+            "type": "integer",
+            "description": _memory_descriptions.PARAMS["read_memory_body"]["offset"].text,
+        },
+        "limit": {
+            "type": "integer",
+            "description": _memory_descriptions.PARAMS["read_memory_body"]["limit"].text,
+        },
+    },
+    "required": ["layer", "slug"],
+}
+
+_REMEMBER_SHARED_PARAMETERS: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "slug": {
+            "type": "string",
+            "description": _memory_descriptions.PARAMS["remember_shared"]["slug"].text,
+        },
+        "name": {"type": "string"},
+        "description": {
+            "type": "string",
+            "description": _memory_descriptions.PARAMS["remember_shared"]["description"].text,
+        },
+        "type": {
+            "type": "string",
+            "enum": ["user", "feedback", "project", "reference"],
+        },
+        "body": {
+            "type": "string",
+            "description": _memory_descriptions.PARAMS["remember_shared"]["body"].text,
+        },
+    },
+    "required": ["slug", "name", "description", "type", "body"],
+}
+
+_REMEMBER_AGENT_PARAMETERS: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "slug": {
+            "type": "string",
+            "description": _memory_descriptions.PARAMS["remember_agent"]["slug"].text,
+        },
+        "name": {"type": "string"},
+        "description": {
+            "type": "string",
+            "description": _memory_descriptions.PARAMS["remember_agent"]["description"].text,
+        },
+        "type": {
+            "type": "string",
+            "enum": ["user", "feedback", "project", "reference"],
+        },
+        "body": {
+            "type": "string",
+            "description": _memory_descriptions.PARAMS["remember_agent"]["body"].text,
+        },
+    },
+    "required": ["slug", "name", "description", "type", "body"],
+}
+
+_FORGET_MEMORY_PARAMETERS: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "layer": {
+            "type": "string",
+            "enum": ["shared", "agent"],
+        },
+        "slug": {"type": "string"},
+    },
+    "required": ["layer", "slug"],
+}
+
+
+# ── Internal helpers ─────────────────────────────────────────────────────────────
+
+def _memory_dir(workspace_base: Path, state_dir: Path, layer: str) -> Path:
+    """Resolve memory directory from layer.
+
+    layer="shared" → <cwd>/.reyn/memory
+    layer="agent"  → not resolved here (agent dir unknown without the
+                     agent name; returns state_dir/memory as fallback).
+
+    Design-revisit: router_state should carry agent_workspace_dir so the
+    "agent" layer resolves correctly. For now the agent layer always resolves
+    relative to .reyn/agents/ using the agent name from router_state if
+    available, falling back to state_dir.
+    """
+    if layer == "shared":
+        return state_dir / "memory"
+    # agent layer — try to find the agent name from caller context
+    # (deferred: see module docstring). Use state_dir/memory as safe fallback.
+    return state_dir / "agents" / "memory"
+
+
+def _resolve_memory_paths(
+    ctx: ToolContext,
+    layer: str,
+    slug: str | None = None,
+) -> tuple[Path, Path | None]:
+    """Return (mem_dir, body_path_or_None) for the given layer + optional slug.
+
+    Uses workspace.state_dir to construct the path hierarchy.
+    router_state not yet carrying agent_workspace_dir — see
+    module-level design-revisit note.
+    """
+    state_dir = ctx.workspace.state_dir
+    mem_dir = _memory_dir(ctx.workspace.base_dir, state_dir, layer)
+    body_path = (mem_dir / f"{slug}.md") if slug is not None else None
+    return mem_dir, body_path
+
+
+def _strip_frontmatter(content: str) -> str:
+    """Remove leading YAML frontmatter block from a memory file's text.
+
+    Ported from chat/router_loop.py._strip_frontmatter — same logic, same
+    behaviour, same rationale (G12 empty-stop attractor fix). Returns the
+    body text without the ---\\n...\\n--- preamble. If no valid frontmatter
+    is detected, returns the original text unchanged.
+    """
+    text = content or ""
+    if not text.lstrip().startswith("---"):
+        return text
+    lines = text.split("\n")
+    i = 0
+    while i < len(lines) and not lines[i].strip():
+        i += 1
+    if i >= len(lines) or lines[i].strip() != "---":
+        return text
+    close = -1
+    for j in range(i + 1, len(lines)):
+        if lines[j].strip() == "---":
+            close = j
+            break
+    if close == -1:
+        return text
+    body_lines = lines[close + 1:]
+    if body_lines and body_lines[0].strip() == "":
+        body_lines = body_lines[1:]
+    return "\n".join(body_lines).rstrip("\n") + ("\n" if body_lines else "")
+
+
+def _parse_memory_index(content: str) -> list[dict]:
+    """Parse MEMORY.md content into a flat list of entry dicts.
+
+    Each entry: {layer, slug, name, description}.
+    Supports the "# Memory Index (shared)" / "# Memory Index (agent:<name>)"
+    section headers written by MemoryService.
+    """
+    section_re = re.compile(
+        r"^#\s+Memory Index\s*(?:\((?P<layer>shared|agent:[^)]*)\))?"
+    )
+    entry_re = re.compile(r"\[([^\]]+)\]\(([^)]+)\.md\)(?:\s*[—–-]+\s*(.+))?")
+    entries: list[dict] = []
+    current_layer: str | None = None
+
+    for line in content.splitlines():
+        m = section_re.match(line.strip())
+        if m:
+            layer_raw = m.group("layer") or ""
+            if layer_raw == "shared":
+                current_layer = "shared"
+            elif layer_raw.startswith("agent:"):
+                current_layer = "agent"
+            else:
+                current_layer = None
+            continue
+        if current_layer is None:
+            continue
+        for em in entry_re.finditer(line):
+            entries.append({
+                "layer": current_layer,
+                "slug": em.group(2),
+                "name": em.group(1),
+                "description": (em.group(3) or "").strip(),
+            })
+    return entries
+
+
+# ── Handlers ─────────────────────────────────────────────────────────────────────
+
+async def _handle_list_memory(
+    args: Mapping[str, Any], ctx: ToolContext
+) -> ToolResult:
+    """Adapter for list_memory.
+
+    Router path (= production, ADR-0026 Phase 3.5-B-heavy): delegate to
+    ``ctx.router_state.list_memory_fn`` which is RouterLoop-bound to
+    ``RouterLoop._list_memory``.  That helper consumes
+    ``host.get_memory_index()`` (= the agent-aware combined index built
+    by the session layer), matching the legacy router branch behavior.
+
+    Fallback (= phase-side / test sites): read the layer indexes directly
+    from the workspace filesystem.  This path is NOT agent-aware and is
+    intended for non-router callers; the router production path always
+    populates list_memory_fn.
+    """
+    rs = ctx.router_state
+    if rs is not None and rs.list_memory_fn is not None:
+        return rs.list_memory_fn(args.get("path", ""))
+
+    path = args.get("path", "")
+    state_dir = ctx.workspace.state_dir
+
+    def _read_index(layer: str) -> str:
+        idx_path = state_dir / ("memory" if layer == "shared" else "agents/memory") / "MEMORY.md"
+        try:
+            content, found = ctx.workspace.read_file(str(idx_path))
+            return content if found else ""
+        except Exception:
+            return ""
+
+    shared_content = _read_index("shared")
+    agent_content = _read_index("agent")
+
+    if not path:
+        # Return root: [{path: "shared", count: N}, {path: "agent", count: M}]
+        shared_entries = _parse_memory_index(shared_content)
+        agent_entries = _parse_memory_index(agent_content)
+        shared_count = sum(1 for e in shared_entries if e["layer"] == "shared")
+        agent_count = sum(1 for e in agent_entries if e["layer"] == "agent")
+        return [
+            {"path": "shared", "count": shared_count},
+            {"path": "agent", "count": agent_count},
+        ]
+
+    parts = path.split("/", 1)
+    layer = parts[0]
+    content = shared_content if layer == "shared" else agent_content
+    all_entries = _parse_memory_index(content)
+    layer_entries = [e for e in all_entries if e["layer"] == layer]
+
+    if len(parts) == 1:
+        # Return sub-categories (types) for this layer
+        type_counts: dict[str, int] = {}
+        type_re = re.compile(r"^(user|feedback|project|reference)_")
+        for e in layer_entries:
+            tm = type_re.match(e["slug"])
+            if tm:
+                mtype = tm.group(1)
+                type_counts[mtype] = type_counts.get(mtype, 0) + 1
+        return [
+            {"path": f"{layer}/{mtype}", "count": count}
+            for mtype, count in sorted(type_counts.items())
+            if count > 0
+        ]
+
+    # path == "shared/user" etc. → items matching layer + type
+    mtype = parts[1]
+    type_re = re.compile(r"^(user|feedback|project|reference)_")
+    items = []
+    for e in layer_entries:
+        tm = type_re.match(e["slug"])
+        if tm and tm.group(1) == mtype:
+            items.append({
+                "slug": e["slug"],
+                "name": e["name"],
+                "description": e["description"],
+            })
+    return items
+
+
+def _slice_body_lines(
+    content: str, offset: int | None, limit: int | None,
+) -> str:
+    """Apply line-based offset/limit slicing to memory body text.
+
+    Mirrors ``op_runtime/file.py`` read-op slicing semantics so the
+    three "read one entry" surfaces (= ``read_file`` / ``reyn_repo_read``
+    / ``read_memory_body``) behave identically when given the same
+    offset/limit values.
+    """
+    if offset is None and limit is None:
+        return content
+    lines = content.splitlines(keepends=True)
+    start = max(0, offset or 0)
+    sliced = lines[start:start + limit] if limit is not None else lines[start:]
+    return "".join(sliced)
+
+
+async def _handle_read_memory_body(
+    args: Mapping[str, Any], ctx: ToolContext
+) -> ToolResult:
+    """Adapter for read_memory_body.
+
+    Router path: delegate to ``ctx.router_state.memory_service.read_body``
+    (= the session's MemoryService) for agent-aware file resolution.
+
+    Fallback: read the body file via ``ctx.workspace.read_file`` and
+    strip the YAML frontmatter (= same G12 attractor fix logic as the
+    router helper).
+
+    Optional ``offset`` / ``limit`` line-slice args apply against the
+    body **after** frontmatter is stripped — so the offset counts the
+    content the LLM would actually see.
+    """
+    offset_raw = args.get("offset")
+    limit_raw = args.get("limit")
+    offset = int(offset_raw) if offset_raw is not None else None
+    limit = int(limit_raw) if limit_raw is not None else None
+
+    rs = ctx.router_state
+    if rs is not None and rs.memory_service is not None:
+        return await rs.memory_service.read_body(
+            layer=args.get("layer", ""), slug=args.get("slug", ""),
+            offset=offset, limit=limit,
+        )
+
+    layer = args.get("layer", "")
+    slug = args.get("slug", "")
+
+    _mem_dir, body_path = _resolve_memory_paths(ctx, layer, slug)
+    if body_path is None:
+        return {"error": "slug is required"}
+
+    try:
+        content, found = ctx.workspace.read_file(str(body_path))
+        if not found:
+            return {"error": f"memory entry not found: {slug}", "layer": layer, "slug": slug}
+        body = _strip_frontmatter(content)
+        return {
+            "content": _slice_body_lines(body, offset, limit),
+            "layer": layer,
+            "slug": slug,
+        }
+    except Exception as exc:
+        return {"error": str(exc), "layer": layer, "slug": slug}
+
+
+async def _handle_remember(
+    args: Mapping[str, Any],
+    ctx: ToolContext,
+    *,
+    layer: str,
+) -> ToolResult:
+    """Shared adapter body for remember_shared / remember_agent.
+
+    Router path: delegate to ``ctx.router_state.memory_service.remember``
+    (= the session's MemoryService), which owns the whole sequence: threat
+    scan → write → listing-index regen → knowledge ingest.
+
+    Fallback: write frontmatter + body via ctx.workspace, then
+    regenerate MEMORY.md by scanning the layer dir.
+    """
+    rs = ctx.router_state
+    if rs is not None and rs.memory_service is not None:
+        return await rs.memory_service.remember(
+            layer=layer,
+            slug=args.get("slug", ""),
+            name=args.get("name", ""),
+            description=args.get("description", ""),
+            type=args.get("type", ""),
+            body=args.get("body", ""),
+        )
+
+    slug = args.get("slug", "")
+    name = args.get("name", "")
+    description = args.get("description", "")
+    mem_type = args.get("type", "")
+    body = args.get("body", "")
+
+    # Defensive: strip trailing .md (LLM may emit it despite the schema description).
+    if slug.endswith(".md"):
+        slug = slug[:-3]
+
+    mem_dir, body_path = _resolve_memory_paths(ctx, layer, slug)
+    if body_path is None:
+        return {"error": "slug is required"}
+
+    frontmatter = (
+        f"---\nname: {name}\ndescription: {description}\ntype: {mem_type}\n---\n\n{body}\n"
+    )
+
+    try:
+        ctx.workspace.write_file(str(body_path), frontmatter)
+    except Exception as exc:
+        return {"error": str(exc)}
+
+    # Regenerate MEMORY.md index — scan the layer dir and rebuild.
+    index_path = mem_dir / "MEMORY.md"
+    try:
+        _regenerate_index(ctx, mem_dir, index_path)
+    except Exception as exc:
+        return {"error": f"index regeneration failed: {exc}"}
+
+    ctx.events.emit("memory_saved", layer=layer, slug=slug, path=str(body_path))
+
+    # FP-0066 P3a (#3247 firm §3/§7): dynamic sync-in-op knowledge ingest —
+    # same hook as MemoryService.remember's production path (see
+    # sync_memory_ingest's docstring for the §G2 best-effort contract).
+    # This fallback path is exercised by non-router (phase/test) callers.
+    from reyn.data.index.coordinator import get_index_coordinator
+    from reyn.data.index.knowledge_ingest import sync_memory_ingest
+    from reyn.tools.op_context_bridge import build_legacy_op_context
+
+    await sync_memory_ingest(
+        get_index_coordinator(ctx.workspace.base_dir),
+        ctx.workspace.base_dir,
+        build_legacy_op_context(ctx),
+        events=ctx.events,
+    )
+
+    return {"saved": slug, "layer": layer, "path": str(body_path)}
+
+
+async def _handle_remember_shared(
+    args: Mapping[str, Any], ctx: ToolContext
+) -> ToolResult:
+    """Adapter for remember_shared — delegates to shared layer."""
+    return await _handle_remember(args, ctx, layer="shared")
+
+
+async def _handle_remember_agent(
+    args: Mapping[str, Any], ctx: ToolContext
+) -> ToolResult:
+    """Adapter for remember_agent — delegates to agent layer."""
+    return await _handle_remember(args, ctx, layer="agent")
+
+
+async def _handle_forget_memory(
+    args: Mapping[str, Any], ctx: ToolContext
+) -> ToolResult:
+    """Adapter for forget_memory.
+
+    Router path: delegate to ``ctx.router_state.memory_service.forget``
+    (= the session's MemoryService), which owns the whole sequence: delete →
+    listing-index regen → knowledge de-index.
+
+    Fallback: delete the body file via ctx.workspace and regenerate the
+    layer's MEMORY.md.
+    """
+    rs = ctx.router_state
+    if rs is not None and rs.memory_service is not None:
+        return await rs.memory_service.forget(
+            layer=args.get("layer", ""), slug=args.get("slug", ""),
+        )
+
+    layer = args.get("layer", "")
+    slug = args.get("slug", "")
+
+    if slug.endswith(".md"):
+        slug = slug[:-3]
+
+    mem_dir, body_path = _resolve_memory_paths(ctx, layer, slug)
+    if body_path is None:
+        return {"error": "slug is required"}
+
+    try:
+        deleted = ctx.workspace.delete_file(str(body_path))
+    except Exception as exc:
+        return {"error": str(exc)}
+
+    if not deleted:
+        return {"error": f"memory entry not found: {slug}"}
+
+    index_path = mem_dir / "MEMORY.md"
+    try:
+        _regenerate_index(ctx, mem_dir, index_path)
+    except Exception as exc:
+        return {"error": f"index regeneration failed: {exc}"}
+
+    ctx.events.emit("memory_deleted", layer=layer, slug=slug, path=str(body_path))
+
+    # FP-0066 P3a (#3247 firm §4 G3): sync de-index — NOT best-effort (see
+    # sync_memory_deindex's docstring). Mirrors MemoryService.forget's
+    # production hook for this non-router fallback path.
+    from reyn.data.index.coordinator import get_index_coordinator
+    from reyn.data.index.knowledge_ingest import sync_memory_deindex
+
+    try:
+        await sync_memory_deindex(
+            get_index_coordinator(ctx.workspace.base_dir), layer, slug,
+        )
+    except Exception as exc:
+        return {"error": f"knowledge de-index failed: {exc}", "layer": layer, "slug": slug}
+
+    return {"deleted": slug, "layer": layer}
+
+
+# ── Index regeneration helper ────────────────────────────────────────────────────
+
+def _regenerate_index(ctx: ToolContext, mem_dir: Path, index_path: Path) -> None:
+    """Regenerate MEMORY.md by scanning <mem_dir>/*.md (excluding MEMORY.md).
+
+    Reads frontmatter from each .md file to extract name / description, then
+    writes a fresh MEMORY.md. This is a synchronous filesystem operation —
+    acceptable for M3 because workspace file ops are synchronous. M4 may switch
+    to the MemoryService async callbacks when ToolContext exposes them.
+    """
+    frontmatter_re = re.compile(
+        r"^---\s*\nname:\s*(?P<name>[^\n]*)\ndescription:\s*(?P<desc>[^\n]*)\n",
+        re.MULTILINE,
+    )
+
+    entries: list[tuple[str, str, str]] = []  # (slug, name, description)
+    try:
+        mem_dir.mkdir(parents=True, exist_ok=True)
+        for md_file in sorted(mem_dir.glob("*.md")):
+            if md_file.name == "MEMORY.md":
+                continue
+            try:
+                content, _ = ctx.workspace.read_file(str(md_file))
+                m = frontmatter_re.search(content)
+                name_val = m.group("name").strip() if m else md_file.stem
+                desc_val = m.group("desc").strip() if m else ""
+            except Exception:
+                name_val = md_file.stem
+                desc_val = ""
+            entries.append((md_file.stem, name_val, desc_val))
+    except Exception:
+        pass
+
+    lines = ["# Memory Index\n\n"]
+    for slug, name, desc in entries:
+        lines.append(f"- [{name}]({slug}.md) — {desc}\n")
+
+    ctx.workspace.write_file(str(index_path), "".join(lines))
+
+
+# ── ToolDefinition instances ─────────────────────────────────────────────────────
+
+from reyn.core.offload.canonical import (  # noqa: E402
+    forget_memory_to_canonical,
+    memory_body_to_canonical,
+    memory_list_to_canonical,
+    remember_to_canonical,
+)
+
+LIST_MEMORY = ToolDefinition(
+    canonical=memory_list_to_canonical,
+    name="list_memory",
+    router_dispatched=True,
+    description=_LIST_MEMORY_DESCRIPTION,
+    parameters=_LIST_MEMORY_PARAMETERS,
+    gates=ToolGates(router="allow"),
+    handler=_handle_list_memory,
+    category="memory",
+    purity="read_only",
+    returns_external_content=True,  # FP-0050/#1822: user/agent-written .md descriptions
+)
+
+READ_MEMORY_BODY = ToolDefinition(
+    canonical=memory_body_to_canonical,
+    name="read_memory_body",
+    router_dispatched=True,
+    description=_READ_MEMORY_BODY_DESCRIPTION,
+    parameters=_READ_MEMORY_BODY_PARAMETERS,
+    gates=ToolGates(router="allow"),
+    handler=_handle_read_memory_body,
+    category="memory",
+    purity="read_only",
+    returns_external_content=True,  # FP-0050/#1822: user/agent-written .md body
+)
+
+REMEMBER_SHARED = ToolDefinition(
+    canonical=remember_to_canonical,
+    name="remember_shared",
+    router_dispatched=True,
+    description=_REMEMBER_SHARED_DESCRIPTION,
+    parameters=_REMEMBER_SHARED_PARAMETERS,
+    gates=ToolGates(router="allow"),
+    handler=_handle_remember_shared,
+    category="memory",
+    purity="side_effect",
+)
+
+REMEMBER_AGENT = ToolDefinition(
+    canonical=remember_to_canonical,
+    name="remember_agent",
+    router_dispatched=True,
+    description=_REMEMBER_AGENT_DESCRIPTION,
+    parameters=_REMEMBER_AGENT_PARAMETERS,
+    gates=ToolGates(router="allow"),
+    handler=_handle_remember_agent,
+    category="memory",
+    purity="side_effect",
+)
+
+FORGET_MEMORY = ToolDefinition(
+    canonical=forget_memory_to_canonical,
+    name="forget_memory",
+    router_dispatched=True,
+    description=_FORGET_MEMORY_DESCRIPTION,
+    parameters=_FORGET_MEMORY_PARAMETERS,
+    gates=ToolGates(router="allow"),
+    handler=_handle_forget_memory,
+    category="memory",
+    purity="side_effect",
+)

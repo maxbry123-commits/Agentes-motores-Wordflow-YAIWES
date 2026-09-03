@@ -1,0 +1,683 @@
+"""Tool descriptions for the ``mcp`` category.
+
+Every MCP-consumption / MCP-lifecycle ToolDefinition's description string
+lives here as a reviewable ``ToolDescription`` record. Each ``.text``
+value is byte-identical to its origin tool module's ``_X_DESCRIPTION``
+constant, which now aliases to ``mcp.NAME.text`` so every call site is
+unchanged.
+
+Grouped here by feature (MCP), not by each entry's literal
+``ToolDefinition.category=`` value: 11 entries carry ``category="discovery"``
+in code (predating the ``mcp`` category) and 6 install/drop entries carry
+``category="io"`` — but all 17 are MCP-specific verbs a reviewer wants
+audited in one place. Excludes ``mcp_search_registry``, which lives in
+``descriptions.discovery`` — its own ``ToolDefinition.category`` IS
+``"discovery"`` and it is discovery-shaped, not install-shaped.
+
+Covers, by origin module:
+  ``mcp.py``: list_mcp_servers, list_mcp_tools, call_mcp_tool,
+    describe_mcp_tool, list_mcp_resources, list_mcp_resource_templates,
+    read_mcp_resource, subscribe_mcp_resource, unsubscribe_mcp_resource,
+    list_mcp_prompts, get_mcp_prompt.
+  ``mcp_verbs.py``: mcp_install_registry, mcp_install_package,
+    mcp_install_local, mcp_call_tool.
+  ``mcp_install.py``: mcp_install (legacy install op, gates.router=deny).
+  ``mcp_drop.py``: mcp_drop_server.
+"""
+from __future__ import annotations
+
+from reyn.tools.descriptions._types import ParamDescription, ToolDescription
+
+list_mcp_servers = ToolDescription(
+    tool_name="list_mcp_servers",
+    surfaced="router (gates.router=allow)",
+    purpose="Enumerate configured MCP servers (name + description) for this agent.",
+    text=(
+        "List available MCP servers configured for this agent. "
+        "Returns name + description per server."
+    ),
+    ja="このエージェント用に設定された MCP サーバーを列挙する。サーバーごとに name + description を返す。",
+)
+
+list_mcp_tools = ToolDescription(
+    tool_name="list_mcp_tools",
+    surfaced="router (gates.router=allow)",
+    purpose=(
+        "List the tools exposed by one MCP server, including inputSchema, "
+        "so the LLM can construct call_mcp_tool args without an extra "
+        "describe round-trip (#879)."
+    ),
+    text=(
+        "List tools exposed by one MCP server "
+        "(with description per tool)."
+    ),
+    ja="1つの MCP サーバーが公開するツールを一覧表示する（ツールごとに説明付き）。",
+)
+
+call_mcp_tool = ToolDescription(
+    tool_name="call_mcp_tool",
+    surfaced="router (gates.router=allow)",
+    purpose=(
+        "Invoke a named tool on an MCP server with args matching its "
+        "declared input schema."
+    ),
+    text=(
+        "Invoke a mcp_tool on an MCP server. Construct args matching "
+        "the mcp_tool's input schema (see describe_mcp_tool)."
+    ),
+    ja=(
+        "MCP サーバー上の mcp_tool を呼び出す。mcp_tool の入力スキーマに"
+        "合わせて引数を構築する（describe_mcp_tool 参照）。"
+    ),
+)
+
+describe_mcp_tool = ToolDescription(
+    tool_name="describe_mcp_tool",
+    surfaced="router (gates.router=allow) — FP-0032 D4",
+    purpose=(
+        "Fetch one MCP tool's input schema when unsure how to construct "
+        "call_mcp_tool's args."
+    ),
+    text=(
+        "Get the input schema for one mcp_tool registered on an MCP server. "
+        "Call this before call_mcp_tool if you're unsure how to "
+        "construct the args."
+    ),
+    ja=(
+        "MCP サーバーに登録された1つの mcp_tool の入力スキーマを取得する。"
+        "call_mcp_tool の引数の組み立て方が分からない場合、事前に呼ぶ。"
+    ),
+)
+
+list_mcp_resources = ToolDescription(
+    tool_name="list_mcp_resources",
+    surfaced="router (gates.router=allow) — #2597 slice ②a",
+    purpose="Enumerate one MCP server's resources (uri + description per resource).",
+    text=(
+        "List resources exposed by one MCP server "
+        "(with uri + description per resource)."
+    ),
+    ja="1つの MCP サーバーが公開するリソースを一覧表示する（uri + 説明付き）。",
+)
+
+list_mcp_resource_templates = ToolDescription(
+    tool_name="list_mcp_resource_templates",
+    surfaced="router (gates.router=allow) — #2597 slice ②a",
+    purpose=(
+        "Enumerate one MCP server's parameterized resource-URI templates, "
+        "distinct from list_mcp_resources' concrete resource list."
+    ),
+    text=(
+        "List resource templates (parameterized URI patterns) exposed by one "
+        "MCP server. Use list_mcp_resources for concrete resources."
+    ),
+    ja=(
+        "1つの MCP サーバーが公開するリソーステンプレート（パラメータ化"
+        "された URI パターン）を一覧表示する。具体的なリソースには "
+        "list_mcp_resources を使う。"
+    ),
+)
+
+read_mcp_resource = ToolDescription(
+    tool_name="read_mcp_resource",
+    surfaced="router (gates.router=allow) — #2597 slice ②a",
+    purpose=(
+        "Read one MCP resource's content by URI, resolved from "
+        "list_mcp_resources or a list_mcp_resource_templates template."
+    ),
+    text=(
+        "Read the contents of one MCP resource by URI. Get the uri from "
+        "list_mcp_resources (or by resolving a list_mcp_resource_templates "
+        "template)."
+    ),
+    ja=(
+        "URI で指定した1つの MCP リソースの内容を読む。uri は "
+        "list_mcp_resources から取得する（または list_mcp_resource_"
+        "templates のテンプレートを解決して得る）。"
+    ),
+)
+
+subscribe_mcp_resource = ToolDescription(
+    tool_name="subscribe_mcp_resource",
+    surfaced="router (gates.router=allow) — #2597 slice ②b",
+    purpose=(
+        "Subscribe to server-pushed change notifications for one MCP "
+        "resource; the notification itself carries no content — "
+        "read_mcp_resource must be re-called to see it."
+    ),
+    text=(
+        "Subscribe to server-pushed updates for one MCP resource by URI. When the "
+        "server-side content changes, a mcp_resource_updated event is recorded — "
+        "call read_mcp_resource again to see the new content (the push notification "
+        "itself carries no content, just a signal that something changed)."
+    ),
+    ja=(
+        "URI で指定した1つの MCP リソースについて、サーバー側からのプッシュ"
+        "更新を購読する。サーバー側のコンテンツが変わると mcp_resource_"
+        "updated イベントが記録される — 新しい内容を見るには read_mcp_"
+        "resource を再度呼ぶ（プッシュ通知自体はコンテンツを持たず、変化の"
+        "シグナルのみ）。"
+    ),
+)
+
+unsubscribe_mcp_resource = ToolDescription(
+    tool_name="unsubscribe_mcp_resource",
+    surfaced="router (gates.router=allow) — #2597 slice ②b",
+    purpose="Cancel a previously-established subscribe_mcp_resource subscription.",
+    text=(
+        "Unsubscribe from server-pushed updates for one MCP resource by URI "
+        "(previously subscribed via subscribe_mcp_resource)."
+    ),
+    ja=(
+        "URI で指定した1つの MCP リソースについて、以前 subscribe_mcp_"
+        "resource で購読したサーバープッシュ更新を解除する。"
+    ),
+)
+
+list_mcp_subscriptions = ToolDescription(
+    tool_name="list_mcp_subscriptions",
+    surfaced="router (gates.router=allow) — #4686",
+    purpose=(
+        "Report currently-tracked resource subscriptions, per MCP "
+        "connection — never aggregated across connections, since what "
+        "'subscribed' confirms differs by connection mode (Legacy can't "
+        "report honored-ness; Listen can)."
+    ),
+    text=(
+        "List currently-tracked MCP resource subscriptions, one entry per "
+        "connection with at least one subscribed URI. Each entry reports "
+        "the connection's mode (legacy/listen), the URIs this session is "
+        "trying to keep subscribed, and which of those the server did NOT "
+        "confirm (or null if that can't be determined for this connection "
+        "right now). A URI the server declined still appears here — it is "
+        "never dropped from the list, so a subscription that silently "
+        "stopped working stays visible instead of disappearing."
+    ),
+    ja=(
+        "現在追跡している MCP リソース購読を、接続ごとに一覧表示する — "
+        "接続をまたいだ集計は行わない（'subscribed' が意味することは接続の"
+        "モードで異なるため — Legacy は honored かどうかを報告できず、"
+        "Listen はできる）。エントリごとに接続モード（legacy/listen）、この"
+        "セッションが購読を維持しようとしている URI 一覧、そのうちサーバー"
+        "が確認しなかったもの（この接続では判定できない場合は null）を返す。"
+        "サーバーが拒否した URI も一覧から消えない — 静かに機能しなくなった"
+        "購読が画面から消えて見えなくなることを防ぐため。"
+    ),
+)
+
+list_mcp_prompts = ToolDescription(
+    tool_name="list_mcp_prompts",
+    surfaced="router (gates.router=allow) — #2597 slice ②c",
+    purpose="Enumerate one MCP server's prompts (name + description + arguments).",
+    text=(
+        "List prompts exposed by one MCP server "
+        "(with name + description + arguments per prompt)."
+    ),
+    ja=(
+        "1つの MCP サーバーが公開するプロンプトを一覧表示する（プロンプト"
+        "ごとに name + description + arguments 付き）。"
+    ),
+)
+
+get_mcp_prompt = ToolDescription(
+    tool_name="get_mcp_prompt",
+    surfaced="router (gates.router=allow) — #2597 slice ②c",
+    purpose=(
+        "Fetch one MCP prompt's rendered messages by name, using the "
+        "argument schema from list_mcp_prompts."
+    ),
+    text=(
+        "Fetch one rendered MCP prompt's messages by name. Get the name (and its "
+        "argument schema) from list_mcp_prompts."
+    ),
+    ja=(
+        "名前で指定した1つの MCP プロンプトのレンダリング済みメッセージを"
+        "取得する。name（と引数スキーマ）は list_mcp_prompts から取得する。"
+    ),
+)
+
+mcp_install_registry = ToolDescription(
+    tool_name="mcp_install_registry",
+    surfaced="router (gates.router=allow) — install source-axis split",
+    purpose=(
+        "Install an MCP server from the official registry by server_id "
+        "(paired with mcp_search_registry candidates), handling the "
+        "needs_secrets round-trip when secret env-vars are required."
+    ),
+    text=(
+        "Install an MCP server from the official MCP registry by its "
+        "registry name (server_id from mcp_search_registry candidates[].name). "
+        "When the server requires secret environment variables that the "
+        "operator has not yet set, the call returns status='needs_secrets' "
+        "with a guide explaining the `reyn secret set <KEY>` command; relay "
+        "that to the user and retry after they confirm secrets are set."
+    ),
+    ja=(
+        "公式 MCP レジストリから server_id を指定してサーバーをインストール"
+        "する（server_id は mcp_search_registry の candidates[].name から"
+        "得る）。サーバーがシークレット環境変数を要求し未設定の場合、"
+        "status='needs_secrets' と `reyn secret set <KEY>` の案内を返す — "
+        "ユーザーに伝え、設定確認後に再試行する。"
+    ),
+)
+
+mcp_install_package = ToolDescription(
+    tool_name="mcp_install_package",
+    surfaced="router (gates.router=allow) — install source-axis split",
+    purpose=(
+        "Install an MCP server from a third-party package channel "
+        "(npm/pypi/docker) or a GitHub repo URL, for servers not in the "
+        "official registry."
+    ),
+    text=(
+        "Install an MCP server from a third-party package channel "
+        "(npm / pypi / docker) or a GitHub repo URL. Use when the server "
+        "isn't in the official registry (= mcp_search_registry returned "
+        "no match). Secret detection works the same as install_registry "
+        "for npm/pypi/docker; github URLs cannot pre-declare secrets."
+    ),
+    ja=(
+        "サードパーティのパッケージチャネル（npm/pypi/docker）または "
+        "GitHub リポジトリ URL から MCP サーバーをインストールする。公式"
+        "レジストリにない場合（mcp_search_registry が一致なしを返した"
+        "場合）に使う。npm/pypi/docker はシークレット検出が install_"
+        "registry と同様に働くが、github URL は事前宣言できない。"
+    ),
+)
+
+mcp_install_local = ToolDescription(
+    tool_name="mcp_install_local",
+    surfaced="router (gates.router=allow) — install source-axis split",
+    purpose=(
+        "Register a local MCP server ({command, args} pair) directly, for "
+        "LLM-authored scripts or local dev servers, bypassing package "
+        "registries."
+    ),
+    text=(
+        "Install a local MCP server by registering a {command, args} pair "
+        "directly. Use for LLM-authored scripts or local development "
+        "servers. Bypasses package registries — cannot auto-detect required "
+        "secrets, so pass env_overrides inline when the server needs env-vars."
+    ),
+    ja=(
+        "{command, args} のペアを直接登録してローカル MCP サーバーを"
+        "インストールする。LLM が作成したスクリプトやローカル開発サーバー"
+        "向け。パッケージレジストリを経由しないため必要なシークレットを"
+        "自動検出できない — env-var が必要な場合は env_overrides を"
+        "インラインで渡す。"
+    ),
+)
+
+mcp_call_tool = ToolDescription(
+    tool_name="mcp_call_tool",
+    surfaced=(
+        "router (gates.router=allow) — generic "
+        "fallback beneath per-tool universal-catalog actions"
+    ),
+    purpose=(
+        "Call any installed MCP server's tool by its <server>__<tool> "
+        "identifier."
+    ),
+    text=(
+        "Call a tool on an installed MCP server. Pass the tool identifier in "
+        "<server>__<tool> form (e.g. 'time__get_current_time') exactly as "
+        "returned by list_mcp_tools, plus the tool's own args dict. "
+        "list_mcp_tools also returns each tool's authoritative input_schema, so "
+        "no describe round-trip is needed to build those args."
+    ),
+    ja=(
+        "インストール済み MCP サーバーのツールを呼び出す。ツール識別子は "
+        "list_mcp_tools が返す <server>__<tool> 形式（例 "
+        "'time__get_current_time'）＋そのツール自身の引数 dict を渡す。"
+        "各ツールの入力スキーマも list_mcp_tools が返すので、事前の照会は不要。"
+    ),
+)
+
+mcp_install = ToolDescription(
+    tool_name="mcp_install",
+    surfaced=(
+        "not surfaced (gates.router=deny) — legacy Control "
+        "IR install op, ADR-0026 + ADR-0029"
+    ),
+    purpose=(
+        "Phase-authored install of an MCP server from the registry into a "
+        "chosen scope config file, with permission gate + secret prompting "
+        "owned by op_runtime.mcp_install."
+    ),
+    text=(
+        "Install an MCP server from the registry. "
+        "Fetches server.json, gates via permission resolver, "
+        "prompts for secrets, and writes the server entry to the "
+        "appropriate scope config file (local / project / user). "
+        "Status: enabled — this tool's presence in your tool list means "
+        "the required `file.write` and `http.get` permissions are verified. "
+        "Call mcp_install directly; do not abort on permission concerns."
+    ),
+    ja=(
+        "レジストリから MCP サーバーをインストールする（フェーズ専用の "
+        "Control IR オペレーション）。server.json を取得し、パーミッション"
+        "リゾルバでゲートし、シークレットを尋ね、適切なスコープの設定"
+        "ファイル（local/project/user）にサーバーエントリを書き込む。"
+        "このツールがツールリストに存在すること自体が file.write / "
+        "http.get 権限確認済みを意味する — 権限懸念で中断せず直接呼ぶ。"
+    ),
+)
+
+mcp_drop_server = ToolDescription(
+    tool_name="mcp_drop_server",
+    surfaced="router (gates.router=allow) — FP-0034 §D23",
+    purpose=(
+        "Remove a configured MCP server entry (the destructor counterpart "
+        "to mcp_install), optionally clearing its secrets, gated by a "
+        "distinct mcp_drop_server permission."
+    ),
+    text=(
+        "Remove a configured MCP server. "
+        "Counter-op to mcp_install — deletes the server entry from "
+        "reyn.local.yaml / reyn.yaml / ~/.reyn/config.yaml (scope is "
+        "auto-detected when omitted). Optionally cleans the matching "
+        "${KEY} env entries from ~/.reyn/secrets.env. "
+        "Permission-gated via mcp_drop_server (= distinct from "
+        "mcp_install; install intent alone is insufficient)."
+    ),
+    ja=(
+        "設定済みの MCP サーバーを削除する（mcp_install の対になる破壊的"
+        "操作）。reyn.local.yaml / reyn.yaml / ~/.reyn/config.yaml から"
+        "サーバーエントリを削除する（scope 省略時は自動検出）。任意で "
+        "~/.reyn/secrets.env の対応する ${KEY} エントリも削除する。"
+        "mcp_drop_server という別個のパーミッションでゲートされる"
+        "（mcp_install とは別）。"
+    ),
+)
+
+ALL: dict[str, ToolDescription] = {
+    "list_mcp_servers": list_mcp_servers,
+    "list_mcp_tools": list_mcp_tools,
+    "call_mcp_tool": call_mcp_tool,
+    "describe_mcp_tool": describe_mcp_tool,
+    "list_mcp_resources": list_mcp_resources,
+    "list_mcp_resource_templates": list_mcp_resource_templates,
+    "read_mcp_resource": read_mcp_resource,
+    "subscribe_mcp_resource": subscribe_mcp_resource,
+    "unsubscribe_mcp_resource": unsubscribe_mcp_resource,
+    "list_mcp_prompts": list_mcp_prompts,
+    "get_mcp_prompt": get_mcp_prompt,
+    "mcp_install_registry": mcp_install_registry,
+    "mcp_install_package": mcp_install_package,
+    "mcp_install_local": mcp_install_local,
+    "mcp_call_tool": mcp_call_tool,
+    "mcp_install": mcp_install,
+    "mcp_drop_server": mcp_drop_server,
+}
+
+
+# ── Phase 4: per-parameter descriptions (byte-identical relocation) ──────────
+#
+# ``server_mcp_name_param`` / ``server_uri_param`` are re-used across
+# several entries below wherever the origin schema repeats the exact same
+# literal string (mirrors the origin file's own repetition, not a new
+# dedup).
+
+_server_param = ParamDescription(
+    text="MCP server name — choose from the enum (verbatim).",
+    ja="MCP サーバー名 — enum からそのまま選ぶ。",
+)
+_resource_uri_param = ParamDescription(
+    text="Resource URI, verbatim from list_mcp_resources.",
+    ja="list_mcp_resources から得たリソース URI（そのまま）。",
+)
+
+PARAMS: dict[str, dict[str, ParamDescription]] = {
+    "call_mcp_tool": {
+        "server": _server_param,
+        "mcp_tool_name": ParamDescription(
+            text=(
+                "Dotted mcp_tool identifier: <server>.<tool> — choose from "
+                "the enum. Use describe_mcp_tool for the full input schema."
+            ),
+            ja=(
+                "ドット区切りの mcp_tool 識別子: <server>.<tool> — enum から"
+                "選ぶ。完全な入力スキーマは describe_mcp_tool で取得。"
+            ),
+        ),
+        "tool_args": ParamDescription(
+            text=(
+                "The target MCP tool's OWN parameters (the shape from "
+                "describe_mcp_tool), as a nested object here — NOT flat alongside "
+                "server / mcp_tool_name."
+            ),
+            ja=(
+                "対象 MCP ツール自体のパラメータ（describe_mcp_tool の形）。"
+                "ここではネストされたオブジェクトとして渡す — server / "
+                "mcp_tool_name と同じ階層に平らに置かない。"
+            ),
+        ),
+    },
+    "describe_mcp_tool": {
+        "server": _server_param,
+        "mcp_tool_name": ParamDescription(
+            text=(
+                "Dotted mcp_tool identifier: <server>.<tool> — choose from "
+                "the enum."
+            ),
+            ja="ドット区切りの mcp_tool 識別子: <server>.<tool> — enum から選ぶ。",
+        ),
+    },
+    "list_mcp_resources": {"server": _server_param},
+    "list_mcp_resource_templates": {"server": _server_param},
+    "read_mcp_resource": {
+        "server": _server_param,
+        "uri": _resource_uri_param,
+    },
+    "subscribe_mcp_resource": {
+        "server": _server_param,
+        "uri": _resource_uri_param,
+    },
+    "unsubscribe_mcp_resource": {
+        "server": _server_param,
+        "uri": _resource_uri_param,
+    },
+    "list_mcp_prompts": {"server": _server_param},
+    "get_mcp_prompt": {
+        "server": _server_param,
+        "name": ParamDescription(
+            text="Prompt name, verbatim from list_mcp_prompts.",
+            ja="list_mcp_prompts から得たプロンプト名（そのまま）。",
+        ),
+        "arguments": ParamDescription(
+            text=(
+                "Arguments to render the prompt with, matching the shape "
+                "from list_mcp_prompts' arguments field. Optional — omit "
+                "for a prompt that takes none."
+            ),
+            ja=(
+                "プロンプトをレンダリングする引数。list_mcp_prompts の "
+                "arguments フィールドの形に一致させる。任意 — 引数を取らな"
+                "いプロンプトなら省略可。"
+            ),
+        ),
+    },
+    "mcp_install": {
+        "server_id": ParamDescription(
+            text=(
+                "Registry identifier, e.g. "
+                "'io.github.modelcontextprotocol/server-filesystem'."
+            ),
+            ja="レジストリ識別子（例 'io.github.modelcontextprotocol/server-filesystem'）。",
+        ),
+        "scope": ParamDescription(
+            text=(
+                "Config tier to write the server entry to. "
+                "'local' → reyn.local.yaml (default), "
+                "'project' → reyn.yaml, "
+                "'user' → ~/.reyn/config.yaml."
+            ),
+            ja=(
+                "サーバーエントリを書き込む設定階層。'local' → "
+                "reyn.local.yaml（デフォルト）、'project' → reyn.yaml、"
+                "'user' → ~/.reyn/config.yaml。"
+            ),
+        ),
+        "env_overrides": ParamDescription(
+            text=(
+                "Pre-supplied env values for secret vars required by the server. "
+                "Keys are env var names; values are the secrets. "
+                "Values not provided here will be prompted interactively."
+            ),
+            ja=(
+                "サーバーが必要とするシークレット変数への事前供給値。キーは"
+                "環境変数名、値はシークレット。ここで与えられない値は対話的"
+                "に確認される。"
+            ),
+        ),
+    },
+    "mcp_drop_server": {
+        "server": ParamDescription(
+            text=(
+                "Short server name as it appears under mcp.servers in "
+                "configuration (e.g. 'filesystem', 'brave')."
+            ),
+            ja="設定の mcp.servers に現れる短いサーバー名（例 'filesystem', 'brave'）。",
+        ),
+        "scope": ParamDescription(
+            text=(
+                "Config tier to remove from. Omit to auto-detect by "
+                "walking local → project → user and removing from the "
+                "first match."
+            ),
+            ja=(
+                "削除元の設定階層。省略すると local → project → user の順に"
+                "探索し最初に一致した階層から削除する。"
+            ),
+        ),
+        "clear_secrets": ParamDescription(
+            text=(
+                "When true (default), also remove the corresponding "
+                "${KEY} entries from ~/.reyn/secrets.env. Set false to "
+                "keep the secrets for reinstall."
+            ),
+            ja=(
+                "true（デフォルト）なら ~/.reyn/secrets.env の対応する "
+                "${KEY} エントリも削除する。再インストール用に残すなら "
+                "false にする。"
+            ),
+        ),
+    },
+    "mcp_install_registry": {
+        "server_id": ParamDescription(
+            text=(
+                "Registry identifier from mcp_search_registry "
+                "(= candidates[].name, "
+                "e.g. 'io.github.modelcontextprotocol/server-time')."
+            ),
+            ja=(
+                "mcp_search_registry から得たレジストリ識別子"
+                "（= candidates[].name、例 'io.github.modelcontextprotocol/server-time'）。"
+            ),
+        ),
+        "env_overrides": ParamDescription(
+            text=(
+                "Inline env values. Usually NOT needed — the first call "
+                "returns status='needs_secrets' listing which keys to "
+                "set via `reyn secret set <KEY>`; only pass this dict "
+                "when the operator supplied values inline."
+            ),
+            ja=(
+                "インラインの環境変数値。通常は不要 — 最初の呼び出しは "
+                "status='needs_secrets' を返し `reyn secret set <KEY>` で"
+                "設定すべきキーを列挙する。オペレーターが値をインラインで"
+                "供給した場合のみこの辞書を渡す。"
+            ),
+        ),
+    },
+    "mcp_install_package": {
+        "kind": ParamDescription(
+            text="Package channel.",
+            ja="パッケージのチャネル種別。",
+        ),
+        "identifier": ParamDescription(
+            text=(
+                "npm: package name (e.g. '@scope/server-foo')\n"
+                "pypi: distribution name (e.g. 'my-mcp-server')\n"
+                "docker: image with optional tag "
+                "(e.g. 'org/img:v1')\n"
+                "github: full URL "
+                "(e.g. 'https://github.com/owner/repo' or "
+                "'https://github.com/owner/repo/tree/<ref>/src/<sub>')"
+            ),
+            ja=(
+                "npm: パッケージ名（例 '@scope/server-foo'）／pypi: 配布名"
+                "（例 'my-mcp-server'）／docker: タグ付きイメージ（例 "
+                "'org/img:v1'）／github: フル URL。"
+            ),
+        ),
+        "version": ParamDescription(
+            text=(
+                "Version constraint. npm/pypi/docker only — "
+                "ignored for github."
+            ),
+            ja="バージョン制約。npm/pypi/docker のみ有効 — github では無視される。",
+        ),
+        "env_overrides": ParamDescription(
+            text=(
+                "Inline env values when the operator provides them; "
+                "otherwise expect status='needs_secrets' on the "
+                "first call (npm/pypi/docker only)."
+            ),
+            ja=(
+                "オペレーターが値を提供する場合のインライン環境変数値。"
+                "それ以外は最初の呼び出しで status='needs_secrets' を"
+                "想定する（npm/pypi/docker のみ）。"
+            ),
+        ),
+    },
+    "mcp_install_local": {
+        "name": ParamDescription(
+            text=(
+                "Short config key written under mcp.servers.<name> "
+                "(e.g. 'weather'). Used as the server prefix in "
+                "mcp_call_tool's '<server>__<tool>' identifier."
+            ),
+            ja=(
+                "mcp.servers.<name> に書き込まれる短い設定キー（例 "
+                "'weather'）。mcp_call_tool の '<server>__<tool>' 識別子の"
+                "サーバー部分として使われる。"
+            ),
+        ),
+        "command": ParamDescription(
+            text=(
+                "Executable to spawn (e.g. 'python', 'node', 'uvx', "
+                "or an absolute path)."
+            ),
+            ja="起動する実行ファイル（例 'python', 'node', 'uvx'、または絶対パス）。",
+        ),
+        "args": ParamDescription(
+            text=(
+                "Command-line arguments. Typically the script path "
+                "(e.g. ['/tmp/weather_mcp.py']) plus flags the server "
+                "expects."
+            ),
+            ja=(
+                "コマンドライン引数。通常はスクリプトパス（例 "
+                "['/tmp/weather_mcp.py']）とサーバーが要求するフラグ。"
+            ),
+        ),
+        "env_overrides": ParamDescription(
+            text="Inline env values for the spawned process.",
+            ja="起動するプロセスへのインライン環境変数値。",
+        ),
+    },
+    "mcp_call_tool": {
+        "tool": ParamDescription(
+            text=(
+                "<server>__<tool> identifier from list_mcp_tools "
+                "(e.g. 'time__get_current_time')."
+            ),
+            ja="list_mcp_tools から得た <server>__<tool> 識別子（例 'time__get_current_time'）。",
+        ),
+        "tool_args": ParamDescription(
+            text="Per-tool args dict (consult list_mcp_tools).",
+            ja="ツール毎の引数辞書（list_mcp_tools を参照）。",
+        ),
+    },
+}

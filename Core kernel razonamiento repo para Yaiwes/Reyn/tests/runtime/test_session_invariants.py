@@ -1,0 +1,1347 @@
+"""Tier 2: OS invariant tests for Session (chain mgmt + intervention + WAL/snapshot).
+
+Re-encodes the invariants formerly pinned by `tests/scaffold/test_chain_manager.py`
+and `tests/scaffold/test_intervention_registry.py` (Tier 4 — Mock + private
+state) at the Session public surface (Tier 2). The scaffold files are
+removed in the same PR that lands these tests.
+
+Policy compliance (`docs/deep-dives/contributing/testing.ja.md`):
+- LLM is faked via a real async callable stub (Tier 2c policy).  No
+  unittest.mock.AsyncMock / patch usage.
+- Private state assertion: prohibited. Observation flows through:
+    - `session.outbox` (OutboxMessage kind / text / meta)
+    - `session.history` (ChatMessage list)
+    - `StateLog.iter_from()` on the on-disk WAL
+    - `AgentSnapshot.load(agent_name, path)` for fully external snapshot re-read
+    - `iv.future` (the producer-side contract for a UserIntervention)
+- Internal-attribute access is restricted to:
+    - `session.chains.has()` / `.get()` — public ChainManager methods, used as a
+      precondition check; final post-condition uses `AgentSnapshot.load`.
+    - `session._dispatch_intervention` / `_drop_interventions_for_run` /
+      `_maybe_answer_oldest_intervention` — session-level thin wrappers over
+      InterventionRegistry, kept in the public surface so the bus can forward to
+      them.
+- Each test docstring's first line starts with `Tier 2: <intent>`.
+"""
+from __future__ import annotations
+
+import asyncio
+from pathlib import Path
+
+import pytest
+
+from reyn.config import OnLimitConfig, SafetyConfig, TimeoutConfig
+from reyn.core.events.agent_snapshot import AgentSnapshot
+from reyn.core.events.state_log import StateLog
+from reyn.llm.llm import LLMToolCallResult
+from reyn.llm.pricing import TokenUsage
+from reyn.runtime.session import Session
+from reyn.runtime.task_types import Requester
+from reyn.user_intervention import (
+    InterventionAnswer,
+    InterventionChoice,
+    UserIntervention,
+)
+from tests._async_wait import wait_until  # noqa: E402 — shared #1751 test wait helper
+from tests._support.agent_session import make_session
+from tests._support.events import collect_events, settle
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+_EMPTY_USAGE = TokenUsage(prompt_tokens=5, completion_tokens=3)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _text_result(text: str) -> LLMToolCallResult:
+    """Minimal LLMToolCallResult that triggers the text-reply branch in RouterLoop."""
+    return LLMToolCallResult(
+        content=text,
+        tool_calls=[],
+        finish_reason="stop",
+        usage=_EMPTY_USAGE,
+    )
+
+
+class _FakeRegistry:
+    """Minimal fake AgentRegistry satisfying the session's send/receive surface.
+
+    Does NOT use unittest.mock — it is a plain fake (Fake > Mock per policy).
+    Tracks send_agent_request calls so tests can verify upstream routing.
+    """
+
+    def __init__(self):
+        # Map agent_name → fake target session (if needed)
+        self._targets: dict[str, "Session"] = {}
+        self.sent_requests: list[dict] = []
+        self.sent_responses: list[dict] = []
+
+    def register(self, name: str, session: "Session") -> None:
+        self._targets[name] = session
+
+    def exists(self, name: str) -> bool:
+        return name in self._targets
+
+    def permit(self, from_agent: str, to_agent: str) -> bool:
+        return True
+
+    def iter_reachable_agents(self, self_name: str) -> list[dict]:
+        return [
+            {"name": n, "role": "assistant"}
+            for n in self._targets
+            if n != self_name
+        ]
+
+    def get_or_load(self, name: str, *, is_delegate: bool = False) -> "Session":
+        return self._targets[name]
+
+    async def ensure_running(self, name: str) -> None:
+        pass
+
+
+def _make_session(
+    tmp_path: Path,
+    *,
+    agent_name: str = "test_agent",
+    chain_timeout_seconds: float = 60.0,
+    registry: _FakeRegistry | None = None,
+    on_limit: OnLimitConfig | None = None,
+) -> Session:
+    """Build a Session with WAL + per-test snapshot path via public kwargs.
+
+    issue #254 Phase 1: register a placeholder listener so the registry's
+    ``enforce_listener_presence=True`` short-circuit does not fire — these
+    tests exercise the chat-side intervention flow and resolve answers
+    via ``deliver_answer`` themselves.
+
+    Tests that want the legacy "abort immediately on limit hit" behaviour
+    (= chain-timeout fires + emits chain_timeout_fired) pass
+    ``on_limit=OnLimitConfig(mode="unattended")`` explicitly; otherwise
+    the default ``interactive`` + ``ask_timeout=0`` is applied and the
+    registered listener keeps the prompt awaiting forever.
+    """
+    safety_kwargs = {"timeout": TimeoutConfig(chain_seconds=chain_timeout_seconds)}
+    if on_limit is not None:
+        safety_kwargs["on_limit"] = on_limit
+    safety = SafetyConfig(**safety_kwargs)
+    session = make_session(
+        agent_name=agent_name,
+        state_log=StateLog(tmp_path / "state.wal"),
+        safety=safety,
+        registry=registry,
+        snapshot_path=tmp_path / f"{agent_name}_snapshot.json",
+        # #1657: these chain-invariant tests stub the LLM with the universal-
+        # category tool-call shape (_delegate_result = invoke_action wrapper),
+        # so pin the scheme to match the stub. They assert WAL/chain behaviour,
+        # not the tool-use scheme; the default is now enumerate-all (which
+        # interprets FLAT native tool_calls, not the wrapper) so an unpinned
+        # session would not dispatch the stub's delegate → no chain_register.
+        chat_tool_use_scheme="universal-category",
+    )
+    session.register_intervention_listener("test")
+    return session
+
+
+def _wal_events(tmp_path: Path) -> list[dict]:
+    """Read all events from the WAL in tmp_path."""
+    wal_path = tmp_path / "state.wal"
+    log = StateLog(wal_path)
+    return list(log.iter_from(0))
+
+
+def _subscribe_outbox(session: Session):
+    """Open the REAL hub subscription ``_drain_outbox`` reads from (#3813,
+    #3793 stage 2 follow-up) — status/trace are dropped at emission unless
+    ``outbox_hub.has_subscribers()``, the true replacement for the old
+    ``session.is_attached = True`` these tests used to set (a manually-
+    synced flag).
+
+    Call this IMMEDIATELY after ``_make_session`` (#4873: an explicit call
+    the test itself makes, not an attribute ``_make_session`` used to smuggle
+    onto ``Session`` — the production class never declared it, an mypy
+    ``# type: ignore[attr-defined]`` was the only thing keeping that
+    quiet) — no ``await`` may run between the two, so a status announce made
+    during dispatch is never dropped as "nobody is watching" (the SAME
+    ordering guarantee the old in-``_make_session`` call had, now explicit
+    at the call site instead of implicit inside a helper).
+
+    ``subscribe()`` needs a running loop (it arms the hub's drain task) — a
+    test with a SYNC body that never touches the outbox has no use for this;
+    those simply never call it (and never called ``_drain_outbox`` either).
+    """
+    return session.outbox_hub.subscribe()
+
+
+async def _drain_outbox(session: Session, sub) -> list:
+    """Drain via the hub subscription the caller opened with
+    ``_subscribe_outbox`` — reading ``session.outbox`` directly would race
+    the hub's own drain task, which starts consuming it the moment that
+    subscription exists. The single ``sleep(0)`` tick lets that task's
+    already-scheduled continuation (queued by the preceding ``put_nowait``'s
+    waiter callback, via ``call_soon`` — not delivered synchronously)
+    actually run before this reads the sub queue."""
+    await asyncio.sleep(0)
+    msgs = []
+    while not sub._queue.empty():
+        msgs.append(sub._queue.get_nowait())
+    return msgs
+
+
+def _make_llm_stub(result: LLMToolCallResult | list):
+    """Return a real async callable that mimics call_llm_tools.
+
+    Replacing AsyncMock per testing policy (Tier 2c): use a real callable
+    so that signature drift in call_llm_tools raises TypeError at the call
+    site rather than silently succeeding.
+    """
+    if isinstance(result, list):
+        results = list(result)
+        call_count = [0]
+
+        async def _stub(**kwargs) -> LLMToolCallResult:  # noqa: ANN202
+            idx = call_count[0]
+            call_count[0] += 1
+            if idx < len(results):
+                return results[idx]
+            return results[-1]
+
+        return _stub
+    else:
+        async def _stub(**kwargs) -> LLMToolCallResult:  # noqa: ANN202
+            return result
+
+        return _stub
+
+
+# ---------------------------------------------------------------------------
+# Test 1: chain_register emits WAL event with required payload
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_chain_register_emits_wal_event(tmp_path, monkeypatch):
+    """Tier 2: chain_register WAL event emitted with required payload fields.
+
+    Scenario: ChainManager registers a chain (the real registration site
+    every producer shares — delegate_to_agent's own dispatch used to drive
+    this before retiring in proposal 0067 P6, #3978; run_pipeline
+    (collect="async") is the currently-live producer, session_api.py:631).
+    Driven directly through ``session.chains.register`` (a public surface
+    per this file's own testing-policy docstring), the same real
+    ``ChainManager`` method every producer calls — not a parallel
+    reimplementation of it.
+
+    P6 invariant [historical numbering, predates proposal 0067's own P6]:
+    every state change (chain registration) must emit a WAL event. Missing
+    event = state invisible to crash recovery.
+    """
+    monkeypatch.chdir(tmp_path)
+
+    session = _make_session(tmp_path, on_limit=OnLimitConfig(mode="unattended"))
+
+    await session.chains.register(
+        chain_id="chain-reg-001", depth=1,
+        original_text="do something", sender="origin_agent",
+        waiting_on={"peer_agent"},
+        requester=Requester(agent_name="origin_agent", session_id="main"),
+        origin_depth=1,
+    )
+
+    await session.journal.flush()  # #2259 PR-2b: drain async WAL writes
+    events = _wal_events(tmp_path)
+    register_events = [e for e in events if e.get("kind") == "chain_register"]
+
+    assert register_events, (
+        "Expected at least one 'chain_register' WAL event; none found."
+    )
+    ev = register_events[0]
+    assert ev.get("chain_id") == "chain-reg-001", (
+        f"chain_id mismatch: {ev.get('chain_id')!r}"
+    )
+    assert "requester" in ev, f"Missing 'requester' in WAL event: {ev}"
+    assert ev["requester"].get("agent_name") == "origin_agent", (
+        f"requester.agent_name mismatch in WAL event: {ev}"
+    )
+    assert "origin_depth" in ev, f"Missing 'origin_depth' in WAL event: {ev}"
+    assert "waiting_on" in ev, f"Missing 'waiting_on' in WAL event: {ev}"
+
+    # Snapshot must reflect the chain as pending.
+    snapshot = AgentSnapshot.load(session.agent_name, session._snapshot_path)
+    assert "chain-reg-001" in snapshot.pending_chains, (
+        f"chain-reg-001 not found in snapshot.pending_chains: {snapshot.pending_chains}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 2: chain_resolve clears snapshot and emits resolve WAL event
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_chain_resolve_clears_snapshot_and_emits_resolve(tmp_path, monkeypatch):
+    """Tier 2: chain_resolve removes chain from snapshot; WAL order is register → resolve.
+
+    Scenario: register a chain directly (the real registration site every
+    producer shares — see ``test_chain_register_emits_wal_event`` for why
+    this drives ``session.chains.register`` rather than the retired
+    delegate_to_agent dispatch) → peer replies (agent_response) → router
+    produces text reply → chain resolved via the REAL
+    ``session._handle_agent_response`` path (unaffected by P6 — it resolves
+    by chain_id lookup, not by which producer registered the chain).
+
+    P6 invariant [historical numbering, predates proposal 0067's own P6]:
+    chain_register and chain_resolve must both appear in the WAL in order;
+    snapshot must show no pending chain after resolution.
+    """
+    monkeypatch.chdir(tmp_path)
+
+    session = _make_session(tmp_path, on_limit=OnLimitConfig(mode="unattended"))
+
+    # Phase 1: register a pending chain directly.
+    await session.chains.register(
+        chain_id="chain-res-001", depth=1,
+        original_text="synthesize", sender="origin_agent",
+        waiting_on={"peer_agent"},
+        requester=Requester(agent_name="origin_agent", session_id="main"),
+        origin_depth=1,
+    )
+    assert session.chains.has("chain-res-001"), (
+        "Chain should be pending after registration"
+    )
+
+    # Phase 2: peer_agent responds → router re-runs and produces text reply.
+    stub_round2 = _make_llm_stub(_text_result("synthesized answer"))
+    monkeypatch.setattr("reyn.runtime.router_loop.call_llm_tools", stub_round2)
+    await session._handle_agent_response({
+        "from_agent": "peer_agent",
+        "response": "peer result",
+        "depth": 1,
+        "chain_id": "chain-res-001",
+    })
+
+    # Snapshot must NOT contain the chain after resolve.
+    snapshot = AgentSnapshot.load(session.agent_name, session._snapshot_path)
+    assert "chain-res-001" not in snapshot.pending_chains, (
+        f"chain-res-001 still present in snapshot after resolve: {snapshot.pending_chains}"
+    )
+
+    # WAL must have register before resolve (intermediate updates are OK).
+    await session.journal.flush()  # #2259 PR-2b: drain async WAL writes
+    events = _wal_events(tmp_path)
+    kinds = [e.get("kind") for e in events if e.get("chain_id") == "chain-res-001"]
+    assert "chain_register" in kinds, f"chain_register missing from WAL: {kinds}"
+    assert "chain_resolve" in kinds, f"chain_resolve missing from WAL: {kinds}"
+    reg_idx = kinds.index("chain_register")
+    res_idx = kinds.index("chain_resolve")
+    assert reg_idx < res_idx, (
+        f"chain_register ({reg_idx}) must precede chain_resolve ({res_idx})"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 2b: InterAgentMessaging's own chain manager IS session.chains
+# ---------------------------------------------------------------------------
+#
+# #4862 rescue: replaces `tests/scaffold/test_family7_intervention_bundle_
+# byte_identical.py::test_inter_agent_messaging_chain_manager_is_the_same_
+# chains_instance` / `test_strip_falsify_f8_dep_check_is_live`, which pinned
+# the F8→F7 cross-dependency via a private `is` identity check
+# (`session._inter_agent_messaging._chains is session._chains`). That check
+# has no equivalent elsewhere: every other InterAgentMessaging test in the
+# suite (`test_a2a_handler_invariants.py`) hand-pairs a fresh
+# InterAgentMessaging + ChainManager, never routing through a real Session's
+# own builder — so a broken F8→F7 wiring (the builder injecting a
+# DIFFERENT ChainManager into InterAgentMessaging than the one
+# `session.chains` exposes) would leave every existing test green.
+#
+# Witnessed here via effect, not identity: a chain registered through the
+# PUBLIC `session.chains.register()` is looked up by
+# `InterAgentMessaging.handle_agent_response` — real production behavior
+# (partial multi-hop resolution, no LLM/router loop needed since a second
+# peer is still outstanding). If the wiring were broken, the lookup would
+# miss (`pending is None`), and `waiting_on` would stay untouched.
+
+
+@pytest.mark.asyncio
+async def test_agent_response_resolves_the_same_chain_session_chains_exposes(
+    tmp_path, monkeypatch,
+):
+    """Tier 2: F8→F7 cross-dep — a chain registered via ``session.chains``
+    is the SAME chain ``InterAgentMessaging.handle_agent_response`` looks
+    up. Two peers are registered as ``waiting_on``; only one responds, so
+    resolution stays partial (no router loop / LLM needed) — the only
+    observable effect is ``waiting_on`` shrinking on the chain
+    ``session.chains`` itself exposes.
+
+    Scope: this drives ``session._handle_agent_response`` directly, so it
+    proves the wiring FROM that call inward. It does not re-prove that the
+    real inbox actually reaches that call (the (b)-registration half) —
+    that call site is ``Session._run_turn_body``'s ``AGENT_RESPONSE``
+    branch (``session.py``, dispatched via ``_put_inbox``/``run_one_iteration``),
+    confirmed statically, not re-driven here."""
+    monkeypatch.chdir(tmp_path)
+    session = _make_session(tmp_path, on_limit=OnLimitConfig(mode="unattended"))
+
+    await session.chains.register(
+        chain_id="chain-f8f7-001", depth=1,
+        original_text="need two peers", sender="origin_agent",
+        waiting_on={"peer_a", "peer_b"},
+        requester=Requester(agent_name="origin_agent", session_id="main"),
+        origin_depth=1,
+    )
+    assert session.chains.has("chain-f8f7-001")
+
+    # peer_a responds; peer_b has not. If InterAgentMessaging's own chain
+    # manager were a DIFFERENT instance than session.chains, this lookup
+    # would miss entirely (chain_id ∉ self._chains — the PR11
+    # user-initiated branch, a materially different code path that would
+    # attempt a fresh router loop instead of this partial-resolution no-op).
+    await session._handle_agent_response({
+        "from_agent": "peer_a",
+        "response": "partial answer from peer_a",
+        "depth": 1,
+        "chain_id": "chain-f8f7-001",
+    })
+
+    pending = session.chains.get("chain-f8f7-001")
+    assert pending is not None, (
+        "chain must still be pending after only ONE of TWO expected peers replied"
+    )
+    assert pending.waiting_on == {"peer_b"}, (
+        f"peer_a must be dropped from waiting_on by the SAME chain instance "
+        f"session.chains exposes; got {pending.waiting_on}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_strip_falsify_agent_response_chain_lookup_needs_the_prior_registration(
+    tmp_path, monkeypatch,
+):
+    """Tier 2: strip-falsify — a chain_id never registered via
+    ``session.chains`` must NOT be found by
+    ``InterAgentMessaging.handle_agent_response`` (``session.chains.has()``
+    stays False), proving the positive test above genuinely depends on
+    the PRIOR ``session.chains.register()`` call landing in the SAME
+    manager the lookup reads — not a check that would trivially pass for
+    any chain_id regardless of wiring. The unregistered chain_id instead
+    takes the PR11 user-initiated branch, which re-runs the router; a
+    scripted LLM keeps that branch from needing a real network call."""
+    monkeypatch.chdir(tmp_path)
+    session = _make_session(tmp_path, on_limit=OnLimitConfig(mode="unattended"))
+
+    assert not session.chains.has("chain-f8f7-never-registered")
+
+    stub = _make_llm_stub(_text_result("unrelated reply"))
+    monkeypatch.setattr("reyn.runtime.router_loop.call_llm_tools", stub)
+    await session._handle_agent_response({
+        "from_agent": "peer_a",
+        "response": "reply for a chain nobody registered",
+        "depth": 1,
+        "chain_id": "chain-f8f7-never-registered",
+    })
+
+    # PR11 user-initiated path never creates a _PendingChain entry — it
+    # replies upstream directly. session.chains must never have seen this
+    # chain_id at any point.
+    assert not session.chains.has("chain-f8f7-never-registered"), (
+        "an unregistered chain_id must never appear in session.chains — "
+        "if it did, the positive test's lookup would be vacuous (any "
+        "chain_id would resolve, not specifically the one registered "
+        "through session.chains)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 3: chain timeout fires upstream error and emits WAL event
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_chain_timeout_fires_upstream_error_and_emits_event(tmp_path, monkeypatch):
+    """Tier 2: chain timeout emits chain_timeout_fired WAL event + upstream error response.
+
+    Registers a pending chain directly (the real registration site every
+    producer shares — see ``test_chain_register_emits_wal_event`` for why
+    this drives ``session.chains.register``/``arm_timeout`` rather than the
+    retired delegate_to_agent dispatch) with a real, short-fused timeout
+    watchdog, then lets it fire for real.
+
+    P6 invariant [historical numbering, predates proposal 0067's own P6]:
+    chain_timeout_fired must be recorded in the WAL.
+    PR18 contract: on timeout, an error response is sent upstream AND a WAL
+    event is appended — no silent failures.
+    """
+    monkeypatch.chdir(tmp_path)
+
+    # upstream_session receives the error agent_response.
+    upstream_session = make_session(agent_name="upstream_agent")
+    upstream_received: list[dict] = []
+
+    async def _fake_submit_agent_response(*, from_agent, response, depth, chain_id, responder_sid=None):
+        upstream_received.append({
+            "from_agent": from_agent,
+            "response": response,
+            "chain_id": chain_id,
+        })
+
+    upstream_session.submit_agent_response = _fake_submit_agent_response
+
+    registry = _FakeRegistry()
+    registry.register("upstream_agent", upstream_session)
+
+    # Short timeout so it fires fast. Use unattended mode so the chain
+    # timeout fires as an abort + emits chain_timeout_fired event, rather
+    # than awaiting the new ``interactive`` default's user prompt that
+    # nothing would resolve in this test (the registered placeholder
+    # listener stays silent under ``ask_timeout=0``).
+    session = _make_session(
+        tmp_path,
+        registry=registry,
+        chain_timeout_seconds=0.05,
+        on_limit=OnLimitConfig(mode="unattended"),
+    )
+
+    # Register a chain waiting on a peer that never responds, and arm its
+    # timeout watchdog — the same two-call pairing every real producer uses
+    # (inter_agent_messaging.py's own delegation registration site).
+    await session.chains.register(
+        chain_id="chain-timeout-001", depth=1,
+        original_text="do slow work", sender="upstream_agent",
+        waiting_on={"slow_peer"},
+        requester=Requester(agent_name="upstream_agent", session_id="main"),
+        origin_depth=1,
+    )
+    await session.chains.arm_timeout(
+        "chain-timeout-001", on_fire=session._on_chain_timeout_fire,
+    )
+
+    # Wait for the watchdog to ACTUALLY fire, not for a fixed span to elapse.
+    # `upstream_received` is the fire's observable effect and it happens-after the
+    # WAL append: `ChainManager.fire_timeout` awaits `record_chain_timeout_fired`
+    # before returning the chain the upstream response is built from — so the
+    # `flush()` below drains an append that is already queued.
+    await wait_until(lambda: bool(upstream_received))
+
+    # WAL must contain chain_register → chain_timeout_fired.
+    await session.journal.flush()  # #2259 PR-2b: drain async WAL writes
+    events = _wal_events(tmp_path)
+    chain_events = [
+        e for e in events if e.get("chain_id") == "chain-timeout-001"
+    ]
+    kinds = [e.get("kind") for e in chain_events]
+    assert "chain_register" in kinds, f"chain_register missing: {kinds}"
+    assert "chain_timeout_fired" in kinds, f"chain_timeout_fired missing: {kinds}"
+    reg_idx = kinds.index("chain_register")
+    to_idx = kinds.index("chain_timeout_fired")
+    assert reg_idx < to_idx, (
+        f"chain_register ({reg_idx}) must precede chain_timeout_fired ({to_idx})"
+    )
+
+    # Upstream session must have received an agent_response with "chain timeout".
+    assert upstream_received, (
+        "Expected upstream_agent to receive an agent_response on timeout; none received"
+    )
+    resp = upstream_received[0]
+    assert resp["chain_id"] == "chain-timeout-001"
+    assert "chain timeout" in resp["response"].lower(), (
+        f"Expected 'chain timeout' in response text; got: {resp['response']!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 4: restore_state reconstructs chains and inbox from snapshot
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_restore_reconstructs_chains_and_inbox_from_snapshot(tmp_path, monkeypatch):
+    """Tier 2: restore_state() re-populates inbox queue and re-arms chain from snapshot.
+
+    Scenario: build a pre-populated AgentSnapshot with one pending chain and
+    one inbox message → construct a fresh Session → call restore_state().
+
+    P5 invariant: workspace is the single source of truth; restoration must
+    reconstruct in-memory state faithfully from the persisted snapshot.
+
+    Observation: restored chain is verified through `_chains.has()/.get()`
+    (public ChainManager methods); restored inbox is verified by draining
+    `session.inbox` (public asyncio.Queue).
+    """
+    monkeypatch.chdir(tmp_path)
+
+    chain_id = "chain-restore-001"
+    msg_id = "aabbccdd"
+
+    # Build and persist a snapshot with one pending chain + one inbox message.
+    snap = AgentSnapshot(agent_name="test_agent")
+    snap.pending_chains[chain_id] = {
+        "chain_id": chain_id,
+        "origin_agent": "origin",
+        "origin_depth": 1,
+        "original_request": "original task",
+        "waiting_on": ["peer_agent"],
+    }
+    snap.inbox.append({
+        "id": msg_id,
+        "kind": "user",
+        "payload": {"text": "hello from snapshot", "_msg_id": msg_id},
+    })
+    snap.applied_seq = 5
+
+    snapshot_path = tmp_path / "test_agent_snapshot.json"
+    snap.save(snapshot_path)
+
+    # Build a fresh session and restore.
+    session = _make_session(tmp_path)
+    loaded_snap = AgentSnapshot.load("test_agent", snapshot_path)
+    session.restore_state(loaded_snap)
+
+    # Inbox queue must have the restored message.
+    assert not session.inbox.empty(), (
+        "session.inbox should be non-empty after restore_state"
+    )
+    kind, payload = session.inbox.get_nowait()
+    assert kind == "user"
+    assert payload.get("text") == "hello from snapshot"
+
+    # ChainManager must have the chain loaded (public query API).
+    assert session.chains.has(chain_id), (
+        f"ChainManager.has({chain_id!r}) returned False after restore_state"
+    )
+    pc = session.chains.get(chain_id)
+    assert pc is not None
+    assert pc.requester.agent_name == "origin"
+    assert "peer_agent" in pc.waiting_on
+
+
+# ---------------------------------------------------------------------------
+# Test 5: inbox_put / inbox_consume emit WAL events with monotonic seq
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_inbox_put_consume_emits_wal_events_with_monotonic_seq(tmp_path, monkeypatch):
+    """Tier 2: inbox_put and inbox_consume WAL events have strictly increasing seq.
+
+    Scenario: 3× submit_user_text → run() consumes all three (mocked router).
+
+    P6 invariant: every state change has a WAL event; seq is monotonically
+    increasing so crash recovery can replay in order without gaps.
+    """
+    monkeypatch.chdir(tmp_path)
+
+    session = _make_session(tmp_path)
+
+    # Queue three user messages.
+    await session.submit_user_text("msg one")
+    await session.submit_user_text("msg two")
+    await session.submit_user_text("msg three")
+
+    # Router stub: always returns text so the loop exits after 1 iteration.
+    # Real async callable per Tier 2c policy (no unittest.mock.AsyncMock).
+    stub = _make_llm_stub([_text_result(f"reply {i}") for i in range(3)])
+    monkeypatch.setattr("reyn.runtime.router_loop.call_llm_tools", stub)
+
+    async def _run_one_turn():
+        """Process all three inbox messages then shutdown.
+
+        #5159 (census finding): this used to give the loop a flat
+        `await asyncio.sleep(0.05)` to consume all three messages before
+        calling `shutdown()` — a duration standing in for the real
+        condition ("has `run_task` actually drained the inbox yet"), with
+        no ordering guarantee against it: under load, `run_task` could
+        still not have run even once by the time the sleep elapses, and
+        `shutdown()` arriving first would end the run with messages never
+        consumed (`consume_events` empty — the assertion this test makes).
+        Waits on the real condition instead: the journal's own snapshot
+        `inbox` list emptying out (every submitted message has been
+        consumed), unboundedly (CI's own --timeout=120 is the kill
+        switch) — a PUBLIC read (`session.journal.snapshot().inbox`), not
+        reyn's private task-scheduling state."""
+        # Start run() in background and shutdown once the inbox is drained.
+        run_task = asyncio.create_task(session.run())
+        await wait_until(lambda: not session.journal.snapshot.inbox)
+        await session.shutdown()
+        try:
+            await asyncio.wait_for(run_task, timeout=2.0)
+        except asyncio.TimeoutError:
+            run_task.cancel()
+            await asyncio.gather(run_task, return_exceptions=True)
+
+    await _run_one_turn()
+
+    await session.journal.flush()  # #2259 PR-2b: drain async WAL writes
+    events = _wal_events(tmp_path)
+    put_events = [e for e in events if e.get("kind") == "inbox_put"]
+    consume_events = [e for e in events if e.get("kind") == "inbox_consume"]
+
+    # P6 invariant: each submitted message must produce a WAL event.
+    # The exact count equals the number of messages submitted (3).
+    assert put_events, f"inbox_put WAL events must be present; got {len(put_events)}"
+    assert consume_events, f"inbox_consume WAL events must be present; got {len(consume_events)}"
+
+    # All seq numbers must be strictly increasing across the WAL.
+    all_seqs = [e["seq"] for e in events if "seq" in e]
+    for a, b in zip(all_seqs, all_seqs[1:]):
+        assert a < b, (
+            f"WAL seq not strictly monotonic: ...{a}, {b}... in {all_seqs}"
+        )
+
+    # Snapshot applied_seq must equal the highest seq in the WAL.
+    max_seq = max(all_seqs)
+    snapshot = AgentSnapshot.load(session.agent_name, session._snapshot_path)
+    assert snapshot.applied_seq == max_seq, (
+        f"snapshot.applied_seq {snapshot.applied_seq} != max WAL seq {max_seq}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 6: shutdown signal bypasses WAL
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_shutdown_signal_bypasses_wal(tmp_path, monkeypatch):
+    """Tier 2: shutdown() does not emit inbox_put or inbox_consume WAL events.
+
+    P21 design: the shutdown signal is out-of-band (crash recovery does not
+    need to replay it — a re-started agent should simply resume from its last
+    snapshot, not re-execute a shutdown).  Any WAL record of shutdown would
+    confuse replay and is explicitly forbidden by the _consume_inbox guard.
+    """
+    monkeypatch.chdir(tmp_path)
+
+    session = _make_session(tmp_path)
+
+    # Trigger the shutdown path: start run() then immediately shutdown.
+    async def _run_with_shutdown():
+        run_task = asyncio.create_task(session.run())
+        await session.shutdown()
+        try:
+            await asyncio.wait_for(run_task, timeout=2.0)
+        except asyncio.TimeoutError:
+            run_task.cancel()
+            await asyncio.gather(run_task, return_exceptions=True)
+
+    await _run_with_shutdown()
+
+    await session.journal.flush()  # #2259 PR-2b: drain async WAL writes
+    events = _wal_events(tmp_path)
+    shutdown_put = [
+        e for e in events
+        if e.get("kind") == "inbox_put" and e.get("msg_kind") == "shutdown"
+    ]
+    shutdown_consume = [
+        e for e in events
+        if e.get("kind") == "inbox_consume"
+        # shutdown messages have no _msg_id so consume is skipped entirely.
+    ]
+
+    assert shutdown_put == [], (
+        f"shutdown inbox_put should NOT appear in WAL; found: {shutdown_put}"
+    )
+    # inbox_consume for shutdown is also skipped (_consume_inbox guard).
+    # Any consume events that DO exist are for non-shutdown messages; there
+    # should be none here since we sent no user messages before shutdown.
+    assert shutdown_consume == [], (
+        f"inbox_consume should be empty (no user messages sent); found: {shutdown_consume}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Helpers (intervention tests)
+# ---------------------------------------------------------------------------
+
+
+def _iv(
+    *,
+    run_id: str | None = None,
+    choices: list[InterventionChoice] | None = None,
+    prompt: str = "Q?",
+    kind: str = "ask_user",
+) -> UserIntervention:
+    """Build a UserIntervention bound to the running asyncio loop's future."""
+    iv = UserIntervention(kind=kind, prompt=prompt, run_id=run_id, choices=choices or [])
+    iv.future = asyncio.get_running_loop().create_future()
+    return iv
+
+
+# ---------------------------------------------------------------------------
+# Test 7: drop_for_run cancels all matching futures
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_intervention_drop_for_run_cancels_all_matching(tmp_path, monkeypatch):
+    """Tier 2: _drop_interventions_for_run cancels every future tagged with run_id.
+
+    Invariant: when a skill run is cancelled, every pending intervention belonging
+    to that run_id must have its future cancelled — no dangling futures that
+    would block the producer forever.
+    """
+    monkeypatch.chdir(tmp_path)
+    session = _make_session(tmp_path)
+
+    iv1 = _iv(run_id="rA", prompt="First Q?")
+    iv2 = _iv(run_id="rA", prompt="Second Q?")
+
+    # Dispatch both without awaiting — each coroutine blocks on iv.future.
+    t1 = asyncio.ensure_future(session._dispatch_intervention(iv1))
+    t2 = asyncio.ensure_future(session._dispatch_intervention(iv2))
+    # Wait until both dispatches have registered (#1751: each fsyncs its WAL
+    # append via to_thread, so a fixed sleep(0) no longer covers them).
+    await wait_until(lambda: len(session.interventions.list_active()) >= 2)
+
+    session.interventions.drop_for_run("rA")
+    await asyncio.sleep(0)
+
+    assert iv1.future.cancelled(), "iv1.future must be cancelled after drop"
+    assert iv2.future.cancelled(), "iv2.future must be cancelled after drop"
+
+    await asyncio.gather(t1, t2, return_exceptions=True)
+
+
+# ---------------------------------------------------------------------------
+# Test 8: choices no-match emits unknown-choice hint
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_intervention_choices_no_match_emits_unknown_choice_hint(tmp_path, monkeypatch):
+    """Tier 2: unrecognised hotkey emits status hint; intervention stays pending.
+
+    Invariant: when user submits text that matches no choice hotkey, the OS must
+    (a) emit a kind="status" message with "unknown choice" text and the
+    intervention's id in meta, (b) return True (consumed) so the router does
+    not start a fresh turn, and (c) keep the intervention pending — the user
+    can retry with a valid hotkey.
+    """
+    monkeypatch.chdir(tmp_path)
+    session = _make_session(tmp_path)
+    sub = _subscribe_outbox(session)  # BEFORE dispatch — see its own docstring
+
+    choices = [
+        InterventionChoice(id="yes", label="[Y]es", hotkey="y"),
+        InterventionChoice(id="no", label="[N]o", hotkey="n"),
+    ]
+    iv = _iv(choices=choices, prompt="Confirm?")
+
+    dispatch_task = asyncio.ensure_future(session._dispatch_intervention(iv))
+    # Wait until the dispatch registered the pending iv (#1751: WAL append now
+    # fsyncs via to_thread; sleep(0) would answer before the iv is pending).
+    await wait_until(lambda: bool(session.interventions.list_active()))
+
+    consumed = await session._maybe_answer_oldest_intervention("invalid")
+    assert consumed is True, (
+        "_maybe_answer_oldest_intervention must return True for unknown choice"
+    )
+
+    messages = await _drain_outbox(session, sub)
+    status_msgs = [m for m in messages if m.kind == "status"]
+    unknown_msgs = [m for m in status_msgs if "unknown choice" in m.text]
+    assert unknown_msgs, (
+        f"Expected status with 'unknown choice', got: {[m.text for m in status_msgs]!r}"
+    )
+    hint_msg = unknown_msgs[0]
+    assert hint_msg.meta.get("intervention_id") == iv.id, (
+        f"Status meta must include intervention_id={iv.id!r}, got {hint_msg.meta!r}"
+    )
+
+    # Intervention still pending — verify by resolving with a valid hotkey.
+    resolved = await session._maybe_answer_oldest_intervention("y")
+    assert resolved is True, "Valid hotkey must resolve the still-pending intervention"
+    assert iv.future.done() and not iv.future.cancelled()
+    assert iv.future.result().choice_id == "yes"
+
+    await asyncio.gather(dispatch_task, return_exceptions=True)
+
+
+# ---------------------------------------------------------------------------
+# Test 9: queued status emitted when dispatched while another is pending
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_intervention_queued_status_when_dispatched_while_pending(tmp_path, monkeypatch):
+    """Tier 2: dispatching while one is pending emits "awaiting answer (N queued)".
+
+    Invariant: the session must surface the queued status with the waiting
+    intervention's id in meta so the UI can inform the user that their
+    question is queued behind another.
+    """
+    monkeypatch.chdir(tmp_path)
+    session = _make_session(tmp_path)
+    sub = _subscribe_outbox(session)  # BEFORE dispatch — see its own docstring
+
+    iv1 = _iv(prompt="First Q?")
+    iv2 = _iv(prompt="Second Q?")
+
+    # Dispatch iv1 — blocks on its future. The registry calls on_announce.
+    t1 = asyncio.ensure_future(session._dispatch_intervention(iv1))
+    # Wait until iv1 is registered/announced (#1751: WAL append now fsyncs via
+    # to_thread; sleep(0) would drain the outbox before the prompt is emitted).
+    await wait_until(lambda: bool(session.interventions.list_active()))
+
+    msgs_after_iv1 = await _drain_outbox(session, sub)
+    intervention_msgs = [m for m in msgs_after_iv1 if m.kind == "intervention"]
+    assert intervention_msgs and "Question:" in intervention_msgs[0].text, (
+        "iv1 announce must have been emitted"
+    )
+
+    # Dispatch iv2 while iv1 is still pending — triggers the queued-status path.
+    t2 = asyncio.ensure_future(session._dispatch_intervention(iv2))
+    # Wait until iv2 is registered (both pending) so its queued-status announce
+    # has been emitted (#1751: WAL append now fsyncs via to_thread).
+    await wait_until(lambda: len(session.interventions.list_active()) >= 2)
+
+    msgs_after_iv2 = await _drain_outbox(session, sub)
+    queued_msgs = [
+        m for m in msgs_after_iv2
+        if m.kind == "status" and "queued" in m.text and "awaiting answer" in m.text
+    ]
+    assert queued_msgs, (
+        f"Expected queued status; got: {[(m.kind, m.text) for m in msgs_after_iv2]!r}"
+    )
+    assert queued_msgs[0].meta.get("intervention_id") == iv2.id, (
+        "Queued status meta must include iv2's intervention_id"
+    )
+
+    # Cleanup.
+    iv1.future.set_result(InterventionAnswer(text="a"))
+    await asyncio.sleep(0)
+    iv2.future.set_result(InterventionAnswer(text="b"))
+    await asyncio.gather(t1, t2, return_exceptions=True)
+
+
+# ---------------------------------------------------------------------------
+# Test 10: P6 anti-bypass — every chain state mutation emits a WAL event
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_p6_chain_state_changes_emit_events(tmp_path, monkeypatch):
+    """Tier 2: P6 anti-bypass — inbox/chain mutations all emit WAL events.
+
+    Invariant: inbox_put, inbox_consume, chain_register, and chain_resolve must
+    all appear in the WAL with strictly-increasing applied_seq, and snapshot's
+    pending_chains must be empty after resolve. A missing event for any of
+    these operations indicates a state mutation that bypassed P6.
+
+    This test exercises the public surface (`_put_inbox` / `_consume_inbox`,
+    plus `_chains.register` / `.resolve` which are public ChainManager methods)
+    and verifies via WAL+snapshot file reads — no internal state assertions.
+    """
+    monkeypatch.chdir(tmp_path)
+    session = _make_session(tmp_path)
+
+    # ── inbox_put ─────────────────────────────────────────────────────────
+    await session._put_inbox("agent_request", {
+        "from_agent": "upstream",
+        "request": "hello",
+        "depth": 1,
+        "chain_id": "chain-p6-001",
+    })
+
+    # ── inbox_consume ─────────────────────────────────────────────────────
+    kind, payload = await session._inbox_arbiter.consume_inbox()
+    assert kind == "agent_request"
+    chain_id = payload["chain_id"]
+
+    # ── chain_register ────────────────────────────────────────────────────
+    await session.chains.register(
+        chain_id=chain_id,
+        depth=1,
+        original_text="hello",
+        sender="upstream",
+        waiting_on={"downstream"},
+        requester=Requester(agent_name="upstream", session_id="main"),
+        origin_depth=1,
+    )
+
+    # ── chain_resolve ─────────────────────────────────────────────────────
+    resolved_chain = await session.chains.resolve(chain_id)
+    assert resolved_chain is not None, "resolve must return the chain"
+
+    # ── WAL read: verify P6 invariant ─────────────────────────────────────
+    await session.journal.flush()  # #2259 PR-2b: drain async WAL writes
+    wal_entries = _wal_events(tmp_path)
+    kinds_present = {e["kind"] for e in wal_entries}
+    required_kinds = {"inbox_put", "inbox_consume", "chain_register", "chain_resolve"}
+    missing = required_kinds - kinds_present
+    assert not missing, (
+        f"P6 violation: WAL event kinds missing: {missing!r}. "
+        f"A state mutation bypassed the event log."
+    )
+
+    # applied_seq must be strictly increasing across entries.
+    seqs = [e["seq"] for e in wal_entries]
+    for i in range(1, len(seqs)):
+        assert seqs[i] > seqs[i - 1], (
+            f"P6 violation: WAL seq not strictly increasing at index {i}: "
+            f"{seqs[i - 1]} → {seqs[i]}"
+        )
+
+    # External snapshot read — verify pending_chains is empty post-resolve.
+    snapshot = AgentSnapshot.load(session.agent_name, session._snapshot_path)
+    assert snapshot.pending_chains == {}, (
+        f"pending_chains must be empty after resolve, got: {snapshot.pending_chains!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# F6/F7 fix: empty router reply on agent_request → structured marker upstream
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_agent_request_empty_router_reply_sends_marker_upstream(
+    tmp_path, monkeypatch
+):
+    """Tier 2: when RouterLoop produces an empty-stop response during an
+    inbound agent_request, the upstream agent receives a NON-EMPTY reply
+    (F6/F7 fix + ADR-0021 Option F).
+
+    Pre-fix dogfood scenario 2 (multi-agent delegate batch 1): the
+    specialist's RouterLoop returned with `agent_replies = []` (e.g. from
+    max_iterations exhaustion or empty content), and `_handle_agent_request`
+    forwarded `response=""` upstream. The upstream LLM interpreted the
+    empty string as "in-progress" and re-delegated until the router cap
+    fired (= F7 cascade). F6/F7 fix: synthesise a clear text marker.
+
+    ADR-0021 Option F (2026-05-04): when finish_reason=stop and content is
+    empty, RouterLoop itself emits a user-visible failure message (Option F
+    path) rather than an empty put_outbox. The failure message is captured
+    by _router_loop_agent_replies and forwarded upstream as the reply.
+    The upstream therefore always receives a non-empty, human-readable
+    failure description — the F6 invariant (no empty upstream reply) is
+    preserved via a different mechanism.
+    """
+    monkeypatch.chdir(tmp_path)
+
+    upstream_session = make_session(agent_name="origin_agent")
+    upstream_received: list[dict] = []
+
+    async def _fake_submit_agent_response(*, from_agent, response, depth, chain_id, responder_sid=None):
+        upstream_received.append({
+            "from_agent": from_agent,
+            "response": response,
+            "chain_id": chain_id,
+        })
+
+    upstream_session.submit_agent_response = _fake_submit_agent_response
+
+    registry = _FakeRegistry()
+    registry.register("origin_agent", upstream_session)
+
+    session = _make_session(
+        tmp_path, agent_name="specialist", registry=registry
+    )
+
+    # LLM returns empty content (finish_reason="stop", content="").
+    # With ADR-0021 Option F, RouterLoop detects this as empty-stop and
+    # emits a failure message to the outbox (kind="agent", non-empty text).
+    # Session's capture filter picks it up → agent_replies non-empty
+    # → failure message forwarded upstream (not the no-reply marker).
+    stub = _make_llm_stub(_text_result(""))
+    monkeypatch.setattr("reyn.runtime.router_loop.call_llm_tools", stub)
+
+    await session._handle_agent_request({
+        "from_agent": "origin_agent",
+        "request": "what is the recipe?",
+        "depth": 1,
+        "chain_id": "chain-f6-001",
+    })
+
+    assert upstream_received, (
+        "Expected origin_agent to receive an agent_response; none received"
+    )
+    resp = upstream_received[0]
+    assert resp["chain_id"] == "chain-f6-001"
+    # Core F6 invariant: upstream must NOT receive an empty response.
+    assert resp["response"] != "", (
+        "F6 regression: upstream received empty response; "
+        "Option F should produce a non-empty failure message"
+    )
+    # Option F: the response must be a meaningful failure description,
+    # not an empty or trivially short placeholder.
+    assert resp["response"].strip(), (
+        f"Upstream reply must be non-blank: {resp['response']!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_request_router_cap_exhausted_sends_marker_upstream(
+    tmp_path, monkeypatch
+):
+    """Tier 2: RouterCapExceeded during an agent_request handler also
+    sends a structured marker upstream (not "") so the upstream chain
+    doesn't stall on an ambiguous empty response (F6/F7 fix, exception
+    path).
+
+    Triggered by patching `_run_router_loop` to raise RouterCapExceeded
+    directly, isolating the fallback path from RouterLoop's internals.
+    """
+    monkeypatch.chdir(tmp_path)
+
+    upstream_session = make_session(agent_name="origin_agent")
+    upstream_received: list[dict] = []
+
+    async def _fake_submit_agent_response(*, from_agent, response, depth, chain_id, responder_sid=None):
+        upstream_received.append({
+            "from_agent": from_agent,
+            "response": response,
+            "chain_id": chain_id,
+        })
+
+    upstream_session.submit_agent_response = _fake_submit_agent_response
+
+    registry = _FakeRegistry()
+    registry.register("origin_agent", upstream_session)
+
+    session = _make_session(
+        tmp_path, agent_name="specialist", registry=registry
+    )
+
+    # Force RouterCapExceeded from the handler.
+    from reyn.runtime.errors import RouterCapExceeded
+
+    async def _raise_cap(*args, **kwargs):
+        raise RouterCapExceeded(count=3, cap=3, last_reason="loop")
+
+    session._run_router_loop = _raise_cap  # type: ignore[assignment]
+
+    await session._handle_agent_request({
+        "from_agent": "origin_agent",
+        "request": "anything",
+        "depth": 1,
+        "chain_id": "chain-f6-cap-001",
+    })
+
+    assert upstream_received, (
+        "upstream must receive an agent_response on cap exhaustion"
+    )
+    resp = upstream_received[0]
+    assert resp["response"] != ""
+    assert "specialist" in resp["response"]
+    assert "router retry budget exhausted" in resp["response"].lower(), (
+        f"Expected cap-exhausted reason in marker; got: {resp['response']!r}"
+    )
+
+
+# B2-H2 fix: peer _no_reply_marker silently absorbed by LLM → deterministic surfacing
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_peer_no_reply_marker_surfaced_to_user_not_absorbed(
+    tmp_path, monkeypatch
+):
+    """Tier 2: when a peer agent returns a `_no_reply_marker`-formatted
+    response on a user-initiated chain, the receiving agent must surface the
+    failure to the user explicitly via OS-level deterministic message — NOT
+    silently absorb it into a polite close like "かしこまりました..." (B2-H2).
+
+    This is the inverse safety: the F6 marker mechanism produces a clear
+    failure signal from the OS, but B2-H2 dogfood found that weak LLMs
+    read the marker as conversational reply and ignore the failure. We bypass
+    the LLM for this specific case.
+
+    Path exercised: `_handle_agent_response` → `chain_id ∉ self._chains`
+    branch (user-initiated chain, PR11 path).
+    """
+    monkeypatch.chdir(tmp_path)
+    from reyn.runtime.session import _no_reply_marker
+
+    session = _make_session(tmp_path, agent_name="default_agent")
+    sub = _subscribe_outbox(session)  # BEFORE dispatch — see its own docstring
+    audit_collected = collect_events(session._audit_events)
+
+    # Inject a no-reply marker as if a specialist peer sent it.
+    marker = _no_reply_marker("specialist", "router completed without producing a text reply")
+
+    # _run_router_loop must NOT be called — we verify by patching it to raise.
+    router_called = []
+
+    async def _should_not_call(*args, **kwargs):
+        router_called.append(True)
+        raise AssertionError("_run_router_loop should NOT be called for a no-reply marker")
+
+    session._run_router_loop = _should_not_call  # type: ignore[assignment]
+
+    await session._handle_agent_response({
+        "from_agent": "specialist",
+        "response": marker,
+        "depth": 1,
+        "chain_id": "chain-b2h2-user-001",
+    })
+
+    # Must NOT have called the router loop.
+    assert not router_called, "B2-H2 regression: _run_router_loop was called for a marker"
+
+    # Outbox must contain a kind=agent failure message.
+    msgs = await _drain_outbox(session, sub)
+    agent_msgs = [m for m in msgs if m.kind == "agent"]
+    assert agent_msgs, (
+        "B2-H2 regression: outbox has no 'agent' message; user was not notified of peer failure"
+    )
+    # The message must reference the failing peer.
+    combined_text = " ".join(m.text for m in agent_msgs)
+    assert "specialist" in combined_text, (
+        f"B2-H2: expected peer name 'specialist' in user message; got: {combined_text!r}"
+    )
+    # meta must carry peer_failure=True.
+    peer_failure_msgs = [m for m in agent_msgs if m.meta.get("peer_failure")]
+    assert peer_failure_msgs, (
+        f"B2-H2: no message with meta.peer_failure=True; msgs: {agent_msgs!r}"
+    )
+
+    # Audit event log must contain peer_reply_failed_surfaced event (P6 audit).
+    await settle(session._audit_events)
+    audit_event_types = [e.type for e in audit_collected]
+    assert "peer_reply_failed_surfaced" in audit_event_types, (
+        f"B2-H2: expected 'peer_reply_failed_surfaced' audit event; got: {audit_event_types!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_peer_no_reply_marker_forwarded_upstream_in_pending_chain(
+    tmp_path, monkeypatch
+):
+    """Tier 2: when a peer returns a `_no_reply_marker`-formatted response
+    and the receiving agent has a *pending chain* (multi-hop relay path),
+    the failure is forwarded upstream deterministically without consulting
+    the LLM (B2-H2, `_resolve_pending_chain` path).
+
+    Path exercised: `_handle_agent_response` → `chain_id ∈ self._chains`
+    branch → `_resolve_pending_chain`.
+    """
+    monkeypatch.chdir(tmp_path)
+    from reyn.runtime.session import _no_reply_marker
+
+    # Set up upstream origin agent to capture the forwarded response.
+    origin_session = make_session(agent_name="origin_agent")
+    upstream_received: list[dict] = []
+
+    async def _fake_submit_agent_response(*, from_agent, response, depth, chain_id, responder_sid=None):
+        upstream_received.append({
+            "from_agent": from_agent,
+            "response": response,
+            "chain_id": chain_id,
+        })
+
+    origin_session.submit_agent_response = _fake_submit_agent_response
+
+    registry = _FakeRegistry()
+    registry.register("origin_agent", origin_session)
+
+    session = _make_session(
+        tmp_path, agent_name="relay_agent", registry=registry
+    )
+    audit_collected = collect_events(session._audit_events)
+
+    # Manually register a pending chain: relay_agent is waiting on "specialist"
+    # for a request that came from "origin_agent".
+    chain_id = "chain-b2h2-relay-001"
+    await session.chains.register(
+        chain_id=chain_id,
+        depth=2,
+        original_text="what is the recipe?",
+        sender="origin_agent",
+        waiting_on={"specialist"},
+        requester=Requester(agent_name="origin_agent", session_id="main"),
+        origin_depth=1,
+    )
+
+    # Confirm the chain exists.
+    assert session.chains.get(chain_id) is not None
+
+    # _run_router_loop must NOT be called.
+    router_called = []
+
+    async def _should_not_call(*args, **kwargs):
+        router_called.append(True)
+        raise AssertionError("_run_router_loop should NOT be called for a marker in pending chain")
+
+    session._run_router_loop = _should_not_call  # type: ignore[assignment]
+
+    # Simulate specialist sending a no-reply marker.
+    marker = _no_reply_marker("specialist", "router completed without producing a text reply")
+
+    await session._handle_agent_response({
+        "from_agent": "specialist",
+        "response": marker,
+        "depth": 2,
+        "chain_id": chain_id,
+    })
+
+    # Must NOT have called the router.
+    assert not router_called, "B2-H2 relay regression: _run_router_loop was called for a marker"
+
+    # Chain must be resolved.
+    assert session.chains.get(chain_id) is None, (
+        "B2-H2 relay: chain should be resolved after marker detection, but it is still pending"
+    )
+
+    # Origin agent must have received a forwarded failure message.
+    assert upstream_received, (
+        "B2-H2 relay: origin_agent received no forwarded response"
+    )
+    fwd = upstream_received[0]
+    assert fwd["chain_id"] == chain_id
+    # Forwarded message should mention the failing peer name.
+    assert "specialist" in fwd["response"], (
+        f"B2-H2 relay: expected 'specialist' in forwarded failure; got: {fwd['response']!r}"
+    )
+    # Should NOT be a raw marker anymore (the OS translates it to a user-facing message).
+    assert "could not produce a reply" not in fwd["response"], (
+        f"B2-H2 relay: raw marker was forwarded verbatim; should be localized: {fwd['response']!r}"
+    )
+
+    # Audit event log must contain peer_reply_failed_surfaced event (P6 audit).
+    await settle(session._audit_events)
+    audit_event_types = [e.type for e in audit_collected]
+    assert "peer_reply_failed_surfaced" in audit_event_types, (
+        f"B2-H2 relay: expected 'peer_reply_failed_surfaced' audit event; got: {audit_event_types!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# B17-S8-3 fix: router op context declares index_drop permission
+# ---------------------------------------------------------------------------
+
+
+def test_router_op_context_declares_canonical_file_write_paths(tmp_path, monkeypatch):
+    """Tier 2: router op context declares file.write for the canonical OS paths.
+
+    #571 collapse arc Phase 5: the bool-axis ``index_drop`` /
+    ``mcp_install`` declarations on the router context are replaced
+    with the equivalent ``file.write`` entries for the canonical
+    mutation paths. The op handlers (= index_drop / mcp_install /
+    mcp_drop_server / cron_register) now gate via
+    ``require_file_write`` against these paths.
+
+    Observation: the test calls _make_router_op_context() and reads
+    the public ``file_write`` list on the PermissionDecl. No private
+    internal state is asserted.
+    """
+    monkeypatch.chdir(tmp_path)
+
+    session = _make_session(tmp_path)
+    ctx = session._make_router_op_context()
+
+    declared_paths = {
+        entry["path"]
+        for entry in ctx.permission_decl.file_write
+        if isinstance(entry, dict) and entry.get("path")
+    }
+    for canonical in (".reyn/config/mcp.yaml", ".reyn/config/cron.yaml", ".reyn/config/index/sources.yaml"):
+        assert canonical in declared_paths, (
+            f"#571 Phase 5: router op context must declare file.write for "
+            f"{canonical!r} so the corresponding op handler's "
+            f"require_file_write gate can pass; declared={sorted(declared_paths)}"
+        )

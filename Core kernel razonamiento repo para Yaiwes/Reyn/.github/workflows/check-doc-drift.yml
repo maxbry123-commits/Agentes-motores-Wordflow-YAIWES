@@ -1,0 +1,100 @@
+name: Removed-identifier-in-docs check
+
+# #5003: flag a PR that removes an identifier from src/ without touching
+# any docs/ file that still names it. See
+# scripts/check_doc_drift.py's module docstring for the discriminator
+# (asks the PR, not the doc) and the structural exclusions.
+#
+# Renamed from "Doc-drift check" (#5478 ⑥, lead-coder): "doc drift"
+# reads as covering any way a doc goes stale, but this gate's needle is
+# narrowly REMOVED IDENTIFIERS — a name this script's grep can see.
+# lead-coder missed #5463 the same night (a doc's own COUNT claim,
+# "six things", going stale) precisely because a count is not an
+# identifier this gate's discriminator can ever catch; naming this
+# check "doc-drift" invited reading its green as broader coverage than
+# it provides — the same overclaim shape #5466 closed for
+# `events.ja.md`'s "every kind is listed" line. The rename is
+# cosmetic-only: the discriminator, exclusions, and warn-only posture
+# below are all unchanged.
+#
+# WARN-ONLY (architect ruling 2026-08-21, REVERTING the same day's
+# earlier promotion — #5010). Full account in
+# scripts/check_doc_drift.py's module docstring, "Blocking" section
+# (kept, corrected in place — do not re-derive from PR history alone).
+#
+# The promotion's structural premise was falsified within hours — NOT
+# its TP/FP count (see scripts/check_doc_drift.py's module docstring
+# for the full, corrected account, including a RETRACTED "0 TP" claim
+# an earlier revision of this file made without doing the verification
+# it asserted). `docs/reference/runtime/session-construction.md` is
+# CURRENTLY ACCURATE (a correctly-phrased historical rename note;
+# #5016, closed). PR #4572 — independently re-verified against its own
+# merge commit — genuinely removed `_action_retrieval` from src/
+# without touching this doc, and the doc's text at that exact point was
+# present-tense, describing then-live behavior: a real, confirmed true
+# positive at the time. It only became accurate LATER, when PR #4582 (a
+# separate, later PR) fixed it. The discriminator structurally cannot
+# see that a later PR already fixed a doc some earlier PR should have
+# — it only asks "did THIS removing PR touch the doc", re-evaluated
+# against TODAY's doc content on every run. Re-running `--pr 4572`
+# TODAY still fires, even though flagging it back then was correct,
+# because today's doc is already accurate and touching it again would
+# mean writing something false. That dead end — not any specific FP
+# count — is why this reverted. Re-promotion needs its own structural
+# discriminator for this class, not another metric push. See #5010
+# for the corrected record and re-promotion status.
+#
+# Trigger scoped to `paths: ["src/**"]` — the discriminator only ever
+# considers identifiers removed from src/, so a PR that never touches
+# src/ cannot produce a finding; running the job anyway would just be a
+# nonzero-cost no-op every time.
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+    paths:
+      - "src/**"
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  doc-drift:
+    name: removed-identifier-in-docs check (warn-only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      # fetch-depth: 0 (full history) — the precise extraction path
+      # reads real pre/post file content via `git show <sha>:<path>`,
+      # which needs the base ref's commit present locally; the default
+      # shallow (depth 1) checkout would only have the PR's own tip
+      # commit and make every file fall back to the line heuristic
+      # (logged, not silent, but pointless to pay for every run when a
+      # full checkout avoids it).
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      # scripts/check_doc_drift.py is stdlib-only (argparse / re /
+      # subprocess, `git`/`gh` as external tools). No pip install needed.
+      - name: Check for src/ identifiers removed without a docs/ touch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          python scripts/check_doc_drift.py --pr "${{ github.event.pull_request.number }}" > doc_drift_output.txt 2>&1
+          exit_code=$?
+          cat doc_drift_output.txt
+          if [ "$exit_code" -ne 0 ]; then
+            while IFS= read -r line; do
+              echo "::warning::${line}"
+            done < <(grep "^  '" doc_drift_output.txt)
+          fi
+          exit 0

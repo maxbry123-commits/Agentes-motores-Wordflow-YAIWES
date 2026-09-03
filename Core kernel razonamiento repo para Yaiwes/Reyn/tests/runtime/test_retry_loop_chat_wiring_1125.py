@@ -1,0 +1,506 @@
+"""Tier 2: OS invariant — retry_loop is wired into the chat overflow path (#1125 Item 2).
+
+PR-N6 built ``retry_loop`` (bounded adaptive-shrink overflow recovery) but the
+chat router never called it — the overflow path ran a degraded compact-once and
+hard-failed if the first compaction itself overflowed. axis-1's eager 30K
+trigger masked the gap by keeping the middle small. This wires the real
+mechanism in:
+
+- ``Session._decompose_history_for_retry`` exposes the
+  head / raw_middle / tail / summary decomposition retry_loop consumes (the
+  structural refactor the prior degraded path's comment punted as "follow-up").
+- The router overflow handler hands that decomposition to ``retry_loop`` so it
+  can fold raw_middle into the summary and monotonically shrink — the
+  "never dead-end" continuity guarantee.
+
+These pin the wiring's *data contract* (the decomposition is retry_loop-shaped
+and the session's real engine/learner feed it). retry_loop's shrink mechanics
+are covered by test_pr_n6_compaction_overflow_retry.py (Fake engine); the literal
+except-block → retry_loop invocation is verified live via dogfood (the real
+RouterLoop LLM overflow is not reconstructable in a unit test without the full
+router stack). No mocks — real Session + real CompactionEngine + real
+retry_loop; ``main_call`` is a retry_loop parameter (a test async fn, as the
+PR-N6 tests use), not a mocked collaborator.
+"""
+from __future__ import annotations
+
+import asyncio
+from datetime import datetime, timezone
+from pathlib import Path
+
+import pytest
+
+from reyn.config import CompactionConfig
+from reyn.core.events.state_log import StateLog
+from reyn.llm.pricing import TokenUsage
+from reyn.runtime.budget.budget import BudgetTracker, CostConfig
+from reyn.runtime.chat_message import ChatMessage
+from reyn.runtime.session import Session
+from reyn.runtime.usage_shim import _RouterUsageShim
+from reyn.services.compaction.engine import retry_loop
+from tests._support.agent_session import make_session
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _make_session(
+    tmp_path: Path, monkeypatch: "pytest.MonkeyPatch", *, t_max: int = 1_000_000
+) -> Session:
+    """Create a Session with a synthetic T_max controlling effective_trigger.
+
+    #1128 step 3: slicing is token-budget based (not turn-count).
+    ``use_chars4_estimate=True`` makes counting deterministic (chars // 4).
+    ``section_caps_spec_tokens=0`` keeps B_M positive for small T_max values.
+
+    Default t_max=1_000_000 → effective_trigger is large → small histories
+    return all turns (no elide).  Pass a small t_max to force the elide branch.
+
+    With t_max=2800 (section_caps_spec_tokens=0; re-measured post-#3083
+    plugin_management SP addition — the original ≈570/t_max=2000 pin went
+    stale as the SP grew across many unrelated PRs and finally crashed to a
+    negative effective_trigger, #3083 was simply the straw that tipped it):
+      head_budget≈74, tail_budget≈112, effective_trigger≈489.
+    Turns of content ``'X'*320`` each cost 80 tokens via chars4.  With 8 such
+    turns (total=640 > 489), elide fires.  head=[t0], tail=[t7], middle=[t1-t6].
+
+    #3671 follow-up: takes the caller's ``monkeypatch`` fixture rather than
+    manually saving/restoring ``get_max_input_tokens`` — CompactionEngine now
+    builds LAZILY (``CompactionController._engine``, a property, on first
+    reference) rather than eagerly inside ``Session.__init__``, so a patch
+    that un-does itself the moment this function returns would go stale
+    before the caller ever triggers the lazy build. ``monkeypatch`` restores
+    at the CALLING TEST's teardown instead — the patch stays live for
+    whatever that test does with the session, matching the window the real
+    (unpatched) value would actually be read across.
+    """
+    import reyn.llm.model_budget as _mb
+
+    state_log = StateLog(tmp_path / ".reyn" / "state" / "wal.jsonl")
+    bt = BudgetTracker(CostConfig())
+    cfg = CompactionConfig(
+        body_token_cap=1500,
+        use_chars4_estimate=True,  # deterministic offline token counts
+        section_caps_spec_tokens=0,  # keeps B_M positive for small T_max
+    )
+    monkeypatch.setattr(_mb, "get_max_input_tokens", lambda model, **kw: t_max)
+    return make_session(
+        agent_name="default",
+        agent_role="",
+        output_language="en",
+        budget_tracker=bt,
+        state_log=state_log,
+        compaction_config=cfg,
+        snapshot_path=tmp_path / ".reyn" / "agents" / "default" / "state" / "snapshot.json",
+    )
+
+
+# Content that yields exactly 80 tokens per turn via use_chars4_estimate=True.
+# 'X' * 320 = 320 chars → max(1, 320 // 4) = 80 tokens.
+_TURN_80TOK = "X" * 320
+
+
+def _push(session: Session, role: str, text: str) -> None:
+    if role == "agent":
+        role = "assistant"
+    session.history.append(ChatMessage(role=role, content=text, ts=_now()))
+
+
+# ── _decompose_history_for_retry correctness ─────────────────────────────────
+
+
+def test_decompose_slices_head_raw_middle_tail(tmp_path, monkeypatch) -> None:
+    """Tier 2: when total tokens > effective_trigger, decomposition produces
+    non-empty head, raw_middle, and tail, and head + raw_middle + tail is a
+    lossless in-order partition of all turns (no dropped or duplicated turn).
+
+    Uses t_max=2800 with 30 turns of 80-token content (total=2400 tokens).
+    2400 > T_max=2800 by construction so elide fires regardless of SP size —
+    default-independent: hot_list_n and other SP-affecting defaults don't change
+    whether elide fires.
+    """
+    session = _make_session(tmp_path, monkeypatch, t_max=2800)
+    msgs_pushed = 30
+    for i in range(msgs_pushed):
+        _push(session, "user" if i % 2 == 0 else "assistant", _TURN_80TOK)
+
+    head, raw_middle, tail, summary, _seq_by_id = session._history_buffer.decompose_history_for_retry()
+
+    assert head, "head must be non-empty after elide"
+    assert tail, "tail must be non-empty after elide"
+    assert raw_middle, "raw_middle must be non-empty for a middle-elide scenario"
+    assert summary is None
+
+    # Lossless partition: concatenating head+raw_middle+tail reproduces all turns.
+    all_via_decomp = head + raw_middle + tail
+    assert len(all_via_decomp) == msgs_pushed, (
+        f"expected all {msgs_pushed} pushed turns in partition, got {len(all_via_decomp)}"
+    )
+    # No duplicate objects — each turn appears exactly once by identity.
+    assert len(all_via_decomp) == len(set(id(m) for m in all_via_decomp)), (
+        "duplicate message objects detected — partition overlap guard failed"
+    )
+
+
+def test_decompose_no_elide_when_history_fits_window(tmp_path, monkeypatch) -> None:
+    """Tier 2: when total tokens <= effective_trigger, everything is in head —
+    raw_middle and tail are empty (nothing to elide).
+
+    retry_loop's shrink can still trim head if needed.
+    """
+    # Large t_max → effective_trigger large → 3 short turns easily fit.
+    session = _make_session(tmp_path, monkeypatch, t_max=1_000_000)
+    for i in range(3):
+        _push(session, "user", f"q-{i}")
+
+    head, raw_middle, tail, summary, _seq_by_id = session._history_buffer.decompose_history_for_retry()
+
+    assert [m["content"] for m in head] == ["q-0", "q-1", "q-2"]
+    assert raw_middle == []
+    assert tail == []
+    assert summary is None
+
+
+def test_decompose_extracts_structured_summary(tmp_path, monkeypatch) -> None:
+    """Tier 2: a persisted summary turn surfaces its structured dict (immutable base)."""
+    session = _make_session(tmp_path, monkeypatch)
+    structured = {"topic_arc": "greeting", "decisions": []}
+    session.history.append(ChatMessage(
+        role="summary",
+        content="rendered text",
+        ts=_now(),
+        meta={"structured": structured, "covers_through_seq": 3},
+    ))
+    for i in range(6):
+        _push(session, "user", f"m-{i}")
+
+    _head, _raw_middle, _tail, summary, _seq_by_id = session._history_buffer.decompose_history_for_retry()
+    assert summary == structured
+
+
+def test_decompose_wire_shape_matches_build_history(tmp_path, monkeypatch) -> None:
+    """Tier 2: decomposed head+tail turns use the same wire serialisation as
+    the normal router path (_build_history_for_router).
+
+    retry_loop must rebuild the prompt the normal router send would have
+    produced; a divergent wire shape (different role normalisation, missing
+    tool fields) would make the recovery prompt differ.
+
+    This test forces the elide branch on both paths via t_max=2800 so that
+    _build_history_for_router also returns head+tail (no summary bridge).
+    """
+    session = _make_session(tmp_path, monkeypatch, t_max=2800)
+    for i in range(8):
+        _push(session, "user" if i % 2 == 0 else "assistant", _TURN_80TOK)
+
+    head, raw_middle, tail, _summary, _seq_by_id = session._history_buffer.decompose_history_for_retry()
+    via_build = session._history_buffer.build_history()
+
+    # Both paths must return HEAD- and TAIL-turn wire serialisation
+    # identically — the actual claim this test makes (retry_loop's
+    # recovery prompt must reuse the same head/tail rendering the normal
+    # router path used). #5367: _build_history_for_router's own output is
+    # no longer ONLY head+[bridge?]+tail — an elided mid range now folds
+    # back in as ref-previews / a synthetic report turn between them, so
+    # this test compares head as a PREFIX and tail as a SUFFIX of
+    # build_history's output, rather than asserting whole-list equality
+    # against decompose's own (mid-free) head+tail concatenation.
+    head_contents = [m["content"] for m in head]
+    tail_contents = [m["content"] for m in tail]
+    build_contents = [m["content"] for m in via_build]
+    assert build_contents[:len(head_contents)] == head_contents, (
+        "decompose's head must match _build_history_for_router's own head "
+        "prefix (same serialisation, same turns) — retry_loop recovery "
+        "path must be byte-identical"
+    )
+    assert build_contents[len(build_contents) - len(tail_contents):] == tail_contents, (
+        "decompose's tail must match _build_history_for_router's own tail "
+        "suffix (same serialisation, same turns) — retry_loop recovery "
+        "path must be byte-identical"
+    )
+
+
+def test_recovery_summary_bridge_matches_normal_path(tmp_path, monkeypatch) -> None:
+    """Tier 2: with a persisted summary, the recovery bridge text equals the
+    normal router path's bridge.
+
+    The recovery prompt rebuilt by ``_router_main_call`` renders the structured
+    summary via ``render_summary_for_storage`` — the same renderer that produced
+    the persisted ``summary.content`` the normal path uses for its bridge.
+    So the summary bridge is byte-identical across both paths.
+    """
+    from reyn.runtime.session_pure import render_summary_for_storage
+
+    session = _make_session(tmp_path, monkeypatch, t_max=2800)
+    structured = {
+        "topic_arc": "planning the trip",
+        "decisions": ["book the tuesday flight"],
+        "pending": ["confirm hotel"],
+        "session_user_facts": [],
+        "artifacts_referenced": [],
+    }
+    rendered = render_summary_for_storage(structured)
+    session.history.append(ChatMessage(
+        role="summary",
+        content=rendered,
+        ts=_now(),
+        meta={"structured": structured, "covers_through_seq": 2},
+    ))
+    # 30 turns × 80 tokens = 2400 > T_max=2800 → elide fires → bridge inserted
+    # (default-independent: 2400 > T_max by construction regardless of SP size).
+    for i in range(30):
+        _push(session, "user" if i % 2 == 0 else "assistant", _TURN_80TOK)
+
+    # Normal path bridge content.
+    normal = session._history_buffer.build_history()
+    normal_bridge = next(
+        m["content"] for m in normal
+        if isinstance(m["content"], str) and m["content"].startswith("[summary")
+    )
+    # Recovery path renders the structured dict the same way.
+    _h, _rm, _t, summary_dict, _seq_by_id = session._history_buffer.decompose_history_for_retry()
+    recovery_bridge = (
+        "[summary of earlier conversation]\n" + render_summary_for_storage(summary_dict)
+    )
+    assert recovery_bridge == normal_bridge
+
+
+# ── wiring data contract: session decomposition feeds real retry_loop ────────
+
+
+def test_session_decomposition_feeds_retry_loop(tmp_path, monkeypatch) -> None:
+    """Tier 2: the session's real decomposition + engine/learner drive retry_loop.
+
+    Proves the wiring data contract end-to-end on the no-overflow path: the
+    session's ``_decompose_history_for_retry`` output is retry_loop-shaped, the
+    real CompactionEngine's budgets are accessible (non-None by construction),
+    and the learner observes via the ``_RouterUsageShim``. retry_loop's shrink /
+    engine.compact recovery is covered separately (PR-N6 Fake-engine tests).
+    """
+    # Large t_max → everything fits → empty raw_middle → no engine.compact LLM call.
+    session = _make_session(tmp_path, monkeypatch, t_max=1_000_000)
+    for i in range(3):
+        _push(session, "user", f"hi-{i}")
+
+    head, raw_middle, tail, summary, _seq_by_id = session._history_buffer.decompose_history_for_retry()
+    engine = session._compaction_controller._engine
+    new_msg = {"role": "user", "content": "latest"}
+
+    calls: list[dict] = []
+
+    async def _main_call(*, SP, head, summary, tail, new_msg):
+        calls.append({"head": head, "tail": tail, "summary": summary})
+        return _RouterUsageShim(TokenUsage(prompt_tokens=123))
+
+    shim = asyncio.run(retry_loop(
+        SP=session._history_buffer.build_system_prompt(),
+        head=head,
+        summary=summary,
+        raw_middle=raw_middle,
+        tail=tail,
+        new_msg=new_msg,
+        cfg=session._compaction,
+        model=session.model,
+        engine=engine,
+        learner=session._token_learner,
+        main_call=_main_call,
+    ))
+
+    # retry_loop returned the main_call response (the session reads .usage back).
+    assert isinstance(shim, _RouterUsageShim)
+    assert shim.usage.prompt_tokens == 123
+    # No-overflow path → main_call invoked exactly once; unpack enforces that
+    # structurally (raises if calls has 0 or >1 entries) and binds the call.
+    (only_call,) = calls
+    assert [m["content"] for m in only_call["head"]] == ["hi-0", "hi-1", "hi-2"]
+
+
+def test_router_usage_shim_exposes_usage(tmp_path) -> None:
+    """Tier 2: _RouterUsageShim exposes .usage with prompt_tokens (retry_loop's learner contract)."""
+    usage = TokenUsage(prompt_tokens=42, completion_tokens=7)
+    shim = _RouterUsageShim(usage)
+    assert shim.usage is usage
+    assert shim.usage.prompt_tokens == 42
+
+
+# ── #4957: chat.compaction.max_shrink_iterations reaches retry_loop's OWN bound ──
+
+
+def test_max_shrink_iterations_config_value_bounds_the_real_driver_call(
+    tmp_path, monkeypatch,
+) -> None:
+    """Tier 1: RouterLoopDriver._run_with_shrink passes
+    ``self._compaction.max_shrink_iterations`` — NOT the retry_loop
+    signature default (8) — as retry_loop's ``max_iterations``. Uses a
+    non-default value (3) per the issue's own explicit requirement: the
+    same value as the signature default would prove nothing (the wiring
+    could be entirely absent and this would still pass).
+
+    Drives the REAL ``RouterLoopDriver._run_with_shrink`` (the literal
+    production call site #4957 changed), not a re-implementation of it —
+    only ``loop.run`` is a scripted async fn (a ``_run_with_shrink``
+    parameter, the same shape ``main_call`` is a ``retry_loop`` parameter
+    in the sibling tests above), since a real ``RouterLoop`` LLM call
+    cannot run offline.
+    """
+    from reyn.services.compaction.engine import UnrecoveredError
+
+    class _FakeStatusError(Exception):
+        def __init__(self, message: str, *, status_code: int) -> None:
+            super().__init__(message)
+            self.status_code = status_code
+
+    cfg = CompactionConfig(
+        body_token_cap=1500,
+        use_chars4_estimate=True,
+        section_caps_spec_tokens=0,
+        max_shrink_iterations=3,  # non-default — see docstring
+    )
+    state_log = StateLog(tmp_path / ".reyn" / "state" / "wal.jsonl")
+    bt = BudgetTracker(CostConfig())
+    session = make_session(
+        agent_name="default",
+        agent_role="",
+        output_language="en",
+        budget_tracker=bt,
+        state_log=state_log,
+        compaction_config=cfg,
+        snapshot_path=tmp_path / ".reyn" / "agents" / "default" / "state" / "snapshot.json",
+    )
+    _push(session, "user", "hi")
+
+    class _AlwaysOverflowLoop:
+        async def run(self, *, user_text: str, history: list) -> None:
+            raise _FakeStatusError("request too large", status_code=413)
+
+    with pytest.raises(UnrecoveredError) as excinfo:
+        asyncio.run(
+            session._loop_driver._run_with_shrink(_AlwaysOverflowLoop(), "hi again")
+        )
+
+    # Names the ACTUAL config value (3), proving it reached retry_loop —
+    # the signature default (8) appearing here instead would mean the
+    # wiring silently regressed back to always-8.
+    assert "max_iterations=3" in str(excinfo.value)
+
+
+# ── #4954 (b): a byte-limit exhaustion triggers a real compaction ────────────
+
+
+@pytest.mark.parametrize(
+    ("recovery_policy", "compaction_expected"),
+    [("next_turn", True), ("never", False)],
+)
+def test_byte_limit_recovery_policy_controls_compaction(
+    tmp_path, monkeypatch, recovery_policy: str, compaction_expected: bool,
+) -> None:
+    """Tier 1: #5296 — the recovery stop-line changes real behavior.
+
+    With ``next_turn`` (the default), a byte-limit exhaustion triggers the
+    existing durable compaction path for the following turn. With ``never``, the same measured
+    exhaustion propagates without compaction. Both assertions observe the
+    controller's real ``compaction_check`` event, not a mock call count.
+
+    The existing #4954 behavior is preserved by the default policy; the
+    ``never`` arm is the explicit opt-out for deployments that must not make
+    an irreversible change during same-turn recovery.
+    """
+    from reyn.services.compaction.engine import UnrecoveredError
+
+    class _FakeStatusError(Exception):
+        def __init__(self, message: str, *, status_code: int) -> None:
+            super().__init__(message)
+            self.status_code = status_code
+
+    cfg = CompactionConfig(
+        body_token_cap=1500,
+        use_chars4_estimate=True,
+        section_caps_spec_tokens=0,
+        max_shrink_iterations=3,
+        recovery_policy=recovery_policy,
+    )
+    state_log = StateLog(tmp_path / ".reyn" / "state" / "wal.jsonl")
+    bt = BudgetTracker(CostConfig())
+    session = make_session(
+        agent_name="default",
+        agent_role="",
+        output_language="en",
+        budget_tracker=bt,
+        state_log=state_log,
+        compaction_config=cfg,
+        snapshot_path=tmp_path / ".reyn" / "agents" / "default" / "state" / "snapshot.json",
+    )
+    _push(session, "user", "hi")
+
+    events: list = []
+    session._compaction_controller._events.add_subscriber(lambda e: events.append(e))
+
+    class _AlwaysOverflowLoop:
+        async def run(self, *, user_text: str, history: list) -> None:
+            raise _FakeStatusError("request too large", status_code=413)
+
+    with pytest.raises(UnrecoveredError) as excinfo:
+        asyncio.run(
+            session._loop_driver._run_with_shrink(_AlwaysOverflowLoop(), "hi again")
+        )
+
+    assert excinfo.value.saw_byte_limit is True
+    checks = [e for e in events if e.type == "compaction_check"]
+    assert bool(checks) is compaction_expected, (
+        f"recovery_policy={recovery_policy!r} expected compaction="
+        f"{compaction_expected}, observed: {[e.data for e in checks]!r}"
+    )
+
+
+def test_non_byte_limit_exhaustion_does_not_trigger_compaction(
+    tmp_path, monkeypatch,
+) -> None:
+    """Tier 1: falsification pair — a NON-byte-limit exhaustion
+    (`saw_byte_limit=False`) must NOT trigger `force_compact_now`.
+    #4885's own token-overflow pre-trigger already handles that axis; a
+    non-byte-limit failure reaching here means the pre-trigger's estimate
+    was wrong, which the adaptive learner fixes, not a second compaction
+    trigger here (architect ruling ④)."""
+    from reyn.services.compaction.engine import UnrecoveredError
+
+    cfg = CompactionConfig(
+        body_token_cap=1500,
+        use_chars4_estimate=True,
+        section_caps_spec_tokens=0,
+        max_shrink_iterations=3,
+    )
+    state_log = StateLog(tmp_path / ".reyn" / "state" / "wal.jsonl")
+    bt = BudgetTracker(CostConfig())
+    session = make_session(
+        agent_name="default",
+        agent_role="",
+        output_language="en",
+        budget_tracker=bt,
+        state_log=state_log,
+        compaction_config=cfg,
+        snapshot_path=tmp_path / ".reyn" / "agents" / "default" / "state" / "snapshot.json",
+    )
+    _push(session, "user", "hi")
+
+    events: list = []
+    session._compaction_controller._events.add_subscriber(lambda e: events.append(e))
+
+    class _AlwaysNonByteOverflowLoop:
+        async def run(self, *, user_text: str, history: list) -> None:
+            # No status_code — a plain context-length overflow, not a 413.
+            raise RuntimeError("context_length_exceeded: too many tokens")
+
+    with pytest.raises(UnrecoveredError) as excinfo:
+        asyncio.run(
+            session._loop_driver._run_with_shrink(
+                _AlwaysNonByteOverflowLoop(), "hi again",
+            )
+        )
+
+    assert excinfo.value.saw_byte_limit is False
+    checks = [e for e in events if e.type == "compaction_check"]
+    assert not checks, (
+        f"force_compact_now must not fire on a non-byte-limit exhaustion; "
+        f"observed: {[e.data for e in checks]!r}"
+    )

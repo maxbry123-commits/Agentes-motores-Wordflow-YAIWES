@@ -1,0 +1,107 @@
+"""web_fetch ToolDefinition — Wave 1 migration (ADR-0026 M3).
+
+Mirrors web_search.py structure. The existing handler in
+src/reyn/op_runtime/web.py is preserved and wrapped via a thin
+adapter that translates between the old (op, ctx) signature
+and the new (args, ctx) signature.
+
+The router dispatch path consumes this ToolDefinition; Wave 1 verifies
+byte-identity against the pre-migration ToolSpec.
+"""
+from __future__ import annotations
+
+from typing import Any, Mapping
+
+from reyn.tools.descriptions import discovery
+from reyn.tools.types import ToolContext, ToolDefinition, ToolGates, ToolResult
+
+# The description text lives in src/reyn/tools/descriptions/discovery.py
+# (Phase 1 of the tool-description package refactor); this alias keeps the
+# call site unchanged. The wording stays purely descriptive — no behavioural
+# guidance about WHEN to fetch (= sandbox_2 cofounder warning (b): keep the
+# LLM's decision driven by the tool schema, not by prompt-engineered
+# instructions).
+_WEB_FETCH_DESCRIPTION = discovery.web_fetch.text
+
+# #3580 ③: ``url`` is the ONLY LLM-settable argument. ``max_length`` used to sit
+# here as a per-tool size cap; it is gone with nothing replacing it (owner ruling
+# on #3580: 「わけわからんオレオレ仕様なんて廃止して」 — abolish the bespoke
+# per-tool scheme rather than add a second mechanism). The size ceiling on what
+# reaches the model's context is the OS-level tool-result cap alone
+# (``offload.enabled``, default false), not anything web_fetch owns.
+_WEB_FETCH_PARAMETERS: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "url": {"type": "string"},
+    },
+    "required": ["url"],
+}
+
+
+async def _handle(args: Mapping[str, Any], ctx: ToolContext) -> ToolResult:
+    """Adapter wrapping op_runtime.web.handle_web_fetch.
+
+    Bridges between the unified (args, ctx) signature and the
+    existing (op, ctx) signature. Once M3 Wave 1 succeeds,
+    the body of handle_web_fetch may be inlined here in M4 cleanup.
+
+    OpContext resolution (parallel with ``file.py:_build_legacy_op_context``):
+      Preferred — ``ctx.router_state.op_context_factory()`` so the
+        OpContext carries the session's PermissionResolver,
+        PermissionDecl, and InterventionBus. This is what makes
+        ``web.fetch: deny`` actually raise on the router-invoked
+        path (#53 fix).
+      Fallback — minimal synthesis from ToolContext fields. Used by
+        narrow test sites that don't exercise permission gating. ``intervention_bus=None`` is acceptable
+        here because the fallback path doesn't have a session bus to
+        reuse anyway.
+    """
+    # Lazy import to avoid circular dependency at registry-init time.
+    from reyn.core.op_runtime.context import OpContext
+    from reyn.core.op_runtime.web import handle_web_fetch
+    from reyn.schemas.models import WebFetchIROp
+    from reyn.security.permissions.permissions import PermissionDecl
+
+    op = WebFetchIROp(
+        kind="web_fetch",
+        url=args["url"],
+    )
+
+    rs = ctx.router_state
+    if rs is not None and rs.op_context_factory is not None:
+        legacy_ctx = rs.op_context_factory()
+    else:
+        # Narrow test sites + future surfaces without a router factory.
+        # ``intervention_bus=None`` is acceptable only because the
+        # fallback path doesn't have any bus to reuse anyway; the
+        # handler will raise the explicit RuntimeError above if a
+        # PermissionResolver is also present.
+        legacy_ctx = OpContext(
+            workspace=ctx.workspace,
+            events=ctx.events,
+            permission_decl=PermissionDecl(),
+            permission_resolver=ctx.permission_resolver,
+            actor="",
+            subscribers=getattr(ctx.events, "subscribers", []),
+            # #1673: never resolver=None (the bug-class invariant). web_fetch makes
+            # no LLM call, but the uniform threading keeps the invariant provable.
+            resolver=ctx.resolver,
+        )
+
+    return await handle_web_fetch(op=op, ctx=legacy_ctx)
+
+
+from reyn.core.offload.canonical import web_fetch_to_canonical  # noqa: E402
+
+WEB_FETCH = ToolDefinition(
+    canonical=web_fetch_to_canonical,
+    name="web_fetch",
+    router_dispatched=True,
+    description=_WEB_FETCH_DESCRIPTION,
+    parameters=_WEB_FETCH_PARAMETERS,
+    gates=ToolGates(router="allow"),
+    handler=_handle,
+    category="discovery",
+    purity="read_only",   # web fetch reads a URL, no workspace side effect
+    returns_external_content=True,  # FP-0050/#1822: internet content
+)

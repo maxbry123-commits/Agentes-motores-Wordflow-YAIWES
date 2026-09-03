@@ -1,0 +1,680 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "reyn"
+version = "0.1.0a2"
+# #4737: "LLM-driven phase execution engine with a Markdown DSL" described
+# the phase-graph skill engine, removed #2434/#2438 — same class as
+# interfaces/cli/__init__.py's --help description, kept in sync with it.
+# Owner ruling 2026-08-15: A (see #4745 for B/C, the alternatives not chosen).
+description = "Agent OS — decide, spawn, orchestrate, bounded by construction"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+readme = "README.md"
+authors = [
+    { name = "Tetsuya Yasuda" },
+]
+keywords = [
+    "llm",
+    "agent",
+    "workflow",
+    "dsl",
+    "multi-agent",
+    "orchestration",
+    "os",
+    # "phase" removed (#4737): a PyPI discovery keyword for the phase-graph
+    # skill engine, removed in #2434/#2438 — "dsl" above still applies (the
+    # live pipeline DSL), this one described a feature that no longer
+    # exists.
+    "LLM workflow",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+    "Topic :: System",
+    "Typing :: Typed",
+]
+
+dependencies = [
+    "litellm>=1.89.3",  # #3288 follow-up: floor raised for litellm's native
+                        # /v1/responses auto-bridge (BerriAI/litellm#23577,
+                        # merged 2026-03-13) — reyn's own manual bridge (#1678)
+                        # was deleted in favor of delegating to this; an older
+                        # litellm would silently lack the bridge reyn now
+                        # relies on for reasoning+tools calls.
+    "pydantic>=2.0",
+    "jsonschema>=4.0",
+    # #3869: names the process "reyn:<subcommand>" instead of "python3.12".
+    # CORE, not optional: the value is entirely in being able to identify a
+    # reyn process on a machine that is misbehaving, and an optional extra is
+    # never installed on the machine where that matters — the operator spent
+    # two reboots on 2026-08-09 unable to tell whether a 29 GB python was
+    # reyn. A diagnostic you have to have predicted needing is not one.
+    "setproctitle>=1.3",
+    "pyyaml>=6.0",
+    "prompt_toolkit>=3.0",   # plain CUI (--cui flag) keeps this
+    "ddgs>=8.0",
+    "rich>=13",              # inline CUI renderer — DIRECT dep (plain renderer imports it).
+                             # Kept explicit deliberately: textual is back in the tree
+                             # transitively via textual-flowview (below), and rich would
+                             # otherwise silently revert to "transitive via textual" — but
+                             # the plain renderer uses rich directly, independent of textual.
+    # TUI-rebuild arc (#3273): the interactive TTY conversation pane
+    # (`reyn.interfaces.inline.textual_chat`) is a Textual app built on the
+    # textual-flowview primitives (Presentation.background, FlowView(spacing=)).
+    # Git-pinned to a specific commit of the PUBLIC repo (no auth needed).
+    # Phase 1 promotes `textual` to an explicit DIRECT dep now that the app code
+    # imports `textual.app`/`textual.widgets` directly (Phase 0 left it transitive
+    # via flowview) — same reasoning that keeps rich direct above. The app module
+    # is imported LAZILY on the TTY path only, so the plain / --cui / non-TTY /
+    # CI paths never touch textual or flowview and stay green even if flowview
+    # fails to resolve.
+    # #4077: floor raised from flowview's own bare requirement (textual>=0.80)
+    # to 8.2.8 — a scoped `tests/interfaces/` run at 8.2.0 reproducibly failed
+    # (test_3310_n2_reset_hydrate.py: 9/9 failed; test_textual_chat_intervention_
+    # panel_3299.py: hung) with an AttributeError chain rooted in
+    # `build_presentation`; the SAME scope at 8.2.8 is 9/9 + 25/25 green, no
+    # hang. Confirmed on this env only (not bisected below 8.2.8 to find the
+    # exact minimum) — if you drop this floor, #4077's scoped-run failures can
+    # come back.
+    "textual>=8.2.8",
+    # v0.12.0 (5a72da0), up from v0.9.0 (#3624). 0.5.0: animated jumps,
+    # body_width/effective gutter widths. 0.6.0: empty state,
+    # scroll_to_entry(align=), opt-in keyboard cursor, ReachedTop/ReachedBottom
+    # infinite scroll, insert_many/extend. 0.9.0: O(1) differential reflow
+    # (Viewport.invalidate_height_of dirties only the prefix-sum offsets from
+    # the changed entry onward) — internal, so reyn's existing set_item path
+    # gets it with no call-site change; plus Entry.patch_rows /
+    # Presentation(strips=) (NOT wired here — deferred pending #3539) and
+    # body-only text selection (the gutter is decoration, so a yank no longer
+    # carries gutter glyphs). 0.10.0: copy mode half/full-page scroll
+    # (Ctrl-D/U/F/B) — adopted implicitly (reyn declares no motion binding of
+    # its own, so upstream's keymap growing is a no-op change here); and
+    # FlowView(copy_mode=True) — looked at, DECLINED (reyn's `c` toggle is the
+    # deliberate entry point; always-on would bypass the ordinary
+    # conversation-cursor keys). 0.11.0: keyboard highlight and mouse
+    # selection unified into one `selectable=` cursor — a click now MOVES and
+    # COMMITS it, so `Selected` fires on a click exactly like Enter/Space with
+    # nothing to tell them apart; reyn no longer reads `Selected` for its
+    # clipboard-copy handler (a naive port would let a stray click overwrite
+    # the user's clipboard) — see `_CursorFlowView` in
+    # `textual_chat/app.py` and "Textual TUI keyboard cursor" in
+    # `docs/reference/runtime/agui-transport.md`. 0.12.0: removed the 0.11.0
+    # back-compat aliases (`highlight=`, `.highlighted`/`.selected`,
+    # `.select()`, `.clear_selection()`, `.highlight_entry()`/`move_highlight()`
+    # /`highlight_first()`/`highlight_last()`, `FlowView.Activated`,
+    # `flowview--selected`) — pure rename onto the 0.11.0 names reyn had
+    # already adopted, no further behaviour change. All additive; defaults
+    # unchanged (cursor=False, empty=None, animate=False) — #3476 adoption arc.
+    # 0.13: "refactor!: replace copy mode with always-on text cursor + visual
+    # mode" — there is no copy_mode to enter/leave any more; the vim movement
+    # keys are always live, `c` (upstream) shows/hides the cursor block, and
+    # visual mode (`v`/`V`…`y`) is the one real mode. Removed:
+    # enter/exit/toggle_copy_mode, the `copy_mode` prop/flag, `CopyModeChanged`,
+    # the `copy_` method prefix. New: show_cursor/hide_cursor/toggle_cursor/
+    # cursor_visible + `cursor=`. reyn's own copy-mode BINDINGS/state/handler
+    # are removed with this pin bump (#3692 PR-A) — `c` is no longer reyn's to
+    # declare, and yank is `y` (flowview's own), not a reyn-side alias. 0.13.1
+    # fixes the addressed-row-rail regression 0.13.0 introduced (`c` moved the
+    # addressed row; 0.13.1 moves the cursor onto `current` via `set_current`
+    # instead) — pinned straight to 0.13.1, 0.13.0 was never released to reyn.
+    # 0.14.0 (#3784) exposes `following`/`FollowChanged` and fixes the
+    # early-scroll-release bug; reyn's tail-away indicator drives off that
+    # event rather than the per-frame geometry poll it replaced. (This entry
+    # is retrospective — #3784 moved the pin without extending this narrative,
+    # so the comment described 0.13.1 while the pin was 0.14.0.)
+    # 0.15.1 adds a viewport overlay API (`play_overlay` / `stop_overlay` /
+    # the `overlay` property / `OverlayFinished`) and nothing else. There is no
+    # `set_overlay` — this comment named one until #3841 checked it against
+    # `_view.py`; the setter is the `overlay` property's, not a method.
+    # Verified as no-change-for-reyn from
+    # the DIFF, not from the release notes: `__all__` is untouched (only
+    # `__version__` moved), the sole deleted line in `_view.py` is an import
+    # widening (`Callable` -> `Callable, Iterator`), and the two insertions
+    # that land inside EXISTING methods — `on_unmount` and `render_line` — are
+    # both guarded on overlay state that initialises to None and is written
+    # only by the overlay API. reyn references none of those three names, so
+    # both guards are permanently false and the render path is unchanged.
+    # "The changelog says additive" would not have established that: an
+    # insertion into `render_line` is a change to the hot path whatever the
+    # release notes call it.
+    # 0.15.2 / 0.15.3 are DOCS-ONLY for the library: the whole diff
+    # 503a536->21c6a1c is CHANGELOG/README, two new `examples/`, and the version
+    # string in `pyproject.toml` + `__init__.py`. Nothing under
+    # `src/textual_flowview/` changes behaviour, so the bump cannot regress reyn.
+    # It is taken for what the examples ESTABLISH rather than for library code:
+    # `examples/image.py` shows a Rich renderable (textual-image, built from a
+    # PIL image IN THE CLIENT PROCESS) dropped into a `Presentation`, and
+    # `examples/gif.py` shows `animate_entry` driving frames with off-screen
+    # auto-pause. Both are the upstream demonstrating a usage reyn's own image
+    # work (#3811 and the present-op `image` component) needs to know is
+    # supported — "the library did not change" is a reason not to fear the bump,
+    # not a reason to skip it.
+    # 0.16.0 (`feat!`) changes the overlay factory's signature:
+    # `frames(width, height)` -> `frames(width, height, covered)`, where
+    # `covered` is the body text of the rows the overlay is hiding, one string
+    # per visible row. A BREAKING change taken deliberately — reyn's #3796
+    # effect animated a fixed banner because there was no way to ask what was
+    # on screen, and reconstructing it reyn-side from the scroll offset was
+    # rejected (owner: 「viewport の内容は再構築すべきではないでしょ。flowview が
+    # 対応すべきでしょ」). The break is the point: a two-argument factory that
+    # kept working would keep animating the wrong thing silently.
+    # The SHA is the *commit*, not the tag object: v0.13.1/v0.12.0 are
+    # LIGHTWEIGHT tags (no `^{}` peel in `git ls-remote`), same as v0.9.0,
+    # unlike the annotated v0.7.0/v0.8.0.
+    # 0.16.2/0.16.4: paint caches (body strips 0.16.2; gutter + separator
+    # caches 0.16.4) are released when an entry leaves the visible band
+    # instead of only on removal/resize/model-clear — memory now tracks
+    # what's on screen, not everything ever scrolled past. reyn configures a
+    # decorator (ReynGutter/ReynRightGutter), so the 0.16.4 gutter half is
+    # directly relevant, but both decorators already read live state off the
+    # app each repaint (`_streaming_replies`, `_turn_usage`, ...) rather than
+    # caching anything themselves, so trimming flowview's OWN paint cache
+    # underneath them changes nothing observable — they're just called again.
+    # 0.16.3: an off-screen `update()` (the swap-to-a-light-body-while-hidden
+    # pattern, driven from `track_visibility`'s `on_hide`) now releases the
+    # superseded presentation immediately instead of only on next re-present
+    # — makes that pattern actually reclaim memory. reyn does not currently
+    # use this pattern; picked up for when it does.
+    # 0.17.0 (#4171, `feat!`): text search (`*`/`n`/`N`, live via the
+    # `_CursorFlowView` cursor reyn enables) read rows through the RENDER
+    # path — an entry that had never scrolled into view had no
+    # `Presentation` yet, so search saw the "Loading..." placeholder instead
+    # of its content and silently missed it, with no indication the result
+    # was partial. New optional `FlowView(search_text=lambda item: ...)`
+    # lets FlowView read an un-rendered entry's text directly: the matching
+    # entry is found from that cheap text (no rendering), then only that one
+    # entry is presented to resolve the exact row/column. Adopted here as
+    # `search_text=lambda msg: msg.text` (`OutboxMessage.text`) —
+    # deliberately the raw text, not what the gutter prefixes onto it, since
+    # a search match on gutter decoration (not message content) would be a
+    # confusing result. Breaking: `search`/`search_next`/`search_previous`/
+    # `search_selection` are now `async` (a match may need its entry
+    # presented first) — inert for reyn, which never calls these
+    # programmatically (only via FlowView's own key bindings).
+    # 0.18.1-0.19.0 (docs-only, taken for #4474): a live-verify session found
+    # a real reyn bug through this chain — `textual_image.renderable.Image`
+    # auto-selects Sixel first on WezTerm/Kitty, and Sixel draws pixels
+    # relative to the CURSOR rather than into cells, so FlowView (a
+    # virtualized, cell-repainting painter) cannot place or clip it,
+    # producing a duplicated/ghosted image after any row-height reflow.
+    # 0.18.1 named the supported-renderable matrix (Kitty placeholder mode
+    # or half-block, never Sixel); a follow-up finding (0.18.2/0.18.3, "a
+    # consumer hit exactly this") showed Kitty placeholder mode is ALSO
+    # unreliable — WezTerm/Konsole report Kitty-graphics support but render
+    # the placeholder's normally-invisible combining diacritics as visible
+    # garbled glyphs, and there is no query for "do placeholders actually
+    # draw" (`tgp.query_terminal_support()` only probes base Kitty support),
+    # so this cannot be auto-detected. 0.19.0's own conclusion: half-block
+    # cells are the ONLY form that needs no protocol negotiation and is
+    # reliable everywhere — ~15 lines of `__rich_console__` yielding
+    # `Segment("▀", Style(color=…, bgcolor=…))`, no third-party image
+    # library at all. reyn's own `HalfBlockImage` (`present_renderer.py`)
+    # follows `examples/image.py`'s exact shape. This SUPERSEDES #3970's
+    # own textual-image adoption decision — not a downgrade to a "lighter"
+    # renderer (#3970's own reinvention-comparison rule: a degraded
+    # reimplementation is not a smaller version of the same feature), but a
+    # correction of #3970's premise: real-pixel rendering (the capability
+    # #3970 chose textual-image FOR) turns out to be undeliverable inside
+    # FlowView's virtualized painting model at all, on the terminals reyn
+    # targets — #3970's trade-off no longer applies because the option it
+    # was weighing against never actually worked here.
+    "textual-flowview @ git+https://github.com/tya5/textual-flowview.git@d90584af11ed89c064cfd796b6bb7e76e27aa2cb",  # v0.22.0
+    "numpy>=1.24",           # RAG index backend cosine similarity (ADR-0033)
+    "croniter>=2.0",         # cron expression parsing for FP-0009 Component B
+    "charset-normalizer>=3.0",  # #1452 read_file encoding detection (MIT, pure-python)
+    "mcp>=2.0,<3.0",          # #4412: the arc this comment used to describe (mcp 2.0 port)
+                              # is DONE -- bumped from `>=1.24,<2.0`. fastmcp stays DROPPED
+                              # from every reyn-side dependency declaration (#4302, #3698
+                              # stage 1, #4282, #4299 -- unaffected by this bump). Server
+                              # CONSTRUCTION (Tool(...)/CallToolResult(...)/etc.) now uses
+                              # 2.0's field-name vocabulary directly (input_schema/
+                              # mime_type/...) -- #4368's own ruling was ONE-WAY migration,
+                              # no dual-pin seam for construction (owner: reyn's surface
+                              # must not grow every time the SDK's vocabulary grows), so
+                              # this bump's own commit mechanically flips every
+                              # construction call site in the SAME PR. Registration + ctx
+                              # shape stay behind `_mcp_server_boundary.py`
+                              # /`_mcp_client_boundary.py` (#4368) -- those seams already
+                              # speak 2.0 natively and needed ZERO changes for this bump
+                              # (their whole POINT). `mcp.server.fastmcp` is gone, renamed
+                              # `mcp.server.mcpserver` (`FastMCP`->`MCPServer`, #4412 Class
+                              # B) -- the decorator API itself (`@mcp.tool()`) is UNCHANGED,
+                              # confirmed live, so this was a pure import/construction
+                              # rename, no test-double logic changed. The bundled `rag` PLUGIN
+                              # still declares its OWN `fastmcp>=3.4,<4` in its own
+                              # `builtin/plugins/rag/requirements.txt` (#4388) -- a SEPARATE
+                              # venv (ADR-0064), untouched by this bump.
+    # #4395: was transitive only (Required-by: httpx, mcp, openai,
+    # sse-starlette, starlette, watchfiles — 4.14.0 already installed via
+    # that chain). Owner decision: declare it directly rather than keep
+    # relying on other packages' own pins to keep pulling it in — the same
+    # "make an existing transitive a direct dependency" move as `mcp`'s own
+    # entry above. Floor set to the version already resolved and in use
+    # (4.14.x); not raised for a specific new API this PR relies on.
+    "anyio>=4.14",
+    # #5059: was transitive only (Required-by: chonkie, datasets, ddgs,
+    # huggingface_hub, litellm, openai — every one of which is already a
+    # DIRECT dependency of reyn itself, so httpx was never genuinely
+    # optional). reyn's own code imports it directly too (8 files:
+    # `_network.py`, `_ssrf_pin.py`, `core/present/image_fetch.py`,
+    # `core/registry/client.py`, `core/op_runtime/web.py`,
+    # `interfaces/web/notifications.py`, `interfaces/repl/remote_client.py`
+    # — grepped, not assumed). Declared directly rather than relying on
+    # other packages' own pins — the same "make an existing transitive a
+    # direct dependency" move `anyio` above already made (#4395). A future
+    # release of ddgs/litellm/openai that drops or re-pins httpx would
+    # otherwise silently break every one of those 8 call sites with no
+    # signal until runtime — "who stops this if it repeats" had no answer
+    # (owner finding, `gh issue view 5059`). Floor set to the version
+    # already resolved and in use (0.28.x, same convention `anyio` above
+    # states) — not raised for a specific new API this change relies on.
+    "httpx>=0.28",
+    # #5059: was transitive only, via `mcp`'s own `pyjwt[crypto]>=2.10.1`
+    # requirement (verified: `importlib.metadata.metadata("PyJWT").
+    # get_all("Requires-Dist")` shows `cryptography>=3.4.0; extra ==
+    # "crypto"` — `mcp` is core, above, so this chain is guaranteed
+    # TODAY). reyn's own `interfaces/web/auth/tls.py` imports it directly
+    # (x509 / hazmat primitives) — a real direct dependency wearing a
+    # transitive one's clothes, same class as `httpx` just above. Declared
+    # directly so a future `mcp` release dropping the `[crypto]` extra (or
+    # downgrading pyjwt below the version that requests it) cannot
+    # silently take TLS out from under `tls.py` with no signal until a
+    # runtime `ImportError` — see that module's own updated docstring
+    # (its former "install the [web] extra" guidance never worked: `[web]`
+    # has been an empty back-compat alias since #5051, and cryptography
+    # was never part of it in the first place). Floor set well above
+    # pyjwt's own `>=3.4.0` (a security-sensitive x509/TLS library, not
+    # pinned to a specific new API) rather than to whatever happens to be
+    # resolved on any one machine.
+    "cryptography>=42.0",
+    "pyperclip>=1.9",        # #3616 ①: cross-platform clipboard, replacing a
+                              # hand-rolled pbcopy/wl-copy/xclip/xsel/clip
+                              # dispatch table whose Windows arm piped UTF-8
+                              # to clip.exe (which decodes stdin under the OEM
+                              # code page, garbling non-ASCII). pyperclip's
+                              # Windows backend writes CF_UNICODETEXT directly.
+                              # Linux still needs xclip/xsel/wl-clipboard on
+                              # PATH — pyperclip does not vendor them either.
+    # #3846 ③ / #3970: owner-approved REGULAR dependency (not extra) —
+    # "入れた瞬間に効く" (UX/predictability > a silent text-only fallback,
+    # owner's own standing policy). pip resolvability measured (#3970):
+    # manylinux(3.11/3.12) / win_amd64(3.11) / macosx_11_0_arm64(3.12) all
+    # have prebuilt wheels (no compiler needed); the one gap is
+    # macosx_10_9_x86_64 (Intel Mac, source build needs libjpeg/zlib
+    # headers) — neither CI nor the owner's machine is affected.
+    #
+    # #4474: `textual-image` (the real-pixel renderer #3970 chose this
+    # section's OTHER half for) is REMOVED from this list — see the
+    # `textual-flowview` pin comment above for the full chain. pillow alone
+    # remains: `present_renderer.py`'s own `HalfBlockImage` decodes with it
+    # and needs nothing else (no third-party image-rendering library at
+    # all, matching flowview's own `examples/image.py` — "you don't need an
+    # image library to put images in the feed").
+    "pillow>=11.0",
+    # #5051: owner-directed move from the `[web]` extra to a REGULAR
+    # dependency (2026-08-22, `gh issue view 5051`). AG-UI is one of the two
+    # `ClientTransport` implementations (`InProcessTransport` /
+    # `AgUiTransport`) `reyn web`/`--connect` need — half the shipped
+    # transport design not working with the config as-shipped is exactly
+    # CLAUDE.md's second question ("is this visible with the shipped
+    # config?"). Measured lightweight (#5041 ⑦): 4 packages against 17 core
+    # deps, unlike `[voice]` (faster-whisper)/`[builtin-rag]` (sqlite-vec /
+    # apsw / chonkie)/`[sandbox-linux]` (landlock/pyseccomp, platform-gated),
+    # which correctly stay optional. Pins below are unchanged from the
+    # former `[web]` extra — see that block's own comment for the
+    # fastapi/starlette upper-bound rationale (#1621).
+    "fastapi>=0.110,<0.137",
+    "starlette>=1.0,<1.3",
+    "uvicorn[standard]>=0.27",
+    "websockets>=12",
+]
+
+[project.urls]
+Homepage = "https://tya5.github.io/reyn/"
+Documentation = "https://tya5.github.io/reyn/docs/"
+Repository = "https://github.com/tya5/reyn"
+Issues = "https://github.com/tya5/reyn/issues"
+Changelog = "https://github.com/tya5/reyn/blob/main/CHANGELOG.md"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov",
+    "pytest-xdist>=3.5",
+    "pytest-timeout>=2.2",
+    "ruff",
+    "mypy",
+    "pytest-asyncio>=0.23",
+    "pre-commit>=3",
+    "markdown>=3.6",  # #3126: doc-anchor CI gate imports the canonical
+                       # markdown.extensions.toc.slugify_unicode/unique
+                       # functions directly — the same slugify mkdocs' `toc`
+                       # extension (docs extra) uses at build time. A pure-
+                       # python leaf dep, listed here (not `docs`) so `pytest`
+                       # (installed via this extra in CI) has it without
+                       # pulling the mkdocs-material/i18n toolchain.
+]
+fetch = [
+    "trafilatura>=1.8",       # higher-quality HTML extraction for web_fetch (issue #355)
+]
+docs = [
+    "mkdocs>=1.5",
+    "mkdocs-material>=9.5",
+    "mkdocs-static-i18n>=1.2",
+]
+# `web` is now a no-op back-compat alias, same shape as `mcp` below: #5051
+# moved its 4 packages (fastapi/starlette/uvicorn/websockets, with the
+# #1621 upper-bound pins now living on the `dependencies` entries above)
+# into the REGULAR dependency set — `reyn web`/`--connect` is half of the
+# shipped `ClientTransport` design, not an optional add-on. Kept as an
+# empty extra so an existing `pip install -e ".[web]"` invocation (CI,
+# user docs, `reyn[web]`) keeps resolving instead of erroring on an
+# unknown extra.
+web = []
+# `mcp` is now a no-op back-compat alias: the MCP client path runs on the `mcp`
+# SDK directly (core `dependencies` above, `mcp>=2.0,<3.0` — #4412 bumped this
+# off the prior `>=1.24,<2.0` floor; the MCP client is always constructed by
+# `Session.__init__`), not `fastmcp` — #4302 dropped
+# fastmcp from core (and every extra) entirely. Kept as an empty extra so
+# existing `pip install -e ".[mcp]"` invocations (CI, user docs, `reyn[mcp]`)
+# keep resolving instead of erroring on an unknown extra.
+mcp = []
+# ADR 0064 P5 (grew out of FP-0063 P2) -- the runtime deps of the builtin
+# `rag` PLUGIN's two MCP servers (`src/reyn/builtin/plugins/rag/scripts/`:
+# vector-store over sqlite-vec, chunker over chonkie). These are NO LONGER
+# a runtime path reyn's own env needs: `plugin_install(source={"kind":
+# "builtin", "name": "rag"})` materialises them into a DEDICATED per-plugin
+# venv (`~/.reyn/plugins/rag/.venv`, from the plugin's own
+# `requirements.txt`) at install time, so a user's `pip install reyn` (or
+# `reyn[builtin-rag]`) never needs to resolve them, and reyn core never
+# imports them. This extra survives ONLY as a dev/test convenience so this
+# repo's OWN unit tests (tests/test_fp0063_p2_builtin_mcp_rag.py and the
+# rag-plugin install tests) can import chonkie/apsw/sqlite-vec directly
+# without a `uv`-materialised venv in the loop -- it is not part of the user
+# launch path and is not referenced by any `[project.scripts]` entry point.
+#   - sqlite-vec (dual MIT/Apache-2.0): pure-C SQLite extension, no bundled
+#     embedding model -> no HuggingFace-fetch hazard (FP-0057 line 55).
+#   - apsw (zlib-like "any-OSI"): sqlite-vec loads via
+#     `sqlite3.Connection.load_extension`, which the STDLIB `sqlite3` module
+#     is not guaranteed to support (e.g. this repo's own pyenv-built
+#     CPython 3.12.7 .venv has no `enable_load_extension`). apsw statically
+#     bundles its own SQLite with extension loading always enabled, so
+#     loading is portable regardless of how the host interpreter's `sqlite3`
+#     was compiled.
+#   - chonkie (MIT): recursive/semantic/etc. chunking, ~15 MiB vs LangChain's
+#     ~80 MiB; no bundled model in the default character-tokenizer path used
+#     here -> no network fetch at import or call time.
+builtin-rag = [
+    "sqlite-vec>=0.1.9",
+    "apsw>=3.51",
+    "chonkie>=1.7",
+]
+# #2608 H4: filesystem watcher external-event source (`fs_watch:` config block ->
+# `file_changed` hook). Extras-only — a build with no fs_watch config configured
+# never imports this, and a build WITH config but no extra installed degrades to
+# "feature off + warn" (see reyn.runtime.fs_watcher module docstring).
+fs-watch = ["watchdog>=4.0"]
+release = [
+    "build>=1.0",
+    "twine>=5.0",
+]
+sandbox-linux = [
+    # No stable landlock >=1.0 exists on PyPI — only 1.0.0.dev* pre-releases.
+    # A specifier that names a pre-release opts this requirement into them
+    # (PEP 440), so `>=1.0.0.dev4` installs where a bare `>=1.0` resolves to
+    # nothing (pip excludes pre-releases by default). #1693.
+    "landlock>=1.0.0.dev4",
+    "pyseccomp>=0.1",
+]
+voice = [
+    "sounddevice>=0.4.6",
+    "faster-whisper>=1.0.0",
+]
+# #3796: the full-viewport text effect on ctrl+l — a joke, and the only thing
+# in reyn that wants an animation library. Its own extra rather than a core
+# dependency (owner ruling, 2026-08-08「依存は extra かな」): not everyone who
+# installs reyn should carry a dependency for a joke. Without it the key says so
+# and names this extra, so the feature is discoverable without being installed.
+effects = [
+    "terminaltexteffects>=0.12",
+]
+# OpenTelemetry (OTLP) export surface — opt-in observability. Reyn core stays
+# SDK-free unless an operator activates OTEL export (an OTLP endpoint plus this
+# extra); when the SDK isn't installed the exporter stays not-attached, fail-open.
+observability = [
+    "opentelemetry-exporter-otlp-proto-http>=1.20",
+    "opentelemetry-sdk>=1.20",
+]
+# FP-0041 #489 plugins-api PR-2: sample webhook plugins use OSS SDKs.
+# Reyn core stays SDK-free for operators who don't activate the
+# samples; SDK deps are opt-in via these extras:
+#
+#   pip install reyn[sample_slack]      # = reyn + slack-bolt
+#   pip install reyn[sample_line]       # = reyn + line-bot-sdk
+#   pip install reyn[all-samples]       # = reyn + both
+#
+# When the SDK isn't installed, ``register_router`` returns ``None``
+# with a clear log message; reyn boots without crashing.
+sample_slack = ["slack-bolt>=1.18"]
+sample_line = ["line-bot-sdk>=3.0"]
+all-samples = ["slack-bolt>=1.18", "line-bot-sdk>=3.0"]
+
+[project.scripts]
+reyn = "reyn._cli:main"
+# Builtin RAG MCP server console scripts (`reyn-rag-chunker` /
+# `reyn-rag-vector-store`, #2972) are RETIRED under ADR 0064 P5 -- the
+# console-script approach bound the servers to reyn's OWN environment
+# (needed `pip install "reyn[builtin-rag]"` into reyn's env), which is
+# exactly the coupling the plugin model exists to remove. The builtin `rag`
+# plugin's `.mcp.json` instead declares `command: python` against a path
+# inside the plugin's own copy; `plugin_install` materialises a DEDICATED
+# per-plugin venv and rewrites that command to the materialised venv's own
+# interpreter, so spawn is network-free without depending on the ambient
+# PATH's `python3` OR on reyn's console-script shebang trick (ADR 0064
+# §3.11 / §4). See `src/reyn/builtin/plugins/rag/`.
+
+# FP-0041 #489 plugin framework: sample webhook plugins bundled with reyn.
+# External plugins register the same way via their own pyproject.toml.
+[project.entry-points."reyn.webhooks"]
+sample_slack = "reyn.gateway.sample_slack:register_router"
+sample_line = "reyn.gateway.sample_line:register_router"
+
+# FP-0041 #489 plugins-api PR-2: sample plugins now use OSS SDKs for
+# transport-specific protocol (= slack-bolt / line-bot-sdk). Installed
+# via optional pip extras so reyn core stays SDK-free for operators
+# who don't activate the samples:
+#
+#   pip install reyn[sample_slack]      # = reyn + slack-bolt
+#   pip install reyn[sample_line]       # = reyn + line-bot-sdk
+#   pip install reyn[all-samples]       # = reyn + both
+#
+# When the SDK isn't installed, ``register_router`` returns ``None``
+# with a clear log message so reyn boots without crashing.
+
+[tool.pytest.ini_options]
+asyncio_mode = "strict"
+pythonpath = ["src"]
+# dogfood/fixtures/ ships failing-test workspaces consumed by
+# dogfood/scripts/ runners on isolated tmp copies. They MUST NOT
+# be collected by the project's main pytest suite — the placeholder
+# stubs (= NotImplementedError) would fail CI at collection time.
+#
+# .claude/worktrees/ holds transient git worktrees created by the Agent
+# tool's `isolation: "worktree"` mode (gitignored, local-only). Each is a
+# full copy of the tree at some other branch state, so a rootdir
+# `pytest -q` would otherwise collect tens of thousands of stale-import
+# test modules. Declaring an explicit norecursedirs drops pytest's default
+# `.*` dotdir exclusion, so `.claude` (and `.reyn`) must be listed back.
+norecursedirs = ["dogfood/fixtures", ".reyn", ".claude", "reyn-worktrees"]
+
+# Hatchling build config (0061 §3.1 — replaces the former
+# [tool.setuptools.packages.find] / [tool.setuptools.package-data] / setup.py
+# build_py cmdclass trio). `packages` maps 1:1 to the old `packages.find`
+# clause; the three `artifacts` entries preserve — byte-for-byte — the old
+# `package-data` glob (py.typed, builtin/**/*, environment/*.Dockerfile).
+# `artifacts` (not `include`) is used deliberately: it forces inclusion
+# regardless of Hatchling's default VCS-tracked-file selection, so these three
+# entries can never silently drop out if a future file under one of these
+# globs is untracked/gitignored (the top omission risk called out in 0061
+# §3.1 — dropping any of the 3 = a silently-broken wheel).
+# Allow the git-pinned `textual-flowview @ git+https://...@<sha>` direct
+# reference in `project.dependencies` (TUI-rebuild arc Phase 0, #3273).
+# Hatchling refuses direct (URL/VCS) references by default; this opt-in is
+# required for the pinned-commit flowview dep to build/resolve.
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/reyn"]
+artifacts = [
+    "src/reyn/py.typed",
+    "src/reyn/builtin/**/*",
+    "src/reyn/environment/*.Dockerfile",
+]
+
+# 0061 §3.2/§3.3 — the reachable-set SSoT: docs-delivery force-include below
+# mirrors `reyn.runtime.reyn_src.FORCE_INCLUDE_ENTRIES` (the single Python
+# declaration; TOML can't import Python, so the two are kept in sync by
+# construction of the parity gate in tests/test_0061_repo_self_access_parity.py,
+# which fails if the two drift). `docs/` stays at the repo root (mkdocs
+# `docs_dir: ../docs` unaffected) — this only maps it into the wheel's
+# installed tree.
+[tool.hatch.build.targets.wheel.force-include]
+"README.md" = "reyn/_bundled/README.md"
+"CHANGELOG.md" = "reyn/_bundled/CHANGELOG.md"
+"docs" = "reyn/_bundled/docs"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+exclude = [
+    "venv",
+    ".venv",
+    "site",
+    "dist",
+    "build",
+    "tmp",
+    "zenn-book",
+    ".claude",
+]
+
+[tool.ruff.lint]
+# Pyflakes (real bugs) + import sorting only. The pycodestyle style
+# rules (E501 long lines, E402 module-level imports, E741 ambiguous
+# names) are intentionally not enforced — we keep the line-length
+# target as a guideline rather than a hard rule, since wrapping
+# Reyn's narrative comments and skill scripts often hurts
+# readability more than it helps.
+select = ["F", "I"]
+ignore = [
+    # F811: local imports inside functions for clarity (e.g. lazy
+    # imports of optional deps) trigger this.
+    "F811",
+    # F841: explicit `_ = ...` placeholders or guard variables that
+    # aren't used outside an assertion are intentional.
+    "F841",
+]
+
+# #4653 (F401's own sibling): F821 (undefined name) was unignored repo-wide,
+# not sliced -- 35 findings, an order of magnitude smaller than #4097's F401
+# population, so no per-directory rollout was needed. The stale rationale
+# above this used to claim a forward ref under TYPE_CHECKING "confuses"
+# pyflakes; it doesn't -- pyflakes correctly flags a name that resolves to
+# nothing at runtime. Each finding was one of two genuinely different
+# shapes, never decided from the count alone: (a) a missing import -- 32
+# cases, all but 2 a TYPE_CHECKING-only import (the annotation is never
+# evaluated at runtime under `from __future__ import annotations`); 2 cases
+# (`ExternalTransportRouting` in config/root.py, `OAuthProviderConfig` in
+# config/infra.py) needed a CONCRETE import instead, because
+# config_schema.py's own `walk_config_schema` calls `get_type_hints()`,
+# which eagerly resolves every forward ref against the class's real module
+# globals -- a TYPE_CHECKING-only name is never in there, so the field would
+# have silently dropped from the schema walk. (b) a wrong name in the
+# annotation -- 3 cases where the annotation referenced a name that never
+# existed anywhere in the file (a typo'd class, e.g. `_OnLimitConfig` for
+# the real `OnLimitConfig`) and the fix was correcting the name, not adding
+# an import. Landing (a)'s 2 concrete-import cases also let
+# config_schema.py drop its own hardcoded `_patch_localns` workaround that
+# duplicated those same two names in a second file, specifically to paper
+# over this exact gap for `get_type_hints()` alone -- the workaround is now
+# unnecessary because both names are real module attributes.
+
+# #4097: F401 (unused import) — enforced in src/, still ignored in tests/.
+# A blanket F401 ignore meant no gate could ever say "nobody uses this
+# import any more" -- #4094/#4095's own motivating case: a dead import in
+# a2a.py survived months of green CI, and its OWN module docstring cited
+# it as evidence two callers took the same lock (they didn't). Measured
+# before landing (#4097 first slice): removing the ignore surfaced 64
+# findings in src/ -- 61 were genuinely dead (no reference anywhere in
+# the file, not even inside a quoted annotation or a comment); 1 was a
+# deliberate re-export needing an inline `# noqa: F401` (router_loop.py's
+# EMPTY_STOP_RETRY_DIRECTIVE -- real external consumers import it FROM
+# router_loop, not from its origin module); 2 were re-exports missing
+# from their __init__.py's own `__all__` (services/__init__.py's
+# tests/ is measured + sliced per-directory (335 findings total, an order
+# of magnitude more than src/ and a distinct population -- test fixtures/
+# helpers imported for side effect, parametrize decorators, plus a real
+# hazard #4597 slice(3) surfaced: an import that supported a hand-rolled
+# fake/stand-in REMOVED by an earlier refactor can look F401-dead while
+# actually being a signal the stand-in's replacement is incomplete --
+# verify per-import what it supported, don't bulk --fix). Sliced by
+# top-level tests/ subdirectory, ruff per-file-ignores has no "more
+# specific pattern wins" override (verified empirically -- an inner glob's
+# empty ignore list does NOT subtract an outer glob's ignore, so a
+# subdirectory is cleared by ABSENCE from this list, not by an explicit
+# override entry): tests/core/ (#4097 2nd slice), tests/builtin/,
+# tests/dev/, tests/repo/, tests/scripts/ (#4097 3rd slice),
+# cli/config/data/environment/hooks/http_safety/observability/plugins/
+# services/web (#4636, the 10 smallest remaining directories, 21
+# findings), tests/llm/ + tests/mcp/ (14 findings), tests/security/
+# + tests/tools/ (48 findings, same per-import verification), and
+# tests/interfaces/ (69 findings) and tests/runtime/ (59 findings, same
+# per-import verification) are all enforced -- the final #4097 slice,
+# every tests/ subdirectory now enforces F401. ROOT-level tests/*.py files
+# (conftest.py etc.) and tests/_support/ are deliberately NOT listed
+# here -- both measured 0 findings already, so leaving them off this
+# list enforces F401 there too, for free (caught in review, #4640: an
+# earlier draft of this list carried a stale tests/_support entry
+# despite the 0-finding measurement). A single-`*` "tests/*.py" pattern
+# was tried first and DISCARDED: ruff's glob crosses `/` on a bare `*`
+# the same as `**`, so that one entry silently re-exempted every nested
+# subdirectory too (verified: it alone reproduced the FULL 335-finding
+# blanket ignore) -- the per-subdirectory `tests/<dir>/**/*.py` entries
+# below don't have this failure mode because the directory NAME is the
+# anchor, not a wildcard.
+[tool.ruff.lint.per-file-ignores]
+
+# #3726: wired into CI as a ratchet (.github/workflows/test.yml's "mypy
+# (ratchet)" job), not a blocking full-adoption gate — the tree currently
+# carries 603 findings (212 unique (file, error-code) pairs), too many to
+# close before adopting. scripts/mypy_ratchet.py fails CI only on a pair NOT
+# already in the committed scripts/mypy_ratchet_baseline.json; see that
+# script's module docstring for the full rationale (same skeleton as
+# tests/test_3595_s4_slash_handler_seam.py's residue ratchet).
+[tool.mypy]
+python_version = "3.11"
+strict = false
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# numpy 2.x's bundled __init__.pyi uses PEP 695 `type X = ...` (3.12+-only
+# syntax) internally; mypy applies the declared `python_version` restriction
+# to third-party stubs too, not just first-party code, so parsing it under
+# our `python_version = "3.11"` (matching `requires-python`, #3726) raises a
+# real SyntaxError in numpy's OWN stub — nothing to do with our code.
+# `follow_imports = "skip"` treats numpy as untyped (Any) instead of parsing
+# its stub, which is the standard workaround for this exact upstream tension.
+module = ["numpy", "numpy.*"]
+follow_imports = "skip"
+follow_imports_for_stubs = true

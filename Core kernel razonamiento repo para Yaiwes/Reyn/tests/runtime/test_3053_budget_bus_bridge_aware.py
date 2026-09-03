@@ -1,0 +1,360 @@
+"""#3053 — the `safety.limit` cost-gate bus (`_ChatBudgetBus`) is bridge-aware.
+
+Sibling gap to #3049/#3052: the per-LLM-call budget-exceed gate
+(`_budget_exceed_allows_continue` -> `handle_limit_exceeded`) dispatches its
+`safety.limit.*` "keep going?" prompt via `Session._ChatBudgetBus` (a bus
+published at `Session.__init__` through `set_llm_call_limit_context`, read
+back by `_budget_exceed_allows_continue`'s ambient `LLMCallLimitContext`). Prior
+to this fix that bus was built by CAPTURING `self._dispatch_intervention`
+directly — a bus wrapping the local session's OWN dispatcher, bypassing
+`Session._intervention_bridge` entirely. On an ATTACHED spawned/driver session
+(a pipeline driver, a delegated sub-agent) that means a budget-exceed prompt
+dispatched on the driver's own listener-less `InterventionRegistry`
+(`enforce_listener_presence=True`, no listener registered for a driver) and
+the `enforce_listener_presence` short-circuit resolved it to an EMPTY
+`InterventionAnswer` immediately — auto-refusing without ever reaching the
+pipeline ORIGINATOR's live operator. Different symptom from #3049 (auto-refuse,
+not an orphaned hang — `handle_limit_exceeded` turns a `choice_id`-less answer
+into `allow_continue=False`), same delivery-rule violation
+(`docs/concepts/runtime/intervention-delivery.md`): "an intervention... is
+answered by the originator the run is ultimately attached to."
+
+Fix: `_ChatBudgetBus.request` now resolves its bus fresh on each call via
+`Session._make_router_intervention_bus` — the SAME bridge-aware seam #3052
+gave the 5 MCP router-op methods — instead of freezing a self-bound
+`_dispatch_intervention` reference at `__init__` time.
+
+Drive-measured live (see PR description) with real `AgentRegistry` / `Session`
+/ `BridgeToParent` objects before writing this fix: pre-fix, the prompt in the
+attached case resolved to `LimitDecision(reason="user_refused")` in the same
+event-loop tick, WITHOUT the originator's active queue ever seeing it.
+Post-fix it lands on the originator's queue and only resolves once answered.
+
+Real `AgentRegistry` / `Session` / `BridgeToParent` / `BudgetCheck` /
+`handle_limit_exceeded` — no collaborator mocks. Mirrors
+`test_3049_driver_router_op_intervention_reaches_originator.py`'s
+cross-session-witness + fail-close + structural-guard pattern.
+"""
+from __future__ import annotations
+
+import ast
+import asyncio
+import inspect
+import textwrap
+from pathlib import Path
+
+import pytest
+
+from reyn.core.events.state_log import StateLog
+from reyn.intervention_choices import YES
+from reyn.llm.llm import _budget_exceed_allows_continue
+from reyn.runtime.budget.budget import BudgetCheck
+from reyn.runtime.registry import AgentRegistry
+from reyn.runtime.session import DEFAULT_CHAT_CHANNEL_ID, Session
+from reyn.runtime.session_api import _build_agent_step_narrowing, spawn_ephemeral_session
+from reyn.runtime.session_params import PresentationWiring
+from reyn.runtime.spawn_routing import AuditOnlyNoSurface, BridgeToParent
+from tests._async_wait import wait_until
+from tests._support.agent_session import make_session
+
+
+def _registry(tmp_path: Path, state_log: "StateLog") -> AgentRegistry:
+    """Real AgentRegistry + a Session factory that forwards BOTH spawn overrides — the
+    driver spawn threads a parent-bound ``intervention_bridge`` exactly as production does.
+    ``non_interactive=False`` (unlike the #3049 harness) because ``handle_limit_exceeded``'s
+    ``interactive`` mode only reaches the bus at all when the caller CAN ask (a non-interactive
+    caller takes the bounded-auto-extend branch before ever touching the bus — #1649)."""
+    holder: dict = {}
+
+    def _factory(profile, *, presentation_consumer=None, intervention_bridge=None) -> Session:
+        return make_session(
+            agent_name=profile.name, state_log=state_log, registry=holder.get("reg"),
+            non_interactive=False, presentation_wiring=PresentationWiring(presentation_consumer=presentation_consumer, intervention_bridge=intervention_bridge),
+        )
+
+    reg = AgentRegistry(project_root=tmp_path, session_factory=_factory, state_log=state_log)
+    holder["reg"] = reg
+    if not reg.exists("worker"):
+        reg.create("worker")
+    return reg
+
+
+async def _spawn_driver(reg: "AgentRegistry", routing) -> Session:
+    """A pipeline driver session spawned with ``routing``'s intervention bridge — the SAME
+    spawn shape ``_spawn_pipeline_driver_session`` uses (BridgeToParent attached / AuditOnly
+    detached). Constructing the driver publishes its OWN ``_ChatBudgetBus`` as the ambient
+    ``LLMCallLimitContext`` (``Session.__init__`` -> ``set_llm_call_limit_context``) — the
+    same contextvar ``_budget_exceed_allows_continue`` reads, so calling it from this same
+    async context after spawning the driver drives the EXACT bus a budget-exceed check on the
+    driver would use."""
+    sid = await spawn_ephemeral_session(
+        reg, identity="worker", narrowing=_build_agent_step_narrowing(None),
+        presentation_consumer=routing.presentation_consumer,
+        intervention_bridge=routing.intervention_bridge,
+    )
+    driver = reg.get_session("worker", sid)
+    assert driver is not None
+    return driver
+
+
+def _cancel_tasks(reg: "AgentRegistry") -> None:
+    for task in list(reg._tasks.values()):  # noqa: SLF001 — teardown precedent (sibling tests)
+        if not task.done():
+            task.cancel()
+
+
+# ── Attached: a driver-session budget-exceed prompt reaches the originator operator ────────
+
+
+@pytest.mark.asyncio
+async def test_attached_driver_budget_exceed_prompt_reaches_originator_operator(
+    tmp_path: Path,
+) -> None:
+    """Tier 2: an ATTACHED pipeline driver's budget-exceed gate — driven for real through
+    ``_budget_exceed_allows_continue`` (the exact function ``call_llm_tools`` invokes when
+    ``check_pre_llm`` refuses) — delivers its ``safety.limit.*`` prompt to the ORIGINATOR
+    operator's live listener, and the operator's approval flows back as ``allow_continue=True``.
+    RED before the fix: ``_ChatBudgetBus`` captured ``self._dispatch_intervention`` bound to the
+    DRIVER itself, so the prompt resolved to an empty answer (``allow_continue=False``,
+    ``reason="user_refused"``) in the same tick, WITHOUT ever reaching the originator's queue."""
+    state_log = StateLog(tmp_path / ".reyn" / "wal.jsonl")
+    reg = _registry(tmp_path, state_log)
+    originator = reg.get_or_load("worker")
+    originator.register_intervention_listener(DEFAULT_CHAT_CHANNEL_ID)
+
+    await _spawn_driver(reg, BridgeToParent(originator))
+
+    # Real BudgetCheck as call_llm_tools' check_pre_llm would return on a hard-cap refusal.
+    check = BudgetCheck(allowed=False, hard_dimension="test_budget")
+    gate = asyncio.ensure_future(_budget_exceed_allows_continue(check, "worker"))
+
+    await wait_until(lambda: bool(originator.interventions.list_active()))
+    assert originator.list_stalled_interventions() == [], (
+        "the bridged budget-exceed prompt was parked in the originator's stalled queue "
+        "instead of its live listener."
+    )
+
+    # #5057: answer_oldest_intervention_choice retired -- deliver BY ID (R1).
+    head = originator.interventions.head()
+    assert head is not None
+    consumed = await originator.answer_intervention_by_id(head.id, "", choice_id_override=YES)
+    assert consumed is True
+    allow_continue = await asyncio.wait_for(gate, timeout=5.0)
+    assert allow_continue is True, (
+        "the operator's YES approval on the originator surface did not flow back as "
+        "allow_continue=True."
+    )
+
+    _cancel_tasks(reg)
+
+
+# ── Detached: a headless driver's budget-exceed gate fails closed (never reaches, never hangs) ─
+
+
+@pytest.mark.asyncio
+async def test_detached_driver_budget_exceed_fail_closed_refuse(tmp_path: Path) -> None:
+    """Tier 2: (fail-close half of the rule "no attached originator -> close and answer") a
+    DETACHED driver (spawned ``AuditOnlyNoSurface``, as ``start_pipeline_run`` does) resolves
+    its budget-exceed gate to a deliberate refusal (``allow_continue=False``) without ever
+    reaching (or hanging on) a would-be operator's live listener. The fix preserves the
+    detached fail-close by construction (the bridge IS ``AuditOnlyInterventionBridge``), not
+    by a per-gate special case."""
+    state_log = StateLog(tmp_path / ".reyn" / "wal.jsonl")
+    reg = _registry(tmp_path, state_log)
+    # A would-be operator exists but this driver is NOT attached to it — it must never be consulted.
+    originator = reg.get_or_load("worker")
+    originator.register_intervention_listener(DEFAULT_CHAT_CHANNEL_ID)
+
+    await _spawn_driver(reg, AuditOnlyNoSurface())
+
+    check = BudgetCheck(allowed=False, hard_dimension="test_budget")
+    allow_continue = await asyncio.wait_for(
+        _budget_exceed_allows_continue(check, "worker"), timeout=3.0
+    )
+    assert allow_continue is False, (
+        "a detached driver's budget-exceed gate must fail-close (deny), never silently allow."
+    )
+    assert originator.interventions.list_active() == [], (
+        "a detached driver's budget-exceed prompt reached a non-attached operator — detached "
+        "must fail-close locally, not bridge to an unrelated surface."
+    )
+
+    _cancel_tasks(reg)
+
+
+# ── Root, no listener: a headless root session's limit gate fails closed (never parks/hangs) ──
+
+
+@pytest.mark.asyncio
+async def test_root_no_listener_budget_exceed_fail_closed_not_parked(tmp_path: Path) -> None:
+    """Tier 2: a ROOT session (no intervention bridge) with NO live listener — a headless /
+    run-once / test-harness chat — resolves its budget-exceed gate to a deliberate refusal
+    (``allow_continue=False``) that returns IMMEDIATELY, never parking the intervention in the
+    stalled queue to ``await`` a future no one will resolve.
+
+    This is the fail-close half of the delivery rule applied to the ROOT (no-bridge) branch of
+    ``_make_router_intervention_bus``. Regression guard for #3053-fix2: routing the
+    ``safety.limit`` buses through that seam first exposed a latent gap — its self-bound branch
+    unconditionally returned a channel-id-STAMPED ``ChatInterventionBus``, and on a no-listener
+    session the stamp tripped the #268 origin-pin stall (``InterventionCoordinator.dispatch``
+    parks the iv + ``await``s its future forever) instead of the ``enforce_listener_presence``
+    auto-refuse. Five router-cap / i18n-fallback tests hung 120s on exactly this before the
+    branch was completed with the no-listener fail-close terminal. Uses ``non_interactive=False``
+    (an interactive-mode root that simply has no listener bound yet) so the gate genuinely
+    reaches the bus rather than short-circuiting on the non-interactive auto-extend branch."""
+    state_log = StateLog(tmp_path / ".reyn" / "wal.jsonl")
+    reg = _registry(tmp_path, state_log)
+    # A root session, loaded but with NO intervention listener registered (headless root).
+    root = reg.get_or_load("worker")
+    assert root.interventions.list_active() == []  # sanity: nothing pending at start
+
+    check = BudgetCheck(allowed=False, hard_dimension="test_budget")
+    # MUST resolve promptly. Before the fix this parked + awaited forever (the 120s CI hang);
+    # a tight wait_for turns that latent hang into a loud failure here.
+    allow_continue = await asyncio.wait_for(
+        _budget_exceed_allows_continue(check, "worker"), timeout=3.0
+    )
+    assert allow_continue is False, (
+        "a headless root session's budget-exceed gate must fail-close (deny), never silently allow."
+    )
+    # The iv must NOT have been parked in the stalled queue (the origin-pin park = the hang).
+    assert root.list_stalled_interventions() == [], (
+        "the root no-listener budget-exceed prompt was parked stalled (the #3053-fix2 origin-pin "
+        "hang) instead of fail-closing immediately."
+    )
+    assert root.interventions.list_active() == [], (
+        "the root no-listener budget-exceed prompt was left pending instead of fail-closing."
+    )
+
+    _cancel_tasks(reg)
+
+
+# ── Structural: the budget bus resolves through the single bridge-aware seam, not a frozen ──
+# ── self-bound `_dispatch_intervention` capture ──────────────────────────────────────────────
+
+
+def _parsed_session_source() -> "tuple[str, ast.Module]":
+    """Parse ``Session``'s own source ONCE — ``inspect.getsource(Session)`` (a CLASS) resolves
+    via CPython's ``_ClassFinder`` (matches on ``__qualname__`` via a fresh ``ast.parse``,
+    #5290), not the function/method branch (``findsource``'s ``co_firstlineno``-plus-regex-scan,
+    re-read from whatever ``linecache.checkcache`` finds on disk at call time — fragile if the
+    file is edited between this call and a LATER ``getsource`` call in the same process, #5290's
+    own report, mirroring #5299's identical fix on the sibling #3049 test). Both the offender
+    scan and the vacuity guard below read the SAME parse of the SAME source instead of each
+    doing its own ``getsource`` — the exact shape #5290 describes: two ``getsource`` calls in
+    one test, one of a class (safe) and one of a method (not)."""
+    src = textwrap.dedent(inspect.getsource(Session))
+    return src, ast.parse(src)
+
+
+def _frozen_dispatch_capture_bus_classes(tree: ast.Module) -> "list[str]":
+    """Enumerate nested classes defined inside a ``Session`` method that invoke a LOCAL name
+    assigned directly from ``self._dispatch_intervention`` (e.g. ``_x = self._dispatch_intervention``
+    then ``_x(iv)`` inside the nested class) — the #3053 anti-pattern: a bespoke intervention-bus
+    class built by freezing a self-bound dispatcher at construction time, bypassing
+    ``_make_router_intervention_bus`` (bridge-aware). Derived from the live class source (never
+    hand-listed), so a FUTURE limit/budget-style bus reintroducing the same self-bound freeze is
+    caught automatically, independent of variable naming."""
+    offenders: list[str] = []
+    for func in ast.walk(tree):
+        if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        frozen_names: set[str] = set()
+        for stmt in ast.walk(func):
+            if (
+                isinstance(stmt, ast.Assign)
+                and len(stmt.targets) == 1
+                and isinstance(stmt.targets[0], ast.Name)
+                and isinstance(stmt.value, ast.Attribute)
+                and stmt.value.attr == "_dispatch_intervention"
+                and isinstance(stmt.value.value, ast.Name)
+                and stmt.value.value.id == "self"
+            ):
+                frozen_names.add(stmt.targets[0].id)
+        if not frozen_names:
+            continue
+        for node in ast.walk(func):
+            if not isinstance(node, ast.ClassDef):
+                continue
+            for call in ast.walk(node):
+                if (
+                    isinstance(call, ast.Call)
+                    and isinstance(call.func, ast.Name)
+                    and call.func.id in frozen_names
+                ):
+                    offenders.append(f"{func.name}.{node.name}")
+                    break
+    return offenders
+
+
+def test_budget_bus_has_no_frozen_self_bound_dispatch_capture() -> None:
+    """Tier 2: #3053's fix-class guard — no nested bus class inside a ``Session`` method may
+    invoke a name frozen directly from ``self._dispatch_intervention`` at construction time.
+    That was the exact ``_ChatBudgetBus`` anti-pattern: it bypassed ``_intervention_bridge``
+    entirely, so an attached driver session's budget-exceed prompt auto-refused on the driver's
+    OWN listener-less registry instead of reaching the pipeline originator. RED before the fix:
+    ``__init__`` captured ``_session_dispatch = self._dispatch_intervention`` and
+    ``_ChatBudgetBus.request`` called it directly."""
+    src, tree = _parsed_session_source()
+    offenders = _frozen_dispatch_capture_bus_classes(tree)
+    assert offenders == [], (
+        "these Session-nested bus classes invoke a frozen self-bound `_dispatch_intervention` "
+        "capture directly, bypassing the bridge-aware `_make_router_intervention_bus` seam — "
+        f"an attached driver session's intervention raised there would auto-refuse or orphan "
+        f"instead of reaching the pipeline originator (#3053): {sorted(set(offenders))}"
+    )
+
+    # Vacuity guard: `_ChatBudgetBus` must still resolve through `_make_router_intervention_bus`
+    # on each call (not a frozen bus reference), else the scan above is vacuously green because
+    # there is nothing left to freeze-and-call in the first place (guard inert).
+    #
+    # #5290: reads `__init__`'s own source segment out of the SAME tree the offender scan just
+    # walked (`ast.get_source_segment`, byte-exact against `src`) rather than a second,
+    # independent `inspect.getsource(Session.__init__)` call — that second call resolves via
+    # CPython's line-number-plus-regex branch (`inspect.findsource`'s `co_firstlineno`),
+    # re-read from whatever the file on disk currently contains (`linecache.checkcache`) at
+    # call time. If the file is edited between the two `getsource` calls in the same test run
+    # (a real, observed shape the night this was found: #5284/#5285 both landed lines in
+    # session.py mid-sweep), `__init__`'s SOURCE moves and the second call can read a DIFFERENT
+    # method's body entirely — a false vacuity-guard failure that looks like the wiring
+    # disappeared, when nothing did.
+    #
+    # architect's TESTS-READ(B) BLOCK (#5341): an earlier version of this fix searched
+    # `ast.walk(tree)` for a node named `__init__` — `Session` has TWO nested classes
+    # (`_ChatBudgetBus`, `_ChatLimitBus`; neither currently defines its own `__init__`), and
+    # `ast.walk`'s own docstring is explicit — "in no specified order" — so that search
+    # depended on an unspecified CPython implementation detail (today's BFS order) AND would
+    # silently start reading a NESTED class's `__init__` body instead of `Session`'s own the
+    # moment either nested class gained one — reintroducing the exact "silently reads a
+    # different method's body" defect this fix exists to remove, just relocated. Fixed to walk
+    # only `Session`'s OWN ClassDef body (never descending into a nested class at all), which
+    # depends on neither `ast.walk`'s order nor a re-run census of what nested classes
+    # currently do or don't define.
+    #
+    # No separate test witnesses "one parse, not two, is used" — that is a structural property
+    # of THIS code (which resolution path it takes), not an observable behavior a test can
+    # assert on without transcribing the implementation (Tier 4). What DOES stay observable,
+    # and is guarded below, is that `__init__` is actually found and that its source still
+    # names the two markers the vacuity guard exists to check.
+    session_cls = next(
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "Session"
+    )
+    init_node = next(
+        (
+            node for node in session_cls.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "__init__"
+        ),
+        None,
+    )
+    assert init_node is not None, (
+        "Session.__init__ not found in Session's own source — this guard needs updating, "
+        "not a bare StopIteration."
+    )
+    init_src = ast.get_source_segment(src, init_node)
+    assert init_src is not None
+    assert "_ChatBudgetBus" in init_src and "_make_router_intervention_bus" in init_src, (
+        "Session.__init__ no longer wires `_ChatBudgetBus` through `_make_router_intervention_bus` "
+        "— the frozen-capture structural scan would be vacuously green (guard inert)."
+    )

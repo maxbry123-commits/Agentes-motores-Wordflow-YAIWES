@@ -1,0 +1,348 @@
+"""Tool descriptions for the ``io`` category.
+
+Phase 2 of the tool-description package refactor (byte-identical
+relocation — no LLM-facing text change): every ``io``-category
+ToolDefinition's description string lives here as a reviewable
+``ToolDescription`` record. Each ``.text`` value is copied verbatim from
+its origin tool module; the origin module now aliases its
+``_X_DESCRIPTION`` module constant to ``io.NAME.text`` so every call
+site is unchanged.
+
+Covers: file.py's 7 verbs (read_file / write_file / delete_file /
+edit_file / list_directory / grep_files / glob_files).
+
+FP-0066 P1b: ``drop_source`` and ``index_update`` — the agent-facing
+layer-1 in-core RAG tools (FP-0057 Phase 2a) — are RETIRED along with the
+``ToolDescription`` records that used to live here. The OS-internal
+``IndexUpdateIROp`` substrate they rode is kept; see
+docs/deep-dives/proposals/0066-retrieval-two-groups-two-axes.md §9.
+"""
+from __future__ import annotations
+
+from reyn.tools.descriptions._types import ParamDescription, ToolDescription
+
+read_file = ToolDescription(
+    tool_name="read_file",
+    surfaced="router (gates.router=allow)",
+    purpose=(
+        "Read a file's contents under the agent's read scope, with "
+        "guidance toward conventional project-root file locations."
+    ),
+    text=(
+        "Read a file's contents under the agent's read scope. "
+        "Common conventions: README is at project root as "
+        "`README.md`. CLAUDE.md, CHANGELOG.md, and "
+        "configuration files (e.g. `reyn.yaml`, "
+        "`pyproject.toml`) are at project root. Try these "
+        "conventional paths directly instead of asking the "
+        "user where the file lives."
+    ),
+    ja=(
+        "エージェントの読み取りスコープ内のファイル内容を読む。README は "
+        "プロジェクトルートの README.md、CLAUDE.md / CHANGELOG.md / 設定"
+        "ファイル（reyn.yaml、pyproject.toml 等）もプロジェクトルートにある"
+        "という慣習を踏まえ、ユーザーに場所を尋ねる前にこれらの慣習パスを"
+        "直接試す。"
+    ),
+)
+
+write_file = ToolDescription(
+    tool_name="write_file",
+    surfaced="router (gates.router=allow)",
+    purpose=(
+        "Create or overwrite a whole file under the agent's write scope; "
+        "steers the LLM toward edit_file for partial changes."
+    ),
+    text=(
+        "Write content to a file under the agent's write scope. "
+        "Creates or overwrites the WHOLE file. For a partial or surgical "
+        "change to an existing file, prefer the `edit_file` action instead of "
+        "rewriting the whole file."
+    ),
+    ja=(
+        "エージェントの書き込みスコープ内のファイルにコンテンツを書き込む。"
+        "ファイル全体を新規作成または上書きする。既存ファイルへの部分的な"
+        "変更には、ファイル全体を書き直すのではなく edit_file を使うことを"
+        "推奨する。"
+    ),
+)
+
+delete_file = ToolDescription(
+    tool_name="delete_file",
+    surfaced="router (gates.router=allow)",
+    purpose="Delete a file under the agent's write scope.",
+    text="Delete a file under the agent's write scope.",
+    ja="エージェントの書き込みスコープ内のファイルを削除する。",
+)
+
+edit_file = ToolDescription(
+    tool_name="edit_file",
+    surfaced="router (gates.router=allow)",
+    purpose=(
+        "Replace a unique string in an existing file for a partial/surgical "
+        "edit, avoiding a whole-file read+write round-trip."
+    ),
+    text=(
+        "Replace a unique string in a file under the agent's write scope. "
+        "`old_string` MUST appear exactly once in the file; if it appears "
+        "multiple times, the call fails with a count — re-call with a longer "
+        "context-including snippet, or pass `replace_all=true` to replace "
+        "every occurrence. Use this for partial edits instead of read+write "
+        "for the whole file."
+    ),
+    ja=(
+        "エージェントの書き込みスコープ内のファイルで、一意な文字列を置換"
+        "する。old_string はファイル内にちょうど1回だけ出現する必要があり、"
+        "複数回出現する場合はエラーになる（より長い文脈を含めて再指定する"
+        "か、replace_all=true を渡す）。ファイル全体の読み書きではなく部分"
+        "編集に使う。"
+    ),
+)
+
+grep_files = ToolDescription(
+    tool_name="grep_files",
+    surfaced="router (gates.router=allow)",
+    purpose=(
+        "Search for a regex pattern across files under the agent's read "
+        "scope, distinct from list_directory's name-only enumeration."
+    ),
+    text=(
+        "Search for a regex pattern across files under the agent's read scope. "
+        "Use this when you need to find text or code patterns in files — "
+        "do NOT use list_directory for grep/glob intent. "
+        "Returns matching lines with file paths and line numbers."
+    ),
+    ja=(
+        "エージェントの読み取りスコープ内のファイルに対して正規表現パター"
+        "ンで検索する。テキストやコードパターンを探す際に使う（list_"
+        "directory はグレップ/グロブ用途には使わない）。マッチした行を"
+        "ファイルパスと行番号付きで返す。"
+    ),
+)
+
+glob_files = ToolDescription(
+    tool_name="glob_files",
+    surfaced="router (gates.router=allow)",
+    purpose=(
+        "Enumerate files by name/glob pattern under the agent's read scope, "
+        "distinct from list_directory's flat single-level listing."
+    ),
+    text=(
+        "Find files matching a glob pattern (e.g. '**/*.py') under the agent's "
+        "read scope. Use `**` to recurse into subdirectories. Use this when you "
+        "need to enumerate files by name pattern — do NOT use list_directory "
+        "for glob intent. Returns a list of matching file paths."
+    ),
+    ja=(
+        "エージェントの読み取りスコープ内で glob パターン（例: '**/*.py'）"
+        "に一致するファイルを探す。`**` でサブディレクトリを再帰する。"
+        "ファイル名パターンでの列挙に使う（list_directory はグロブ用途には"
+        "使わない）。一致したファイルパスのリストを返す。"
+    ),
+)
+
+list_directory = ToolDescription(
+    tool_name="list_directory",
+    surfaced="router (gates.router=allow)",
+    purpose=(
+        "List a single directory's immediate contents (names + types) "
+        "under the agent's read scope — the flat, non-recursive counterpart "
+        "to grep_files / glob_files."
+    ),
+    text=(
+        "List contents of a directory under the agent's read scope. "
+        "Returns names + types (file/dir)."
+    ),
+    ja=(
+        "エージェントの読み取りスコープ内のディレクトリの内容を一覧表示"
+        "する。名前と種別（file/dir）を返す。"
+    ),
+)
+
+ALL: dict[str, ToolDescription] = {
+    "read_file": read_file,
+    "write_file": write_file,
+    "delete_file": delete_file,
+    "edit_file": edit_file,
+    "grep_files": grep_files,
+    "glob_files": glob_files,
+    "list_directory": list_directory,
+}
+
+
+# ── Phase 4: per-parameter descriptions (byte-identical relocation) ──────────
+#
+# Only fields that actually declare a "description" in the origin
+# ``parameters`` JSON-schema get an entry here — many params (e.g. `path`
+# on read_file) are bare `{"type": "string"}` with no description.
+
+PARAMS: dict[str, dict[str, ParamDescription]] = {
+    "read_file": {
+        "offset": ParamDescription(
+            text=(
+                "Line number to start reading from (0-indexed). "
+                "Omit to start at the beginning of the file."
+            ),
+            ja="読み取り開始行（0始まり）。省略時はファイル先頭から。",
+        ),
+        "limit": ParamDescription(
+            text=(
+                "Number of lines to read from `offset`. Omitting it does "
+                "NOT guarantee reading through end of file — a remaining "
+                "span too large for the model's context window is still "
+                "cut. If it is, the result flags it (`status: "
+                "\"truncated\"`, `_truncated: true`) instead of silently "
+                "returning a partial file, and carries `next_offset` (and "
+                "`next_char_offset` when a single line alone was too "
+                "long) to resume from — pass those back as `offset` (and "
+                "`char_offset`) on the next call."
+            ),
+            ja=(
+                "`offset` から読む行数。省略しても必ずファイル末尾まで"
+                "読めるとは限らない — モデルのコンテキスト窓に収まらない"
+                "残り部分は切り詰められる。切り詰められた場合は黙って"
+                "一部だけ返すのではなく結果に `status: \"truncated\"`（"
+                "`_truncated: true`）が立ち、続きを読むための "
+                "`next_offset`（1 行が単独で長すぎた場合は "
+                "`next_char_offset` も）を含む — 次回呼び出しでそれらを "
+                "`offset`（`char_offset`）として渡すこと。"
+            ),
+        ),
+        "char_offset": ParamDescription(
+            text=(
+                "Character position within the line at `offset` to resume "
+                "from. Only needed when a PREVIOUS truncated read of this "
+                "same file returned `next_char_offset` (a single line "
+                "longer than the context window, cut mid-line) — pass "
+                "that value back here to continue from where it was cut, "
+                "instead of re-reading the same oversized line from its "
+                "start and truncating identically again."
+            ),
+            ja=(
+                "`offset` 行内で読み再開する文字位置。同じファイルの"
+                "直前の切り詰め読み取りが `next_char_offset` を返した"
+                "場合（1 行がコンテキスト窓より長く、行の途中で"
+                "切られた場合）にのみ必要 — その値をここに渡すことで、"
+                "切られた箇所から続きを読める。渡さないと同じ長すぎる"
+                "行を先頭から読み直し、同じところでまた切り詰められる。"
+            ),
+        ),
+    },
+    "edit_file": {
+        "old_string": ParamDescription(
+            text=(
+                "Exact text to replace. Must appear exactly once unless "
+                "replace_all is true; include surrounding context to "
+                "make it unique."
+            ),
+            ja=(
+                "置換対象の完全一致テキスト。replace_all=true でない限り"
+                "ファイル内に1回だけ出現する必要があるので、周辺文脈を含めて"
+                "一意にする。"
+            ),
+        ),
+        "new_string": ParamDescription(
+            text="Replacement text.",
+            ja="置換後のテキスト。",
+        ),
+        "replace_all": ParamDescription(
+            text=(
+                "When true, every occurrence of old_string is replaced. "
+                "Default false (= require uniqueness)."
+            ),
+            ja="true なら old_string の全出現を置換。デフォルト false（一意性を要求）。",
+        ),
+    },
+    "grep_files": {
+        "pattern": ParamDescription(
+            text="Regex pattern to search for.",
+            ja="検索する正規表現パターン。",
+        ),
+        "path": ParamDescription(
+            text="Directory or file to search. Defaults to '.' (workspace root).",
+            ja="検索対象のディレクトリまたはファイル。デフォルトは '.'（ワークスペースルート）。",
+        ),
+        "glob": ParamDescription(
+            text="File-glob filter (e.g. '**/*.py'). Searches all files when omitted.",
+            ja="ファイル glob フィルタ（例 '**/*.py'）。省略時は全ファイルを検索。",
+        ),
+        "case_sensitive": ParamDescription(
+            text="When true, search is case-sensitive. Defaults to false.",
+            ja="true なら大文字小文字を区別。デフォルト false。",
+        ),
+        "max_results": ParamDescription(
+            text="Maximum number of matches to return. Defaults to 50.",
+            ja="返す一致件数の上限。デフォルト 50。",
+        ),
+    },
+    "glob_files": {
+        "pattern": ParamDescription(
+            text=(
+                "Glob pattern. To match by name anywhere under a directory, "
+                "always include `**` (e.g. '**/*.py' or 'src/**/*.md'). "
+                "A bare name without `**` matches only at the exact root "
+                "level, not recursively."
+            ),
+            ja=(
+                "glob パターン。ディレクトリ配下のどこでも名前一致させたいなら"
+                "必ず `**` を含める（例 '**/*.py'）。`**` のない裸の名前は"
+                "ルート直下のみ一致し再帰しない。"
+            ),
+        ),
+        "path": ParamDescription(
+            text="Root directory for the glob. Defaults to '.' (workspace root).",
+            ja="glob 検索の起点ディレクトリ。デフォルトは '.'（ワークスペースルート）。",
+        ),
+        "max_results": ParamDescription(
+            text=(
+                "Maximum number of matching paths to return. Defaults to 50 — "
+                "raise this explicitly when enumerating a directory that may "
+                "hold more entries than that (e.g. bulk ingestion). If the cap "
+                "does discard matches, the result flags it (`truncated` with "
+                "the total/returned counts) rather than silently dropping them."
+            ),
+            ja=(
+                "返す一致パス件数の上限。デフォルト 50 — それを超える件数が"
+                "見込まれるディレクトリを列挙する場合（一括取り込み等）は"
+                "明示的に引き上げること。上限で一致が切り捨てられた場合は"
+                "黙って消えるのではなく、結果に `truncated`（total/returned"
+                "件数つき）が立つ。"
+            ),
+        ),
+        "absolute": ParamDescription(
+            text=(
+                "When true, return absolute paths even for a relative "
+                "pattern (default false = project-relative paths). Set "
+                "this when the result feeds something that needs an "
+                "absolute path regardless of the pattern's own form (e.g. "
+                "a file:// URI) — do not try to reconstruct an absolute "
+                "path from a relative match yourself."
+            ),
+            ja=(
+                "true なら相対パターンでも絶対パスを返す（デフォルト false"
+                "＝プロジェクト相対パス）。パターン自体が相対かどうかに"
+                "関わらず絶対パスが必要な用途（file:// URI 構築等）で"
+                "使うこと — 相対一致から絶対パスを自前で組み立てようと"
+                "しないこと。"
+            ),
+        ),
+    },
+    "list_directory": {
+        "max_results": ParamDescription(
+            text=(
+                "Maximum number of directory entries to return. Defaults to "
+                "50 — raise this explicitly for directories that may hold "
+                "more entries than that. If the cap does discard entries, "
+                "the listing ends with a trailing note stating how many of "
+                "how many were shown rather than silently dropping them."
+            ),
+            ja=(
+                "返すディレクトリエントリ件数の上限。デフォルト 50 — それを"
+                "超える件数が見込まれるディレクトリでは明示的に引き上げる"
+                "こと。上限でエントリが切り捨てられた場合は、黙って消える"
+                "のではなく、一覧の末尾に「何件中何件を表示したか」の注記"
+                "が付く。"
+            ),
+        ),
+    },
+}

@@ -1,0 +1,110 @@
+"""Tier 1: #187 Stage B — list_actions returns selection-grade items.
+
+When the browse is narrowed to a category, each list_actions item carries the
+full ``description`` + ``input_schema`` that describe_action returns (name +
+description + schema), so the model can SELECT an action without a separate
+describe_action round-trip — which weak models rarely make. This inherits the
+schema-blind-hallucination protection the removed ARS block provided. The
+unfiltered alphabetical browse stays compact (breadth scan). The shared
+``_describe_one`` core guarantees ``list ≡ describe`` BY CONSTRUCTION.
+
+Real ToolContext + RouterCallerState with a stub host; no mocks of collaborators.
+"""
+from __future__ import annotations
+
+import asyncio
+
+from reyn.core.events.events import EventLog
+from reyn.tools import get_default_registry
+from reyn.tools.types import RouterCallerState, ToolContext
+from reyn.tools.universal_catalog import (
+    _describe_one,
+    _handle_describe_action,
+    _handle_list_actions,
+)
+
+
+class _FakeHost:
+    """Minimal host: list_available_skills returns the D2-full catalogue shape
+    (input_schema per entry) so resource-category enrichment resolves."""
+
+    def __init__(self, skills):
+        self._skills = skills
+
+    def list_available_skills(self):
+        return list(self._skills)
+
+
+def _ctx(skills=None) -> ToolContext:
+    sk = skills or []
+    return ToolContext(
+        events=EventLog(),
+        permission_resolver=None,
+        workspace=None,
+        caller_kind="router",
+        router_state=RouterCallerState(host=_FakeHost(sk), mcp_servers=None),
+    )
+
+
+def _list(ctx: ToolContext, **args) -> dict:
+    return asyncio.run(_handle_list_actions(args, ctx))
+
+
+def _describe(ctx: ToolContext, name: str) -> dict:
+    return asyncio.run(_handle_describe_action({"action_name": name}, ctx))
+
+
+def test_narrowed_list_item_carries_description_and_schema():
+    """Tier 1: a category-narrowed list_actions item carries full description + input_schema."""
+    ctx = _ctx()
+    items = _list(ctx, category=["file"])["items"]
+    fe = next(i for i in items if i["action_name"] == "edit_file")
+    assert fe.get("description"), "narrowed item must carry a full description"
+    assert fe.get("input_schema", {}).get("properties"), "narrowed item must carry input_schema"
+
+
+def test_static_op_and_resource_both_enriched():
+    """Tier 1: a static op (edit_file) gets its input_schema."""
+    ctx = _ctx()
+    file_items = _list(ctx, category=["file"])["items"]
+    fe = next(i for i in file_items if i["action_name"] == "edit_file")
+    assert fe["input_schema"]["properties"], "static op must carry its parameters schema"
+
+
+def test_unfiltered_browse_is_uniformly_enriched():
+    """Tier 1: #1455 — the unfiltered (all-category) browse is enriched too.
+
+    #1455 removed the prior ``if valid_filter:`` gate (which left the unfiltered
+    browse compact, an asymmetry): EVERY page item now carries description +
+    input_schema via the shared _describe_one, so an unfiltered browse is as
+    actionable as a narrowed one. Token-bounded by the (now-10) page limit."""
+    ctx = _ctx()
+    # High limit so a known-enrichable operation action (read_file) is on the
+    # page regardless of the default page size; enrichment is per-item.
+    items = _list(ctx, limit=100)["items"]
+    assert items, "expected a non-empty browse page"
+    fr = next((i for i in items if i["action_name"] == "read_file"), None)
+    assert fr is not None and "input_schema" in fr, (
+        "the unfiltered browse must now enrich each item (#1455 uniform enrich)"
+    )
+
+
+def test_list_equals_describe_by_construction():
+    """Tier 1: ★load-bearing invariant — a narrowed list item's description +
+    input_schema EQUAL describe_action's for the same action (shared _describe_one).
+    Guards against future drift if either path bypasses the helper."""
+    ctx = _ctx()
+    for cat, name in [("file", "edit_file")]:
+        item = next(
+            i for i in _list(ctx, category=[cat])["items"]
+            if i["action_name"] == name
+        )
+        d = _describe(ctx, name)
+        assert item["description"] == d["description"], f"{name}: description must match describe_action"
+        assert item["input_schema"] == d["input_schema"], f"{name}: input_schema must match describe_action"
+
+
+def test_describe_one_returns_none_for_unresolvable():
+    """Tier 1: _describe_one returns None for an unresolvable name — so list_actions
+    skips enrichment for such an item gracefully (keeps short_description, no crash)."""
+    assert _describe_one("bogus_category__nope", _ctx(), get_default_registry()) is None

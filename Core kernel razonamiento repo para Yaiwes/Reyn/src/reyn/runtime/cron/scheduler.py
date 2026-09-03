@@ -1,0 +1,382 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    pass
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class CronJob:
+    """One scheduled execution (FP-0009 Component B + FP-0041 #489 PR-B;
+    ``action`` #5209).
+
+    ``to`` (= target agent name) is required for EVERY job regardless of
+    ``action`` — it names the agent whose ``cron:<job_name>`` Session this
+    job runs on (the "host"): ``resolve_cron_session``/``dispatch_cron_fired``
+    have no session-less path to fire ``cron_fired`` on. ``action`` declares
+    what a fire actually does on that host session:
+
+      - ``"message"`` (default, unchanged, FP-0041 PR-B): ``to`` doubles as
+        the message RECIPIENT too. ``message`` (= free-form text) is
+        required; the scheduler dispatches it to the agent's inbox with
+        ``sender="cron:<name>"`` so the LLM reads it as a normal attributed
+        turn — always starts an LLM turn.
+      - ``"hook"`` (#5209): only fires ``cron_fired`` on the host session —
+        never starts a turn itself. A ``hooks.yaml`` ``on: cron_fired`` entry
+        (typically ``exec_capture`` + ``push_when``) decides whether
+        anything happens next; an unfired/false ``push_when`` costs zero
+        LLM turns. ``message`` is never set on a ``"hook"`` job (rejected at
+        config load).
+
+    (A config entry missing the required shape for its ``action`` — e.g. no
+    ``to`` at all, or a ``message`` on a ``"hook"`` job — is rejected at load.)
+
+    Mutable on the scheduler side: ``last_run_at`` / ``last_run_status``
+    / ``last_run_error`` / ``next_run_at`` are updated after each fire.
+    """
+
+    name: str               # job identifier, unique within scheduler
+    schedule: str           # cron expression, 5-field (e.g. "0 */6 * * *")
+    to: str | None = None       # target agent name — the host session, required for every action
+    message: str | None = None  # free-form text dispatched to agent.inbox — action="message" only
+    action: str = "message"     # #5209: "message" (default) | "hook"
+    # FP-0043 S4b-3b: opt-in unattended notification channel (e.g. "telegram").
+    # None = off (event-log only = current behaviour). When set, the fired cron
+    # turn's final reply is routed to the channel via the external-transport outbox
+    # interceptor (reply_to=ExternalRef), and a job-execution FAILURE is notified at
+    # the runner level. The channel name maps to an MCP tool via reyn.yaml
+    # external_transports (e.g. telegram→broker__post_message).
+    notify: str | None = None
+    input: dict = field(default_factory=dict)
+    # ── shared ─────────────────────────────────────────────────────
+    enabled: bool = True
+    last_run_at: datetime | None = None
+    last_run_status: str | None = None   # "ok" | "error" | "cancelled" | None
+    last_run_error: str | None = None    # short error description on failure
+    next_run_at: datetime | None = None
+    last_run_duration_seconds: float | None = None
+
+    def is_message_based(self) -> bool:
+        """True if this job uses the message-based shape (= ``to + message``)."""
+        return bool(self.to and self.message)
+
+    def is_hook_based(self) -> bool:
+        """#5209: True if this job only fires ``cron_fired`` — never starts
+        a turn itself (``action == "hook"``)."""
+        return self.action == "hook"
+
+    def to_dict(self) -> dict:
+        """JSON-safe shape for `reyn cron list` and `reyn cron status`."""
+        return {
+            "name": self.name,
+            "to": self.to,
+            "message": self.message,
+            "action": self.action,
+            "notify": self.notify,
+            "schedule": self.schedule,
+            "input": self.input,
+            "enabled": self.enabled,
+            "last_run_at": self.last_run_at.isoformat() if self.last_run_at is not None else None,
+            "last_run_status": self.last_run_status,
+            "last_run_error": self.last_run_error,
+            "next_run_at": self.next_run_at.isoformat() if self.next_run_at is not None else None,
+            "last_run_duration_seconds": self.last_run_duration_seconds,
+        }
+
+
+class CronScheduler:
+    """Asyncio-based cron scheduler for message-based cron jobs.
+
+    Each enabled job runs in its own asyncio.Task that sleeps until the
+    next croniter-computed fire time, then dispatches the job. Failures
+    are recorded on the CronJob entry and logged at WARNING; the scheduler
+    continues to the next interval (= no retry beyond the next fire).
+
+    Lifecycle:
+      - `start()` spawns one Task per enabled job.
+      - `stop()` cancels all tasks and awaits them.
+    Single scheduler instance per process; web mode attaches to
+    `app.state.cron_scheduler`, CLI mode runs in the foreground.
+
+    Time source:
+      - `clock_fn` (= callable returning aware datetime) is injectable
+        for tests. Production omits and uses `datetime.now(timezone.utc)`.
+
+    Job execution:
+      - `runner_fn` (= async callable that runs the job and returns
+        a status string) is injectable. Production passes a function
+        that dispatches the job's message to the target agent's inbox.
+      - If omitted, scheduler logs WARNING and marks status="error"
+        with "no runner configured" so unconfigured deployments fail
+        loudly rather than silently.
+    """
+
+    def __init__(
+        self,
+        jobs: list[CronJob],
+        *,
+        clock_fn: Callable[[], datetime] | None = None,
+        runner_fn: Callable[[CronJob], "asyncio.Future"] | None = None,
+    ) -> None:
+        self._jobs: dict[str, CronJob] = {j.name: j for j in jobs}
+        self._clock = clock_fn or (lambda: datetime.now(timezone.utc))
+        self._runner = runner_fn  # may be None until set_runner is called
+        self._tasks: dict[str, asyncio.Task] = {}
+        self._running: bool = False
+
+    @property
+    def tasks(self) -> dict:
+        """Read-only accessor for the running cron-task map (name → asyncio.Task)."""
+        return self._tasks
+
+    @property
+    def running(self) -> bool:
+        """Read-only flag: True between ``start()`` and ``stop()``."""
+        return self._running
+
+    def set_runner(self, runner_fn: Callable[[CronJob], "asyncio.Future"]) -> None:
+        """Inject the runner after construction (= web lifespan needs the
+        AgentRegistry which is created after the scheduler in some paths).
+        """
+        self._runner = runner_fn
+
+    async def start(self) -> None:
+        """Spawn one asyncio.Task per enabled job. Idempotent."""
+        if self._running:
+            return
+        self._running = True
+        for job in self._jobs.values():
+            if job.enabled and job.name not in self._tasks:
+                task = asyncio.create_task(
+                    self._run_job_loop(job),
+                    name=f"cron:{job.name}",
+                )
+                self._tasks[job.name] = task
+
+    async def stop(self, *, timeout: float = 5.0) -> None:
+        """Cancel all tasks; await up to ``timeout`` for cleanup."""
+        self._running = False
+        if not self._tasks:
+            return
+        for task in self._tasks.values():
+            task.cancel()
+        tasks = list(self._tasks.values())
+        self._tasks.clear()
+        # Gather with return_exceptions so CancelledError doesn't propagate
+        await asyncio.wait_for(
+            asyncio.gather(*tasks, return_exceptions=True),
+            timeout=timeout,
+        )
+
+    def jobs(self) -> list[CronJob]:
+        """Return all jobs (enabled + disabled), preserving insertion order."""
+        return list(self._jobs.values())
+
+    def get_job(self, name: str) -> CronJob | None:
+        return self._jobs.get(name)
+
+    # ── FP-0041 #489 PR-B2: live mutation API ──────────────────────────
+    #
+    # These methods support the LLM-callable ``cron`` action category
+    # (= ``cron_register / unregister / enable / disable`` tools).
+    # All mutations happen on the current event loop — the scheduler's
+    # per-job tasks and the tool handlers share one asyncio loop in
+    # both ``reyn web`` and ``reyn cron run``, so no lock is needed.
+
+    async def add_job(self, job: CronJob) -> None:
+        """Register ``job`` and (if running + enabled) spawn its task.
+
+        Idempotency: if a job with the same name exists, it is replaced
+        (= the existing task is cancelled first to prevent ghost dispatch
+        from the stale schedule). Used by ``cron_register`` to swap
+        job definitions without restart.
+        """
+        existing_task = self._tasks.pop(job.name, None)
+        if existing_task is not None:
+            existing_task.cancel()
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(existing_task, return_exceptions=True),
+                    timeout=2.0,
+                )
+            except asyncio.TimeoutError:
+                pass
+        self._jobs[job.name] = job
+        if self._running and job.enabled:
+            task = asyncio.create_task(
+                self._run_job_loop(job),
+                name=f"cron:{job.name}",
+            )
+            self._tasks[job.name] = task
+
+    async def remove_job(self, name: str) -> bool:
+        """Cancel + drop the job ``name``. Returns True iff the job
+        existed and was removed."""
+        if name not in self._jobs:
+            return False
+        task = self._tasks.pop(name, None)
+        if task is not None:
+            task.cancel()
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(task, return_exceptions=True),
+                    timeout=2.0,
+                )
+            except asyncio.TimeoutError:
+                pass
+        del self._jobs[name]
+        return True
+
+    async def set_enabled(self, name: str, enabled: bool) -> bool:
+        """Toggle ``job.enabled``. When transitioning to enabled (and
+        the scheduler is running), spawn the task; to disabled, cancel
+        the running task. Returns True iff the job exists.
+
+        Used by ``cron_enable`` / ``cron_disable`` tools to pause /
+        resume jobs without removing them.
+        """
+        job = self._jobs.get(name)
+        if job is None:
+            return False
+        job.enabled = bool(enabled)
+        if not job.enabled:
+            task = self._tasks.pop(name, None)
+            if task is not None:
+                task.cancel()
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(task, return_exceptions=True),
+                        timeout=2.0,
+                    )
+                except asyncio.TimeoutError:
+                    pass
+        elif self._running and name not in self._tasks:
+            task = asyncio.create_task(
+                self._run_job_loop(job),
+                name=f"cron:{job.name}",
+            )
+            self._tasks[name] = task
+        return True
+
+    async def run_now(self, name: str) -> bool:
+        """Trigger one-off execution outside the schedule. Returns True iff
+        job exists and runner is configured. Updates last_run_* fields."""
+        job = self._jobs.get(name)
+        if job is None:
+            return False
+        if self._runner is None:
+            return False
+        await self._fire(job)
+        return True
+
+    def compute_next_run(self, job: CronJob, *, after: datetime | None = None) -> datetime | None:
+        """Compute the next fire time for ``job.schedule`` after ``after``
+        (or now). Returns None if the cron expression is invalid (= logs
+        WARNING and disables the job in-place)."""
+        from croniter import CroniterBadCronError, croniter
+
+        start = after if after is not None else self._clock()
+        try:
+            it = croniter(job.schedule, start)
+            return it.get_next(datetime)
+        except (CroniterBadCronError, ValueError, KeyError) as exc:
+            logger.warning(
+                "CronJob %r has invalid schedule %r — disabling. Error: %s",
+                job.name,
+                job.schedule,
+                exc,
+            )
+            job.enabled = False
+            return None
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    async def _run_job_loop(self, job: CronJob) -> None:
+        """Per-job loop: sleep until next fire time, then run."""
+        while self._running:
+            next_at = self.compute_next_run(job)
+            if next_at is None:
+                return  # invalid cron; already logged + disabled
+            job.next_run_at = next_at
+            wait_seconds = max(0.0, (next_at - self._clock()).total_seconds())
+            try:
+                await asyncio.sleep(wait_seconds)
+            except asyncio.CancelledError:
+                return
+            if not self._running:
+                return
+            await self._fire(job)
+
+    async def _fire(self, job: CronJob) -> None:
+        """Execute the job via the runner, record outcome."""
+        import time
+
+        fired_at = self._clock()
+        job.last_run_at = fired_at
+        start = time.monotonic()
+
+        if self._runner is None:
+            logger.warning(
+                "CronJob %r fired but no runner is configured — marking error.",
+                job.name,
+            )
+            job.last_run_status = "error"
+            job.last_run_error = "no runner configured"
+            job.last_run_duration_seconds = time.monotonic() - start
+            return
+
+        try:
+            result = await self._runner(job)
+            job.last_run_status = result if isinstance(result, str) else "ok"
+            job.last_run_error = None
+        except asyncio.CancelledError:
+            job.last_run_status = "cancelled"
+            job.last_run_error = None
+            job.last_run_duration_seconds = time.monotonic() - start
+            raise
+        except Exception as exc:
+            short_err = f"{type(exc).__name__}: {exc}"
+            logger.warning(
+                "CronJob %r raised an exception during execution: %s",
+                job.name,
+                short_err,
+            )
+            job.last_run_status = "error"
+            job.last_run_error = short_err
+        finally:
+            job.last_run_duration_seconds = time.monotonic() - start
+
+
+# ── FP-0041 #489 PR-B2: active scheduler registry ──────────────────────
+#
+# Module-level singleton so LLM-callable cron tools (= ``cron_register``
+# / unregister / enable / disable) can reach the live scheduler in the
+# same process. Set by whoever boots the scheduler (``reyn web``
+# lifespan or ``reyn cron run`` foreground), queried by tool handlers.
+#
+# Returns None when no scheduler is registered (= CLI subcommand other
+# than ``reyn cron run``, or process boot has not reached scheduler
+# init yet). Tool handlers degrade gracefully: write to ``.reyn/cron.yaml``
+# but skip live-update.
+_active_scheduler: "CronScheduler | None" = None
+
+
+def set_active_scheduler(scheduler: "CronScheduler | None") -> None:
+    """Register / unregister the process-wide active scheduler."""
+    global _active_scheduler
+    _active_scheduler = scheduler
+
+
+def get_active_scheduler() -> "CronScheduler | None":
+    """Return the active scheduler, or None when unset."""
+    return _active_scheduler

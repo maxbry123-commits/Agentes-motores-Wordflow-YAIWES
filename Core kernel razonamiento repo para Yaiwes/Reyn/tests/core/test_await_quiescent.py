@@ -1,0 +1,181 @@
+"""Tier 2: Session.await_quiescent — the global-rewind quiescence primitive.
+
+ADR-0038 Stage 1c part-1. Real `Session` + `StateLog` + real asyncio tasks
+(no mocks). `await_quiescent()` must return only once no turn / skill / plan is
+in flight, and — the correctness-critical invariant — **no WAL append lands after
+it returns** (a straggler past the future rewind reset-record would contaminate
+the active branch).
+"""
+from __future__ import annotations
+
+import asyncio
+from pathlib import Path
+
+import pytest
+
+from reyn.core.events.state_log import StateLog
+from reyn.runtime.session import Session
+from reyn.user_intervention import InterventionAnswer, UserIntervention
+from tests._support.agent_session import make_session
+
+
+def _session(tmp_path: Path, log: StateLog, *, agent: str = "alpha") -> Session:
+    session = make_session(
+        agent_name=agent, state_log=log, snapshot_path=tmp_path / "snap.json",
+    )
+    session.register_intervention_listener("test")
+    return session
+
+
+@pytest.mark.asyncio
+async def test_await_quiescent_returns_when_idle(tmp_path):
+    """Tier 2: with nothing in flight, await_quiescent returns promptly."""
+    log = StateLog(tmp_path / "state.wal")
+    session = _session(tmp_path, log)
+    await asyncio.wait_for(session.await_quiescent(), timeout=2.0)
+
+
+# ── per-source-type coverage (ADR-0038 Stage 1c coverage-fix, #1533) ──────────
+# One no-append-after-quiescent test per append-capable spawned task type beyond
+# the obvious skill/plan set: chain-timeout timers, fire-and-forget intervention
+# dispatch, fire-and-forget intervention_answer_consumed. Each must be cancelled +
+# joined by await_quiescent so no WAL append can land past the future reset-record.
+
+
+@pytest.mark.asyncio
+async def test_await_quiescent_cancels_chain_timeout_timer_no_append(tmp_path):
+    """Tier 2: await_quiescent cancels an armed chain-timeout watchdog (no append).
+
+    A chain-timeout watchdog, on fire, appends ``chain_timeout_fired`` to the WAL.
+    await_quiescent must cancel+join it so it cannot fire after a rewind reset.
+    The watchdog is armed with a real (short) timeout and a minimal real on_fire
+    that performs the WAL append it would do in production; the test proves the
+    timer is cancelled before that fire can happen.
+    """
+    log = StateLog(tmp_path / "state.wal")
+    session = _session(tmp_path, log)
+
+    # The chain must be registered so the watchdog's "still pending?" check passes
+    # and on_fire would actually run (otherwise the fire short-circuits).
+    await session.chains.register(
+        chain_id="c1", depth=0, original_text="q", sender=None,
+    )
+
+    async def _on_fire(chain_id: str) -> None:
+        # Minimal stand-in for the production fire path's terminal WAL append.
+        await log.append("chain_timeout_fired", agent="alpha", chain_id=chain_id)
+
+    # Short timeout so the watchdog WOULD fire almost immediately if not cancelled.
+    session.chains._chain_timeout_seconds = 0.05
+    await session.chains.arm_timeout("c1", on_fire=_on_fire)
+    # proposal 0067 P8 (#3978): arm_timeout() now persists arm_at via a
+    # fire-and-forget WAL append (append_nowait — the worker assigns the
+    # seq off-loop, not synchronously when record_chain_update() returns).
+    # Flush BEFORE capturing seq_after so that legitimate append is
+    # counted here, not raced into the "nothing new happened" window
+    # below — this test is about the WATCHDOG being cancelled, not about
+    # whether arm_timeout's own bookkeeping write has landed yet.
+    await log.flush()
+
+    await asyncio.wait_for(session.await_quiescent(), timeout=2.0)
+
+    seq_after = log.current_seq
+    await asyncio.sleep(0.12)                  # well past the 0.05s timeout
+    # Behavioral proof of cancellation: had the watchdog NOT been cancelled it
+    # would have fired by now and appended chain_timeout_fired — seq stability
+    # across this window shows await_quiescent cancelled it.
+    assert log.current_seq == seq_after
+
+
+@pytest.mark.asyncio
+async def test_await_quiescent_cancels_intervention_dispatch_no_append(tmp_path):
+    """Tier 2: await_quiescent cancels an in-flight intervention-dispatch task.
+
+    The fire-and-forget dispatch task (claim_pending_intervention →
+    ensure_future(_dispatch_intervention)) awaits the user-answer future
+    (``iv.future``) indefinitely. await_quiescent must cancel+join it — a bare
+    join would hang — so no later WAL append lands after a rewind reset. The
+    dispatch path's ``finally`` appends ``intervention_resolved`` on the cancel
+    exit, which the join settles before await_quiescent returns.
+    """
+    log = StateLog(tmp_path / "state.wal")
+    session = _session(tmp_path, log)
+
+    iv = UserIntervention(kind="ask_user", prompt="Q?")
+    # Seed the stalled queue directly (test precedent: test_pending_intervention_268)
+    # so claim re-dispatches through the real path.
+    session.interventions._stalled[iv.id] = iv
+
+    view = await session.claim_pending_intervention(iv.id, "new-channel")
+    assert view is not None
+    await asyncio.sleep(0)                     # let the dispatch task reach its await
+
+    # Must RETURN (not hang) despite the indefinitely-blocking dispatch task.
+    await asyncio.wait_for(session.await_quiescent(), timeout=2.0)
+
+    # Public proof the dispatch task was cancelled (not left blocked/untracked):
+    # the task awaits iv.future, so cancelling the task cancels iv.future.
+    assert iv.future.cancelled()
+    seq_after = log.current_seq
+    await asyncio.sleep(0.02)
+    assert log.current_seq == seq_after        # no append after quiescent
+
+
+@pytest.mark.asyncio
+async def test_await_quiescent_returns_when_called_from_turn_owner_task(tmp_path):
+    """Tier 2: await_quiescent does not deadlock when called from the turn-owner task.
+
+    A slash handler calling registry.checkout (which calls await_quiescent) runs
+    on the SAME asyncio task that holds _turn_idle.clear() — awaiting _turn_idle
+    from the same task would deadlock.  The re-entrancy guard must detect this and
+    return promptly instead of hanging.
+
+    The setup AND the await_quiescent call run inside a single inner coroutine so
+    the task identity is consistent.  asyncio.wait_for wraps the coroutine in a
+    new Task in Python ≤3.12; setting _turn_owner_task from WITHIN that Task
+    ensures the re-entrancy guard sees a matching identity on all versions.
+    """
+    log = StateLog(tmp_path / "state.wal")
+    session = _session(tmp_path, log)
+
+    async def _simulate_turn_calling_quiescent() -> None:
+        # Simulate being inside a turn: clear _turn_idle and record THIS task as
+        # the owner — exactly as run_one_iteration does before dispatching a turn.
+        session._turn_idle.clear()
+        session._turn_owner_task = asyncio.current_task()
+        try:
+            # Must return promptly, not deadlock.
+            await session.await_quiescent()
+        finally:
+            session._turn_owner_task = None
+            session._turn_idle.set()
+
+    # 10s timeout: generous enough to survive a loaded CI runner, tight enough
+    # to catch a true deadlock (which would hang indefinitely).
+    await asyncio.wait_for(_simulate_turn_calling_quiescent(), timeout=10.0)
+
+
+@pytest.mark.asyncio
+async def test_await_quiescent_settles_intervention_answer_consumed_no_append(tmp_path):
+    """Tier 2: await_quiescent settles the fire-and-forget answer-consumed task.
+
+    consume_buffered_intervention_answer schedules a fire-and-forget
+    ``record_intervention_answer_consumed`` WAL append. await_quiescent must
+    track + settle it so no such append lands after a rewind reset.
+    """
+    log = StateLog(tmp_path / "state.wal")
+    session = _session(tmp_path, log)
+
+    session.buffered_intervention_answers["run-1"] = InterventionAnswer(text="ok")
+    answer = session.consume_buffered_intervention_answer("run-1")
+    assert answer is not None and answer.text == "ok"
+
+    await asyncio.wait_for(session.await_quiescent(), timeout=2.0)
+
+    # Behavioral proof of tracking: an *untracked* fire-and-forget consume task
+    # would still be pending here and would append intervention_answer_consumed
+    # during this sleep (after quiescent returned) — advancing the seq. Seq
+    # stability shows await_quiescent tracked + settled it before returning.
+    seq_after = log.current_seq
+    await asyncio.sleep(0.02)
+    assert log.current_seq == seq_after        # no append after quiescent

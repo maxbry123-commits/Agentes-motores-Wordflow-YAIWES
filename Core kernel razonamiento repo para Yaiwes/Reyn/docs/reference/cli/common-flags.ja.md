@@ -1,0 +1,54 @@
+---
+type: reference
+topic: cli
+audience: [human, agent]
+applies_to: [reyn chat, reyn run-once]
+---
+
+# 共通フラグ
+
+`reyn chat` と `reyn run-once` に共通のフラグです。コマンド固有のフラグはそれぞれのページに記載されています。
+
+## モデル選択
+
+| フラグ | デフォルト | 説明 |
+|------|---------|-------------|
+| `--model MODEL` | `reyn.yaml` の `model`（または `standard`） | モデルクラス（`light` / `standard` / `strong`）または LiteLLM モデル文字列。`reyn.yaml` の `models` マップを通じて解決されます。 |
+
+## 出力言語
+
+| フラグ | デフォルト | 説明 |
+|------|---------|-------------|
+| `--output-language LANG` | `reyn.yaml` の `output_language`（または `ja`） | LLM コンテキストに `output_language` として注入される言語コード。ユーザー向けテキストを生成する Phase がそれに従います。 |
+
+## ランタイム制限
+
+すべての制限はデフォルトで `reyn.yaml` の `safety:` ブロックから読み取られ、呼び出しごとにオーバーライドできます。
+
+| フラグ | デフォルト | 説明 |
+|------|---------|-------------|
+| `--llm-timeout SECONDS` | `safety.timeout.llm_call_seconds`（または `60`） | LiteLLM に渡される呼び出しごとの HTTP タイムアウト。 |
+| `--llm-max-retries N` | `safety.timeout.llm_max_retries`（または `3`） | LLM 呼び出しごとの一時的エラーのリトライ数（LiteLLM 指数バックオフ）。 |
+
+## 削除されたフラグ
+
+`argparse` は認識できないフラグを報告するだけで、なぜ無くなったかは説明しません。そのため削除はここに記録します。
+
+| フラグ | 削除 | 理由 |
+|------|---------|-----|
+| `--phase-budget SECONDS` | #2696（2026-07） | `safety.timeout.phase_seconds` を設定していましたが、**これを読むランタイムコードは存在しませんでした** — 強制していた phase エンジンは削除済み（#2434 / #2438）。フラグを受け付けて何もしないのは「ランに上限がある」という誤った表示なので、フラグと設定キーの両方を削除しました。代替はありません。ランのウォールクロックを縛りたい場合はループを縛ってください（`--max-iterations` / `safety.loop.max_router_iterations`）。 |
+
+## 解決順序
+
+各フラグについて、ランタイムは（優先度が高い順で）チェックします:
+
+1. CLI フラグ
+2. `reyn.yaml`（プロジェクト）— 一致するキーの値
+3. `.reyn/config.yaml`（個人設定オーバーライド）— `reyn.yaml` と同じスキーマ
+4. 組み込みデフォルト
+
+## 関連情報
+
+- [chat.md](chat.md)、[run-once.md](run-once.md)
+- [リファレンス: reyn.yaml](../config/reyn-yaml.md)
+- [リファレンス: permissions](../config/permissions.md)

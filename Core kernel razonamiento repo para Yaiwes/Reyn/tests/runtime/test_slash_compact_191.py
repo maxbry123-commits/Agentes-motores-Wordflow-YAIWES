@@ -1,0 +1,172 @@
+"""Tier 2: OS invariant — /compact slash fires on-demand compaction + reports freed.
+
+#191 enabler: the user-control avoidance mechanism for the conversation-window
+dead-end (the LLM `compact` op + the retry_loop backstop being the other routes).
+`/compact` runs the session-level compaction directly (user input, not an LLM op)
+via the same `force_compact_now` wrapper the compact op uses (`_compact_now_for_op`),
+and reports freed tokens + the free window afterwards.
+
+Real instances, no mocks: a real Session with a real CompactionController/
+engine; only `litellm.acompletion` (the compaction LLM call) is monkeypatched to a
+plain async callable returning a scripted summary. Verifies the slash actually
+fires compaction and reports the freed tokens — not LLM behavior.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+from datetime import datetime, timezone
+from types import SimpleNamespace
+
+import litellm
+
+from reyn.config import CompactionConfig
+from reyn.core.events.state_log import StateLog
+from reyn.interfaces.slash import REGISTRY
+from reyn.runtime.budget.budget import BudgetTracker, CostConfig
+from reyn.runtime.chat_message import ChatMessage
+from reyn.runtime.session import Session
+from tests._support.agent_session import make_session
+from tests._support.slash import slash_ctx
+
+# Compaction summary the engine's litellm call returns; new_turn_seqs lists the
+# candidate turn seqs (head=2/tail=2 over 8 turns → candidates 3..6).
+_SUMMARY_JSON = json.dumps({
+    "topic_arc": "compacted summary of older turns",
+    "decisions": [], "pending": [],
+    "session_user_facts": [], "artifacts_referenced": [],
+    "new_turn_seqs": [3, 4, 5, 6],
+})
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _make_session(tmp_path, monkeypatch) -> Session:
+    """Create a Session with a small synthetic T_max to force non-empty candidates.
+
+    #1128 step 3: _select_candidates uses token-budget boundaries from the engine.
+    With ``t_max=2800`` and ``section_caps_spec_tokens=0`` (re-measured post-#3083
+    plugin_management SP addition; the original ≈570/t_max=2000 pin went stale
+    as the SP grew across many unrelated PRs and finally crashed to a negative
+    effective_trigger — #3083 was simply the straw that tipped it):
+    head_budget≈74, tail_budget≈112, effective_trigger≈489.
+    Turns of 'x'*4000 (=1000 tokens) each individually exceed both budgets, so
+    the Axis-7 single-oversized-turn rule includes exactly one turn in head and
+    one in tail.  With 8 turns: middle=[t1..t6]=6 candidates ≥ min_compact_batch=1.
+
+    #3671 follow-up: takes the caller's ``monkeypatch`` fixture rather than
+    manually saving/restoring ``get_max_input_tokens`` — CompactionEngine now
+    builds LAZILY (``CompactionController._engine``, a property, on first
+    reference) rather than eagerly at Session construction, so a patch that
+    un-does itself the moment this function returns would go stale before
+    the caller ever triggers the lazy build. ``monkeypatch`` restores at the
+    CALLING TEST's teardown instead, keeping the patch live for whatever
+    that test does with the session.
+    """
+    import reyn.llm.model_budget as _mb
+
+    monkeypatch.setattr(_mb, "get_max_input_tokens", lambda model, **kw: 2800)
+    return make_session(
+        agent_name="default",
+        budget_tracker=BudgetTracker(CostConfig()),
+        state_log=StateLog(tmp_path / ".reyn" / "state" / "wal.jsonl"),
+        compaction_config=CompactionConfig(
+            use_chars4_estimate=True,      # deterministic offline token counts
+            section_caps_spec_tokens=0,    # keeps B_M positive for small T_max
+        ),
+        snapshot_path=tmp_path / ".reyn" / "agents" / "default" / "state" / "snapshot.json",
+    )
+
+
+def _reply_text(ctx) -> str:
+    """What /compact displayed — #3595 S4 routes a slash reply through the
+    client transport, so the recording transport is where it lands."""
+    return " ".join(ctx.transport.texts())
+
+
+def test_compact_slash_registered() -> None:
+    """Tier 2: /compact resolves in the slash registry to its handler."""
+    cmd = REGISTRY.get("compact")
+    assert cmd is not None
+    assert cmd.name == "compact"
+
+
+def _populate(session) -> None:
+    # 8 user turns (seq 1..8 auto-assigned); head=2/tail=2 → candidates 3..6.
+    for _ in range(8):
+        session._append_history(ChatMessage(role="user", content="x" * 4000, ts=_now()))
+
+
+def _script_compaction_llm(monkeypatch) -> None:
+    async def _fake_acompletion(model, messages, **kw):  # noqa: ANN001, ANN003
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=_SUMMARY_JSON))]
+        )
+    monkeypatch.setattr(litellm, "acompletion", _fake_acompletion)
+
+
+def test_compact_now_for_op_real_chat_measurement(tmp_path, monkeypatch) -> None:
+    """Tier 2: with a REAL engine (not a stub), _compact_now_for_op on the chat
+    axis reports the middle-COMPRESSION metric — summarized_turns>0 and
+    compressed_tokens shrunk into a smaller bridge — while router-view
+    freed_tokens is ~0 (structural: the router prompt is head+tail turn-bounded,
+    so compaction bridges the already-elided middle rather than shrinking the
+    view). Closes the #1177/#1182 test gap (those scripted a compact_now stub)."""
+    monkeypatch.chdir(tmp_path)
+    session = _make_session(tmp_path, monkeypatch)
+    _populate(session)
+    _script_compaction_llm(monkeypatch)
+
+    result = asyncio.run(session._compact_now_for_op())
+
+    assert result["summarized_turns"] > 0, "compaction must have summarised older turns"
+    assert result["compressed_tokens"] > 0
+    assert result["compressed_tokens"] > result["bridge_tokens"], (
+        "the summary bridge must be smaller than the raw middle it compresses"
+    )
+    # router-view freed is ~0 for chat (the documented structural finding) — it is
+    # NOT the chat signal; assert it doesn't masquerade as a large freeing.
+    assert result["freed_tokens"] < result["compressed_tokens"]
+    assert any(m.role == "summary" for m in session.history)
+
+
+def test_compact_slash_reports_compression(tmp_path, monkeypatch) -> None:
+    """Tier 2: /compact runs real compaction and reports the summarised-turns +
+    raw→bridge compression (not a misleading router-view 'freed' number)."""
+    monkeypatch.chdir(tmp_path)
+    session = _make_session(tmp_path, monkeypatch)
+    _populate(session)
+    _script_compaction_llm(monkeypatch)
+
+    ctx = slash_ctx(session)
+    asyncio.run(REGISTRY.get("compact").handler(ctx, ""))
+
+    text = _reply_text(ctx).lower()
+    assert "summaris" in text and "bridge" in text, (
+        f"expected a summarised-turns + bridge compression report; got: {text!r}"
+    )
+    assert any(m.role == "summary" for m in session.history), (
+        "compaction must have produced a summary turn in history"
+    )
+
+
+def test_compact_slash_nothing_to_compact(tmp_path, monkeypatch) -> None:
+    """Tier 2: with no compactable turns, /compact reports nothing to compact
+    (freed=0 path) — never a misleading 'freed' claim."""
+    monkeypatch.chdir(tmp_path)
+    session = _make_session(tmp_path, monkeypatch)
+    # 3 turns < head(2)+tail(2) → no candidates → force_compact_now no-ops.
+    for _ in range(3):
+        session._append_history(ChatMessage(role="user", content="hi", ts=_now()))
+
+    async def _fail_acompletion(*a, **k):  # noqa: ANN002, ANN003
+        raise AssertionError("no LLM call expected when there is nothing to compact")
+    monkeypatch.setattr(litellm, "acompletion", _fail_acompletion)
+
+    ctx = slash_ctx(session)
+    asyncio.run(REGISTRY.get("compact").handler(ctx, ""))
+
+    text = _reply_text(ctx).lower()
+    assert "nothing to compact" in text, f"expected the no-op report; got: {text!r}"

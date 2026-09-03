@@ -1,0 +1,2471 @@
+"""Budget / cost / rate-limit enforcement (PR22 + PR25).
+
+A process-shared `BudgetTracker` accumulates token + USD usage per agent
+and per-model call rates. Hooked into LLM calls (pre-check refuses on hard
+cap, post-record updates counters).
+
+PR25 adds persistent daily / monthly quota enforcement via a JSONL ledger
+(.reyn/state/budget_ledger.jsonl). On startup call `tracker.hydrate(path)`
+to re-aggregate today's / this month's usage from the ledger. Every
+`record_llm()` call appends a line to the ledger (fsync'd for durability).
+
+Hybrid cap behavior:
+  - hard_limit: refuse the next operation (subsequent calls return
+    BudgetCheck.allowed=False)
+  - warn at hard_limit * warn_ratio: emit one warn per dimension/key,
+    pushed to the user as a status message and recorded in events.jsonl
+
+Per P7: this is OS-level generic infrastructure — the dimension names
+are not tied to any specific domain.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import os
+import time
+from collections import OrderedDict, defaultdict, deque
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
+
+from reyn.llm.pricing import (
+    CostBreakdown,
+    EmbeddingCost,
+    TokenUsage,
+    UsageSource,
+    estimate_cost,
+    estimate_cost_breakdown,
+    estimate_embedding_cost,
+    merge_usage_sources,
+)
+
+logger = logging.getLogger(__name__)
+
+#: #4206 Slice B (#4724): the cost.* warn-ratio subset of
+#: ``reyn.runtime.preferences.PREFERENCE_KEYS`` — DERIVED, not a second
+#: hand-maintained literal set (PREFERENCE_KEYS stays the ONE declaration
+#: of the ③ axis's vocabulary; this module only needs to know which of
+#: those keys IT is the consumer for).
+def _load_warn_ratio_preference_keys() -> "frozenset[str]":
+    from reyn.runtime.preferences import PREFERENCE_KEYS
+
+    return frozenset(k for k in PREFERENCE_KEYS if k.startswith("cost."))
+
+
+_WARN_RATIO_PREFERENCE_KEYS: "frozenset[str]" = _load_warn_ratio_preference_keys()
+
+#: Models already reported as unpriced (#3695). Once per model per process:
+#: the condition holds for every call to that model, so a per-call warning
+#: would be a flood, and a flood is read as noise and filtered out — which is
+#: indistinguishable from never having warned at all.
+_UNPRICED_MODELS_WARNED: set[str] = set()
+
+
+def _warn_unpriced_model_once(model: str) -> None:
+    """Say once, per model, that its calls are being counted as costing $0.
+
+    The counter (``BudgetTracker.agent_unpriced_calls``) records the fact for
+    a reader that asks; this is the surface for the reader who does not know
+    to ask. The embedding path's equivalent counter has existed for some time
+    and NOTHING under ``interfaces/`` reads it, so a counter alone would
+    reproduce the same silence one level over.
+    """
+    if model in _UNPRICED_MODELS_WARNED:
+        return
+    _UNPRICED_MODELS_WARNED.add(model)
+    logger.warning(
+        "no price is known for model %r — its calls are recorded with tokens "
+        "but $0.00, so the reported cost is a LOWER BOUND, not the amount "
+        "spent. reyn reads litellm's bundled cost map "
+        "(LITELLM_LOCAL_MODEL_COST_MAP), so a model newer than that snapshot "
+        "stays unpriced.",
+        model,
+    )
+
+
+# ── exceptions ──────────────────────────────────────────────────────────────
+
+
+class BudgetExceeded(Exception):
+    """Raised when a pre-call budget check refuses the LLM call."""
+
+    def __init__(self, dimension: str, detail: str) -> None:
+        super().__init__(detail)
+        self.dimension = dimension
+        self.detail = detail
+
+
+# ── config ──────────────────────────────────────────────────────────────────
+
+
+@dataclass
+class CostLimitConfig:
+    """A single hybrid-cap dimension. None hard_limit = unlimited.
+
+    #4522: ``extension_calls`` was removed (was ``FP-0005``/#1877's
+    per-grant extension amount for the unified ``safety.on_limit``
+    3-mode policy) — investigation traced its actual, tested, working
+    implementation to the ``per_chain_skill_calls`` dimension only
+    (``Session._ask_budget_extension`` / ``SkillRunner``'s spawn gate,
+    #1879's own test file: ``test_ask_budget_extension_on_limit_1877.py``
+    keys its fixture on ``hard_dimension="per_chain_skill_calls"``
+    specifically). That whole subsystem was later deliberately, audit-
+    approved removed (#2448, "skill machinery is gone → zero live
+    callers") — but the field's NAME lived on here too, since every
+    ``CostLimitConfig`` (``daily_tokens``/``per_agent_tokens``/etc.)
+    shares this one dataclass. None of THOSE dimensions ever had a
+    dedicated consumer for it — the field's presence on them was
+    incidental, not a separate design decision — so #2448's removal left
+    it silently orphaned everywhere except the ``per_chain_skill_calls``
+    axis it was actually built for, which #2448 removed too. Same shape
+    as ``ask_on_exceed`` below it in git history: declared, parsed,
+    never read (CLAUDE.md's testing-policy six-questions ③ names this
+    exact class — #3850). See ``_build_cost_limit``
+    (config/chat.py) for the deprecation warning an operator who still
+    sets this key gets.
+    """
+
+    hard_limit: float | None = None
+    warn_ratio: float = 0.8
+
+    @property
+    def warn_threshold(self) -> float | None:
+        if self.hard_limit is None or self.warn_ratio <= 0:
+            return None
+        return self.hard_limit * self.warn_ratio
+
+    @property
+    def is_active(self) -> bool:
+        return self.hard_limit is not None
+
+
+def _effective_warn_threshold(
+    cap: "CostLimitConfig", override_ratio: "float | None",
+) -> "float | None":
+    """#4206 Slice B (#4724): *cap*'s warn threshold, using *override_ratio*
+    in place of ``cap.warn_ratio`` when given.
+
+    Design C (lead-coder ruling, #4724): the CALLER resolves the ③
+    preference-axis override (session/agent/project composition, via
+    ``reyn.runtime.preferences.resolve_preference``) and passes the final
+    ratio in — ``BudgetTracker`` itself never learns a session or agent
+    identity beyond the ``agent: str | None`` it already had. This mirrors
+    the SAME shape #4723 used for ``reasoning_display``: the tracker is a
+    read-only consumer of an already-resolved value, not a second
+    resolution point.
+
+    Never mutates ``cap`` — the SAME ``CostLimitConfig`` instance is shared
+    by every agent/session in this process (``self._config``), so mutating
+    it in place to reflect one caller's preference would leak that
+    preference to every OTHER caller reading the same field next."""
+    if cap.hard_limit is None:
+        return None
+    ratio = cap.warn_ratio if override_ratio is None else override_ratio
+    if ratio <= 0:
+        return None
+    return cap.hard_limit * ratio
+
+
+def _validate_warn_ratio_overrides(overrides: "dict[str, float] | None") -> None:
+    """#4724 condition (lead-coder): *overrides*' keys are checked against
+    the SAME ``PREFERENCE_KEYS`` vocabulary the ③ axis declares them in
+    (narrowed to the ``cost.*`` warn-ratio subset) — an unknown/typo'd key
+    raises loudly rather than silently doing nothing, the #4655 defect
+    class reproduced on the TRANSPORT side (a resolved override that never
+    reaches the tracker) rather than the storage side slice 1/#4655 already
+    closed."""
+    if not overrides:
+        return
+    from reyn.runtime.preferences import PREFERENCE_KEYS, UnknownPreferenceKeyError
+
+    unknown = set(overrides) - _WARN_RATIO_PREFERENCE_KEYS
+    if unknown:
+        raise UnknownPreferenceKeyError(
+            f"warn_ratio_overrides: unrecognized key(s) {sorted(unknown)!r} — "
+            f"not in the cost.* warn-ratio subset of PREFERENCE_KEYS "
+            f"({sorted(_WARN_RATIO_PREFERENCE_KEYS)!r})."
+        )
+    # Defensive: PREFERENCE_KEYS itself is the ONE declaration (#4206); this
+    # subset is DERIVED from it (never a second, independently-drifting
+    # literal set), so the assert below is a not-both-drifted guard, not a
+    # live check against operator input.
+    assert _WARN_RATIO_PREFERENCE_KEYS <= PREFERENCE_KEYS  # noqa: S101
+
+
+@dataclass
+class CostConfig:
+    """`cost:` — financial budget caps and rate limits (PR22 + PR25).
+
+    Contains only financial knobs (per-agent token/USD, daily/monthly quota,
+    rate limits). Loop-detection caps (router_invocations_per_turn) moved
+    to ``SafetyConfig.loop`` in the FP-0004/0005 refactor.
+    """
+
+    per_agent_tokens: CostLimitConfig = field(default_factory=CostLimitConfig)
+    per_agent_cost_usd: CostLimitConfig = field(default_factory=CostLimitConfig)
+    rate_limit_per_minute: dict[str, int] = field(default_factory=dict)
+    rate_limit_warn_ratio: float = 0.8
+    # PR25: persistent daily / monthly quota (reset automatically at period boundary)
+    daily_tokens: CostLimitConfig = field(default_factory=CostLimitConfig)
+    daily_cost_usd: CostLimitConfig = field(default_factory=CostLimitConfig)
+    monthly_tokens: CostLimitConfig = field(default_factory=CostLimitConfig)
+    monthly_cost_usd: CostLimitConfig = field(default_factory=CostLimitConfig)
+
+
+# ── check result ────────────────────────────────────────────────────────────
+
+
+@dataclass
+class BudgetCheck:
+    allowed: bool = True
+    warn_dimensions: list[str] = field(default_factory=list)
+    hard_dimension: str | None = None
+    detail: str = ""
+    # Snapshot of current/limit values for the dimension that triggered
+    # warn or hard. Used by formatters to build user-facing messages.
+    context: dict = field(default_factory=dict)
+
+
+# ── period helpers ──────────────────────────────────────────────────────────
+
+
+def _period_key(ts: float, kind: str) -> tuple[str, str]:
+    """Return a period key tuple for the given POSIX timestamp.
+
+    kind="day"   → ("day",   "2026-05-02")
+    kind="month" → ("month", "2026-05")
+
+    Uses local time (time.localtime) — no external TZ config needed.
+    """
+    lt = time.localtime(ts)
+    if kind == "day":
+        return ("day", f"{lt.tm_year:04d}-{lt.tm_mon:02d}-{lt.tm_mday:02d}")
+    if kind == "month":
+        return ("month", f"{lt.tm_year:04d}-{lt.tm_mon:02d}")
+    raise ValueError(f"unknown period kind: {kind!r}")
+
+
+def _current_period_key(kind: str) -> tuple[str, str]:
+    return _period_key(time.time(), kind)
+
+
+# ── persistent ledger ───────────────────────────────────────────────────────
+
+
+class BudgetLedger:
+    """Append-only JSONL ledger for durable budget records (PR25).
+
+    Each line is an LLM-call record::
+
+        {"ts": "2026-05-02T10:23:00+09:00", "agent": "alice",
+         "model": "...", "tokens": 300, "cost_usd": 0.0023,
+         "purpose": "main", "chain_id": "c-1a2b",
+         "usage_source": "provider"}
+
+    ``purpose`` (#1190) and ``chain_id`` (#3339, the turn key) are optional —
+    written only when known, so a record from a call with no turn, and a
+    record written before either field existed, both stay valid.
+
+    ``usage_source`` (#3351) is the PROVENANCE of ``tokens``: ``"provider"``
+    (the provider reported the counts) or ``"estimated"``
+    (``litellm.token_counter`` filled them locally because the stream carried
+    no usage). Omitted when provenance was never stated, which is also how
+    every record written before #3351 reads — a MISSING field means
+    ``"unknown"``, never ``"provider"``. Together with ``chain_id`` this is
+    what makes "which turns were billed on estimated counts" answerable after
+    the fact, durably, from the same file the caps are rebuilt from.
+
+    Records are fsync'd on append so a process crash cannot roll back a
+    completed LLM call and under-count quota usage. This is the cap-critical
+    durability layer; the throttled ``budget_state.json`` is a best-effort
+    cache on top of it (see ``BudgetTracker.hydrate``).
+
+    This class is synchronous and not asyncio-aware — all writes are tiny
+    and complete in microseconds.  The asyncio event loop is never blocked
+    meaningfully.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self._path = Path(path)
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+
+    @property
+    def path(self) -> Path:
+        return self._path
+
+    def append(
+        self,
+        *,
+        agent: str | None,
+        model: str,
+        tokens: int,
+        cost_usd: float,
+        purpose: str | None = None,
+        chain_id: str | None = None,
+        usage_source: UsageSource = UsageSource.UNKNOWN,
+    ) -> None:
+        """Append one LLM-call record and fsync.
+
+        ``purpose`` (#1190) is the cost-attribution bucket
+        (main/compaction/judge/dogfood). It is omitted
+        from the record when None so pre-existing ledger lines stay
+        byte-identical.
+
+        ``chain_id`` (#3339) is the turn key — the identity of the user
+        submission whose turn made this call — so the ledger can be
+        re-grouped per turn after the fact. Same omit-when-None rule: a
+        call made outside any turn (the ``/compact`` slash short-circuit,
+        a dev/dogfood surface) writes no ``chain_id`` at all rather than a
+        null turn key, and a record
+        written before #3339 simply lacks the field (readers must treat a
+        missing ``chain_id`` as "no turn", never as an error).
+
+        ``usage_source`` (#3351) is the provenance of ``tokens`` — see the
+        class docstring. ``UNKNOWN`` writes NO field, which is precisely how a
+        pre-#3351 record reads, so old and unstated records are the same case
+        for a reader and neither can be mistaken for a provider-verified one.
+        """
+        record: dict = {
+            "ts": self._now_iso(),
+            "agent": agent,
+            "model": model,
+            "tokens": tokens,
+            "cost_usd": cost_usd,
+        }
+        if purpose is not None:
+            record["purpose"] = purpose
+        if chain_id is not None:
+            record["chain_id"] = chain_id
+        if usage_source is not UsageSource.UNKNOWN:
+            record["usage_source"] = usage_source.value
+        self._write_record(record)
+
+    @staticmethod
+    def _now_iso() -> str:
+        """Current local time as an ISO-8601 string with UTC offset."""
+        lt = time.localtime(time.time())
+        offset_sec = lt.tm_gmtoff  # seconds east of UTC
+        sign = "+" if offset_sec >= 0 else "-"
+        offset_abs = abs(offset_sec)
+        offset_str = f"{sign}{offset_abs // 3600:02d}:{(offset_abs % 3600) // 60:02d}"
+        return (
+            f"{lt.tm_year:04d}-{lt.tm_mon:02d}-{lt.tm_mday:02d}"
+            f"T{lt.tm_hour:02d}:{lt.tm_min:02d}:{lt.tm_sec:02d}"
+            f"{offset_str}"
+        )
+
+    def _write_record(self, record: dict) -> None:
+        """Serialize *record* as one SELF-TERMINATING JSONL line (always
+        ``line + "\\n"``, unconditionally) and append it — no read of any
+        kind happens on this path.
+
+        #5192 (architect ruling, issuecomment-5384627324/5384637352): this
+        method used to pre-check whether the file's own last byte was
+        already a newline (a separate ``stat()`` + ``open("rb")``/``seek``/
+        ``read`` of the tail) and insert a leading ``"\\n"`` when it wasn't
+        — defending against a torn (no-trailing-newline) write left by a
+        crash. Under real concurrent writers that check is itself a TOCTOU
+        race: it can observe ANOTHER process's write mid-flight and insert
+        a spurious lead newline, inflating the raw line count without
+        corrupting any record (:meth:`iter_records`'s own ``if not line:
+        continue`` tolerates a blank line silently — see that method's own
+        docstring for why that tolerance is an INVARIANT, not an accident,
+        and must not be "cleaned up" later). Root-caused live for the
+        sibling ``ApprovalLedger`` class (docs-maintainer, issuecomment-
+        5384615994) — this class is where architect's own #5153 ruling
+        told that class to mirror THIS one, so the same defect propagated
+        here by construction, not by a second independent bug.
+
+        Fixed the same way there: remove the read entirely rather than
+        make it smarter/locked/retried (all three still read before
+        writing). A torn write from before this fix is a one-time
+        historical concern, not something every append needs to
+        re-verify."""
+        line = json.dumps(record, ensure_ascii=False) + "\n"
+        with self._path.open("a", encoding="utf-8") as f:
+            f.write(line)
+            f.flush()
+            os.fsync(f.fileno())
+
+    def iter_records(self):
+        """Yield parsed record dicts; skip broken / non-dict lines.
+
+        #5192: an embedded blank line — the ONE artifact the pre-fix
+        leading-newline guard could produce under real concurrent writers
+        (never a corrupted record; see :meth:`_write_record`'s own
+        docstring) — is silently skipped here by the SAME ``if not line:
+        continue`` this method already had for a torn/malformed line. This
+        is an INVARIANT this method must keep, not incidental tolerance:
+        the population an existing ledger file may contain includes a
+        legacy blank line from before #5192, and this reader must keep
+        reading past it."""
+        if not self._path.is_file():
+            return
+        with self._path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                yield entry
+
+    def iter_records_from(self, byte_offset: int):
+        """Yield parsed record dicts starting at *byte_offset* (the tail since
+        the last checkpoint anchor). Same broken-line tolerance as
+        ``iter_records``. Used by ``BudgetTracker.hydrate`` to bound the
+        re-parse cost to activity since the last checkpoint instead of the
+        whole (lifetime, monotonically-growing) ledger — see #2945."""
+        if not self._path.is_file():
+            return
+        with self._path.open("rb") as f:
+            f.seek(byte_offset)
+            for raw_line in f:
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                yield entry
+
+    def tail_boundary(self, chunk_size: int = 8192) -> tuple[int, bytes] | None:
+        """Return ``(file_size, last_line_bytes)`` for the ledger's current end,
+        or ``None`` if the ledger is empty/missing.
+
+        ``last_line_bytes`` is the raw bytes of the final record line
+        (including its trailing newline) ending exactly at ``file_size``. Used
+        as the checkpoint anchor's content pin (#2945 P1) — cheap (bounded by
+        line length, not ledger size) since every append is fsync'd with a
+        trailing newline, so the file reliably ends on a line boundary.
+        """
+        if not self._path.is_file():
+            return None
+        size = self._path.stat().st_size
+        if size == 0:
+            return None
+        read_size = min(chunk_size, size)
+        with self._path.open("rb") as f:
+            f.seek(size - read_size)
+            buf = f.read(read_size)
+        # The buffer should end with the append's trailing "\n". Find the
+        # newline immediately before it to isolate the last complete line.
+        search_end = len(buf) - 1 if buf.endswith(b"\n") else len(buf)
+        idx = buf.rfind(b"\n", 0, search_end)
+        if idx == -1:
+            if read_size < size:
+                # Pathological: a single line longer than chunk_size. Grow the
+                # window rather than mis-frame the anchor.
+                return self.tail_boundary(chunk_size=chunk_size * 4)
+            line_bytes = buf
+        else:
+            line_bytes = buf[idx + 1:]
+        return (size, line_bytes)
+
+    def leading_boundary(self, chunk_size: int = 8192) -> bytes | None:
+        """Return the raw bytes of the FIRST complete record line (including
+        its trailing newline), or ``None`` if the ledger is empty/missing or
+        no complete line has been written yet.
+
+        Used as the checkpoint's LEDGER IDENTITY pin (#3201): unlike
+        ``tail_boundary`` (which anchors to the current END and is expected
+        to move as the ledger grows, and to stop matching the instant the
+        ledger is truncated), the first line of an append-only,
+        never-rotated ledger never changes for the life of that ledger file
+        — so it is a stable fingerprint of WHICH ledger this is, independent
+        of how much of it currently remains. Same chunk-growth handling as
+        ``tail_boundary`` for a pathological first line longer than
+        ``chunk_size``. Any read failure (permissions, race with a
+        concurrent delete) also yields ``None`` rather than propagating —
+        the identity check is an over-count-avoidance OPTIMIZATION, never
+        something a read glitch may downgrade into an under-count: an
+        unreadable identity floats to ``verify_anchor``'s "identity_absent"
+        status, which still floors.
+        """
+        try:
+            if not self._path.is_file():
+                return None
+            size = self._path.stat().st_size
+            if size == 0:
+                return None
+            read_size = min(chunk_size, size)
+            with self._path.open("rb") as f:
+                buf = f.read(read_size)
+        except OSError:
+            return None
+        idx = buf.find(b"\n")
+        if idx == -1:
+            if read_size < size:
+                # Pathological: a single line longer than chunk_size. Grow
+                # the window rather than conclude there is no first line.
+                return self.leading_boundary(chunk_size=chunk_size * 4)
+            # Whole file read and still no newline -- no COMPLETE line yet
+            # (a partial/unflushed write), so no identity is available.
+            return None
+        return buf[: idx + 1]
+
+
+# ── ISO-8601 timestamp parser ───────────────────────────────────────────────
+
+
+def _parse_iso_ts(ts_str: str) -> float:
+    """Parse an ISO-8601 timestamp (with +HH:MM offset) → POSIX float.
+
+    Handles the format written by BudgetLedger.append:
+      "2026-05-02T10:23:00+09:00"
+
+    Raises ValueError on parse failure (caller should skip the record).
+    """
+    # datetime.fromisoformat supports timezone offsets in Python 3.7+.
+    from datetime import datetime, timezone
+    # Python 3.10 accepts "+09:00" directly; earlier versions need workaround.
+    # Use a simple manual parse to stay compatible with 3.8+.
+    if len(ts_str) >= 19:
+        # Try stdlib first (3.7+ handles +HH:MM in Python 3.11+)
+        try:
+            dt = datetime.fromisoformat(ts_str)
+            return dt.timestamp()
+        except ValueError:
+            pass
+    # Fallback: strip offset manually and apply it.
+    # Format: "2026-05-02T10:23:00+09:00" (25 chars)
+    import re
+    m = re.match(
+        r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})"
+        r"([+-])(\d{2}):(\d{2})$",
+        ts_str,
+    )
+    if not m:
+        raise ValueError(f"cannot parse ts: {ts_str!r}")
+    dt_naive_str, sign, hh, mm = m.groups()
+    from datetime import datetime, timedelta
+    dt_naive = datetime.strptime(dt_naive_str, "%Y-%m-%dT%H:%M:%S")
+    offset = timedelta(hours=int(hh), minutes=int(mm))
+    if sign == "-":
+        offset = -offset
+    tz = timezone(offset)
+    dt = dt_naive.replace(tzinfo=tz)
+    return dt.timestamp()
+
+
+# ── compacted checkpoint (#2945) ─────────────────────────────────────────────
+#
+# ``hydrate`` re-parsing the whole (monotonically-growing, never-rotated)
+# ledger on every startup is a blocking-startup-path bug, not a "make it
+# faster" optimization: the per-agent lifetime aggregate is the only
+# unbounded dimension (daily/monthly self-heal at their period boundary), so
+# ``BudgetCheckpoint`` compacts *only* per-agent totals + the current
+# daily/monthly-so-far totals into a small file, anchored to an exact ledger
+# byte position. ``hydrate`` then only re-parses the ledger TAIL after that
+# anchor.
+#
+# Core invariant (do not weaken): the checkpoint must always be safe to
+# delete. It carries no fact the ledger does not already durably hold — it is
+# a *rebuildable* cache of a prefix-sum over the ledger, never the sole
+# holder of truth.
+#
+# P3 (ambiguity -> over-count-safe, never under-count) resolves differently
+# depending on WHY the checkpoint is untrustworthy — see ``hydrate``'s
+# docstring for the full breakdown (missing/corrupt checkpoint vs. ledger
+# "truncated"/"missing"/"identity_absent" vs. ledger "invalid"). The one
+# that matters most: a checkpoint that is itself still internally consistent
+# (``content_sha256`` verifies) but whose ledger has been TRUNCATED below its
+# anchor (or deleted outright) is NOT discarded — its per-agent totals are
+# merged in as a floor. Silently falling back to "just re-scan whatever
+# ledger remains" for that case would re-introduce the exact staleness this
+# whole mechanism exists to prevent: a lost/truncated ledger would silently
+# reset a cap-critical per-agent counter.
+#
+# #3201: the ONE case that gets NO floor is a ledger AFFIRMATIVELY proven,
+# by ledger IDENTITY (a hash of the ledger's leading record line, stable
+# across truncation/growth since the ledger is append-only and
+# never-rotated), to be a genuinely DIFFERENT ledger — not merely
+# "same-size-or-larger with a content mismatch" (an earlier version of this
+# discriminated "truncated" vs "invalid" by file SIZE, which is
+# attacker-controllable: a replacement ledger can be padded to any length,
+# making size an over-approximation of "different"). Identity makes the
+# floor MORE PRECISE, never looser: absence of identity (a pre-#3201
+# checkpoint, or an unreadable leading line on either side) can never
+# AFFIRMATIVELY prove "different", so it floats to the floor-applying side
+# by default — see ``verify_anchor``.
+
+
+@dataclass
+class BudgetCheckpoint:
+    """A compacted, point-in-time summary of ``budget_ledger.jsonl``.
+
+    Lives at ``.reyn/cache/budget_checkpoint.json`` (DERIVED/cache — see
+    ``docs/reference/runtime/reyn-dir-layout.md``): fully reconstructable from
+    the ledger, so it is not write-gated recovery-core and may be deleted at
+    any time with no data loss (the next ``hydrate`` falls back to a full
+    ledger scan and rewrites it).
+    """
+
+    agent_tokens: dict[str, int]
+    agent_cost_usd: dict[str, float]
+    day_key: str | None
+    daily_tokens: int
+    daily_cost_usd: float
+    month_key: str | None
+    monthly_tokens: int
+    monthly_cost_usd: float
+    anchor_byte_offset: int
+    anchor_line_len: int
+    anchor_line_sha256: str
+    # #2945 follow-up (co-vet finding): whether THIS checkpoint's totals were
+    # produced by floor-merging a previous checkpoint into a re-scan (i.e.
+    # the ledger was found truncated/missing/identity_absent when this
+    # checkpoint was written) — and why. Surfaced to the operator via
+    # `/budget` (never silent — "bound fired but nobody can tell" is the
+    # failure mode this closes). ``floor_reason`` is one of "truncated" /
+    # "missing" / "identity_absent", or ``None`` when no floor was applied.
+    # (#3201: "replaced" is no longer a floor reason — an AFFIRMATIVELY
+    # different ledger identity now gets NO floor; see ``verify_anchor``.)
+    floor_applied: bool = False
+    floor_reason: str | None = None
+    # #3201: a fingerprint of the LEDGER this checkpoint was built from —
+    # sha256 of the ledger's leading (first) record line at write time.
+    # Unlike ``anchor_*`` (which pins the ledger's END and is EXPECTED to
+    # stop matching the moment the ledger is truncated), the leading line of
+    # an append-only, never-rotated ledger never changes for that ledger's
+    # lifetime, so it survives truncation and lets ``verify_anchor``
+    # discriminate "same ledger, corrupted/shrunk" (floor) from "genuinely
+    # DIFFERENT ledger" (no floor) by IDENTITY rather than by file SIZE
+    # (size is attacker-controllable — pad a replacement to any length).
+    # ``None`` for a checkpoint written before #3201 (or the vanishingly
+    # rare case the ledger's leading line could not be read at write time)
+    # — see ``verify_anchor``'s "identity_absent" status: an absent
+    # identity can never AFFIRMATIVELY prove a different ledger, so it is
+    # routed to the floor-applying side by default, never to "no floor".
+    ledger_identity_sha256: str | None = None
+
+    def _content_payload(self) -> dict:
+        """The counted-values subset covered by ``content_sha256`` — everything
+        EXCEPT the anchor (which pins the checkpoint to the ledger, not to
+        itself) and the hash field itself. Sorted keys for a stable digest.
+
+        ``floor_applied``/``floor_reason`` are included here (not just
+        stored alongside) so tampering with them — e.g. hiding that a floor
+        was applied — is caught by the same ``content_sha256`` check as
+        tampering with the counted totals themselves.
+
+        ``ledger_identity_sha256`` (#3201) is likewise included here rather
+        than in the excluded ``anchor`` sub-object, DELIBERATELY: it must be
+        tamper-evident (a forged/stripped identity must not be able to
+        spoof the truncated-vs-different-ledger decision), which the
+        anchor's own exclusion from this hash would defeat. It is omitted
+        from the payload entirely (not merely set to ``None`` inline) when
+        absent, so a pre-#3201 checkpoint's stored ``content_sha256`` still
+        verifies unchanged under this new code — see the field's docstring
+        for why an absent identity must float to the floor-applying side,
+        not be treated as tampering.
+        """
+        payload = {
+            "agent_tokens": dict(sorted(self.agent_tokens.items())),
+            "agent_cost_usd": dict(sorted(self.agent_cost_usd.items())),
+            "day_key": self.day_key,
+            "daily_tokens": self.daily_tokens,
+            "daily_cost_usd": self.daily_cost_usd,
+            "month_key": self.month_key,
+            "monthly_tokens": self.monthly_tokens,
+            "monthly_cost_usd": self.monthly_cost_usd,
+            "floor_applied": self.floor_applied,
+            "floor_reason": self.floor_reason,
+        }
+        if self.ledger_identity_sha256 is not None:
+            payload["ledger_identity_sha256"] = self.ledger_identity_sha256
+        return payload
+
+    def content_sha256(self) -> str:
+        canonical = json.dumps(self._content_payload(), sort_keys=True, ensure_ascii=False)
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    def to_dict(self) -> dict:
+        payload = self._content_payload()
+        payload["version"] = 1
+        # #2945 P3 hardening: the ledger-side anchor only proves the
+        # checkpoint is pinned to an unmodified/untruncated ledger position —
+        # it says nothing about whether the checkpoint's OWN counted values
+        # were hand-edited/corrupted afterward. content_sha256 covers that
+        # independently (a direct edit to agent_tokens etc. changes the
+        # digest without touching the ledger at all).
+        payload["content_sha256"] = self.content_sha256()
+        payload["anchor"] = {
+            "byte_offset": self.anchor_byte_offset,
+            "line_len": self.anchor_line_len,
+            "line_sha256": self.anchor_line_sha256,
+        }
+        return payload
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "BudgetCheckpoint | None":
+        """Parse *data*; return ``None`` on ANY shape mismatch OR a
+        ``content_sha256`` mismatch (P3: ambiguous/tampered checkpoint content
+        must fall back to a full ledger re-scan, never guess)."""
+        try:
+            if not isinstance(data, dict) or data.get("version") != 1:
+                return None
+            anchor = data["anchor"]
+            agent_tokens = {str(k): int(v) for k, v in dict(data["agent_tokens"]).items()}
+            agent_cost_usd = {
+                str(k): float(v) for k, v in dict(data["agent_cost_usd"]).items()
+            }
+            expected_content_hash = str(data["content_sha256"])
+            checkpoint = cls(
+                agent_tokens=agent_tokens,
+                agent_cost_usd=agent_cost_usd,
+                day_key=data.get("day_key"),
+                daily_tokens=int(data["daily_tokens"]),
+                daily_cost_usd=float(data["daily_cost_usd"]),
+                month_key=data.get("month_key"),
+                monthly_tokens=int(data["monthly_tokens"]),
+                monthly_cost_usd=float(data["monthly_cost_usd"]),
+                anchor_byte_offset=int(anchor["byte_offset"]),
+                anchor_line_len=int(anchor["line_len"]),
+                anchor_line_sha256=str(anchor["line_sha256"]),
+                floor_applied=bool(data.get("floor_applied", False)),
+                floor_reason=(
+                    str(data["floor_reason"]) if data.get("floor_reason") is not None else None
+                ),
+                # #3201: absent for a pre-#3201 checkpoint — ``None`` is the
+                # correct default (see the field's docstring), NOT a parse
+                # failure, so this must not raise/reject on the missing key.
+                ledger_identity_sha256=(
+                    str(data["ledger_identity_sha256"])
+                    if data.get("ledger_identity_sha256") is not None
+                    else None
+                ),
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+        if checkpoint.content_sha256() != expected_content_hash:
+            return None
+        return checkpoint
+
+
+def _default_checkpoint_path(ledger_path: Path) -> Path:
+    """``.reyn/state/budget_ledger.jsonl`` → ``.reyn/cache/budget_checkpoint.json``.
+
+    Derived rather than threaded through every caller: the checkpoint is an
+    implementation detail of ``hydrate``'s bounded re-scan, always a fixed
+    sibling of the ledger under the project's ``.reyn/`` tree (see
+    ``docs/reference/runtime/reyn-dir-layout.md``).
+    """
+    reyn_dir = ledger_path.parent.parent
+    return reyn_dir / "cache" / "budget_checkpoint.json"
+
+
+def load_checkpoint_or_none(checkpoint_path: Path) -> BudgetCheckpoint | None:
+    """Read + parse the checkpoint; ``None`` on any missing/corrupt/partial
+    shape (P3: caller must fall back to a full ledger re-scan)."""
+    if not checkpoint_path.is_file():
+        return None
+    try:
+        raw = checkpoint_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return BudgetCheckpoint.from_dict(data)
+
+
+def verify_anchor(checkpoint: BudgetCheckpoint, ledger_path: Path) -> tuple[str, int]:
+    """Verify the checkpoint's anchor against the CURRENT ledger file, and —
+    when it no longer verifies — discriminate WHY by ledger IDENTITY, not
+    file size (#3201).
+
+    Returns ``(status, current_size)`` where ``status`` is one of:
+
+    - ``"valid"`` — the ledger still contains, byte-for-byte, the line the
+      checkpoint was anchored to. Fast tail-only path.
+    - ``"truncated"`` — the anchor no longer verifies, but the CURRENT
+      ledger's leading line hashes to the SAME ``ledger_identity_sha256`` as
+      the checkpoint's: this is the SAME ledger, just shrunk/corrupted past
+      the anchor. FLOOR applies.
+    - ``"missing"`` — the ledger file is absent or empty. No identity is
+      derivable from "nothing", so this is ambiguous rather than a proven
+      replacement. FLOOR applies (same side as "truncated" — see below).
+    - ``"identity_absent"`` — the anchor no longer verifies, but identity
+      cannot be established on ONE OR BOTH sides: either this checkpoint
+      predates #3201 (``ledger_identity_sha256 is None``) or the CURRENT
+      ledger's leading line could not be read. FLOOR applies — same side as
+      "truncated"/"missing".
+    - ``"invalid"`` — the anchor no longer verifies, AND both identities
+      *are* computable, AND they differ: an AFFIRMATIVELY DIFFERENT ledger
+      (cross-workspace copy, deliberate archive+recreate). NO FLOOR — a
+      different ledger's past totals are simply not this checkpoint's
+      business.
+
+    #3201 (identity, not size): a prior version of this function used file
+    SIZE as the "truncated" vs "invalid" discriminator (same-size-or-larger
+    => replaced, smaller => truncated). Size is attacker-controllable (pad a
+    replacement to any length), so that was an over-approximation dressed up
+    as a distinction. The load-bearing invariant carried over unchanged from
+    #2945/#3195 (co-vet firm): only an explicit operator action (archiving
+    BOTH the ledger and the checkpoint together) may LOWER a cap-critical
+    counter. Identity discrimination makes this MORE PRECISE, never looser:
+    the floor is the DEFAULT for every status above except "valid" — the
+    ONLY status that lifts it is "invalid", and reaching "invalid" requires
+    POSITIVE proof (both identities present, and they differ), never the
+    mere absence of proof either way. An attacker who truncates the SAME
+    ledger while leaving its leading line intact (the common truncation
+    shape — cut from the tail) is classified "truncated", not "invalid", so
+    the floor still catches them; an attacker who instead strips/corrupts
+    the identity fields to dodge the floor lands in "identity_absent" (or
+    "missing"), which ALSO floors, not "invalid". Only a ledger that
+    genuinely presents a *different*, independently-hashed leading line
+    escapes the floor.
+    """
+    if not ledger_path.is_file():
+        return ("missing", 0)
+    size = ledger_path.stat().st_size
+    if size == 0:
+        return ("missing", size)
+
+    offset = checkpoint.anchor_byte_offset
+    line_len = checkpoint.anchor_line_len
+    anchor_ok = False
+    if not (line_len <= 0 or offset < line_len or size < offset):
+        try:
+            with ledger_path.open("rb") as f:
+                f.seek(offset - line_len)
+                buf = f.read(line_len)
+        except OSError:
+            buf = b""
+        anchor_ok = (
+            len(buf) == line_len
+            and hashlib.sha256(buf).hexdigest() == checkpoint.anchor_line_sha256
+        )
+    if anchor_ok:
+        return ("valid", size)
+
+    # Anchor didn't verify (malformed, truncated-past, or content mismatch)
+    # — discriminate the reason by IDENTITY. The floor is the default;
+    # "invalid" (no floor) requires identity to be AFFIRMATIVELY provable
+    # on both sides AND different.
+    if checkpoint.ledger_identity_sha256 is None:
+        return ("identity_absent", size)
+    leading = BudgetLedger(ledger_path).leading_boundary()
+    if leading is None:
+        return ("identity_absent", size)
+    if hashlib.sha256(leading).hexdigest() == checkpoint.ledger_identity_sha256:
+        return ("truncated", size)
+    return ("invalid", size)
+
+
+def write_checkpoint(
+    checkpoint_path: Path,
+    ledger_path: Path,
+    *,
+    agent_tokens: dict[str, int],
+    agent_cost_usd: dict[str, float],
+    day_key: tuple[str, str] | None,
+    daily_tokens: int,
+    daily_cost_usd: float,
+    month_key: tuple[str, str] | None,
+    monthly_tokens: int,
+    monthly_cost_usd: float,
+    floor_applied: bool = False,
+    floor_reason: str | None = None,
+) -> None:
+    """Write a fresh checkpoint anchored to the ledger's CURRENT end.
+
+    No-op if the ledger is empty/missing (nothing to anchor to yet).
+
+    ``floor_applied``/``floor_reason`` record whether THIS write followed a
+    floor-merge (the ledger was found truncated/missing/identity_absent
+    during the hydrate that produced these totals) — surfaced to the
+    operator via ``BudgetTracker.snapshot()`` / `/budget` so a floor is
+    never silent.
+
+    #3201: also stamps ``ledger_identity_sha256`` — a hash of the ledger's
+    leading (first) record line — as this checkpoint's ledger-identity
+    fingerprint, so a FUTURE ``verify_anchor`` call can discriminate a
+    truncated/corrupted SAME ledger (floor) from a genuinely DIFFERENT
+    ledger (no floor) without relying on file size. ``None`` in the
+    vanishingly rare case the leading line cannot be read even though the
+    tail boundary (checked just above) could be — degrades to
+    ``verify_anchor``'s "identity_absent" status next time, which still
+    floors (never silently drops to "no floor").
+
+    P2 write order (durability): the ledger itself is already fsync'd per
+    append by ``BudgetLedger._write_record`` — by construction this always
+    runs *after* that, never before — then: write a temp file → fsync temp →
+    atomic rename → fsync the containing directory (so the rename survives a
+    crash immediately after).
+    """
+    ledger = BudgetLedger(ledger_path)
+    boundary = ledger.tail_boundary()
+    if boundary is None:
+        return
+    size, line_bytes = boundary
+    leading_line = ledger.leading_boundary()
+    ledger_identity_sha256 = (
+        hashlib.sha256(leading_line).hexdigest() if leading_line is not None else None
+    )
+    checkpoint = BudgetCheckpoint(
+        agent_tokens=dict(agent_tokens),
+        agent_cost_usd=dict(agent_cost_usd),
+        day_key=day_key[1] if day_key else None,
+        daily_tokens=daily_tokens,
+        daily_cost_usd=daily_cost_usd,
+        month_key=month_key[1] if month_key else None,
+        monthly_tokens=monthly_tokens,
+        monthly_cost_usd=monthly_cost_usd,
+        anchor_byte_offset=size,
+        anchor_line_len=len(line_bytes),
+        anchor_line_sha256=hashlib.sha256(line_bytes).hexdigest(),
+        floor_applied=floor_applied,
+        floor_reason=floor_reason,
+        ledger_identity_sha256=ledger_identity_sha256,
+    )
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = checkpoint_path.with_suffix(checkpoint_path.suffix + ".tmp")
+    payload = json.dumps(checkpoint.to_dict(), ensure_ascii=False, indent=2)
+    with tmp.open("w", encoding="utf-8") as f:
+        f.write(payload)
+        f.flush()
+        os.fsync(f.fileno())
+    tmp.replace(checkpoint_path)
+    try:
+        dir_fd = os.open(str(checkpoint_path.parent), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        # Directory fsync is a best-effort durability step for the rename's
+        # metadata; the atomic rename above already leaves either the old or
+        # new file intact on a crash, so a failure here is not data loss.
+        pass
+
+
+# ── tracker ─────────────────────────────────────────────────────────────────
+
+# #3339: how many recent turns keep a live per-turn token/cost bucket. The
+# depth exists so a just-finished turn stays readable while later turns run,
+# not so history accumulates unbounded. The tracker is process-shared, so N
+# concurrent sessions share these buckets: the effective per-session depth is
+# CAP/N.
+#
+# #3283 ④: readers now include a KEYED lookup for OLDER turns
+# (``turn_usage(chain_id)``), not only the latest one — the TUI's right gutter
+# asks "what did the turn this row belongs to use", for rows scrolled well
+# back. So eviction IS reachable for a real read, and the depth above is what
+# decides when. That is handled by contract rather than by depth: a keyed read
+# of an evicted (or never-recorded) turn returns ``None``, so the caller
+# renders "unknown" instead of a fabricated ``0``. The durable record of an
+# evicted turn's spend is the ledger's per-call ``chain_id``.
+TURN_BUCKET_CAP = 64
+
+#: Every per-turn bucket, as ``(attribute name, snapshot key)`` — the SINGLE
+#: declaration of the set, iterated by ``_record_turn_usage``'s eviction loop
+#: and by ``snapshot()`` rather than each re-listing the buckets by hand. Same
+#: shape as ``TextualChatApp._PER_SESSION_DICT_STATE`` (#3310 N2).
+#:
+#: ★ Why a declaration and not four hand-written lines: membership of a turn is
+#: decided by ``_turn_tokens`` ALONE (see :meth:`BudgetTracker.turn_usage`),
+#: which is the right call — one authority, no way for the buckets to disagree
+#: about which turns exist — but it has a second-order consequence. A COMPANION
+#: bucket that stops being evicted grows without limit while every lookup keeps
+#: answering correctly, so no behavioural test can see it: the leak is
+#: invisible precisely BECAUSE the membership decision is clean. Registering a
+#: bucket here is what makes it both bounded and observable
+#: (``snapshot()`` exposes it, and the bound is asserted against that).
+#:
+#: A new bucket MUST be added here. What this tuple does NOT cover:
+#: ``_record_turn_usage``'s accumulation (each bucket sums a different field of
+#: ``TokenUsage``, so there is nothing uniform to drive) and
+#: ``_turn_usage_dict``'s return shape (hand-written on purpose — it is the
+#: documented public contract of ``turn_usage``). Missing either of those is a
+#: visible gap, not a silent leak; missing THIS one is the silent leak.
+_PER_TURN_BUCKETS: "tuple[tuple[str, str], ...]" = (
+    ("_turn_tokens", "turn_tokens"),
+    ("_turn_prompt_tokens", "turn_prompt_tokens"),
+    ("_turn_completion_tokens", "turn_completion_tokens"),
+    ("_turn_cost_usd", "turn_cost_usd"),
+    ("_turn_usage_source", "turn_usage_source"),
+)
+
+
+class BudgetTracker:
+    """Process-wide accumulator + hybrid-cap enforcer.
+
+    Counters live in memory and reset on process restart. `/budget reset`
+    clears them mid-process. The tracker is single-thread / asyncio-safe
+    by virtue of running in a single event loop (no internal locking).
+    """
+
+    def __init__(self, config: CostConfig) -> None:
+        self._config = config
+        self._agent_tokens: dict[str, int] = defaultdict(int)
+        self._agent_cost_usd: dict[str, float] = defaultdict(float)
+        # #3695: how many of this agent's calls had NO price, so a reader can
+        # tell "$0.00 because these calls were free" from "$0.00 because we do
+        # not know what they cost". ``estimate_cost`` returns None for an
+        # unpriced model precisely so the two stay distinguishable
+        # (``pricing.py``: "unknown != free"), and ``record_llm`` then folded
+        # that None into 0.0 — every call adding exactly nothing to a total
+        # that still presented itself as the amount spent. Reported live by
+        # the owner: a model absent from litellm's cost map (which reyn pins
+        # to the bundled snapshot, so a NEW model is unpriced permanently)
+        # left the cost figure frozen at its last hydrated value all day.
+        #
+        # This is the mechanism the embedding path already applies
+        # (``EmbeddingCost.unpriced_calls``, "visible, not a silent $0.00") —
+        # applied here, not invented.
+        #
+        # In-memory only, resetting on restart, for the SAME scope reason
+        # ``_agent_cost_breakdown`` below records: persisting it means
+        # extending the on-disk ledger schema and triggers the CLAUDE.md
+        # recovery-feature gate. The consequence is stated rather than hidden:
+        # after a restart the hydrated total carries no unpriced marker, so
+        # this makes the live session honest and leaves the durable total's
+        # own blindness untouched.
+        self._agent_unpriced_calls: dict[str, int] = defaultdict(int)
+        # Cost-panel breakdown (#cost-panel-breakdown): per-agent CostBreakdown
+        # (prompt/cache-read/cache-creation/completion + savings), accumulated
+        # per call in ``record_llm`` alongside ``_agent_cost_usd``. NOT ledger-
+        # persisted — in-memory only, resets on restart (unlike
+        # ``_agent_cost_usd`` above, which the ledger hydrates). This is a
+        # deliberate scope choice, not an oversight: persisting it durably
+        # would mean extending ``BudgetLedger``'s on-disk schema with the 4
+        # cache-breakdown fields and would trigger the CLAUDE.md recovery-
+        # feature PR gate (truncate-falsify test). The authoritative, durable,
+        # restart-surviving TOTAL is ``_agent_cost_usd`` (unchanged); this
+        # breakdown is a same-process-only refinement the cost panel reads to
+        # show Input/Output/Saved on top of that already-durable Total.
+        self._agent_cost_breakdown: dict[str, CostBreakdown] = defaultdict(CostBreakdown)
+        # FP-0063 PC: embedding spend is tracked as its OWN independent
+        # aggregate (owner: "embedding は独立追跡の想定"), NOT folded into
+        # ``_agent_cost_breakdown`` above — see ``EmbeddingCost``'s docstring
+        # for why (embedding is input-only/uncacheable; mapping it onto
+        # ``CostBreakdown.prompt_cost`` would dilute cache_hit_rate /
+        # cache_savings). Same non-durability posture as
+        # ``_agent_cost_breakdown``: in-memory only, resets on restart — a
+        # deliberate scope choice (persisting it would need a BudgetLedger
+        # schema extension + the CLAUDE.md recovery-feature truncate-falsify
+        # gate), not an oversight.
+        self._agent_embedding_cost: dict[str, EmbeddingCost] = defaultdict(EmbeddingCost)
+        # #1190 stage (iii): per-purpose cost attribution
+        # (main/compaction/judge/dogfood) for the /budget breakdown payoff.
+        self._purpose_tokens: dict[str, int] = defaultdict(int)
+        self._purpose_cost_usd: dict[str, float] = defaultdict(float)
+        # #3339: per-TURN attribution, keyed by the turn's ``chain_id``. Every
+        # other counter here is cumulative, which is exactly why a per-turn
+        # figure was previously unrecoverable: the per-call numbers exist, but
+        # folding them in immediately discards which turn produced them, and a
+        # turn total can NEVER be honestly recovered by differencing cumulative
+        # counters afterwards. Recorded ONLY when ``record_llm`` is given a
+        # chain_id — a call outside any turn contributes to no bucket at all.
+        #
+        # Bounded by construction (cross-cutting band): an insertion-ordered
+        # LRU capped at ``_TURN_BUCKET_CAP`` turns, evicting the oldest turn —
+        # a long-lived session must not accumulate one bucket per turn forever.
+        # In-memory only, NOT ledger-hydrated (same posture as
+        # ``_agent_cost_breakdown``): this is live-session display state, and
+        # after a restart no turn of this process is in flight. The durable
+        # record of a past turn's spend is the ledger's per-call ``chain_id``.
+        #
+        # #3283 ④: kept as a prompt/completion SPLIT as well as a total, so a
+        # reader can distinguish what a turn SENT from what it generated (the
+        # right gutter renders ``↑prompt ↓completion``). The split is recorded
+        # here rather than derived later for the same reason the turn key is:
+        # ``TokenUsage`` carries it at the call, and folding it to a total
+        # first would discard it irrecoverably. The ledger is unaffected — it
+        # persists ``total_tokens`` only, as before.
+        self._turn_tokens: OrderedDict[str, int] = OrderedDict()
+        self._turn_prompt_tokens: OrderedDict[str, int] = OrderedDict()
+        self._turn_completion_tokens: OrderedDict[str, int] = OrderedDict()
+        self._turn_cost_usd: OrderedDict[str, float] = OrderedDict()
+        # #3351: the PROVENANCE of this turn's token figures, merged
+        # least-confident-wins across the turn's calls (``TokenUsage.__add__``'s
+        # rule, applied here per bucket): a turn whose ANY call was billed on
+        # ``litellm.token_counter``'s local estimate reads ``estimated``. Lives
+        # in the same bucket set as the numbers — and is returned by the same
+        # ``turn_usage`` dict — so a reader cannot pick up the token figure
+        # while silently missing what kind of figure it is.
+        self._turn_usage_source: OrderedDict[str, UsageSource] = OrderedDict()
+        self._call_window: dict[str, deque[float]] = defaultdict(deque)
+        self._warned: set[tuple[str, str]] = set()
+        # PR25: persistent daily / monthly counters
+        self._daily_tokens: int = 0
+        self._daily_cost_usd: float = 0.0
+        self._monthly_tokens: int = 0
+        self._monthly_cost_usd: float = 0.0
+        self._day_key: tuple[str, str] | None = None    # ("day", "2026-05-02")
+        self._month_key: tuple[str, str] | None = None  # ("month", "2026-05")
+        self._ledger: BudgetLedger | None = None
+        # #2945: compacted checkpoint path, derived in hydrate() from the
+        # ledger path. None until hydrate() runs (mirrors self._ledger).
+        self._checkpoint_path: Path | None = None
+        # #2945 (co-vet firm): whether the MOST RECENT hydrate() had to
+        # floor-merge a checkpoint (ledger found truncated/missing/replaced)
+        # + why — surfaced via snapshot() -> `/budget` so a floor is never
+        # silent. False/None until hydrate() runs.
+        self._floor_applied: bool = False
+        self._floor_reason: str | None = None
+        # R-D8: auto-save state path + throttle. None path = no auto-save.
+        self._state_path: Path | None = None
+        self._save_throttle_secs: float = 1.0
+        # #3339: the most recent turn to record spend, so a reader that wants
+        # "the last turn's cost" does not have to know a chain_id. None until
+        # a call with a turn in scope is recorded.
+        self._last_turn_chain_id: str | None = None
+        self._last_save_monotonic: float = 0.0  # 0 = never saved
+        # R-D8: True once load_state was called. The loaded state already
+        # includes every committed step's usage, so memo-hit forward-calc
+        # would double-count. Caller (runtime) checks this flag.
+        self._state_loaded: bool = False
+
+    @property
+    def config(self) -> CostConfig:
+        return self._config
+
+    # ── PR25: persistent ledger hydration ───────────────────────────────
+
+    def hydrate(self, ledger_path: Path, *, checkpoint_path: Path | None = None) -> None:
+        """Reconstruct durable counters from the persistent ledger.
+
+        Call once at startup after constructing the tracker. No-op if the
+        ledger file does not exist yet. Broken JSON lines are silently skipped
+        (same pattern as StateLog.iter_from).
+
+        Reconstructed from the fsync-per-append ledger (the cap-critical
+        source of truth):
+          - daily / monthly token + cost (period-filtered to today / this month)
+          - per-agent tokens + cost (#1911 — all-time cumulative, summed per
+            ``agent`` field; mirrors what ``load_state`` restores)
+
+        The throttled ``budget_state.json`` (``load_state``) is a best-effort
+        cache only; a crash inside the 1s throttle window can leave it stale.
+        Because every counted increment is fsync'd to the ledger *before* the
+        throttled save runs, the ledger is always at least as complete — so
+        ledger hydration is the authoritative restore for cap enforcement.
+
+        #2945: re-parsing the WHOLE (monotonically-growing, never-rotated)
+        ledger on every startup is a blocking-startup-path bug. A compacted
+        ``BudgetCheckpoint`` (see module docstring section above) carries the
+        per-agent totals as of an exact ledger byte position (the anchor); if
+        that anchor still verifies against the current ledger (``verify_anchor``
+        returns ``"valid"``), only the TAIL after it is re-parsed here —
+        bounding the cost to activity since the last checkpoint refresh
+        instead of the ledger's lifetime.
+
+        Two fallback classes, both resolved by the SAME rule (co-vet firm,
+        #2945/#3195, precision-refined by #3201):
+        ``per_agent_tokens``/``per_agent_cost_usd`` may only be LOWERED by an
+        explicit operator action (archiving/deleting both the ledger and the
+        checkpoint together); every implicit path (truncation, deletion, or
+        replacement of the ledger alone) is non-decreasing.
+          - missing/corrupt/tampered checkpoint (parse failure, or its own
+            ``content_sha256`` no longer matches) -> full re-scan of the
+            ledger, no floor (nothing trustworthy survives to floor with —
+            there is no explicit-operator-action signal here either way, so
+            this is simply "no checkpoint exists").
+          - ``"truncated"`` / ``"missing"`` / ``"identity_absent"`` (see
+            ``verify_anchor``) -> full re-scan of the current ledger, then
+            the checkpoint's per-agent totals are merged in as a per-agent
+            FLOOR (``max()``, never lower). These are every case EXCEPT an
+            AFFIRMATIVELY proven different ledger — the floor is the
+            default, not the exception, and stays that way whether the
+            anchor is merely stale (truncated), the ledger is gone
+            (missing), or identity simply cannot be established on one or
+            both sides (identity_absent, e.g. a pre-#3201 checkpoint) —
+            because none of those SATISFY the burden of proof for "this is
+            a different ledger". NOTE: this means archiving/deleting ONLY
+            the ledger file no longer resets per-agent totals while a
+            checkpoint still exists (see ``docs/reference/config/budget.md``)
+            — deliberate: the reset UX is "archive BOTH files together".
+          - ``"invalid"`` (#3201: the CURRENT ledger's leading-line identity
+            is AFFIRMATIVELY computable and differs from the checkpoint's
+            stored ``ledger_identity_sha256``) -> full re-scan of the
+            current ledger, NO floor. A genuinely different ledger's past
+            totals are unrelated to this one (cross-workspace copy,
+            deliberate reset) — floor-merging them in would leak a stale,
+            never-lowerable total from an unrelated ledger's history. This
+            is the ONLY status that skips the floor, and it requires
+            POSITIVE proof (both identities present and different), never
+            merely the absence of proof.
+
+        Whenever a floor was applied, the fact and the reason
+        (``"truncated"``/``"missing"``/``"identity_absent"``) are recorded
+        on ``self`` (surfaced via ``snapshot()`` -> `/budget`) AND written
+        into the fresh checkpoint below — a floor firing must never be
+        silent.
+
+        A fresh checkpoint is written at the end of every hydrate call
+        regardless of which path was taken, so the checkpoint self-heals and
+        the *next* hydrate is bounded even after a fallback. That write is
+        best-effort: the checkpoint is DERIVED/cache
+        (``docs/reference/runtime/reyn-dir-layout.md``), so a write failure
+        (read-only cache dir, disk full) is logged and swallowed rather than
+        propagated — it must never block startup.
+        """
+        self._ledger = BudgetLedger(ledger_path)
+        self._checkpoint_path = checkpoint_path or _default_checkpoint_path(ledger_path)
+        now = time.time()
+        day_key = _period_key(now, "day")
+        month_key = _period_key(now, "month")
+
+        checkpoint = load_checkpoint_or_none(self._checkpoint_path)
+        status: str | None = None
+        agent_tokens: dict[str, int] = defaultdict(int)
+        agent_cost: dict[str, float] = defaultdict(float)
+        daily_tokens = 0
+        daily_cost = 0.0
+        monthly_tokens = 0
+        monthly_cost = 0.0
+
+        if checkpoint is not None:
+            status, _ = verify_anchor(checkpoint, ledger_path)
+
+        if checkpoint is not None and status == "valid":
+            # Fast path: seed from the verified checkpoint, only re-parse the
+            # tail written since its anchor.
+            for agent, tok in checkpoint.agent_tokens.items():
+                agent_tokens[agent] += tok
+            for agent, cost in checkpoint.agent_cost_usd.items():
+                agent_cost[agent] += cost
+            # Period baselines only carry over if still the SAME period —
+            # otherwise the checkpoint's stale period total must not leak
+            # into the new period (self-healing at the boundary, same
+            # semantics _roll_period_if_needed already relies on elsewhere).
+            if checkpoint.day_key == day_key[1]:
+                daily_tokens = checkpoint.daily_tokens
+                daily_cost = checkpoint.daily_cost_usd
+            if checkpoint.month_key == month_key[1]:
+                monthly_tokens = checkpoint.monthly_tokens
+                monthly_cost = checkpoint.monthly_cost_usd
+            records = self._ledger.iter_records_from(checkpoint.anchor_byte_offset)
+        else:
+            # No verifiable fast path — full re-scan of the CURRENT ledger.
+            # Unless status is "invalid" (an AFFIRMATIVELY different
+            # ledger), the checkpoint's own totals are merged in as a floor
+            # AFTER this scan (below) — see ``verify_anchor``'s docstring.
+            records = self._ledger.iter_records()
+
+        for record in records:
+            ts_str = record.get("ts")
+            if not isinstance(ts_str, str):
+                continue
+            try:
+                ts = _parse_iso_ts(ts_str)
+            except (ValueError, OSError):
+                continue
+
+            tokens = record.get("tokens", 0)
+            cost = record.get("cost_usd", 0.0)
+            if not isinstance(tokens, (int, float)):
+                tokens = 0
+            if not isinstance(cost, (int, float)):
+                cost = 0.0
+            tokens = int(tokens)
+            cost = float(cost)
+
+            # #1911: per-agent counters are all-time cumulative (not
+            # period-filtered) — same semantics as save_state/load_state.
+            agent = record.get("agent")
+            if isinstance(agent, str):
+                agent_tokens[agent] += tokens
+                agent_cost[agent] += cost
+
+            rec_day = _period_key(ts, "day")
+            rec_month = _period_key(ts, "month")
+            if rec_day == day_key:
+                daily_tokens += tokens
+                daily_cost += cost
+            if rec_month == month_key:
+                monthly_tokens += tokens
+                monthly_cost += cost
+
+        # #2945 (co-vet firm), precision-refined by #3201: only an EXPLICIT
+        # operator action may lower a cap-critical per-agent counter — every
+        # implicit path (truncation, deletion, or replacement of the ledger
+        # alone) is non-decreasing. Merge the checkpoint's totals in as a
+        # per-agent FLOOR (max, never overwrite-down) on top of whatever the
+        # re-scan of the current ledger found, for every status EXCEPT
+        # "invalid" (an AFFIRMATIVELY, identity-proven DIFFERENT ledger) —
+        # see ``verify_anchor``'s docstring for the full reasoning. The
+        # floor is the default; "invalid" is the one narrow exception, and
+        # it requires positive proof, never merely absent proof.
+        self._floor_applied = False
+        self._floor_reason = None
+        if checkpoint is not None and status in ("truncated", "missing", "identity_absent"):
+            for agent, tok in checkpoint.agent_tokens.items():
+                if tok > agent_tokens.get(agent, 0):
+                    agent_tokens[agent] = tok
+            for agent, cost in checkpoint.agent_cost_usd.items():
+                if cost > agent_cost.get(agent, 0.0):
+                    agent_cost[agent] = cost
+            self._floor_applied = True
+            self._floor_reason = status
+
+        self._daily_tokens = daily_tokens
+        self._daily_cost_usd = daily_cost
+        self._monthly_tokens = monthly_tokens
+        self._monthly_cost_usd = monthly_cost
+        self._day_key = day_key
+        self._month_key = month_key
+        # #1911: durable per-agent restore. defaultdict so later record_llm
+        # keeps its increment semantics.
+        self._agent_tokens = agent_tokens
+        self._agent_cost_usd = agent_cost
+
+        # #2945: refresh the checkpoint to the ledger's current end so the
+        # NEXT hydrate (even with zero interim record_llm calls) is bounded
+        # too — the checkpoint is always safe to (re)write from confirmed
+        # in-memory totals, and safe to lose (next hydrate falls back).
+        #
+        # The checkpoint is DERIVED/cache (docs/reference/runtime/
+        # reyn-dir-layout.md): a write failure here (read-only cache dir,
+        # disk full, permissions) must never block startup — swallow and
+        # log, same posture as ``_maybe_auto_save``'s save_state failure
+        # handling below. The in-memory counters (already correct from the
+        # scan above) are unaffected; only the NEXT hydrate loses the fast
+        # path and falls back to a full re-scan again.
+        try:
+            write_checkpoint(
+                self._checkpoint_path,
+                ledger_path,
+                agent_tokens=dict(self._agent_tokens),
+                agent_cost_usd=dict(self._agent_cost_usd),
+                day_key=self._day_key,
+                daily_tokens=self._daily_tokens,
+                daily_cost_usd=self._daily_cost_usd,
+                month_key=self._month_key,
+                monthly_tokens=self._monthly_tokens,
+                monthly_cost_usd=self._monthly_cost_usd,
+                floor_applied=self._floor_applied,
+                floor_reason=self._floor_reason,
+            )
+        except OSError as e:
+            import logging
+            logging.getLogger(__name__).warning(
+                "BudgetTracker.hydrate: failed to write checkpoint to %s: %s "
+                "(startup continues; next hydrate falls back to a full re-scan)",
+                self._checkpoint_path, e,
+            )
+
+    # ── pre-call checks ─────────────────────────────────────────────────
+
+    def check_pre_llm(
+        self, *, model: str, agent: str | None,
+        warn_ratio_overrides: "dict[str, float] | None" = None,
+    ) -> BudgetCheck:
+        """Run before every LLM call. Returns allowed=False to refuse.
+
+        ``warn_ratio_overrides`` (#4206 Slice B, #4724): an OPTIONAL,
+        already-resolved ③ preference-axis mapping (dotted PREFERENCE_KEYS
+        string -> ratio) the CALLER built (session/agent/project
+        composition, ``reyn.runtime.preferences.resolve_preference``) —
+        this tracker never resolves it itself. ``None``/absent-key falls
+        back to ``self._config``'s own project-level ratio, byte-identical
+        to before this slice. Only ``cost.rate_limit_warn_ratio`` affects
+        THIS method (via ``_check_rate_limit``); the cap/hard_limit checks
+        below are unaffected — warn ratio never moves a cap."""
+        _validate_warn_ratio_overrides(warn_ratio_overrides)
+        # 1. Rate limit (per model)
+        rl_check = self._check_rate_limit(model, warn_ratio_overrides)
+        if not rl_check.allowed:
+            return rl_check
+
+        # 2. Per-agent token / cost — already-exceeded check
+        if agent is not None:
+            cap = self._config.per_agent_tokens
+            if cap.is_active:
+                used = self._agent_tokens[agent]
+                if used >= cap.hard_limit:
+                    return BudgetCheck(
+                        allowed=False,
+                        hard_dimension="per_agent_tokens",
+                        detail=f"agent {agent!r}: tokens {used}/{int(cap.hard_limit)}",
+                        context=self._agent_context(agent),
+                    )
+            cap = self._config.per_agent_cost_usd
+            if cap.is_active:
+                used = self._agent_cost_usd[agent]
+                if used >= cap.hard_limit:
+                    return BudgetCheck(
+                        allowed=False,
+                        hard_dimension="per_agent_cost_usd",
+                        detail=f"agent {agent!r}: cost ${used:.2f}/${cap.hard_limit:.2f}",
+                        context=self._agent_context(agent),
+                    )
+
+        # 3. Daily / monthly caps (PR25) — check before call
+        day_check = self._check_daily_monthly()
+        if not day_check.allowed:
+            return day_check
+
+        return rl_check  # may carry warn dims
+
+    # ── recording ───────────────────────────────────────────────────────
+
+    def record_llm(
+        self,
+        *,
+        model: str,
+        agent: str | None,
+        usage: TokenUsage,
+        purpose: str | None = None,
+        chain_id: str | None = None,
+        warn_ratio_overrides: "dict[str, float] | None" = None,
+    ) -> BudgetCheck:
+        """Update counters after a successful LLM call.
+
+        ``warn_ratio_overrides`` (#4206 Slice B, #4724): see
+        ``check_pre_llm``'s own docstring — the same caller-resolved ③
+        mapping, threaded here to the per_agent_tokens/per_agent_cost_usd
+        warn-crossing checks below AND (via ``_check_period_warn``) the
+        daily/monthly ones. Never affects a hard_limit/cap.
+
+        Computes USD cost via litellm (`reyn.pricing.estimate_cost`).
+        Returns a BudgetCheck whose warn_dimensions list any dimensions
+        that newly crossed the warn threshold (for the caller to emit
+        events / outbox notifications).
+
+        ``chain_id`` (#3339) is the turn this call belongs to, read from the
+        ambient turn scope (``reyn.core.turn_scope``) at the LLM chokepoint.
+        When given, this call's tokens/cost also accumulate into that turn's
+        bucket (``turn_tokens`` / ``turn_cost_usd``) and land on the ledger
+        record. When ``None`` — anything with no turn in scope; see
+        ``reyn.core.turn_scope`` for which paths those are (a sub-agent's
+        turn is NOT one of them: it rebinds to its own chain_id and is
+        billed separately) — NO turn bucket is touched:
+        the call is genuinely unattributable to a turn, and quietly adding it
+        to the most recent one would invent a number.
+
+        #3351: ``usage.source`` — the PROVENANCE of the counts, carried by the
+        usage object itself — is written to the ledger record and merged into
+        the turn's provenance bucket. Nothing here changes HOW a figure is
+        computed; ``estimated`` counts are recorded and enforced exactly like
+        provider-reported ones. What changes is that the record now says which
+        it was, so a cap that fired or a `/cost` figure being audited can be
+        traced back to a provider figure or to a local
+        ``litellm.token_counter`` estimate instead of being indistinguishable.
+        """
+        _validate_warn_ratio_overrides(warn_ratio_overrides)
+        # rate limit window
+        self._call_window[model].append(time.monotonic())
+
+        warn_dims: list[str] = []
+        priced_cost_usd, _ = estimate_cost(model, usage)
+        # #3695: keep "unknown" distinguishable from "free" before the fold to
+        # 0.0 below. The fold itself is kept — an unpriced call must still be
+        # counted in tokens, in the ledger and against the period counters —
+        # but the fact that it was unpriced now survives it.
+        unpriced = priced_cost_usd is None
+        cost_usd = priced_cost_usd or 0.0
+        if unpriced and usage.total_tokens:
+            _warn_unpriced_model_once(model)
+
+        # #1190 stage (iii): per-purpose attribution for the /budget breakdown.
+        if purpose is not None:
+            self._purpose_tokens[purpose] += usage.total_tokens
+            self._purpose_cost_usd[purpose] += cost_usd
+
+        # #3339: per-turn attribution. Guarded on a real turn key — the None
+        # (no turn in scope) path deliberately records nothing here.
+        if chain_id is not None:
+            self._record_turn_usage(chain_id, usage, cost_usd)
+
+        if agent is not None:
+            new_tokens = self._agent_tokens[agent] + usage.total_tokens
+            self._agent_tokens[agent] = new_tokens
+            new_cost = self._agent_cost_usd[agent] + cost_usd
+            self._agent_cost_usd[agent] = new_cost
+            if unpriced:
+                self._agent_unpriced_calls[agent] += 1
+
+            # Cost-panel breakdown accumulation (session/agent/project scope
+            # rows). ``estimate_cost_breakdown`` returns None for an unpriced/
+            # unknown model (mirrors ``estimate_cost``'s None-sentinel) — skip
+            # accumulation rather than treat unknown as free.
+            breakdown = estimate_cost_breakdown(model, usage)
+            if breakdown is not None:
+                self._agent_cost_breakdown[agent] += breakdown
+
+            cap = self._config.per_agent_tokens
+            if cap.is_active:
+                threshold = _effective_warn_threshold(
+                    cap, (warn_ratio_overrides or {}).get("cost.per_agent_tokens.warn_ratio"),
+                )
+                if threshold is not None and new_tokens >= threshold:
+                    self._maybe_warn(warn_dims, "per_agent_tokens", agent)
+
+            cap = self._config.per_agent_cost_usd
+            if cap.is_active:
+                threshold = _effective_warn_threshold(
+                    cap, (warn_ratio_overrides or {}).get("cost.per_agent_cost_usd.warn_ratio"),
+                )
+                if threshold is not None and new_cost >= threshold:
+                    self._maybe_warn(warn_dims, "per_agent_cost_usd", agent)
+
+        # PR25: update daily / monthly counters and append to ledger
+        self._update_period_counters(usage.total_tokens, cost_usd)
+        if self._ledger is not None:
+            self._ledger.append(
+                agent=agent,
+                model=model,
+                tokens=usage.total_tokens,
+                cost_usd=cost_usd,
+                purpose=purpose,
+                chain_id=chain_id,
+                # #3351: the provenance rides ON the usage object, so this
+                # cannot fall out of sync with the number it describes and no
+                # caller has to remember to pass it.
+                usage_source=usage.source,
+            )
+
+        # Warn on daily / monthly thresholds
+        self._check_period_warn(warn_dims, warn_ratio_overrides)
+
+        # R-D8: persist state for crash recovery (throttled)
+        self._maybe_auto_save()
+
+        return BudgetCheck(
+            allowed=True,
+            warn_dimensions=warn_dims,
+            context=self._agent_context(agent) if agent else {},
+        )
+
+    # ── FP-0063 PC: embedding cost (independent of record_llm above) ─────
+
+    def record_embedding(
+        self,
+        *,
+        model: str,
+        agent: str | None,
+        tokens: int,
+    ) -> None:
+        """Record one embedding call's spend into the INDEPENDENT per-agent
+        ``EmbeddingCost`` aggregate (FP-0063 X2b) — never touches
+        ``_agent_cost_usd`` / ``_agent_cost_breakdown`` (the chat aggregates)
+        and is not itself gated by the LLM per-agent hard-cap checks above
+        (embedding is not a chat call; ``check_pre_llm`` is unaffected).
+
+        Mixed-model correctness (X6): prices THIS call at model's own rate via
+        ``estimate_embedding_cost`` before folding into the aggregate — never
+        pools tokens across models and prices them afterwards at one rate.
+
+        An unpriced/unknown model (``estimate_embedding_cost`` -> ``(None,
+        None)``) still counts toward ``tokens``/``calls`` but contributes 0 to
+        ``cost_usd``, with ``unpriced_calls`` incremented so the gap stays
+        visible rather than silently reading as a real $0.00 call.
+        """
+        if agent is None:
+            return
+        cost_usd, _ = estimate_embedding_cost(model, tokens)
+        self._agent_embedding_cost[agent] += EmbeddingCost(
+            cost_usd=cost_usd or 0.0,
+            tokens=tokens,
+            calls=1,
+            unpriced_calls=0 if cost_usd is not None else 1,
+        )
+
+    def agent_embedding_cost(self, agent: str) -> EmbeddingCost:
+        """Independent embedding-spend aggregate for ``agent`` (all sessions,
+        this process only — same non-durability posture as
+        ``agent_cost_breakdown``). Returns an empty (all-zero) ``EmbeddingCost``
+        for an agent with no recorded embedding calls this process."""
+        return self._agent_embedding_cost.get(agent, EmbeddingCost())
+
+    # ── reset / introspect ──────────────────────────────────────────────
+
+    def reset_all(self) -> dict:
+        """Clear per-agent / rate-window counters.
+
+        PR25: daily / monthly counters are NOT reset here — they auto-reset
+        at period boundary and are backed by the persistent ledger. Returns
+        a dict describing what was reset (for `/budget reset` output).
+        """
+        before = {
+            "agent_tokens": dict(self._agent_tokens),
+            "agent_cost_usd": dict(self._agent_cost_usd),
+            "rate_window_sizes": {m: len(q) for m, q in self._call_window.items()},
+        }
+        self._agent_tokens.clear()
+        self._agent_cost_usd.clear()
+        self._agent_cost_breakdown.clear()
+        self._agent_embedding_cost.clear()
+        self._call_window.clear()
+        self._warned.clear()
+        return before
+
+    # ── R-D8: state persistence ─────────────────────────────────────────
+
+    def set_state_path(
+        self, path: Path, *, throttle_secs: float = 1.0,
+    ) -> None:
+        """Enable auto-save: every record_llm after this call
+        writes the state file (subject to throttle).
+
+        ``throttle_secs`` collapses rapid consecutive writes (LLM call paths
+        are hot in multi-agent scenarios — a per-call fsync would dominate).
+        Default 1 second. Set to 0 in tests for deterministic save semantics.
+        """
+        self._state_path = Path(path)
+        self._save_throttle_secs = float(throttle_secs)
+        # Reset throttle clock so the first record after set_state_path
+        # always writes (otherwise the very first save would be skipped if
+        # ``set_state_path`` happens close to a prior save).
+        self._last_save_monotonic = 0.0
+
+    def _maybe_auto_save(self) -> None:
+        """Save state if path is configured and throttle has elapsed.
+
+        Defensive: any I/O error is logged + swallowed (auto-save is a
+        best-effort cache write; the in-memory state is the source of
+        truth until save lands).
+        """
+        if self._state_path is None:
+            return
+        now = time.monotonic()
+        if (self._last_save_monotonic > 0
+                and now - self._last_save_monotonic < self._save_throttle_secs):
+            return
+        try:
+            self.save_state(self._state_path)
+            # #2945: refresh the compacted checkpoint on the same throttle
+            # cadence so a long-running session's next restart still only
+            # re-parses a small tail, not everything since the last full
+            # hydrate. Best-effort — a checkpoint miss here just means the
+            # next hydrate falls back to a full re-scan (P3), never
+            # under-counts.
+            if self._ledger is not None and self._checkpoint_path is not None:
+                write_checkpoint(
+                    self._checkpoint_path,
+                    self._ledger.path,
+                    agent_tokens=dict(self._agent_tokens),
+                    agent_cost_usd=dict(self._agent_cost_usd),
+                    day_key=self._day_key,
+                    daily_tokens=self._daily_tokens,
+                    daily_cost_usd=self._daily_cost_usd,
+                    month_key=self._month_key,
+                    monthly_tokens=self._monthly_tokens,
+                    monthly_cost_usd=self._monthly_cost_usd,
+                )
+            self._last_save_monotonic = now
+        except Exception as e:  # noqa: BLE001 — never fail record on save failure
+            import logging
+            logging.getLogger(__name__).warning(
+                "BudgetTracker auto-save to %s failed: %s",
+                self._state_path, e,
+            )
+
+    def save_state(self, path: Path) -> None:
+        """Persist in-memory counters to ``path`` (atomic write).
+
+        R-D8: closes the gap left by PR25 (which only persists daily /
+        monthly via ``budget_ledger.jsonl``). On restart, ``load_state``
+        restores ``agent_tokens`` / ``agent_cost_usd`` so per-agent cap
+        enforcement continues across crash.
+
+        Volatile state is NOT persisted:
+          - rate-limit window (60-second time-based; entries older than
+            the window are invalid anyway)
+          - warning state (operational dedup; OK to re-warn after restart)
+          - daily / monthly (PR25 owns these via ledger)
+
+        Atomic write: tmp file → fsync → rename. Mid-write crash leaves
+        the previous state file intact.
+        """
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        payload = {
+            "version": 1,
+            "agent_tokens": dict(self._agent_tokens),
+            "agent_cost_usd": dict(self._agent_cost_usd),
+        }
+        import os
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        tmp.replace(path)
+
+    def load_state(self, path: Path) -> None:
+        """Restore in-memory counters from ``path``.
+
+        Defensive on failure: missing file → silent no-op (fresh start);
+        corrupt JSON → silent no-op + log warning. Operator can use
+        ``reyn chat --reset`` if state is unrecoverable.
+
+        #1911: live startup runs ``hydrate`` (durable ledger) *before*
+        ``load_state``. For the ledger-backed per-agent tokens/cost counters
+        the value already restored from the ledger is the source of truth and
+        is always at least as complete as this throttled best-effort state
+        file (the ledger is fsync'd before each throttled save). So those
+        counters are merged with ``max`` rather than overwritten — a stale
+        state file can never under-count a cap below the durable ledger
+        value.
+        """
+        path = Path(path)
+        # Mark loaded regardless of file presence — the caller's intent
+        # is "use the persisted state as truth"; memo-hit forward-calc
+        # is suppressed accordingly.
+        self._state_loaded = True
+        if not path.is_file():
+            return
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as e:
+            import logging
+            logging.getLogger(__name__).warning(
+                "BudgetTracker.load_state: cannot read %s: %s; starting fresh",
+                path, e,
+            )
+            return
+        if not isinstance(data, dict):
+            return
+        # Persisted state has no version-validation (reads "version" but does not
+        # gate on it), so a version-skewed / hand-edited file may carry a null /
+        # non-numeric counter. Coerce-with-default rather than crash load_state.
+        def _coerce_int(v: object) -> int:
+            try:
+                return int(v)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                return 0
+
+        def _coerce_float(v: object) -> float:
+            try:
+                return float(v)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                return 0.0
+
+        # agent counters — never drop below the durable ledger value (#1911);
+        # coerce first so a null/garbage persisted value → 0 → max() keeps ledger.
+        for k, v in (data.get("agent_tokens") or {}).items():
+            key = str(k)
+            self._agent_tokens[key] = max(self._agent_tokens.get(key, 0), _coerce_int(v))
+        for k, v in (data.get("agent_cost_usd") or {}).items():
+            key = str(k)
+            self._agent_cost_usd[key] = max(self._agent_cost_usd.get(key, 0.0), _coerce_float(v))
+
+    def snapshot(self) -> dict:
+        """Return a structured view used by `/cost` / `/budget` formatters."""
+        return {
+            "agent_tokens": dict(self._agent_tokens),
+            "agent_cost_usd": dict(self._agent_cost_usd),
+            # #1190 stage (iii): per-purpose cost attribution.
+            "purpose_tokens": dict(self._purpose_tokens),
+            "purpose_cost_usd": dict(self._purpose_cost_usd),
+            # #3339: per-TURN attribution, keyed by chain_id (most recent
+            # ``TURN_BUCKET_CAP`` turns). Only turns that actually recorded
+            # spend appear; calls made outside any turn appear in NO bucket,
+            # so summing these does not reproduce the session total — that is
+            # the point, not a defect. ``last_turn_chain_id`` names the most
+            # recent key (None before any turn recorded spend).
+            # Every per-turn bucket, projected from the ONE declaration of the
+            # set (:data:`_PER_TURN_BUCKETS`). Exposing them all is what makes
+            # their BOUND observable: a bucket that stopped being evicted would
+            # otherwise grow without limit while every lookup still answered
+            # correctly. Keys: turn_tokens / turn_prompt_tokens /
+            # turn_completion_tokens / turn_cost_usd / turn_usage_source
+            # (#3351 — each turn's token-count provenance).
+            **{
+                snap_key: dict(getattr(self, attr_name))
+                for attr_name, snap_key in _PER_TURN_BUCKETS
+            },
+            "last_turn_chain_id": self._last_turn_chain_id,
+            "rate_window": {
+                m: len([t for t in q if time.monotonic() - t <= 60])
+                for m, q in self._call_window.items()
+            },
+            "config": self._config,
+            # PR25: persistent daily / monthly counters
+            "daily_tokens": self._daily_tokens,
+            "daily_cost_usd": round(self._daily_cost_usd, 6),
+            "monthly_tokens": self._monthly_tokens,
+            "monthly_cost_usd": round(self._monthly_cost_usd, 6),
+            "day_key": self._day_key[1] if self._day_key else None,
+            "month_key": self._month_key[1] if self._month_key else None,
+            # #2945 (co-vet firm): whether the most recent hydrate() had to
+            # floor-merge a checkpoint into a re-scan (ledger found
+            # truncated/missing/replaced) + why. Never silent — `/budget`
+            # renders this so an operator can tell a high per-agent total is
+            # a deliberately-preserved floor, not a mystery.
+            "budget_floor_applied": self._floor_applied,
+            "budget_floor_reason": self._floor_reason,
+        }
+
+    # ── internals ───────────────────────────────────────────────────────
+
+    def _maybe_warn(
+        self, warn_dims: list[str], dimension: str, key: str,
+    ) -> None:
+        wkey = (dimension, key)
+        if wkey in self._warned:
+            return
+        self._warned.add(wkey)
+        warn_dims.append(dimension)
+
+    def _check_rate_limit(
+        self, model: str, warn_ratio_overrides: "dict[str, float] | None" = None,
+    ) -> BudgetCheck:
+        cap = self._config.rate_limit_per_minute.get(model)
+        if cap is None:
+            return BudgetCheck(allowed=True)
+        now = time.monotonic()
+        window = self._call_window[model]
+        while window and now - window[0] > 60:
+            window.popleft()
+        used = len(window)
+        if used >= cap:
+            return BudgetCheck(
+                allowed=False,
+                hard_dimension="rate_limit",
+                detail=f"model {model}: {used}/{cap} calls in last minute",
+                context={"model": model, "current": used, "hard": cap},
+            )
+        warn_dims: list[str] = []
+        # #4724: caller-resolved override wins; falls back to the
+        # project-level ratio, byte-identical to before Slice B.
+        _ratio = (warn_ratio_overrides or {}).get(
+            "cost.rate_limit_warn_ratio", self._config.rate_limit_warn_ratio,
+        )
+        warn_threshold = int(cap * _ratio)
+        if warn_threshold > 0 and used >= warn_threshold:
+            wkey = ("rate_limit", model)
+            if wkey not in self._warned:
+                self._warned.add(wkey)
+                warn_dims.append("rate_limit")
+        return BudgetCheck(
+            allowed=True,
+            warn_dimensions=warn_dims,
+            context={"model": model, "current": used, "hard": cap},
+        )
+
+    def agent_cost_usd(self, agent: str) -> float:
+        """All-time cumulative USD cost for ``agent`` — the durable per-agent total (ledger-hydrated,
+        restart-surviving). The single source of truth read by ``/cost`` and, via
+        ``registry.agent_cost_usd`` (#cost-restart), the inline status bar. One counter per agent
+        (summed across all its sessions in ``record_llm``), so it never N×-counts multiple sessions."""
+        return self._agent_cost_usd.get(agent, 0.0)
+
+    def agent_unpriced_calls(self, agent: str) -> int:
+        """How many of ``agent``'s recorded LLM calls had no known price (#3695).
+
+        Non-zero means ``agent_cost_usd`` is a LOWER BOUND, not the amount
+        spent: those calls contributed 0. A reader that shows the cost without
+        consulting this is stating a total it cannot know — which is what the
+        owner saw as a figure that never moved.
+
+        In-memory for this process only (see ``__init__``), so it describes
+        the calls THIS run recorded, not the hydrated durable total.
+        """
+        return self._agent_unpriced_calls.get(agent, 0)
+
+    def agent_tokens(self, agent: str) -> int:
+        """All-time cumulative TOTAL tokens for ``agent`` (durable, ledger-hydrated). Total only —
+        the prompt/completion breakdown is not persisted per ledger record (only ``total_tokens``)."""
+        return self._agent_tokens.get(agent, 0)
+
+    def _record_turn_usage(
+        self, chain_id: str, usage: "TokenUsage", cost_usd: float
+    ) -> None:
+        """Accumulate one call's tokens/cost into turn ``chain_id``'s bucket,
+        keeping the bucket set bounded (oldest turn evicted past
+        ``TURN_BUCKET_CAP``). Insertion order = turn order; a turn already
+        present keeps its original position, so a multi-call turn is not
+        re-dated by its own later calls and the eviction victim stays the
+        genuinely oldest turn.
+
+        Insertion order tracks recency only because turns run SEQUENTIALLY
+        within a session — a turn that stayed open across more than
+        ``TURN_BUCKET_CAP`` later turns would be evicted while still live.
+        That is unreachable while a session runs one turn at a time.
+
+        Eviction IS observable to a reader, though: ``turn_usage(chain_id)``
+        (#3283 ④) asks about turns arbitrarily far back, so the oldest of them
+        will have been evicted in a long session. That is answered by contract
+        — ``None`` for an absent bucket, never a fabricated ``0`` — rather than
+        by trying to keep every turn forever."""
+        self._turn_tokens[chain_id] = (
+            self._turn_tokens.get(chain_id, 0) + usage.total_tokens
+        )
+        self._turn_prompt_tokens[chain_id] = (
+            self._turn_prompt_tokens.get(chain_id, 0) + usage.prompt_tokens
+        )
+        self._turn_completion_tokens[chain_id] = (
+            self._turn_completion_tokens.get(chain_id, 0) + usage.completion_tokens
+        )
+        self._turn_cost_usd[chain_id] = self._turn_cost_usd.get(chain_id, 0.0) + cost_usd
+        # #3351: provenance merges least-confident-wins over the turn's calls
+        # (:func:`reyn.llm.pricing.merge_usage_sources` — the same rule summed
+        # ``TokenUsage`` objects follow), so ONE estimated call marks the whole
+        # turn's figure as estimated. It must: the turn total contains that
+        # call's estimate, and an auditor reading the total is entitled to know
+        # that. Every call that reaches here contributed to the total, so none
+        # is skipped on grounds of size.
+        _prev = self._turn_usage_source.get(chain_id)
+        self._turn_usage_source[chain_id] = (
+            usage.source if _prev is None else merge_usage_sources(_prev, usage.source)
+        )
+        self._last_turn_chain_id = chain_id
+        # EVERY bucket is evicted together, so a chain_id is either present in
+        # ALL of them or in none — which is what lets ``turn_usage`` decide
+        # "known vs unknown" from ``_turn_tokens``'s membership alone and still
+        # return a complete dict. Driven off :data:`_PER_TURN_BUCKETS` rather
+        # than a hand-written list of ``pop`` calls, so a future bucket is
+        # evicted the moment it is registered there — see that constant for why
+        # forgetting one is an INVISIBLE leak rather than a visible bug.
+        while len(self._turn_tokens) > TURN_BUCKET_CAP:
+            evicted, _ = self._turn_tokens.popitem(last=False)
+            for attr_name, _snap_key in _PER_TURN_BUCKETS:
+                getattr(self, attr_name).pop(evicted, None)
+
+    def latest_turn_usage(self) -> dict | None:
+        """#3339: the per-turn figures for the MOST RECENT turn that recorded
+        spend, or ``None`` when no turn has. Same shape as :meth:`turn_usage` —
+        ``{"chain_id", "tokens", "prompt_tokens", "completion_tokens",
+        "cost_usd", "usage_source"}``.
+
+        Tokens and cost are summed over every LLM call that turn made
+        (tool-loop iterations included), each priced at its own model's rate —
+        never derived by differencing cumulative counters.
+
+        Convenience over :meth:`turn_usage` for the caller that does not hold a
+        chain_id — "whatever ran last, process-wide". A caller that DOES know
+        which turn it is asking about should use :meth:`turn_usage` instead:
+        the latest turn process-wide is often not the turn that caller means
+        (one tracker, several sessions)."""
+        chain_id = self._last_turn_chain_id
+        if chain_id is None:
+            return None
+        return self._turn_usage_dict(chain_id)
+
+    def turn_usage(self, chain_id: str) -> dict | None:
+        """#3283 ④: ``{"chain_id", "tokens", "prompt_tokens",
+        "completion_tokens", "cost_usd", "usage_source"}`` for the turn
+        ``chain_id``, or ``None`` when this tracker holds no figure for it.
+
+        The KEYED per-turn read. Tokens (total AND the prompt/completion
+        split) and cost are summed over every LLM call that turn made
+        (tool-loop iterations included), each priced at its own model's rate —
+        never derived by differencing cumulative counters.
+
+        ``None`` — never a ``0`` — is the answer for EVERY "no figure" case,
+        and there are three, indistinguishable from here and deliberately not
+        distinguished: the turn never recorded spend (it made no LLM call, or
+        it is not a turn of this process at all), or its bucket has been
+        EVICTED (``TURN_BUCKET_CAP``). A ``0`` would be indistinguishable from
+        a turn that genuinely used nothing / cost nothing — a reachable state,
+        not a hypothetical — and a renderer that forgot to branch would print
+        it as fact; ``None`` makes that mistake loud (drawn as "None", or a
+        ``TypeError`` the moment anything does arithmetic).
+
+        This lookup was deliberately absent when the per-turn buckets landed
+        (#3339): with no consumer, nothing would have enforced branching on
+        "unknown", so the API was narrowed to :meth:`latest_turn_usage` to make
+        the ambiguous question unaskable. #3283 ④'s right gutter is that
+        consumer — it renders one turn's token figure per conversation row,
+        for rows scrolled arbitrarily far back, and renders ``—`` on ``None``.
+        (It does not display ``cost_usd``; that is a presentation choice at the
+        gutter, and this lookup still returns it for every other caller.) The
+        durable record of an evicted turn's spend is the ledger's per-call
+        ``chain_id``, which lets any past turn be re-grouped after the fact —
+        including that call's ``usage_source`` (#3351), so "was this turn billed
+        on estimated counts" stays answerable after eviction and after a
+        restart, which this in-memory bucket alone would not survive."""
+        if chain_id not in self._turn_tokens:
+            return None
+        return self._turn_usage_dict(chain_id)
+
+    def _turn_usage_dict(self, chain_id: str) -> dict:
+        """The per-turn figure dict for a chain_id KNOWN to have a bucket.
+
+        One builder for both public readers, so the two can never drift into
+        reporting different shapes for the same turn. ``prompt_tokens`` +
+        ``completion_tokens`` == ``tokens`` (``TokenUsage.total_tokens`` is
+        their sum, accumulated call by call).
+
+        #3351: ``usage_source`` ships in the SAME dict as the figures — a
+        ``UsageSource`` (``provider`` / ``estimated`` / ``unknown``), merged
+        least-confident-wins over the turn's calls. Deliberately not a separate
+        lookup: a reader that has the number has the provenance, so "forgot to
+        ask" cannot produce a confident-looking wrong answer."""
+        return {
+            "chain_id": chain_id,
+            "tokens": self._turn_tokens.get(chain_id, 0),
+            "prompt_tokens": self._turn_prompt_tokens.get(chain_id, 0),
+            "completion_tokens": self._turn_completion_tokens.get(chain_id, 0),
+            "cost_usd": self._turn_cost_usd.get(chain_id, 0.0),
+            "usage_source": self._turn_usage_source.get(chain_id, UsageSource.UNKNOWN),
+        }
+
+    def agent_cost_breakdown(self, agent: str) -> CostBreakdown:
+        """Cache-aware ``CostBreakdown`` accumulated for ``agent`` (cost-panel Input/Output/Saved
+        rows). Same-process only (see ``__init__``'s note) — NOT ledger-hydrated, unlike
+        ``agent_cost_usd``/``agent_tokens`` above; resets on restart. Returns an empty (all-zero)
+        ``CostBreakdown`` for an agent with no recorded calls this process."""
+        return self._agent_cost_breakdown.get(agent, CostBreakdown())
+
+    def _agent_context(self, agent: str | None) -> dict:
+        if agent is None:
+            return {}
+        return {
+            "agent": agent,
+            "tokens": self._agent_tokens.get(agent, 0),
+            "cost_usd": round(self._agent_cost_usd.get(agent, 0.0), 4),
+            "tokens_hard": self._config.per_agent_tokens.hard_limit,
+            "cost_hard": self._config.per_agent_cost_usd.hard_limit,
+        }
+
+    # ── PR25: period counter helpers ─────────────────────────────────────
+
+    def _roll_period_if_needed(self) -> None:
+        """Reset daily / monthly counters when the local-time period boundary
+        has been crossed since the last update.
+
+        Called from both check_pre_llm (to avoid wrongly refusing across the
+        midnight boundary when no record_llm has run yet) and record_llm.
+        """
+        now = time.time()
+        new_day = _period_key(now, "day")
+        new_month = _period_key(now, "month")
+
+        if self._day_key is None or self._day_key != new_day:
+            self._daily_tokens = 0
+            self._daily_cost_usd = 0.0
+            self._day_key = new_day
+
+        if self._month_key is None or self._month_key != new_month:
+            self._monthly_tokens = 0
+            self._monthly_cost_usd = 0.0
+            self._month_key = new_month
+
+    def _update_period_counters(self, tokens: int, cost_usd: float) -> None:
+        """Roll period if needed, then add the new tokens / cost."""
+        self._roll_period_if_needed()
+        self._daily_tokens += tokens
+        self._daily_cost_usd += cost_usd
+        self._monthly_tokens += tokens
+        self._monthly_cost_usd += cost_usd
+
+    def _check_daily_monthly(self) -> BudgetCheck:
+        """Return allowed=False if a daily or monthly hard limit is exceeded."""
+        # Roll the period first so a check immediately after midnight does not
+        # see yesterday's exhausted counters.
+        self._roll_period_if_needed()
+        # Daily tokens
+        cap = self._config.daily_tokens
+        if cap.is_active and self._daily_tokens >= cap.hard_limit:
+            label = self._day_key[1] if self._day_key else "today"
+            return BudgetCheck(
+                allowed=False,
+                hard_dimension="daily_tokens",
+                detail=f"daily token cap: {self._daily_tokens}/{int(cap.hard_limit)} (day: {label})",
+                context=self._period_context(),
+            )
+        # Daily cost
+        cap = self._config.daily_cost_usd
+        if cap.is_active and self._daily_cost_usd >= cap.hard_limit:
+            label = self._day_key[1] if self._day_key else "today"
+            return BudgetCheck(
+                allowed=False,
+                hard_dimension="daily_cost_usd",
+                detail=f"daily cost cap: ${self._daily_cost_usd:.4f}/${cap.hard_limit:.2f} (day: {label})",
+                context=self._period_context(),
+            )
+        # Monthly tokens
+        cap = self._config.monthly_tokens
+        if cap.is_active and self._monthly_tokens >= cap.hard_limit:
+            label = self._month_key[1] if self._month_key else "this month"
+            return BudgetCheck(
+                allowed=False,
+                hard_dimension="monthly_tokens",
+                detail=f"monthly token cap: {self._monthly_tokens}/{int(cap.hard_limit)} (month: {label})",
+                context=self._period_context(),
+            )
+        # Monthly cost
+        cap = self._config.monthly_cost_usd
+        if cap.is_active and self._monthly_cost_usd >= cap.hard_limit:
+            label = self._month_key[1] if self._month_key else "this month"
+            return BudgetCheck(
+                allowed=False,
+                hard_dimension="monthly_cost_usd",
+                detail=f"monthly cost cap: ${self._monthly_cost_usd:.4f}/${cap.hard_limit:.2f} (month: {label})",
+                context=self._period_context(),
+            )
+        return BudgetCheck(allowed=True)
+
+    def _check_period_warn(
+        self, warn_dims: list[str],
+        warn_ratio_overrides: "dict[str, float] | None" = None,
+    ) -> None:
+        """Append warning dimension names for daily / monthly thresholds.
+
+        ``warn_ratio_overrides`` (#4724): the counter (`used`) stays
+        PROCESS-SHARED, unchanged by this slice — only the ratio that
+        decides WHEN to warn about it is caller-resolvable, per lead-coder's
+        ruling ("同じ1つの数字について誰がいつ知らされるか")."""
+        for dim, used, cap_cfg in (
+            ("daily_tokens", self._daily_tokens, self._config.daily_tokens),
+            ("daily_cost_usd", self._daily_cost_usd, self._config.daily_cost_usd),
+            ("monthly_tokens", self._monthly_tokens, self._config.monthly_tokens),
+            ("monthly_cost_usd", self._monthly_cost_usd, self._config.monthly_cost_usd),
+        ):
+            if cap_cfg.is_active:
+                threshold = _effective_warn_threshold(
+                    cap_cfg, (warn_ratio_overrides or {}).get(f"cost.{dim}.warn_ratio"),
+                )
+                if threshold is not None and used >= threshold:
+                    key = self._day_key[1] if "daily" in dim else (
+                        self._month_key[1] if self._month_key else "month"
+                    )
+                    self._maybe_warn(warn_dims, dim, key or dim)
+
+    def _period_context(self) -> dict:
+        return {
+            "daily_tokens": self._daily_tokens,
+            "daily_cost_usd": round(self._daily_cost_usd, 6),
+            "monthly_tokens": self._monthly_tokens,
+            "monthly_cost_usd": round(self._monthly_cost_usd, 6),
+            "daily_tokens_hard": self._config.daily_tokens.hard_limit,
+            "daily_cost_hard": self._config.daily_cost_usd.hard_limit,
+            "monthly_tokens_hard": self._config.monthly_tokens.hard_limit,
+            "monthly_cost_hard": self._config.monthly_cost_usd.hard_limit,
+            "day_label": self._day_key[1] if self._day_key else None,
+            "month_label": self._month_key[1] if self._month_key else None,
+        }
+
+
+# ── user-visible formatters ─────────────────────────────────────────────────
+
+
+def format_refusal_message(check: BudgetCheck, *, agent: Optional[str] = None) -> str:
+    """Build the multi-line outbox message shown when a budget refuses a call."""
+    dim = check.hard_dimension or "budget"
+    lines: list[str] = []
+    if dim == "rate_limit":
+        ctx = check.context
+        lines.append(
+            f"[budget exceeded] rate limit for model "
+            f"{ctx.get('model')!r} ({ctx.get('current')}/{ctx.get('hard')} calls/min)."
+        )
+    elif dim in ("per_agent_tokens", "per_agent_cost_usd"):
+        ctx = check.context
+        lines.append(
+            f"[budget exceeded] agent {ctx.get('agent')!r} is over the hard limit."
+        )
+        lines.append("")
+        if dim == "per_agent_tokens":
+            lines.append(
+                f"  Triggered:  per_agent_tokens "
+                f"({ctx.get('tokens')}/{int(ctx.get('tokens_hard') or 0)})"
+            )
+            if ctx.get("cost_hard") is not None:
+                lines.append(
+                    f"  Also used:  ${ctx.get('cost_usd', 0):.2f} "
+                    f"(limit: ${ctx.get('cost_hard'):.2f})"
+                )
+            else:
+                lines.append(f"  Also used:  ${ctx.get('cost_usd', 0):.2f}")
+        else:
+            lines.append(
+                f"  Triggered:  per_agent_cost_usd "
+                f"(${ctx.get('cost_usd', 0):.2f}/${ctx.get('cost_hard', 0):.2f})"
+            )
+            if ctx.get("tokens_hard") is not None:
+                lines.append(
+                    f"  Also used:  {ctx.get('tokens')} tokens "
+                    f"(limit: {int(ctx.get('tokens_hard'))})"
+                )
+            else:
+                lines.append(f"  Also used:  {ctx.get('tokens')} tokens")
+    elif dim in ("daily_tokens", "daily_cost_usd", "monthly_tokens", "monthly_cost_usd"):
+        ctx = check.context
+        period = "daily" if dim.startswith("daily") else "monthly"
+        label = ctx.get("day_label") if period == "daily" else ctx.get("month_label")
+        label_str = f" ({label})" if label else ""
+        lines.append(f"[budget exceeded] {period} limit reached{label_str}.")
+        lines.append("")
+        if dim == "daily_tokens":
+            lines.append(
+                f"  Triggered:  daily_tokens "
+                f"({ctx.get('daily_tokens', 0):,}/{int(ctx.get('daily_tokens_hard') or 0):,})"
+            )
+            if ctx.get("daily_cost_hard") is not None:
+                lines.append(
+                    f"  Also used:  ${ctx.get('daily_cost_usd', 0):.4f} today"
+                    f" (limit: ${ctx.get('daily_cost_hard'):.2f})"
+                )
+        elif dim == "daily_cost_usd":
+            lines.append(
+                f"  Triggered:  daily_cost_usd "
+                f"(${ctx.get('daily_cost_usd', 0):.4f}/${ctx.get('daily_cost_hard', 0):.2f})"
+            )
+            if ctx.get("daily_tokens_hard") is not None:
+                lines.append(
+                    f"  Also used:  {ctx.get('daily_tokens', 0):,} tokens today"
+                    f" (limit: {int(ctx.get('daily_tokens_hard')):,})"
+                )
+        elif dim == "monthly_tokens":
+            lines.append(
+                f"  Triggered:  monthly_tokens "
+                f"({ctx.get('monthly_tokens', 0):,}/{int(ctx.get('monthly_tokens_hard') or 0):,})"
+            )
+            if ctx.get("monthly_cost_hard") is not None:
+                lines.append(
+                    f"  Also used:  ${ctx.get('monthly_cost_usd', 0):.4f} this month"
+                    f" (limit: ${ctx.get('monthly_cost_hard'):.2f})"
+                )
+        elif dim == "monthly_cost_usd":
+            lines.append(
+                f"  Triggered:  monthly_cost_usd "
+                f"(${ctx.get('monthly_cost_usd', 0):.4f}/${ctx.get('monthly_cost_hard', 0):.2f})"
+            )
+            if ctx.get("monthly_tokens_hard") is not None:
+                lines.append(
+                    f"  Also used:  {ctx.get('monthly_tokens', 0):,} tokens this month"
+                    f" (limit: {int(ctx.get('monthly_tokens_hard')):,})"
+                )
+    else:
+        lines.append(f"[budget exceeded] {check.detail}")
+    lines.append("")
+    lines.append("The next LLM call has been refused.")
+    lines.append("")
+    lines.append("What you can do:")
+    lines.append("  • Raise the limit in `reyn.local.yaml` (cost: section)")
+    lines.append("  • Reset counters with `/budget reset`")
+    if check.hard_dimension and check.hard_dimension.startswith(("daily_", "monthly_")):
+        lines.append("  • Daily / monthly limits reset automatically at period boundary")
+    else:
+        lines.append("  • Restart `reyn chat` (limits are per-process)")
+    lines.append("  • See current usage with `/budget`")
+    return "\n".join(lines)
+
+
+def format_warn_message(dimension: str, ctx: dict) -> str:
+    """Build a 1-2 line outbox status when a warn threshold is crossed."""
+    if dimension == "per_agent_tokens":
+        return (
+            f"[budget warn] agent {ctx.get('agent')!r}: "
+            f"{ctx.get('tokens')} / {int(ctx.get('tokens_hard') or 0)} tokens "
+            f"(${ctx.get('cost_usd', 0):.2f} so far)"
+        )
+    if dimension == "per_agent_cost_usd":
+        return (
+            f"[budget warn] agent {ctx.get('agent')!r}: "
+            f"${ctx.get('cost_usd', 0):.2f} / ${ctx.get('cost_hard', 0):.2f} USD"
+        )
+    if dimension == "rate_limit":
+        return (
+            f"[budget warn] rate limit approaching for model "
+            f"{ctx.get('model')}: {ctx.get('current')} / {ctx.get('hard')} calls/min"
+        )
+    if dimension == "daily_tokens":
+        return (
+            f"[budget warn] daily token quota approaching: "
+            f"{ctx.get('daily_tokens', 0):,} / {int(ctx.get('daily_tokens_hard') or 0):,}"
+        )
+    if dimension == "daily_cost_usd":
+        return (
+            f"[budget warn] daily cost quota approaching: "
+            f"${ctx.get('daily_cost_usd', 0):.4f} / ${ctx.get('daily_cost_hard', 0):.2f}"
+        )
+    if dimension == "monthly_tokens":
+        return (
+            f"[budget warn] monthly token quota approaching: "
+            f"{ctx.get('monthly_tokens', 0):,} / {int(ctx.get('monthly_tokens_hard') or 0):,}"
+        )
+    if dimension == "monthly_cost_usd":
+        return (
+            f"[budget warn] monthly cost quota approaching: "
+            f"${ctx.get('monthly_cost_usd', 0):.4f} / ${ctx.get('monthly_cost_hard', 0):.2f}"
+        )
+    return f"[budget warn] {dimension}"
+
+
+def format_cost_line(snapshot: dict, agent: str) -> str:
+    """`/cost` 1-line output for the attached agent."""
+    tokens = snapshot["agent_tokens"].get(agent, 0)
+    cost = snapshot["agent_cost_usd"].get(agent, 0.0)
+    return f"{agent}: {tokens:,} tokens, ${cost:.4f}  (this session)"
+
+
+_FLOOR_REASON_LABEL = {
+    "truncated": "the budget ledger was found shorter than expected (truncated)",
+    "missing": "the budget ledger was missing at startup",
+    # #3201: a checkpoint whose ledger identity could not be established
+    # (pre-#3201 checkpoint, or the ledger's leading line was unreadable) —
+    # NOT a confirmed replacement, so it still floors on the safe side.
+    "identity_absent": (
+        "the budget ledger's identity could not be verified at startup"
+    ),
+}
+
+
+def format_budget_full(
+    snapshot: dict, attached: str | None,
+    warn_ratio_overrides: "dict[str, float] | None" = None,
+) -> str:
+    """`/budget` full breakdown across all dimensions.
+
+    ``warn_ratio_overrides`` (#4206 Slice B, #4724): same caller-resolved ③
+    mapping as ``BudgetTracker.check_pre_llm``/``record_llm`` — this
+    DISPLAY function is the 4th (and final) consumer of the cost.*
+    warn-ratio subset, so what an operator sees in ``/budget`` matches
+    what actually gated their own session's warn events, not silently the
+    project default."""
+    _validate_warn_ratio_overrides(warn_ratio_overrides)
+    _wr = warn_ratio_overrides or {}
+    cfg: CostConfig = snapshot["config"]
+    lines: list[str] = ["Usage (process invocation):", ""]
+
+    # #2945 (co-vet firm): a floor-merge must never be silent. If the most
+    # recent startup had to preserve per-agent totals from a checkpoint
+    # because the ledger was found truncated/missing/replaced, say so up
+    # front — an operator staring at a higher-than-expected per-agent total
+    # must be able to answer "was this intended?" from this output, not a
+    # doc sentence.
+    if snapshot.get("budget_floor_applied"):
+        reason = snapshot.get("budget_floor_reason")
+        detail = _FLOOR_REASON_LABEL.get(reason, reason or "unknown reason")
+        lines.append(
+            f"  ⚠ per-agent totals below were preserved from a checkpoint at "
+            f"startup: {detail}."
+        )
+        lines.append(
+            "    This is intentional (a cap-critical counter never silently "
+            "under-counts). To reset per-agent spend, archive BOTH "
+            "`.reyn/state/budget_ledger.jsonl` AND "
+            "`.reyn/cache/budget_checkpoint.json` while stopped."
+        )
+        lines.append("")
+
+    # PR25: Today / Month sections (shown first if any persistent data)
+    day_label = snapshot.get("day_key")
+    month_label = snapshot.get("month_key")
+    daily_tok = snapshot.get("daily_tokens", 0)
+    daily_cost = snapshot.get("daily_cost_usd", 0.0)
+    monthly_tok = snapshot.get("monthly_tokens", 0)
+    monthly_cost = snapshot.get("monthly_cost_usd", 0.0)
+
+    def _pct(used, limit) -> str:
+        if limit and limit > 0:
+            return f" ({int(used / limit * 100)}%)"
+        return ""
+
+    if day_label is not None or any([
+        cfg.daily_tokens.is_active,
+        cfg.daily_cost_usd.is_active,
+        cfg.monthly_tokens.is_active,
+        cfg.monthly_cost_usd.is_active,
+    ]):
+        # Pre-compute the label column width so `tokens` lines up across
+        # Today / Month rows. `Today (YYYY-MM-DD):` is 4 chars wider than
+        # `Month (YYYY-MM):`; the old hand-rolled "   " spacing assumed an
+        # exact label length and broke when day_label / month_label format
+        # changed.
+        day_label_part = f"Today ({day_label}):" if day_label else ""
+        month_label_part = f"Month ({month_label}):" if month_label else ""
+        label_col = max(len(day_label_part), len(month_label_part)) + 1
+
+        if day_label:
+            tok_cap = cfg.daily_tokens
+            cost_cap = cfg.daily_cost_usd
+            tok_str = (
+                f"{daily_tok:,} / {int(tok_cap.hard_limit):,}{_pct(daily_tok, tok_cap.hard_limit)}"
+                if tok_cap.is_active else f"{daily_tok:,}"
+            )
+            cost_str = (
+                f"${daily_cost:.4f} / ${cost_cap.hard_limit:.2f}{_pct(daily_cost, cost_cap.hard_limit)}"
+                if cost_cap.is_active else f"${daily_cost:.4f}"
+            )
+            lines.append(
+                f"  {day_label_part:<{label_col}}tokens {tok_str} | {cost_str}"
+            )
+
+        if month_label:
+            tok_cap = cfg.monthly_tokens
+            cost_cap = cfg.monthly_cost_usd
+            tok_str = (
+                f"{monthly_tok:,} / {int(tok_cap.hard_limit):,}{_pct(monthly_tok, tok_cap.hard_limit)}"
+                if tok_cap.is_active else f"{monthly_tok:,}"
+            )
+            cost_str = (
+                f"${monthly_cost:.4f} / ${cost_cap.hard_limit:.2f}{_pct(monthly_cost, cost_cap.hard_limit)}"
+                if cost_cap.is_active else f"${monthly_cost:.4f}"
+            )
+            lines.append(
+                f"  {month_label_part:<{label_col}}tokens {tok_str} | {cost_str}"
+            )
+
+        lines.append("")
+
+    agents = sorted(set(snapshot["agent_tokens"]) | set(snapshot["agent_cost_usd"]))
+    if not agents and attached is not None:
+        agents = [attached]
+    for agent in agents:
+        marker = " (attached)" if agent == attached else ""
+        lines.append(f"  {agent}{marker}")
+        tok = snapshot["agent_tokens"].get(agent, 0)
+        cost = snapshot["agent_cost_usd"].get(agent, 0.0)
+        tok_cap = cfg.per_agent_tokens
+        if tok_cap.is_active:
+            warn = int(_effective_warn_threshold(
+                tok_cap, _wr.get("cost.per_agent_tokens.warn_ratio"),
+            ) or 0)
+            mark = "  ⚠ approaching" if tok >= warn > 0 else ""
+            lines.append(
+                f"    tokens:  {tok:>10,} / {int(tok_cap.hard_limit):,}  "
+                f"(warn at {warn:,}){mark}"
+            )
+        else:
+            lines.append(f"    tokens:  {tok:>10,}             (no cap)")
+        cost_cap = cfg.per_agent_cost_usd
+        if cost_cap.is_active:
+            warn = _effective_warn_threshold(
+                cost_cap, _wr.get("cost.per_agent_cost_usd.warn_ratio"),
+            ) or 0
+            mark = "  ⚠ approaching" if cost >= warn > 0 else ""
+            lines.append(
+                f"    cost:    ${cost:>9.4f} / ${cost_cap.hard_limit:.2f}     "
+                f"(warn at ${warn:.2f}){mark}"
+            )
+        else:
+            lines.append(f"    cost:    ${cost:>9.4f}              (no cap)")
+        lines.append("")
+
+    # #1190 stage (iii): per-purpose cost attribution — where the spend went
+    # (main / compaction / judge / dogfood).
+    purpose_tokens = snapshot.get("purpose_tokens") or {}
+    purpose_cost = snapshot.get("purpose_cost_usd") or {}
+    if purpose_tokens or purpose_cost:
+        lines.append("  By purpose:")
+        for p in sorted(set(purpose_tokens) | set(purpose_cost)):
+            tok = purpose_tokens.get(p, 0)
+            cost = purpose_cost.get(p, 0.0)
+            lines.append(f"    {p:<18}{tok:>10,} tok | ${cost:.4f}")
+        lines.append("")
+
+    if snapshot["rate_window"]:
+        lines.append("  Rate limit (last minute):")
+        for model, used in sorted(snapshot["rate_window"].items()):
+            cap = cfg.rate_limit_per_minute.get(model)
+            if cap is not None:
+                _ratio = _wr.get("cost.rate_limit_warn_ratio", cfg.rate_limit_warn_ratio)
+                warn = int(cap * _ratio)
+                mark = "  ⚠" if used >= warn > 0 else ""
+                lines.append(f"    {model}:  {used} / {cap}  (warn at {warn}){mark}")
+            else:
+                lines.append(f"    {model}:  {used}  (no cap)")
+        lines.append("")
+
+    lines.append("  Reset counters with `/budget reset`.")
+    return "\n".join(lines)

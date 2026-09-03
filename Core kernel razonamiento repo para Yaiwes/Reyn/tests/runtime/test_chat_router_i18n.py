@@ -1,0 +1,441 @@
+"""Tier 2: OS invariant — chat router i18n for fallback messages (F8 + F11).
+
+F8: when the per-turn router retry budget is exhausted, the user-facing fallback
+    message must be in the configured output_language, not hardcoded English.
+
+F11: the system prompt built by router_system_prompt must include an explicit
+    language instruction matching the configured output_language, so LLM-generated
+    clarifying questions and direct replies land in the right language.
+
+Policy: no MagicMock / AsyncMock on collaborators. Real Session and
+build_system_prompt instances. RouterLoop.run() is patched only where strictly
+necessary to avoid network calls (Tier 3 LLM-replay tests are separate).
+
+#3382 — why every F8 test below pins the LLM explicitly: the cap-exhausted
+path first attempts an LLM force-close wrap-up and only falls back to the
+canned ``_ROUTER_RETRY_EXHAUSTED_MSG`` when that wrap-up is unavailable
+(``session.py`` #1496 site C). These tests used to reach the canned leg by
+accident — the ambient environment had no usable model, so the wrap-up
+always raised — which made them green for the wrong reason and green in
+exactly one kind of environment. Each canned-leg test now injects a
+``RaisingLLM``, and ``test_retry_exhausted_wrap_up_success_...`` pins the
+OTHER leg, so a regression in either direction is visible with or without
+credentials.
+"""
+from __future__ import annotations
+
+import asyncio
+from pathlib import Path
+
+from reyn.llm.llm import LLMToolCallResult
+from reyn.llm.pricing import TokenUsage
+from reyn.runtime.budget.budget import BudgetTracker, CostConfig
+from reyn.runtime.router_system_prompt import build_system_prompt
+from reyn.runtime.session import (
+    _ROUTER_RETRY_EXHAUSTED_MSG,
+    Session,
+)
+from tests._support.agent_session import make_session
+from tests._support.router_loop import RaisingLLM, ScriptedLLM
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _make_session(
+    tmp_path: Path,
+    *,
+    cap: int = 3,
+    output_language: str | None = "ja",
+) -> Session:
+    """Minimal Session with a real BudgetTracker and configurable language.
+
+    output_language=None tests the unset-user behavior (= no language
+    directive in router prompt; fallback messages use English).
+    """
+    from reyn.config import LoopConfig, SafetyConfig
+    safety = SafetyConfig(loop=LoopConfig(max_router_calls_per_turn=cap))
+    return make_session(
+        agent_name="test_agent",
+        output_language=output_language,
+        budget_tracker=BudgetTracker(CostConfig()),
+        safety=safety,
+    )
+
+
+def _drain_outbox(session: Session) -> list:
+    msgs = []
+    while not session.outbox.empty():
+        msgs.append(session.outbox.get_nowait())
+    return msgs
+
+
+def _run(coro):
+    return asyncio.run(coro)
+
+
+_EMPTY_USAGE = TokenUsage(prompt_tokens=10, completion_tokens=5)
+
+
+def _text_result(text: str) -> LLMToolCallResult:
+    return LLMToolCallResult(
+        content=text,
+        tool_calls=[],
+        finish_reason="stop",
+        usage=_EMPTY_USAGE,
+    )
+
+
+def _pin_llm(monkeypatch, caller) -> None:
+    """Pin the LLM the cap-exhausted wrap-up will reach (#3382).
+
+    ``_handle_user_message`` has no ``_llm_caller`` parameter, so the
+    wrap-up's LLM is pinned at the ``call_llm_tools`` boundary that
+    ``RouterLoop._force_close_call`` falls back to. Replacement is a real
+    callable (policy: Mock vs Fake — ``monkeypatch.setattr`` with a real
+    callable is allowed, and the LLM is the one collaborator a Tier-2c
+    test may fake).
+    """
+    monkeypatch.setattr("reyn.runtime.router_loop.call_llm_tools", caller)
+
+
+# ---------------------------------------------------------------------------
+# F8 tests — retry-exhausted fallback message language
+# ---------------------------------------------------------------------------
+
+def test_retry_exhausted_fallback_is_japanese_when_output_language_ja(
+    tmp_path, monkeypatch
+):
+    """Tier 2: when output_language=ja and the router cap is exhausted,
+    the user-facing agent outbox message contains Japanese (F8).
+
+    The fallback text must come from _ROUTER_RETRY_EXHAUSTED_MSG["ja"],
+    not from the hardcoded English string.
+
+    #3382: the wrap-up is pinned unavailable, so the canned leg is
+    reached by construction rather than by the environment lacking a key.
+    """
+    monkeypatch.chdir(tmp_path)
+    session = _make_session(tmp_path, cap=3, output_language="ja")
+    _pin_llm(monkeypatch, RaisingLLM())
+
+    # Pre-spend the budget and suppress the reset so the very first
+    # _run_router_loop attempt inside _handle_user_message is rejected.
+    monkeypatch.setattr(Session, "_reset_router_turn_counter", lambda self: None)
+    session.router_invocations_this_turn = 3
+    session._router_last_reason = "out_of_scope"
+
+    _run(session._handle_inbox_text("こんにちは", chain_id="chain-ja"))
+
+    msgs = _drain_outbox(session)
+    agent_msgs = [m for m in msgs if m.kind == "agent"]
+    assert agent_msgs, "Expected at least one agent outbox message"
+
+    fallback_text = agent_msgs[0].text
+    # Must contain Japanese-specific marker from _ROUTER_RETRY_EXHAUSTED_MSG["ja"]
+    assert "router 予算" in fallback_text, (
+        f"Expected Japanese fallback but got: {fallback_text!r}"
+    )
+    assert "I couldn't find a way" not in fallback_text, (
+        f"Hardcoded English found in ja fallback: {fallback_text!r}"
+    )
+
+
+def test_retry_exhausted_fallback_is_english_when_output_language_en(
+    tmp_path, monkeypatch
+):
+    """Tier 2: when output_language=en and the router cap is exhausted,
+    the fallback message contains English (F8 — default language path).
+    """
+    monkeypatch.chdir(tmp_path)
+    session = _make_session(tmp_path, cap=3, output_language="en")
+    _pin_llm(monkeypatch, RaisingLLM())  # #3382: canned leg by construction
+
+    monkeypatch.setattr(Session, "_reset_router_turn_counter", lambda self: None)
+    session.router_invocations_this_turn = 3
+    session._router_last_reason = "test_reason"
+
+    _run(session._handle_inbox_text("hello", chain_id="chain-en"))
+
+    msgs = _drain_outbox(session)
+    agent_msgs = [m for m in msgs if m.kind == "agent"]
+    assert agent_msgs, "Expected at least one agent outbox message"
+
+    fallback_text = agent_msgs[0].text
+    assert "I couldn't find a way" in fallback_text, (
+        f"Expected English fallback but got: {fallback_text!r}"
+    )
+
+
+def test_retry_exhausted_fallback_defaults_to_english_for_unsupported_language(
+    tmp_path, monkeypatch
+):
+    """Tier 2: when output_language is an unsupported code (e.g. "fr"),
+    the fallback message falls back to English without raising (F8).
+    """
+    monkeypatch.chdir(tmp_path)
+    session = _make_session(tmp_path, cap=3, output_language="fr")
+    _pin_llm(monkeypatch, RaisingLLM())  # #3382: canned leg by construction
+
+    monkeypatch.setattr(Session, "_reset_router_turn_counter", lambda self: None)
+    session.router_invocations_this_turn = 3
+    session._router_last_reason = ""
+
+    # Must not raise.
+    _run(session._handle_inbox_text("bonjour", chain_id="chain-fr"))
+
+    msgs = _drain_outbox(session)
+    agent_msgs = [m for m in msgs if m.kind == "agent"]
+    assert agent_msgs, "Expected at least one agent outbox message"
+
+    fallback_text = agent_msgs[0].text
+    # Falls back to English (the safe default for unknown languages).
+    assert "I couldn't find a way" in fallback_text, (
+        f"Expected English fallback for unsupported lang but got: {fallback_text!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# F11 tests — system prompt language instruction
+# ---------------------------------------------------------------------------
+
+def test_system_prompt_contains_explicit_ja_instruction():
+    """Tier 2: when output_language=ja, build_system_prompt includes an
+    explicit instruction to reply in Japanese (F11).
+
+    The instruction must be stronger than the generic 'match the user's
+    language' line — it must name the language code 'ja' explicitly so
+    LLM-generated clarifying questions land in Japanese.
+    """
+    prompt = build_system_prompt(
+        agent_name="chat",
+        agent_role="assistant",
+        available_agents=[],
+        memory_index={"status": "not_found", "content": ""},
+        output_language="ja",
+    )
+    assert "language: ja" in prompt, (
+        "Expected explicit 'language: ja' instruction in system prompt.\n"
+        "Prompt excerpt (Behaviour section):\n"
+        + "\n".join(l for l in prompt.splitlines() if "Behaviour" in l or "language" in l.lower())
+    )
+
+
+def test_system_prompt_contains_explicit_en_instruction():
+    """Tier 2: when output_language=en, build_system_prompt includes 'language: en'
+    in the Behaviour section (F11 — symmetric check for English).
+    """
+    prompt = build_system_prompt(
+        agent_name="chat",
+        agent_role="assistant",
+        available_agents=[],
+        memory_index={"status": "not_found", "content": ""},
+        output_language="en",
+    )
+    assert "language: en" in prompt, (
+        "Expected 'language: en' in system prompt but got:\n"
+        + "\n".join(l for l in prompt.splitlines() if "Behaviour" in l or "language" in l.lower())
+    )
+
+
+def test_system_prompt_omits_language_directive_when_output_language_is_none():
+    """Tier 2: when output_language is None (= user did not configure),
+    build_system_prompt does NOT emit any 'Always reply in language: <code>'
+    directive. The LLM picks the reply language based on user input
+    naturally instead of being forced into a Reyn default. (Q2 follow-up.)
+    """
+    prompt = build_system_prompt(
+        agent_name="chat",
+        agent_role="assistant",
+        available_agents=[],
+        memory_index={"status": "not_found", "content": ""},
+        output_language=None,
+    )
+    # No "Always reply in language" line at all.
+    assert "Always reply in language" not in prompt, (
+        "Expected no language directive when output_language=None, "
+        "but got:\n"
+        + "\n".join(l for l in prompt.splitlines() if "language" in l.lower())
+    )
+    # Behaviour section still exists (just without the language line).
+    assert "## Behaviour" in prompt
+
+
+def test_system_prompt_default_output_language_is_none():
+    """Tier 2: build_system_prompt defaults to None when output_language is
+    omitted — same as explicit None (= no language directive). Prior behavior
+    forced 'language: en' as a hardcoded default; that masked the unset-user
+    case, so we now treat omitted == None.
+    """
+    prompt = build_system_prompt(
+        agent_name="chat",
+        agent_role="assistant",
+        available_agents=[],
+        memory_index={"status": "not_found", "content": ""},
+        # output_language intentionally omitted → defaults to None
+    )
+    assert "Always reply in language" not in prompt
+
+
+def test_router_loop_passes_output_language_to_system_prompt(tmp_path, monkeypatch):
+    """Tier 2: RouterLoop.run() passes the host's output_language to
+    build_system_prompt so the LLM receives the correct language instruction
+    (F11 — integration path: Session → RouterLoop → build_system_prompt).
+
+    We stub call_llm_tools to avoid network I/O and capture the system prompt
+    that RouterLoop would send.
+    """
+    monkeypatch.chdir(tmp_path)
+    session = _make_session(tmp_path, cap=3, output_language="ja")
+
+    captured_prompts: list[str] = []
+
+    async def fake_llm_tools(*, model, messages, tools, tool_choice,
+                              budget, budget_agent, **kwargs):
+        # Capture the system message (first in messages list).
+        for msg in messages:
+            if msg.get("role") == "system":
+                captured_prompts.append(msg["content"])
+        return _text_result("テスト応答")
+
+    monkeypatch.setattr("reyn.runtime.router_loop.call_llm_tools", fake_llm_tools)
+    _run(session._handle_inbox_text("こんにちは", chain_id="chain-prompt"))
+
+    assert captured_prompts, "No system prompt was captured — LLM was never called"
+    system_prompt = captured_prompts[0]
+    assert "language: ja" in system_prompt, (
+        "Router did not pass output_language=ja to system prompt.\n"
+        "Prompt lines with 'language':\n"
+        + "\n".join(l for l in system_prompt.splitlines() if "language" in l.lower())
+    )
+
+
+# ---------------------------------------------------------------------------
+# Q2: Optional[str] propagation — unset = no directive, no regional default
+# ---------------------------------------------------------------------------
+
+
+def test_config_output_language_default_is_none(tmp_path, monkeypatch):
+    """Tier 2: when no config file sets output_language, ReynConfig loads
+    with output_language=None (= unset). Reyn explicitly does not silently
+    default to a regional language; the chat router treats None as "no
+    directive, LLM picks based on user input".
+    """
+    from reyn.config import load_config
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))  # avoid reading ~/.reyn
+
+    cfg = load_config(cwd=tmp_path)
+    assert cfg.output_language is None
+
+
+def test_config_output_language_explicit_value_preserved(tmp_path, monkeypatch):
+    """Tier 2: when reyn.yaml sets output_language=ja, ReynConfig
+    preserves the explicit value (= no normalization to None for set
+    values; only the unset case yields None).
+    """
+    from reyn.config import load_config
+
+    (tmp_path / "reyn.yaml").write_text("output_language: ja\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    cfg = load_config(cwd=tmp_path)
+    assert cfg.output_language == "ja"
+
+
+def test_config_output_language_empty_string_treated_as_unset(
+    tmp_path, monkeypatch
+):
+    """Tier 2: yaml `output_language: ""` (= explicit empty) is treated as
+    unset (= None). Allows users to opt out of any language pinning even
+    when a project-level reyn.yaml sets a value, by overriding to "" in
+    reyn.local.yaml.
+    """
+    from reyn.config import load_config
+
+    (tmp_path / "reyn.yaml").write_text("output_language: ja\n", encoding="utf-8")
+    (tmp_path / "reyn.local.yaml").write_text(
+        'output_language: ""\n', encoding="utf-8"
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    cfg = load_config(cwd=tmp_path)
+    assert cfg.output_language is None
+
+
+def test_retry_exhausted_fallback_is_english_when_output_language_is_none(
+    tmp_path, monkeypatch
+):
+    """Tier 2: when output_language is None (= user did not configure),
+    the router retry-exhausted fallback message is English (= the safe
+    global default for an internal error string when the user has not
+    expressed a language preference). Regional languages like ja are
+    NOT silently chosen as fallback.
+
+    #3382: uses the designed ``_llm_caller`` seam to pin the wrap-up as
+    unavailable, so the canned leg is reached by construction.
+    """
+    monkeypatch.chdir(tmp_path)
+    session = _make_session(tmp_path, cap=3, output_language=None)
+
+    from reyn.runtime.errors import RouterCapExceeded
+
+    async def run():
+        await session._emit_router_cap_exhausted_user(
+            RouterCapExceeded(count=3, cap=3, last_reason="loop"),
+            chain_id="chain-test",
+            _llm_caller=RaisingLLM(),
+        )
+
+    _run(run())
+
+    # The agent reply should be the English fallback, not the Japanese one.
+    agent_msgs = [m for m in _drain_outbox(session) if m.kind == "agent"]
+    assert agent_msgs, "no agent reply emitted"
+    assert agent_msgs[0].text == _ROUTER_RETRY_EXHAUSTED_MSG["en"], (
+        f"Expected English fallback when output_language=None; got: "
+        f"{agent_msgs[0].text!r}"
+    )
+    # Specifically NOT the ja message.
+    assert agent_msgs[0].text != _ROUTER_RETRY_EXHAUSTED_MSG["ja"]
+
+
+def test_retry_exhausted_wrap_up_success_replaces_canned_fallback(
+    tmp_path, monkeypatch
+):
+    """Tier 2: when the force-close wrap-up DOES produce text, the user
+    gets that generated summary and NOT the canned i18n fallback (#1496
+    site C's documented specification: the canned message is the fallback,
+    generation is the intent).
+
+    #3382: this is the leg the F8 tests above never had. Without it, the
+    canned-leg assertions stay green in an environment where the wrap-up
+    can never succeed — which is exactly how they came to pin the
+    then-current defect instead of the specification.
+    """
+    monkeypatch.chdir(tmp_path)
+    session = _make_session(tmp_path, cap=3, output_language="ja")
+    _pin_llm(monkeypatch, ScriptedLLM([_text_result("完了した内容の要約です")]))
+
+    monkeypatch.setattr(Session, "_reset_router_turn_counter", lambda self: None)
+    session.router_invocations_this_turn = 3
+    session._router_last_reason = "out_of_scope"
+
+    _run(session._handle_inbox_text("こんにちは", chain_id="chain-wrapup"))
+
+    msgs = _drain_outbox(session)
+    agent_msgs = [m for m in msgs if m.kind == "agent"]
+    assert agent_msgs, "Expected an agent outbox message"
+    (agent_msg,) = agent_msgs
+    assert agent_msg.text == "完了した内容の要約です", (
+        f"Expected the generated wrap-up; got: {agent_msg.text!r}"
+    )
+    assert agent_msg.text != _ROUTER_RETRY_EXHAUSTED_MSG["ja"]
+    assert (agent_msg.meta or {}).get("limit_stopped") is True
+    # The canned leg emits an error message alongside; it must not fire.
+    assert not [m for m in msgs if m.kind == "error"], (
+        "canned fallback fired despite a successful wrap-up"
+    )

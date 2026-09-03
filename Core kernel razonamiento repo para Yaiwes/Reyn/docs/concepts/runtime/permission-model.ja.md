@@ -1,0 +1,372 @@
+---
+type: concept
+topic: architecture
+audience: [human, agent]
+---
+
+# パーミッションモデル
+
+reyn のパーミッションシステムは 4 種類のケイパビリティをゲートします：ファイルパス、exec（argv-only なプロセス実行 — #3226 で `shell` から `exec` へ改名）、MCP ツール呼び出し、Python プリプロセッサーステップです。デフォルトは保守的です。それ以外はすべてワークフローが宣言し、ユーザーが承認する（または `reyn.yaml` で事前承認する）必要があります。
+
+## 3 つのレイヤー（順番通り）
+
+```
+┌──────────────────────────────┐  常に許可。宣言不要
+│  デフォルト（読み取り専用プロジェクト）│
+└──────────────────────────────┘
+             ↓ actor がさらに必要とする場合
+┌──────────────────────────────┐  reyn.yaml `permissions:` で宣言。実際の使用時
+│  宣言されたケイパビリティ      │  点で 1 回プロンプト（起動時ではない）
+└──────────────────────────────┘
+             ↓ プロジェクトを広く信頼する場合
+┌──────────────────────────────┐  reyn.yaml: permissions.<key>: allow
+│  プロジェクト全体の事前承認    │  そのケイパビリティのプロンプトをバイパス
+└──────────────────────────────┘
+```
+
+### レイヤー 1：デフォルト
+
+プロジェクトルート配下のどこでも読み取り/glob/grep。書き込み/編集/削除は `.reyn/` 配下のみ。シェル、MCP、Python は不可。
+
+### レイヤー 2：宣言されたケイパビリティ
+
+デフォルト外のものが必要な actor は `reyn.yaml` の `permissions:` ブロック（`PermissionDecl`、`permissions.file.write` / `file.read` / `mcp` / `tool` / `http.get` / `secret.write` リストから構築）で宣言します。パスを宣言してもそれ自体はアクセスを付与しません — ランタイムがその actor がそのパスを必要とし得ることを認識するだけです。プロンプトは実際にそのパスへアクセスする時点（起動時ではない）で just-in-time に発火します：
+
+```
+[approval] chat_router/file.write needs:
+  /tmp/output (just_path)
+
+  [y] この実行のみ許可
+  [j] この正確なパス + actor について永続化
+  [r] 親ディレクトリ（再帰的）+ actor について永続化
+  [N] 拒否
+```
+
+永続的な選択は `.reyn/approvals.jsonl`(append-only ledger — #5153。1決定=1行のJSONLレコードで、読み込み時にfold・同一keyは最後の行が勝つ)に `<actor>/<op>/<path>`（例: `chat_router/file.write//tmp/output`）のキーで保存されます。キーは actor スコープです。ある actor の承認が別の actor に漏れることはありません（`security/permissions/permissions.py`: "Approval keys are actor-scoped to prevent external-actor privilege escalation"）。`actor` は呼び出し元サブシステムを識別します(例: LLM ルーター駆動の op パスなら `chat_router`、バックグラウンド呼び出しなら `hooks`/`cron` など) — 個々の named agent ではありません。#5153以前の `.reyn/approvals.yaml` snapshotは初回タッチ時に1度だけこのledgerへ移行され、以降は読まれません。
+
+キーだけでは、保存済み承認が「誰に」適用されるかは決まらなくなりました(#5052): 全ての決定は上記キーとは直交する `scope` 値も持ちます。呼び出し元がrunning-agent identityを持つ場合、既定のscopeは `agent:<name>`(その1 agentのみ)に狭まります。agent identityの無いサブシステム/config書き込み(`hooks`/`cron`/`mcp` actor)は代わりに `SCOPE_WORKSPACE`(全agent)を記録します。この既定が狭い側に倒れているのは意図的です(`approval_ledger.scope_for_agent`自身のdocstring): リスクは非対称——狭すぎて誤る場合は2番目のagentが一度再プロンプトされるだけですが、広すぎて誤る場合は1つのagentの承認が workspace 内の全agentを黙って統治してしまいます。#5052以前のレコードは `SCOPE_LEGACY_WORKSPACE` にfoldされます——lookup時の一致挙動は `SCOPE_WORKSPACE` と同一ですが、ディスク上は別の値として区別されます(書かれた時点でagent軸自体が存在しなかった、という事実は「明示的にworkspace全体」とは別物のため)。
+
+`file.read`/`file.write`(path 系)のキーについては、キーが一致するだけでは十分ではありません(#5042): 承認済み path 自体の identity(`st_ino` + `st_birthtime`、`st_birthtime` が使えない環境では ino のみに縮退)が初回使用時に束縛され、以降の一致のたびに再照合されます。同じ path に別の identity のオブジェクトが後から現れた場合(承認対象が削除され、同名で別物が作られた場合)は一致しないものとして扱われ、purge して同じ path に作り直すと古い承認をそのまま引き継がず再度確認を求められます。承認行自体は不一致によって変更されません — 影響を受けるのはその path への新しい使用だけです。
+
+呼び出しに intervention bus が配線されていない場合（`bus=None` — 非インタラクティブなコンテキスト）、JIT プロンプトはスキップされ、ゾーン外アクセスは保留せずに拒否されます。
+
+### レイヤー 3：プロジェクト全体の事前承認
+
+`reyn.yaml` でプロジェクト全体のケイパビリティを事前付与できます：
+
+```yaml
+permissions:
+  exec: allow
+  file.write: allow
+  python:
+    safe: allow
+    unsafe: allow
+```
+
+(`exec` は #3226 Phase 3 で `shell` から改名 — clean-break、alias なし。既存の
+`reyn.yaml` の `permissions.shell:` キーは手動で `permissions.exec:` に改名する
+必要があります。改名しないと権限は一切付与されません。)
+
+控えめに使いましょう。`allow` はプロンプトを完全に削除します。
+
+## 非インタラクティブ実行
+
+intervention bus が配線されていない実行(CI、スクリプト自動化、インタラクティブな TTY の無いコンテキスト)はプロンプトなしで進みます。承認は事前に整っている必要があります。`reyn.yaml` で事前承認されているか、以前のインタラクティブ実行から `.reyn/approvals.jsonl` に永続化されているかです。
+
+これは同じ信頼モデルです。自動化側が何が安全かを決めるのではなく、あなたが事前に決めます。
+
+## なぜ actor スコープのキーなのか
+
+承認はグローバルではなく actor でキー付けされます。actor A が「`/tmp/foo` に書き込んでよいか？」と尋ね、それを承認しても、actor B に同じアクセスを付与することにはなりません。
+
+理由はコンポジションの安全性です: ある actor の承認済みケイパビリティが別の actor のアクセスを推移的に解放してはいけません — 各 actor は自分自身のために求める必要があります。
+
+## `mcp_install` パーミッション {#mcp_install-パーミッション}
+
+`mcp_install` は **設定への新しい MCP サーバーの追加** をゲートします。これはランタイムのツール呼び出しをゲートする `permissions.mcp` とは別物です。
+
+古い doc に載っている `permissions.mcp_install: ask | allow | deny` bool 軸は、
+**[Collapse arc](#collapse-arc571) Phase 5 の時点で単なる非推奨ではなく撤去済み**です:
+`PermissionDecl.from_dict` の `_LEGACY_BOOL_AXIS_KEYS` 処理（`permissions.py:314-323`）は
+このキーに対して警告を出すだけになっています — 以前は同等の list 軸 grant に展開していた
+compat shim は、それが呼んでいた `require_*` メソッド群ごと撤去されました。今
+`permissions.mcp_install: <何か>` を宣言しても**実行時の権限は一切成立しません** —
+値は誰にも読まれません。
+
+`mcp_install.handle`（`op_runtime/mcp_install.py`）は、OS の他の write-and-fetch
+アクションと同じ形でゲートされます — 専用の軸はありません:
+
+```yaml
+permissions:
+  file.write: [.reyn/config/mcp.yaml]                          # install 対象への書き込み
+  http.get:   [{host: registry.modelcontextprotocol.io}]        # server manifest の fetch
+  secret.write: [<ENV_KEY>]                                     # isSecret な env var の永続化
+```
+
+`file.write` と `http.get` はそれぞれ独自の ask/allow/deny 挙動を持ちます（上の各節参照）
+— `mcp_install` 専用のプロンプト文言や 3 層マージは存在しません。install の承認は、
+この 2 つのターゲットに対する file-write 承認 + fetch 承認そのものです。現行の worked
+example（全面ブロック / プロンプトなし許可 / 特定ホストのみ許可）は
+[`reyn.yaml` の「MCP install」節](../../reference/config/reyn-yaml.md) を、CLI 側の
+プロンプト形は [`reyn mcp`](../../reference/cli/mcp.md) を参照してください。
+
+### 監査証跡
+
+インストールが成功するたびに `server_id` と `scope` を持つ `mcp_server_installed` イベントが発行されます。フィルタリング：
+
+```bash
+grep '"mcp_server_installed"' .reyn/events.jsonl
+```
+
+## パーミッション Tier モデル (FP-0022)
+
+Reyn のパーミッションは 2 つの軸で機能します：
+
+**軸 1 — 使用宣言** (`reyn.yaml` の `permissions:` ブロック、`PermissionDecl` にパース):
+オペレーターが actor がデフォルト外で到達できる範囲を宣言します。宣言されていないゾーン外の
+op は `PermissionError` を発生させます（Android のマニフェストに登録されていない API を
+呼び出した場合の `SecurityException` に相当）。
+
+**軸 2 — 認可** (オペレーター / ユーザーによるアクセス付与):
+`PermissionResolver._approve()` の 4 層解決：
+
+| レイヤー | 提供元 | 永続性 |
+|---|---|---|
+| 1 | `reyn.yaml` `permissions.<key>` | 静的設定 |
+| 2 | `.reyn/approvals.jsonl` | セッション横断 |
+| 3 | インメモリセッション決定 | セッションのみ |
+| 4 | インタラクティブプロンプト | → レイヤー 2 または 3 |
+
+### Op Tier 分類
+
+| Tier | 代表的な op | 宣言 | デフォルト | 設定制限 |
+|---|---|---|---|---|
+| 0 | `ask_user` | 不要 | 無条件パス | 不可 |
+| 1 | `web_search`, `web_fetch` | 不要 | allow | `deny` でブロック |
+| 2 | `mcp` | 必須 | ask (4 層) | `allow` で事前承認 |
+| 3 | `shell`, `file` (ゾーン外) | 必須 | ✅ ask（JIT — `bus≠None` でゲート時プロンプト; `bus=None` で deny） | `allow` で事前承認; `deny` はデフォルトゾーンも含めブロック |
+
+Tier 0 は「デフォルト allow」ではなく「無条件パス」です。これらの op をブロックする
+設定キーは存在しません（存在するとワークフローの実行セマンティクスが破壊されます）。
+
+### web_fetch の動作変更 (FP-0022)
+
+FP-0022 以前: `reyn.yaml` に `web.fetch: allow` が必要でした。未設定の場合、
+ツールはルーターのカタログから非表示になりました（サイレントに利用不可）。
+ユーザーが何かを調べるよう依頼しても、プロンプトなしで拒否される混乱した UX でした。
+
+FP-0022 以降: 4 層承認によるデフォルト allow。ツールは常にルーターカタログに含まれます。
+初回使用時にインタラクティブプロンプトが発火します（YES/NO/ALWAYS/NEVER）。
+`web.fetch: allow` は事前承認します（既存の動作を保持）。`web.fetch: deny` は即座にブロックします。
+
+### web_search の設定制限 (FP-0022)
+
+`web_search` は `reyn.yaml` の `web.search: deny` を尊重するようになりました
+（即座に `PermissionError`）。デフォルトは allow です。web 検索は読み取り専用で
+副作用がないため、オペレーターの `deny` のみが合理的な制限パスです。インタラクティブプロンプトは不要です。
+
+### web_fetch と MCP レジストリの SSL 設定 (FP-0022 follow-up)
+
+`reyn.yaml` で `web_fetch` と MCP レジストリリクエストの SSL 設定を宣言的に行えます。
+env var を使わず、設定ファイルレベルで企業 MITM プロキシ / カスタム PKI の
+ユースケースを解決します。
+
+```yaml
+web_fetch:
+  verify_ssl: false          # bool — SSL 検証を完全に無効化
+  ca_bundle: /path/to/ca.pem # str  — カスタム CA バンドルファイルパス
+```
+
+（`web_fetch:` — #4174 T4、`web:` が `web_fetch:` / `gateway:` に分割された際に
+`web.fetch:` から改名。）
+
+両フィールドはオプションです。優先順位（高い方から）：
+
+| 優先度 | 設定元 | 効果 |
+|---|---|---|
+| 1 | `web_fetch.ca_bundle` 設定あり | httpx に `verify=<path>` を渡す（カスタム CA） |
+| 2 | `web_fetch.verify_ssl: false` | SSL 検証を無効化（`verify=False`） |
+| 3 | `web_fetch.verify_ssl: true` | SSL 検証を強制（`verify=True`） |
+| 4 | 両方未設定（デフォルト） | `SSL_VERIFY` env → `litellm.ssl_verify` → `SSL_CERT_FILE` → `True` |
+
+両方設定された場合、`ca_bundle` が `verify_ssl` より優先されます。
+どちらも設定されていない場合は既存の `SSL_VERIFY` / `SSL_CERT_FILE` env var の
+動作がそのまま維持されます（env var を使っている既存環境への影響なし）。
+
+**主なユースケース：**
+
+- **企業 MITM プロキシ（内部 CA あり）**: `ca_bundle: /etc/ssl/certs/corp-ca.pem` を設定
+- **自己署名証明書の開発環境**: `verify_ssl: false` を設定
+- **env var に関係なく SSL 検証を強制**: `verify_ssl: true` を設定
+
+## Permission は OS の I/O primitive
+
+permission system は OS runtime の一部であり、 OS の上に乗る別レイヤーではない。 reyn が行う全 side-effect — ワークフローコード由来も、 op handler 由来も、 その他 OS 内部経路由来も — すべて同じ permission resolver を、 呼び出し起点ワークフローの `PermissionDecl` に対して通る。 inside / outside の区別はない: OS は permission system を、 全 I/O に対する自身の core abstraction として用いる。
+
+具体例: `op_runtime/mcp_install.py` が `.reyn/config/mcp.yaml` を write するとき、 これは `reyn.api.safe.file.write` を経由する — ワークフローレベルの safe-mode python step が使うのと同じ gate。 スコープ上の PermissionDecl は呼び出し起点ワークフローのもの、 OS は呼び出し元に関係なく一様に honor する。 旧来の 「OS は caller を gate するが自分自身は gate しない」 framing は、 この単一機構で解消される — 循環の懸念もない。
+
+## 宣言軸の taxonomy
+
+各 side-effect 種別ごとに対応する宣言軸がある。 軸語彙は小さく保たれ、 **bool 軸は真に capability-shaped な操作 — 単一の file / network / secret I/O scope に reducible でないもの — に予約**されている。
+
+### 軸
+
+| 軸 | 型 | 粒度 | gate site | 補足 |
+|---|---|---|---|---|
+| `file.read` | `list[{path, scope}]` | per-path | `require_file_read()` | scope ∈ {`just_path`, `recursive`}。デフォルトゾーン = CWD。ゾーン外: JIT ask（bus≠None）または deny（bus=None）。`file.read: deny` は CWD も含めブロック。`http.get` パターンを mirror。 |
+| `file.write` | `list[{path, scope}]` | per-path | `require_file_write()` | write / edit / delete を包含。デフォルトゾーン = `.reyn/`。ゾーン外: JIT ask（bus≠None）または deny（bus=None）。`file.write: deny` は `.reyn/` も含めブロック。`http.get` パターンを mirror。 |
+| `http.get` | `list[{host}]` | per-host | `require_http_get()` | specific host = startup prompt → silent runtime / `"*"` wildcard = runtime per-host prompt。 `reyn.api.safe.http.*`（ワークフロー内部、 specific のみ）と `web_fetch`（LLM-driven、 wildcard 受容）の両 surface を統一 |
+| `secret.write` | `list[<key>]` | per-key | `require_secret_write()` | `~/.reyn/secrets.env` write の per-key、 `"*"` wildcard で runtime-determined keys 対応（= value prompt が actual gate）|
+| `mcp` | `list[str]` | per-server | MCP 呼び出し時 implicit | サーバー名の allowlist |
+| `python` | `list[{module, function, mode, timeout}]` | per-step | `require_python_step()` | mode ∈ {`safe`, `unsafe`} |
+| `tool` | `list[str]` | per-tool | `require_tool()` | 名前指定 tool allowlist |
+| `shell` | *(live gate なし)* | — | — | **Doc drift、ここでは未修正のまま flag のみ**: この行はかつて bool `permissions.shell` 軸の gate site として `require_shell()` を挙げていた。`require_shell()` は現行コードベースに存在しない（`grep -rn "require_shell"` は `src/` 全体で 0 件）— この行がかつて指していた subprocess-exec gate は、raw `shell` op が撤廃された際（#1352-A/#1352-L3）に retire 済み。subprocess access は現在、`sandboxed_exec` の seam で `SandboxPolicy.deny_subprocess`（#3901 PR-B ④ で `allow_subprocess` からリネーム・意味反転、`permissions:` dict のエントリではなく sandbox config 側で宣言）により bound される。この行が支えていた、今や stale な rationale については下記 [`shell` だけが bool である理由](#shell-だけが-bool-である理由) 参照。 |
+| `allowed_mcp` | `list[str] \| None` | ACL filter | MCP 呼び出し時 implicit | per-agent restriction、 `mcp` 軸と cross-cut |
+
+### `shell` だけが bool である理由
+
+**歴史的セクション — 上記の軸テーブルの注記を参照。** 本セクションは、RETIRE 済みの bool `shell` 宣言軸とその gate `require_shell()` について記述している — いずれも現行コードベースには存在しない（確認済み: `grep -rn "require_shell"` は `src/` で 0 件）。これは #3226 による LLM-facing `shell` pipeline tool の撤廃（`sandboxed_exec` の上に `/bin/sh -c <command>` を組む薄い sugar であり、この軸システムでは元々宣言不可能だった別の機構）より前から存在する、無関係な drift である。書き直さずここに歴史的記録として残すのは、以下の criterion（「criterion:」で始まる段落）自体は一般原則として今も妥当だからであり、そこで挙げられている唯一の例が stale になっただけである。
+
+`shell` は任意 command の process exec。 side-effect 集合が unbounded（= shell command は任意 file の read / 任意 file の write / 任意 host への network ができる）で、 作者は具体的な invocation がどの side-effect を引き起こすかを enumeration できない。 単一 I/O scope に reduce する余地がない — process exec **そのものが** irreducible primitive。
+
+他の旧 bool 軸（`mcp_install` / `mcp_drop_server` / `cron_register` / `index_drop`）はいずれも、 実際には小さな file / network / secret 操作の集合に reducible であることが判明したため、 1 つ以上の list 軸へと表現し直された:
+
+| 旧 bool 軸 | 等価な list 軸 decomposition |
+|---|---|
+| `mcp_install: true` | `file.write: [.reyn/config/mcp.yaml]` + `http.get: [{host: registry.modelcontextprotocol.io}]` + `secret.write: [<env_key>]` |
+| `mcp_drop_server: true` | `file.write: [.reyn/config/mcp.yaml]` |
+| `cron_register: true` | `file.write: [.reyn/config/cron.yaml]` |
+| `index_drop: true` | `file.write: [.reyn/index/sources.yaml]` + `.reyn/index/<source>/index.db` の delete |
+
+criterion: **capability が有限の I/O scope（file path / host / secret key）に reducible なら list 軸、 そうでなければ bool**。 現状、 唯一の irreducible primitive は shell のみ。
+
+### collapse で失ったもの・失わなかったもの
+
+bool 軸は per-instance approval surface を持っていた（= `mcp_install:<server_id>` のように server ごとに key 化）。 collapse 後:
+
+- **MCP の per-server 粒度は保持される**: call 時点で既存 `permissions.mcp: [<server>]` 軸が依然として per-server gate を効かせる。 server install（= `.reyn/config/mcp.yaml` への write）は 1 段階の grant になるが、 specific server を使う段階で再度 per-server check が走るため、 server package の download + execute は call-time gate の範疇に収まる — **この範囲には `mcp_install` 自身の pre-commit probe も含む（#3552）**: 修正前は config が authoritative になる COMMIT の *前* に、 probe（live connect + `list_tools`）が model/plugin 供給の server 名へ無条件に到達しており、 その probe 自体は `require_mcp` を一度も経由しなかった — "install は config を書くだけ、 実権限は use 時" という前提が、 probe という自分自身の pre-commit network reach には効いていなかった。 probe 内部で `require_mcp`（同じ interactive "Allow access to MCP server X?" 承認 + `ContextualLayer` narrowing）を先に呼ぶことで、 install-probe 時点の reach も use 時点の reach と同じ gate を通るようになった。
+- **cron の per-job 粒度は減る**: 「`.reyn/config/cron.yaml` に書ける」 の 1 段階に集約される。 ただし cron 発火で起動されるワークフローは実行時に自身の permission gate を再度通るため、 下流の保護は bypass されない。
+- **index の per-source 粒度は減る**: post-write gate に相当するものはない。 drop は destructive op であり、 per-source 区別は security ではなく operator UX の話だったので、 粒度減は accept する。
+
+### `allowed_mcp` は ACL filter であって capability ではない
+
+`allowed_mcp` は capability を grant しない — すでに grant 済の `mcp` server list の **subset を agent ごとに restrict** する。 ACL filter は capability 軸と cross-cut する別系統。
+
+## Trust boundary レイヤー
+
+side-effect を実行する surface を強制力の強い順に:
+
+```
+┌────────────────────────────────────────────────────────────────────┐  ← 最強
+│  sandboxed_exec op (FP-0017)                                       │
+│    OS-kernel 強制（Seatbelt / Landlock / Seccomp）                 │
+│    per-call で argv-scoped / network-scoped / fs-scoped            │
+├────────────────────────────────────────────────────────────────────┤
+│  python step（常に safe; FP-0042）                                 │
+│    AST validation（= compile-time に `import os` 等を reject）     │
+│    + reyn.api.safe.* honor-system による per-call path check       │
+│    kernel sandbox なし、 subprocess は user UID で動作             │
+├────────────────────────────────────────────────────────────────────┤
+│  reyn パッケージ内部（op handler / registry client）               │
+│    skill code と同じ `reyn.api.safe.*` primitive を、 呼び出し     │
+│    起点 skill の PermissionDecl に対して使用                       │
+└────────────────────────────────────────────────────────────────────┘
+```
+
+- **最上層 (sandboxed_exec)** は OS-kernel 強制を持つ唯一のレイヤー。 argv / network / fs scope を per-call で declarative 宣言、 platform sandbox が強制。
+- **内部 OS code** はワークフローコードと同じ `reyn.api.safe.*` primitive を、 呼び出し起点ワークフローの PermissionDecl に対して使う。 inside / outside の区別はない — OS は自身の permission 機構を一様に使う。
+- **python step** は常に safe-mode で honor system: AST validation が `import os` を弾き、 `reyn.api.safe.*` が宣言済 path / host / key を check する。 通常の author が accidentally bypass することはないが、 metaprogramming を使う motivated な author はなお escape できるため、 真の境界は subprocess 分離と `run_op` / `reyn.api.safe.*` サーフェスの permission gate。 unsandboxed mode は存在しない: `mode: unsafe` の宣言はロード時に reject される。 生の host アクセスが本当に必要な step は、 その I/O を `run_op` に分離する。
+
+## 業界比較 {#industry-comparison}
+
+| Platform | 宣言 shape | runtime ask | 粒度 | 強制レイヤー |
+|---|---|---|---|---|
+| iOS (TCC + Entitlements) | `Info.plist` capability + purpose string | First-use prompt | Capability axis | OS kernel + signed entitlements |
+| Android (≥ M) | `AndroidManifest.xml` `uses-permission` | dangerous tier に first-use prompt | Permission class + scoped storage | OS kernel + per-app UID |
+| Web Permissions API | feature ごとに query | per-permission prompt | Origin-scoped（= per-domain capability）| Browser sandbox |
+| Anthropic Claude Code | Tool list（Bash / Edit / Read / Write）| デフォルトでは無、 sandbox-mode で opt-in | Tool 名（path scope なし）| Seatbelt（sandbox-mode）または trust |
+| MCP servers | server side で tool list 公開 | server がオーナーシップ | per-tool、 server 定義 | プロセス境界 |
+| **Reyn** | `permissions:` ブロック（list 軸主体、 bool は `shell` のみ）| startup_guard + first-use interactive | per-path / per-host / per-server（resource scope）| safe-mode は AST + `reyn.api.safe.*` honor system / `sandboxed_exec` のみ kernel |
+
+Reyn は iOS / Android の 「capability + first-use prompt」 主流から 2 軸で乖離する:
+
+1. **粒度は業界標準より細かい** — list 軸の path / host / server scope は iOS / Android の capability axis より Web の origin-scope に近い。 正当化: Reyn のワークフローは目的特化コード（= 作者が inventory を知る）、 iOS / Android app は general-purpose。
+2. **safe-mode python の強制は honor system** — iOS / Android は kernel boundary、 Reyn は AST validation + path / host / key の check を `reyn.api.safe.*` primitive 経由で行う。 Trade-off: 実装簡素（= per-step seatbelt セットアップ不要） vs 強制の弱さ。
+
+## Collapse arc（#571）
+
+上の軸 taxonomy は target state。 パーミッション監査で、 旧設計が `mcp_install` / `mcp_drop_server` / `cron_register` / `index_drop` の 4 つの bool 軸を持っており、 これらが `file.write` 軸と重複していることが識別された — side-effect はいずれも canonical な `.reyn/*.yaml` への write に reducible で、 そして `reyn.api.safe.file.write` 経由で到達可能であったため、 bool 軸は新たな capability を gate するのではなく既存 capability を二重 gate していた。 Collapse arc はこれを段階的に除去する:
+
+| Phase | scope | 状態 |
+|---|---|---|
+| 1 | 本 doc — 「permission is an OS I/O primitive」 と collapse map を articulate | 本 PR |
+| 2 | `op_runtime` handler（= `mcp_install` / `mcp_drop_server` / `cron_register` / `index_drop`）を `reyn.api.safe.file.write` 経由化、 loader compat shim で bool 形式と list 形式を両方受け付け | 後続 PR |
+| 3 | `http.get: [{host}]` 軸（= `reyn.api.safe.http.*` を per-host gate）と `secret.write: [<key>]` 軸（= `~/.reyn/secrets.env` write を per-key gate）を新設 | 後続 |
+| 4 | stdlib ワークフロー全体を明示 list 形式に移行 | 後続 |
+| 5 | bool 軸（`mcp_install` 等）と `require_mcp_install` / `require_cron_register` / `require_index_drop` / `require_mcp_drop_server` を OS surface から撤去 | 後続 |
+
+Phase 1–4 の間、 bool 形式（= `mcp_install: true`）は compat shim として受け付けられ、 暗黙的に等価な list 軸 decomposition に展開される。 Phase 5 で bool 形式は撤去される。
+
+### Phase 7 — prompt-timing model 統一 + `safe.http` / `web_fetch` collapse
+
+Phase 7 は `http.get` 軸を `file.write` と同じ prompt model に揃えて alignment を仕上げる:
+
+- **Specific declared host**（`http.get: [{host: "api.github.com"}]`）— `startup_guard` が `<skill, host>` ごとに 1 回 operator に prompt し、 結果を approvals.jsonl に `<skill>/http.get/<host>` で persist。 runtime は silent。 default zone 外 path に対する `file.write` と同 pattern。
+- **Wildcard**（`http.get: [{host: "*"}]` または `["*"]`）— host が write-time に不明（= LLM が runtime に決める、 例: `web_search` 結果 URL を `web_fetch` で follow）なので、 prompt は `require_http_get` 内の実 host gate で fire。 persistence key も同形 `<skill>/http.get/<host>`、 ALWAYS / NEVER は per-host で効く。
+- **宣言なし** — legacy `web.fetch` compat path + `DeprecationWarning`、 segmented migration window 期間中。 Tier-1 default-allow に依存していた既存ワークフローはそのまま動く。
+
+`web_fetch` op handler は legacy `require_web_fetch` でなく `require_http_get` 経由化、 chat router の PermissionDecl は `http.get: [{host: "*"}]` 宣言で LLM-driven fetch を wildcard branch に流す。 `reyn.api.safe.http` subprocess path は preprocessor で wildcard entry を strip — sync subprocess は prompt 不可なので wildcard host fetch は `web_fetch` op route 必須。
+
+これで 2 surface（`safe.http` ワークフロー内部 + `web_fetch` LLM-driven）が 1 軸 + 1 prompt model に統一される。 browser extension `host_permissions`（= 宣言 + install-time prompt）+ Web Permissions API（= runtime per-feature prompt）の合成 pattern に対応 — [業界比較](#industry-comparison) 参照。
+
+| 観点 | Pre-Phase-7 | Post-Phase-7 |
+|---|---|---|
+| `safe.http` ワークフロー内部 | per-host decl、 runtime silent、 prompt なし | specific decl 不変、 wildcard 拒否（= subprocess prompt 不可）|
+| `web_fetch` LLM-driven | Tier-1 default-allow、 4-layer per-URL prompt | `http.get` 軸経由、 chat router decl が wildcard を carry して挙動保持 |
+| Operator prompt 粒度 | per-URL（`web.fetch` key）| per-host（`<skill>/http.get/<host>` key）— ALWAYS で 1 host 全 URL カバー |
+| ワークフロー作者の LLM fetch scope 制御 | なし | specific host 宣言で LLM の fetch 範囲を制限可能（= 宣言 host のみ allow、 wildcard 不在 = fallback なし）|
+| Legacy `web.fetch: allow` / `deny` config | 直接 gate | migration window 中、 `require_http_get` 内で backward-compat alias として honored |
+
+## `python` パーミッションと `mode: safe` allowlist
+
+python ステップは常にサンドボックス化されます。`python` パーミッションは 1 段階です:
+
+| 段階 | 設定キー | 許可する内容 |
+|-------|-----------|----------------|
+| `safe` | `python.safe: allow` | `PURE_STDLIB_ALLOWLIST` に含まれるモジュールのみ import 可能なステップ — clock、entropy、純粋計算、および `__future__`（コンパイラディレクティブ）。ファイルシステム・ネットワーク・プロセスへのアクセス不可。 |
+
+`PURE_STDLIB_ALLOWLIST` は `src/reyn/core/kernel/_python_allowlist.py` で定義されています。`__future__` はコンパイラディレクティブとして一覧に含まれており、ランタイムのケイパビリティを持ちません。
+
+unsandboxed 段階は存在しません: `mode: unsafe` を宣言するステップは、actionable なエラーと共にロード時に reject されます。生の host アクセス（ファイルシステム・ネットワーク・プロセス起動）が必要なステップは、その I/O を `run_op` ステップ（独自の permission gate と event-log エントリーを持つ）に分離します。
+
+**非インタラクティブ自動許可**: 非インタラクティブなコンテキスト（intervention bus 未配線）では、safe モードの python ステップはプロンプトなしで自動許可されます。これは CI 実行で他の op に既に適用されている非インタラクティブ動作と同等です。
+
+**`mode: safe` の形式的契約**（= "ambient sources only"）は allowlist の根拠・生の I/O を `run_op` ステップに分離するリファクタリングパターンを網羅しています。
+
+## クレデンシャルスコーピング（トリガーポイントは削除済み）
+
+FP-0016 Component D は、当時 `run_skill` op（現在は削除済み）経由で spawn されるサブスキルに対する
+呼び出し単位のクレデンシャルスコーピングを導入しました: サブスキルは自身が宣言した
+`required_credentials` にスコープされ、親のスコープと交差した `ScopedSecretStore` を受け取る
+（Confused Deputy 対策）という仕組みでした。そのトリガーポイントは `run_skill` と共に
+消滅しており(#2104)、現在他のどの呼び出し箇所も `ScopedSecretStore` を構築していません
+— `security/secrets/store.py` の `ScopedSecretStore` / `CredentialScopeError` クラス自体は
+まだ存在しますが、`OpContext.secret_store` は現行ランタイムで常に `None` です。現在
+クレデンシャルスコーピングの enforcement は機能していません。シークレットアクセスは
+[`secret.write` 宣言軸](#宣言軸の-taxonomy) と `~/.reyn/secrets.env` に対する
+OS レベルのファイルパーミッションでのみゲートされています。
+
+## パーミッションシステムではないもの
+
+- **Linux ケイパビリティサンドボックスではありません。** Python ステップの subprocess は同じユーザーとして実行され、AST allowlist は honor-system です。reyn はカーネルをサンドボックス化しません（そのレイヤーは `sandboxed_exec`）。
+- **シークレットの保管庫ではありません。** 認証情報を approvals.jsonl に入れたり、パーミッションで環境変数を隠そうとしないでください。認証情報には [コンセプト: シークレット管理](../runtime/secret-handling.md) を使用してください。
+- **ユーザーに対する保護ではありません。** `reyn.yaml` で `permissions: exec: allow` とした場合、exec を承認したことになります。このシステムは意図せずケイパビリティが増大することを防ぐものであり、ユーザーの意図を防ぐものではありません。
+
+## 参考
+
+- [Reference: permissions](../../reference/config/permissions.md) — 完全なスキーマ
+- [Reference: reyn.yaml](../../reference/config/reyn-yaml.md) — `permissions:` キー。現行の MCP install ゲート（`file.write` + `http.get`）を含む
+- [Reference: state-dir](../../reference/config/state-dir.md) — `.reyn/approvals.jsonl`
+- [コンセプト: シークレット管理](../runtime/secret-handling.md) — 認証情報のストレージ（`~/.reyn/secrets.env`）
+- [Reference: `reyn mcp`](../../reference/cli/mcp.md) — `install` サブコマンドとそのパーミッションゲート
+- [How-to: manage permissions](../../guide/for-users/manage-permissions.md)

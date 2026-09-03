@@ -1,0 +1,242 @@
+"""Tier 2: Session invariant — intervention dispatch/resolve hits the WAL.
+
+PR-intervention-link L3. The session-level wrappers
+``_dispatch_intervention`` / ``_deliver_answer_to`` must route through the
+SnapshotJournal so WAL ``intervention_dispatched`` / ``intervention_resolved``
+events are emitted. Without these, an in-flight intervention can't survive a
+crash.
+
+Invariants:
+  - dispatch fires ``intervention_dispatched`` with a serialized iv_dict
+    BEFORE the future await blocks (so a crash mid-await leaves the WAL
+    with the dispatch on disk).
+  - successful answer fires ``intervention_resolved``.
+  - unknown-choice answer does NOT fire resolve (intervention still pending).
+  - drop_for_run fires resolve for each dropped iv (snapshot prune).
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+from pathlib import Path
+
+import pytest
+
+from reyn.core.events.state_log import StateLog
+from reyn.runtime.session import Session
+from reyn.user_intervention import (
+    InterventionChoice,
+    UserIntervention,
+)
+from tests._async_wait import wait_until  # noqa: E402 — shared #1751 test wait helper
+from tests._support.agent_session import make_session
+
+# ---------------------------------------------------------------------------
+# Helpers (mirror tests/runtime/test_session_invariants.py pattern)
+# ---------------------------------------------------------------------------
+
+
+def _make_session(tmp_path: Path, *, agent_name: str = "alpha") -> Session:
+    """Build a Session redirected to ``tmp_path`` via public kwargs.
+
+    issue #254 Phase 1: register a placeholder listener so the registry's
+    ``enforce_listener_presence=True`` short-circuit does not fire — these
+    tests dispatch interventions and verify WAL persistence, treating the
+    test itself as the listener that will resolve via ``deliver_answer``.
+    """
+    session = make_session(
+        agent_name=agent_name,
+        state_log=StateLog(tmp_path / "state.wal"),
+        snapshot_path=tmp_path / f"{agent_name}_snapshot.json",
+    )
+    session.register_intervention_listener("test")
+    return session
+
+
+def _iv(*, run_id: str | None = None, choices: list[InterventionChoice] | None = None,
+        prompt: str = "Q?", kind: str = "ask_user") -> UserIntervention:
+    iv = UserIntervention(
+        kind=kind, prompt=prompt, run_id=run_id, choices=choices or [],
+    )
+    iv.future = asyncio.get_running_loop().create_future()
+    return iv
+
+
+def _wal_events(tmp_path: Path) -> list[dict]:
+    log = StateLog(tmp_path / "state.wal")
+    return list(log.iter_from(0))
+
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dispatch_intervention_appends_wal_before_await(tmp_path, monkeypatch):
+    """Tier 2: ``intervention_dispatched`` lands on disk before the future awaits.
+
+    Crash-safety invariant: a crash mid-await must leave the WAL with the
+    dispatch event so resume can re-enqueue. We verify by inspecting the
+    WAL file after the dispatch coroutine has yielded (= the await is
+    blocking on the future).
+    """
+    monkeypatch.chdir(tmp_path)
+    session = _make_session(tmp_path)
+
+    iv = _iv(run_id="rA", prompt="What's your name?")
+    task = asyncio.ensure_future(session._dispatch_intervention(iv))
+    # Wait until the dispatch durably appends intervention_dispatched. #1751: the
+    # append fsyncs via to_thread, so a fixed sleep(0) no longer covers it.
+    await wait_until(
+        lambda: any(e["kind"] == "intervention_dispatched" for e in _wal_events(tmp_path))
+    )
+
+    events = _wal_events(tmp_path)
+    dispatched = [e for e in events if e["kind"] == "intervention_dispatched"]
+    assert dispatched, (
+        f"expected intervention_dispatched in WAL while awaiting; "
+        f"got {[e['kind'] for e in events]}"
+    )
+    ev = dispatched[0]
+    assert ev["intervention_id"] == iv.id
+    assert ev["target"] == "alpha"
+    iv_dict = ev["iv_dict"]
+    assert iv_dict["kind"] == "ask_user"
+    assert iv_dict["prompt"] == "What's your name?"
+    assert iv_dict["run_id"] == "rA"
+    assert "future" not in iv_dict
+
+    # Resolve and clean up
+    iv.future.set_result(None)
+    await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_deliver_answer_appends_intervention_resolved(tmp_path, monkeypatch):
+    """Tier 2: successful answer → ``intervention_resolved`` in WAL."""
+    monkeypatch.chdir(tmp_path)
+    session = _make_session(tmp_path)
+
+    iv = _iv(prompt="Free text?")
+    task = asyncio.ensure_future(session._dispatch_intervention(iv))
+    # Wait until the dispatch has registered the pending iv (#1751: its WAL append
+    # now fsyncs via to_thread; sleep(0) would answer before the iv is pending).
+    await wait_until(lambda: bool(session.interventions.list_active()))
+
+    consumed = await session._maybe_answer_oldest_intervention("Alice")
+    assert consumed is True
+    # Let the dispatch coroutine resume past `await iv.future` and run its
+    # finally clause where ``record_intervention_resolved`` fires.
+    await asyncio.gather(task, return_exceptions=True)
+
+    # #2279: ``record_intervention_resolved`` is a FIRE-AND-FORGET WAL append (async-decoupled
+    # durability, #2259) — drain the worker so the raw file read below is deterministic. The
+    # pre-existing ``wait_until`` polls the IN-MEMORY pending state, NOT the resolved WAL event, so
+    # it is a FALSE barrier here; ``flush()`` is the bounded-by-construction one (root of the 3.12
+    # flake: the read raced the append's durability).
+    await session.journal.flush()
+    events = _wal_events(tmp_path)
+    resolved = [e for e in events if e["kind"] == "intervention_resolved"]
+    assert resolved, "intervention_resolved must be emitted after successful answer"
+    assert resolved[0]["intervention_id"] == iv.id
+    assert resolved[0]["target"] == "alpha"
+
+
+@pytest.mark.asyncio
+async def test_unknown_choice_does_not_emit_resolved(tmp_path, monkeypatch):
+    """Tier 2: unknown-choice answer leaves the intervention pending — no resolve."""
+    monkeypatch.chdir(tmp_path)
+    session = _make_session(tmp_path)
+
+    choices = [
+        InterventionChoice(id="yes", label="[Y]es", hotkey="y"),
+        InterventionChoice(id="no", label="[N]o", hotkey="n"),
+    ]
+    iv = _iv(choices=choices, prompt="Confirm?")
+    task = asyncio.ensure_future(session._dispatch_intervention(iv))
+    # Wait until the dispatch has registered the pending iv (#1751: its WAL append
+    # now fsyncs via to_thread; sleep(0) would answer before the iv is pending).
+    await wait_until(lambda: bool(session.interventions.list_active()))
+
+    consumed = await session._maybe_answer_oldest_intervention("invalid")
+    assert consumed is True  # consumed but not resolved
+
+    # #2279: the ``wait_until`` above polled IN-MEMORY pending, not the WAL — so drain the worker
+    # before the raw read to make ``intervention_dispatched`` durability deterministic (else racy).
+    await session.journal.flush()
+    events = _wal_events(tmp_path)
+    dispatched = [e for e in events if e["kind"] == "intervention_dispatched"]
+    resolved = [e for e in events if e["kind"] == "intervention_resolved"]
+    assert dispatched, "intervention_dispatched must be present in WAL"
+    assert resolved == [], (
+        f"unknown-choice answer must NOT emit resolve; got {resolved}"
+    )
+
+    # Now resolve correctly to clean up
+    await session._maybe_answer_oldest_intervention("y")
+    await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_outstanding_interventions_in_snapshot_after_dispatch(tmp_path, monkeypatch):
+    """Tier 2: snapshot file on disk reflects the dispatched intervention.
+
+    Crash-recovery invariant: a process restart reads the snapshot file
+    and sees outstanding_interventions populated, ready to be re-enqueued.
+    """
+    monkeypatch.chdir(tmp_path)
+    session = _make_session(tmp_path)
+
+    iv = _iv(run_id="rZ", prompt="Persisted?")
+    task = asyncio.ensure_future(session._dispatch_intervention(iv))
+    # Snapshot path is the one passed via the public kwarg in _make_session
+    snap_path = tmp_path / "alpha_snapshot.json"
+
+    # Wait until the dispatch's snapshot save has persisted the iv to disk (#1751:
+    # the intervention_dispatched WAL append it follows now fsyncs via to_thread,
+    # so a fixed sleep(0) no longer covers it).
+    def _snapshot_has_iv() -> bool:
+        if not snap_path.is_file():
+            return False
+        raw = json.loads(snap_path.read_text())
+        return iv.id in raw.get("outstanding_interventions", {})
+
+    await wait_until(_snapshot_has_iv)
+
+    assert snap_path.is_file(), "snapshot must be persisted to disk"
+    raw = json.loads(snap_path.read_text())
+    outstanding = raw.get("outstanding_interventions", {})
+    assert iv.id in outstanding
+    assert outstanding[iv.id]["prompt"] == "Persisted?"
+
+    iv.future.set_result(None)
+    await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_wal_read_without_flush_races_durability_the_root(tmp_path, monkeypatch):
+    """Tier 2: #2279 the DETERMINISTIC mechanism-falsify (why the flush barrier is required).
+
+    A WAL append is FIRE-AND-FORGET (async-decoupled durability, #2259): it is enqueued to the
+    durability worker and is NOT on disk until the worker drains. A raw file read IMMEDIATELY after
+    — with NO await and NO flush — cannot see it (no yield = no drain), which is exactly the race the
+    flaky intervention tests hit (assert-read before the resolved append is durable; 3.12 scheduling
+    just widens the window). ``flush()`` drains the worker → durable → the read is deterministic.
+
+    Version-independent + scheduling-independent: RED (empty) before flush, GREEN after — the proof
+    that the fix is a structural barrier, not a hard-to-reproduce 3.12 nondeterminism.
+    """
+    monkeypatch.chdir(tmp_path)
+    session = _make_session(tmp_path)
+    # Fire-and-forget the exact append the flaky test asserts on.
+    session.journal._wal_append_nowait(
+        "intervention_resolved", target="alpha", intervention_id="iv-x",
+    )
+    # RAW read with no await / no flush → the worker has not drained → NOT durable yet (the race).
+    before = [e for e in _wal_events(tmp_path) if e["kind"] == "intervention_resolved"]
+    assert before == [], "read-before-flush: a fire-and-forget append is not yet durable (the race root)"
+    # The flush barrier → drain → durable → deterministic read.
+    await session.journal.flush()
+    after = [e for e in _wal_events(tmp_path) if e["kind"] == "intervention_resolved"]
+    assert after and after[0]["intervention_id"] == "iv-x", "flush() makes the append durable"

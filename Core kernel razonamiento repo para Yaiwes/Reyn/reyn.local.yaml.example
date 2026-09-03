@@ -1,0 +1,1440 @@
+# =============================================================================
+# Local environment overrides — exhaustive example template
+#
+# Copy this file to ``reyn.local.yaml`` (which is gitignored) and uncomment the
+# blocks you want to set. Any field omitted falls back to (a) ``reyn.yaml`` if
+# the project sets it, (b) ``~/.reyn/config.yaml`` for user-global defaults,
+# (c) the built-in defaults declared in ``src/reyn/config/root.py``.
+#
+#   cp reyn.local.yaml.example reyn.local.yaml
+#
+# Sections are ordered to mirror ``ReynConfig`` field order so a future
+# version-sync diff against ``src/reyn/config/root.py`` is straightforward.
+#
+# API keys are NEVER stored in YAML. Set them as environment variables — the
+# variable name is determined by the LiteLLM provider prefix in ``models:``:
+#
+#   export OPENAI_API_KEY=sk-...
+#   export ANTHROPIC_API_KEY=sk-ant-...
+#   export GEMINI_API_KEY=...
+#
+# Secrets that don't fit the per-provider env-var pattern (= ``GITHUB_TOKEN``,
+# ``LANGFUSE_SECRET_KEY``, etc.) can live in ``~/.reyn/secrets.env``;
+# they are auto-loaded into ``os.environ`` before YAML is parsed, so any
+# ``${VAR}`` reference below resolves transparently.
+#
+# Two kinds of section below (#4174 T6 — labeling only, no key/structure change):
+#
+#   REGISTRY  named-entry collections a running session can also grow at
+#             runtime (install a skill, register an MCP server, ...) — marked
+#             "[registry]" on their section header below. Of the 9:
+#             ``mcp`` / ``cron`` / ``hooks`` / ``skills`` / ``pipelines`` /
+#             ``presentations`` also live under ``.reyn/config/<name>.yaml``
+#             and are re-read at the turn boundary without a restart (the
+#             hot-reload IN-set, #2073) — new entries written there merge
+#             LAST and win on a name collision with what's declared here.
+#             ``composers`` / ``external_transports`` / ``auth`` are
+#             registry-shaped (named entries) but currently load from this
+#             file only — same restart-only cadence as a POLICY key, until
+#             something adds a ``.reyn/config/`` counterpart for them.
+#   POLICY    everything else — single-value or structural settings read
+#             ONCE at startup from this file (``reyn.yaml`` / this file /
+#             ``~/.reyn/config.yaml``); changing one needs a restart.
+#
+# The registry/policy split is load-bearing in ``config/loader.py``'s
+# ``_HOT_RELOAD_FILES``, whose own comment states it plainly: "the file-split
+# IS the write-gate boundary (owner-confirmed #2073)". Unmarked sections
+# below are policy.
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# output_language: forced LLM reply language (chat router enforces strictly).
+# Unset (default) → no directive added (= LLM follows user message language).
+# Examples: "ja", "en"
+# -----------------------------------------------------------------------------
+# output_language: ja
+
+
+# -----------------------------------------------------------------------------
+# llm: the LLM-layer domain — model selection (#4174 T3: model / models /
+# model_class_by_purpose / api_base / prompt_cache_enabled moved here from
+# top-level keys of the same name) + litellm.Router resilience (#1829) +
+# self-retry backoff timing (#1835).
+#
+# llm.model: default model class when --model is not specified on the CLI.
+# Built-in default: "standard".
+#
+# llm.models: model-class → LiteLLM model string. A class reference (no "/")
+# resolves against the built-in catalog or ``reyn.yaml`` ``llm.models:``; a
+# string containing "/" is passed through to LiteLLM as-is.
+#
+# An entry may also be a MAPPING. ``model`` is the only required key; every
+# other key except ``extends`` / ``api_base`` / ``provider`` is forwarded to
+# ``litellm.acompletion`` unchanged and unvalidated (a typo therefore surfaces
+# as a litellm failure, not a reyn config error). Full field table:
+# docs/reference/config/reyn-yaml.md § `llm` block.
+#
+# The passthrough is also the escape hatch for when litellm does not RECOGNISE
+# a model (``my-new-model`` below). Litellm fetches its model catalog over the
+# network at import and falls back to the copy bundled in the package when that
+# fetch fails; a model too new to appear in the bundled copy is then treated as
+# unknown, and litellm rejects parameters it would otherwise allow:
+#
+#   litellm.UnsupportedParamsError: openai does not support parameters:
+#   ['tool_choice'], for model=<your-model>
+#
+# Because this depends on whether that fetch succeeded, the same config can work
+# on one run and fail on the next. Naming the parameters carries them through
+# the check either way. Prefer that over litellm's other suggestion,
+# ``drop_params: true`` — that one DISCARDS the rejected parameter rather than
+# passing it, silently changing behaviour (dropping ``tool_choice`` changes how
+# the model calls tools).
+#
+# ``stream`` is the exception to the passthrough: it is a REYN field, consumed
+# by the streaming decision and never forwarded to litellm. Reyn normally
+# decides per call by asking litellm whether the model can stream; ``stream:``
+# is your answer and it wins in both directions — ``true`` streams whatever the
+# catalog says, ``false`` never streams. Omit it to leave the decision to reyn.
+#
+# You will need it more often than that sounds. Reyn pins litellm's model table
+# to the snapshot bundled with the installed package (to avoid a startup network
+# fetch), so a model newer than that snapshot is simply absent from it. Absence
+# is not a statement that the model cannot stream — reyn no longer treats it as
+# one — but where the table is actively wrong, this is how you say so.
+#
+# ``stream_options`` is still rejected at load: it has no reyn meaning, and as a
+# passthrough kwarg it reaches the collect-whole branch and makes litellm return
+# a stream object that reyn reads as a finished reply, surfacing as an error
+# naming neither the key nor the config:
+#
+#   EmptyLLMResponseError: LLM returned a 200 response with empty choices
+#   (model=...); provider response: <...CustomStreamWrapper object...>
+#
+# llm.model_class_by_purpose: per-purpose model-class override (#1672). Reyn
+# makes internal LLM calls beyond the main reply, each tied to a purpose
+# (router / control_ir / tool / judge). By DEFAULT every purpose follows
+# `llm.model` (no hidden cheaper tier). Override a purpose here; an unset
+# purpose falls back to `llm.model`. The per-turn router is a common cost
+# knob — opt into a cheaper class explicitly. `compaction` is NOT a valid key
+# (#3785) — compaction always follows the conversation's active model; a
+# config that still sets it fails to load.
+#
+# llm.model_max_class: operator-declared CEILING (#4206 T1) on the model
+# class any call may use (light/standard/strong, same order every tier list
+# uses) — restrict-only, reject-not-clamp (same shape as
+# `sandbox.max_timeout_seconds`'s LLM-extensible ceiling). Unset (default) =
+# unbounded. A call whose resolved class exceeds this is REJECTED before
+# litellm is ever touched, naming the actual ceiling in the error.
+#
+# llm.router: litellm.Router provider-resilience (#1829). DEFAULT OFF
+# (use=false → direct litellm.acompletion, byte-identical to no-Router).
+# When on, the Router owns infra-exception retry (with native Retry-After
+# respect), per-deployment cooldown, and a cross-model fallback chain — no
+# self-implemented retry/cooldown/fallback. `use` / `num_retries` supersede the
+# legacy REYN_LLM_USE_ROUTER / REYN_LLM_ROUTER_NUM_RETRIES env vars (which remain
+# a back-compat fallback when this block is absent).
+#
+# llm.retry: backoff timing for the Reyn self-retry layer (#1835).
+#
+# llm.api_base: LiteLLM proxy / direct provider base URL. Empty (default) →
+# providers' own endpoints. A local proxy is the most common override.
+#
+# llm.prompt_cache_enabled: when true (default), attach Anthropic-style
+# ``cache_control`` markers to the system prompt so providers that support
+# prompt caching (Anthropic, AWS Bedrock Claude) can reuse the prefix across
+# calls. Ignored by providers that don't recognize the marker.
+# -----------------------------------------------------------------------------
+# llm:
+#   model: standard
+#   models:
+#     light:    openai/gpt-4o-mini
+#     standard: claude-sonnet            # built-in catalog reference
+#
+#     strong:                            # mapping form
+#       model: anthropic/claude-3-7-sonnet
+#       temperature: 0.0
+#       max_completion_tokens: 16000     # preferred over max_tokens
+#
+#     my-new-model:
+#       model: some-model-too-new-for-litellm
+#       allowed_openai_params: ["tool_choice"]
+#       stream: true                     # reyn field — the catalog has no row to read
+#   model_class_by_purpose:
+#     router: light            # cheaper per-turn router (explicit opt-in)
+#     # control_ir / tool / judge unset → follow `model`
+#   model_max_class: standard  # ceiling — a call resolving to "strong" is rejected
+#   router:
+#     use: false             # master switch (REYN_LLM_USE_ROUTER fallback)
+#     num_retries: 3         # infra-exception retries (Retry-After aware)
+#     fallbacks:             # primary model → ordered fallback model list
+#       openai/gpt-4o-mini:
+#         - openai/gpt-3.5-turbo
+#     cooldown_time: 60      # seconds a deployment is cooled down after failures
+#     allowed_fails: 2       # failures before a deployment is cooled down
+#     credentials:           # credential rotation — multiple keys per model.
+#       openai/gpt-4o-mini:  # Reference ENV-VAR NAMES only; NEVER inline a key.
+#         - api_key_env: OPENAI_API_KEY_1   # each usable key → one deployment;
+#         - api_key_env: OPENAI_API_KEY_2   # the Router rotates / fails over.
+#     retry_policy:          # per-exception-type retry counts (overrides num_retries
+#                            # for the matched exception class). Absent → litellm
+#                            # defaults (num_retries applies uniformly).
+#       RateLimitErrorRetries: 5
+#       TimeoutErrorRetries: 3
+#       # Supported: BadRequestErrorRetries, AuthenticationErrorRetries,
+#       #   ContentPolicyViolationErrorRetries, InternalServerErrorRetries
+#   retry:                   # backoff timing for the Reyn self-retry layer (#1835)
+#     jitter: true           # equal jitter (AWS): sleep=base/2+uniform(0,base/2).
+#                            # Prevents thundering herd on parallel-chain retries.
+#     respect_retry_after: true  # honour provider Retry-After header on 429/503.
+#                            # Caps the wait at llm_retry_max_backoff (16 s).
+#                            # Falls back to jittered backoff when header absent.
+#   api_base: http://localhost:4000
+#   prompt_cache_enabled: true
+
+
+# -----------------------------------------------------------------------------
+# permissions: pre-approved permission grants — same structure as phase
+# frontmatter ``permissions:`` block, but value is always ``allow``. Lets the
+# operator pre-approve specific tools so the router doesn't gate them at
+# runtime.
+#
+# Shape: a dotted kind key mapped to the flat string ``allow`` (or the
+# nested ``file: {write: allow}`` form). The config permission layer is
+# NON-glob — it does not accept path-glob dicts. Categories:
+#   shell             — pre-approve all shell ops
+#   file.delete       — pre-approve file-delete ops
+#   file.write        — pre-approve all file-write ops (flat kind grant, non-glob)
+#   python.safe       — pre-approve the python preprocessor's safe mode
+#                       (the chat router uses this — already set in reyn.yaml)
+#   mcp.<server>      — pre-approve a specific MCP server's tool surface
+#                       (e.g. `mcp.<server-name>: allow` — see the nested
+#                       `mcp: {<server-name>: allow}` form below; also
+#                       settable per-server via .reyn/approvals.yaml's
+#                       `mcp.<server-name>: true`, written by the chat
+#                       session's own interactive approval prompt — see
+#                       docs/reference/config/permissions.md).
+#                       `reyn pipe run` auto-grants any MCP server it finds
+#                       already CONFIGURED (.reyn/config/mcp.yaml / this
+#                       file's own `mcp.servers`) — this block is only
+#                       needed for a server NOT yet configured, or to
+#                       override that default (e.g. an explicit per-server
+#                       `deny` here is never auto-overridden).
+# -----------------------------------------------------------------------------
+# permissions:
+#   shell: allow
+#   file.delete: allow
+#   python.safe: allow
+#   mcp:
+#     github: allow   # grant this MCP server's tools
+#
+# Headless / benchmark pre-approval: benchmark Agents are constructed with
+# ``intervention_bus=None`` (= ``reyn eval benchmark ...``), so any permission
+# the skill declares (e.g. swe_bench's ``file.write``) raises a RuntimeError on
+# the first control_ir op instead of asking the user. Pre-approve the kind here
+# to clear the prompt — main ``reyn.yaml`` is intentionally left alone (= chat
+# sessions have a bus and CAN ask interactively, so this stays a local /
+# headless-only concern):
+#
+# permissions:
+#   file.write: allow
+#
+# The value MUST be the flat string ``allow`` (= same shape as the
+# checked-in ``reyn.yaml``'s ``python.safe: allow``). The config
+# permission layer is NON-glob: it only recognises a dotted key mapped
+# to ``allow`` / ``deny`` (or the nested ``file: {write: allow}`` form).
+# A glob dict like ``file.write: {"*": allow}`` is NEVER matched by the
+# loader (``_is_config_approved``) and silently fails closed — the
+# benchmark would still hit a permission RuntimeError at the first
+# ``file.write`` op.
+#
+# ``file.write: allow`` grants the whole write-class kind (write / edit
+# / delete) for all skills. If you need a tighter, path-scoped grant,
+# that lives in a different layer (the startup-approval / saved-approval
+# mechanism that records specific paths), not in this config block.
+
+
+# -----------------------------------------------------------------------------
+# mcp: [registry] Model Context Protocol server registry.
+#
+# Two locations write to this section:
+#   - ``reyn.yaml`` / ``reyn.local.yaml`` — operator hand-edited entries
+#   - ``.reyn/mcp.yaml``                  — runtime-managed entries
+#                                           merged LAST; new installs win.
+#
+# Per-server entry (kept as a raw dict so new transport options can be added
+# without OS changes per P7):
+#   type:    "stdio" | "streamable-http" | "sse"   (required transport selector)
+#   command, args, env, cwd             (stdio)
+#   url, headers, timeout               (streamable-http / sse)
+#
+# ``headers`` supports ``${VAR}`` interpolation so secrets stay out of YAML.
+#
+# ``mcp.search_threshold``: number of MCP tools at or
+# above which ``build_tools()`` switches from inlining every tool schema to
+# Anthropic's ``tool_search_tool`` (deferred-loading mode). Default 30 (= Spring AI
+# experiment shows 63–64% token reduction at 40+ tools). Set 0 to disable.
+# (Internally the ``ReynConfig.mcp_search_threshold`` field — set it via the
+# ``mcp.search_threshold`` key here, not a top-level ``mcp_search_threshold:``.)
+#
+# ``mcp.registries``: a list of external registry URLs. Propagated
+# into ``REYN_MCP_REGISTRY_URLS`` so the subprocess-side safe registry resolver
+# inherits it. URLs may be discovery endpoints for fetching server manifests.
+# -----------------------------------------------------------------------------
+# mcp:
+#   search_threshold: 30
+#   registries:
+#     - https://mcp-registry.example.com/v1
+#   servers:
+#     github:
+#       type: streamable-http
+#       url: https://api.githubcopilot.com/mcp/
+#       headers:
+#         Authorization: "Bearer ${GITHUB_TOKEN}"
+#         X-API-Version: "2024-01-01"
+#     local-files:
+#       type: stdio
+#       command: uvx
+#       args: ["mcp-server-filesystem", "/home/me/projects"]
+#       env:
+#         LOG_LEVEL: info
+
+
+# -----------------------------------------------------------------------------
+# skills: [registry] skill registry — raw dict passed to build_skill_registry at
+# session/router construction. Absent/empty (default) → no skills registered
+# beyond whatever a skill directory scan finds elsewhere. Merged across
+# config tiers by name (explicit entries win on collision).
+#
+#   entries.<name>.path:        "skills/foo/SKILL.md"
+#   entries.<name>.description: one-line description (optional)
+#   entries.<name>.enabled:     true (default) | false — false drops the
+#                                entry from the registry outright
+#   entries.<name>.visibility:  menu (default) | on_demand | hidden — which
+#                                discovery surface the skill reaches: menu =
+#                                the L1 system-prompt Skills menu; on_demand =
+#                                the skill_list tool only (no standing token
+#                                cost); hidden = no model-facing surface.
+# -----------------------------------------------------------------------------
+# skills:
+#   entries:
+#     my-skill:
+#       path: "skills/my-skill/SKILL.md"
+#       description: "One-line description"
+#       enabled: true
+#       visibility: menu
+
+
+# -----------------------------------------------------------------------------
+# pipelines: [registry] pipeline registry — raw dict passed to build_pipeline_registry
+# at session-factory time. Pipelines are registered PURELY via explicit
+# ``pipelines.entries`` declarations (a *.yaml file with no config entry is
+# invisible to every session). Absent/empty (default) → no pipelines loaded.
+# Merged across config tiers by name (explicit entries win on collision) —
+# same union-merge shape as ``skills`` above.
+#
+#   entries.<key>.path:        "pipelines/hello.yaml" — parsed via
+#                               parse_pipeline_docs (a file may hold multiple
+#                               pipeline: documents)
+#   entries.<key>.description: one-line description (optional)
+#   entries.<key>.enabled:     true (default) | false
+#
+# The config entry key is a pure namespace label — every pipeline registers
+# as {key}.{declared-name} regardless of the key's own text.
+# -----------------------------------------------------------------------------
+# pipelines:
+#   entries:
+#     hello_cli:
+#       path: "pipelines/hello.yaml"
+#       description: "One-line description"
+#       enabled: true
+
+
+# -----------------------------------------------------------------------------
+# agent_id: runtime identity used in audit events and the
+# ``X-Reyn-Agent-Id`` outbound HTTP header.
+# Default: ``reyn/<hostname>``. Set explicitly for multi-agent fleets.
+# (#4174 T5: flattened from ``agent: {id: ...}`` — a namespace with one
+# field — to this plain top-level scalar.)
+# -----------------------------------------------------------------------------
+# agent_id: reyn/dogfood-laptop-01
+
+
+# -----------------------------------------------------------------------------
+# delegation: cross-agent delegation policy (#2081).
+# ``capability_default`` selects the capability floor a DELEGATED agent (one
+# spawned by another agent's delegation, recursively) receives when otherwise
+# unbound by a topology capability_profile:
+#   inherit (default) — inherit the spawner's surface (byte-identical to pre-#2081)
+#   deny              — an unbound delegate is narrowed by the built-in restrictive
+#                       _delegate profile (re-delegation / exec / memory-write /
+#                       MCP-install denied) unless a topology binding re-grants it
+#                       (the binding REPLACES the default). Propagates recursively
+#                       to sub-delegates (no laundering).
+# -----------------------------------------------------------------------------
+# delegation:
+#   capability_default: inherit
+
+
+# -----------------------------------------------------------------------------
+# auth: [registry, restart-only — see the header note above] OAuth provider configurations consumed by
+# ``reyn auth login``. Each entry maps a provider name to its OAuth 2.0
+# device authorization grant parameters. ``client_secret`` is optional for
+# public clients (= PKCE flow); ``audience`` is Auth0-specific.
+# -----------------------------------------------------------------------------
+# auth:
+#   providers:
+#     github:
+#       client_id: "1234abcd"
+#       device_authorization_url: https://github.com/login/device/code
+#       token_url: https://github.com/login/oauth/access_token
+#       scopes: [repo, "user:email"]
+#     google:
+#       client_id: "...apps.googleusercontent.com"
+#       client_secret: ${GOOGLE_OAUTH_SECRET}
+#       device_authorization_url: https://oauth2.googleapis.com/device/code
+#       token_url: https://oauth2.googleapis.com/token
+#       scopes: [openid, email]
+
+
+# -----------------------------------------------------------------------------
+# chat.compaction: Head/Body/Tail chat-history compaction policy.
+#
+# Ratio-based budget allocation: each ratio is a fraction of the model's main
+# context pool (= T_max - T_SP). The four ratios must sum to ≤ 1.0; this is
+# asserted at engine init.
+#
+# Legacy fields (``trigger_total_tokens``, ``head_size``, ``tail_size``,
+# ``body_token_cap``, ``min_compact_batch``, ``section_token_caps``) still
+# drive the background ``_maybe_compact()`` path that fires after each reply.
+#
+# Weight dicts (``component_weights`` / ``section_weights``) enable fine-grained
+# tuning. Use them when the default 10/5/15/10 split needs adjusting for
+# unusual workloads.
+# -----------------------------------------------------------------------------
+# chat:
+#   compaction:
+#     # ratio-based budget (sum must be ≤ 1.0):
+#     head_ratio: 0.10
+#     body_ratio: 0.05
+#     tail_ratio: 0.15
+#     new_msg_ratio: 0.10
+#     section_caps_spec_tokens: 100
+#     use_chars4_estimate: false        # true = len(text)//4 (latency opt-out)
+#     # Legacy / background-trigger path:
+#     trigger_total_tokens: 30000
+#     head_size: 12
+#     tail_size: 12
+#     body_token_cap: 1500
+#     min_compact_batch: 5
+#     resummarize_passes: 1            # #271: LLM re-compression passes on topic_arc
+#                                      # overshoot before the hard_truncate floor (0 = skip)
+#     max_schema_reprompt_attempts: 1  # #4883: bounded re-prompt budget when the
+#                                      # compaction JSON response has an empty/missing
+#                                      # topic_arc (0 = raise immediately). #4951-B:
+#                                      # new_turn_seqs no longer gates this — the key
+#                                      # was removed from the schema/prompt entirely.
+#     recovery_policy: next_turn        # #5296: 413 recovery stop-line for
+#                                      # irreversible compaction only; spill is
+#                                      # triggered by the constraint itself.
+#     max_shrink_iterations: 8         # #4957: retry_loop's own safety cap — an
+#                                      # ESCAPE VALVE for a slow-to-converge overflow
+#                                      # recovery, not a cure. Raising it only delays
+#                                      # exhaustion if the underlying cause (a
+#                                      # persistent 413/5xx/rate-limit) never
+#                                      # resolves; it does not fix that cause.
+#     section_token_caps:
+#       topic_arc: 200
+#       decisions: 400
+#       pending: 400
+#       session_user_facts: 200
+#       artifacts_referenced: 300
+#
+# chat.reasoning: model reasoning/"thinking" text handling (#1652). Capture of
+# the provider reasoning_content is always-on; these knobs gate what happens
+# afterwards (both default ON). See docs/reference/config/reyn-yaml.md.
+#   reasoning:
+#     continuity: true        # persist reasoning to history + replay recent turns'
+#                             #   reasoning into the next prompt (cross-turn
+#                             #   continuity). false = disable persist+replay.
+#     display: true           # surface reasoning in the UI (TUI + web,
+#                             #   collapsible). false = hide. Independent of continuity.
+#     recent_turns: 3         # how many recent turns' reasoning to replay.
+#                             #   <= 0 (e.g. 0 / -1) = unbounded (keep all).
+
+# chat.render_mode: interactive chat renderer/driver on a TTY (#3273). A non-TTY
+# session (piped / CI / no real terminal) always falls back to `plain`.
+# See docs/reference/config/reyn-yaml.md.
+#   render_mode: alt-screen   # alt-screen (default) | inline | plain | auto
+#                             #   alt-screen = full-screen (recommended; scrollback
+#                             #     auto-saved/restored on enter/exit).
+#                             #   inline = legacy bounded driver, keeps scrollback
+#                             #     in place BUT carries upstream resize/collapse
+#                             #     bugs (#3285/#3286) — escape hatch only.
+#                             #   plain = force plain renderer (= --cui).
+#                             #   auto = alt-screen on a TTY.
+
+# chat.gutters: the TTY conversation pane's two gutter columns (#3352). Each
+# costs its width on EVERY row, taken off the conversation body. These flags set
+# what the pane OPENS with; `ctrl+g` (left) / `ctrl+t` (right) toggle either one
+# at runtime — a keypress is session-scoped and never written back here, so set
+# these for a lasting preference. See docs/reference/config/reyn-yaml.md.
+#   gutters:
+#     left: true              # left state-marker gutter (2 cols) shown at start
+#     right: true             # right elapsed/turn-token gutter (12 cols) at start
+
+# chat.neutralize_body: opt-in ESC/OSC-control-sequence strip on the
+# agent-reply / tool-result BODY text (#3318). Off by default — "UX/
+# predictability over security, security is opt-in". LLM-derived choice
+# labels and intervention prompts are ALWAYS neutralized regardless of this
+# flag (#3302); this widens the same terminal neutralizer to conversation
+# body content, where a raw ESC/OSC sequence from tool output or an
+# untrusted model reply could otherwise reach the terminal.
+#   neutralize_body: false
+
+# chat.image_url_schemes: opt-in narrowing of which URL schemes `present`'s
+# `image` component will fetch (#3846). Default [] = unrestricted (both
+# http and https are fetched) — owner ruling: "even without the bytes, the
+# record of what was presented is enough". Set to restrict to a subset,
+# e.g. ["https"] to reject plain http. Any scheme outside {http, https} is
+# always rejected regardless of this list (nothing else is fetchable).
+#   image_url_schemes: []
+
+# chat.empty_stop_retry: opt-in retry of an empty router response (#4677).
+# When the LLM returns finish_reason="stop" with no content and no tool
+# calls (a provider-level glitch, observed at ~50% rate with weak models),
+# reyn can resend ONE "resume" continuation prompt. Owner default is now
+# false (2026-08-14) — was hardcoded true with no config knob at all,
+# after an incident where 30 empty-response detections in one reyn-self
+# run each cost a second LLM call. Set true to restore the retry — a
+# measured benefit exists for some environments (Trace-patch-replay:
+# 0/10 -> 10/10 narration recovery on a specific case), particularly with
+# weaker/local models (Qwen/LM Studio/Ollama/vLLM/LiteLLM-fronted setups
+# have reported this shape). This does NOT fix empty responses themselves
+# (root cause unmeasured, #3698's anyio cancel-scope is a candidate) — it
+# only changes what happens after one is detected.
+#   empty_stop_retry: false
+
+# chat.theme: override the interactive TUI's Textual theme name (#4840 ③,
+# the config-knob half — the colour direction itself was decided
+# separately and already shipped, #4869/#4875). Default (unset) keeps
+# reyn's own full-colour theme ("reyn"). Any name Textual resolves is
+# accepted — reyn's own registered theme, or any of Textual's built-ins
+# (nord / dracula / gruvbox / catppuccin-mocha / textual-dark / ansi-dark
+# / …). Not validated here — an unknown name raises where Textual itself
+# resolves it, not at config-load time.
+#   theme: nord
+
+# chat.stream_repaint_min_interval: seconds between two repaints of the SAME
+# streamed reply in the TUI (#3570's budget, made reachable). Default 1/30 is
+# a knee measured on one terminal (2000 deltas / 60 KB reply: set_item
+# 1979 -> 75, wall-clock 16.1 s -> 3.3 s). A slower terminal (SSH, tmux) has a
+# different knee — raise this there. Text is never lost: the accumulation is
+# unconditional and a catch-up timer bounds every deferral. 0 or negative
+# falls back to the default rather than repainting on every delta.
+#   stream_repaint_min_interval: 0.1
+
+
+# -----------------------------------------------------------------------------
+# audit_events: audit-log rotation + automatic purge policy (#4174 T5:
+# renamed from ``events:`` — bare "event" is ambiguous in reyn, and this
+# block was always audit-event only). Chat events land under
+# ``.reyn/events/agents/<name>/chat/<YYYY-MM>/`` and rotate when EITHER the
+# active file exceeds ``max_bytes`` OR the file's age (or local date) exceeds
+# ``max_age_seconds``.
+#
+# Automatic purge (#4479, owner ruling 2026-08-13): EITHER axis firing
+# deletes old files — ``cleanup_period_days`` OR ``max_disk_usage_percent``,
+# whichever is touched first (not ``and`` — disabling one axis must not
+# silently disable the other). Runs fire-and-forget, off the event loop, at
+# session start and at rotation; ``reyn events purge`` remains available for
+# a manual/explicit run.
+#
+# ``cleanup_period_days`` (default 30): files whose filename date is older
+# than this many days are purge targets. Practice, not measurement — no
+# local-CLI precedent measures ``.reyn/events``'s own growth rate; 30
+# borrows the nearest comparable tool's own default (Claude Code's own
+# ``cleanupPeriodDays``).
+#
+# ``max_disk_usage_percent`` (default 10): once the events directory's own
+# total size exceeds this percent of the filesystem's CURRENT free space,
+# oldest files are purged until back under. Relative, not absolute — an
+# absolute byte ceiling would need reyn's own measured growth rate to set
+# safely (unmeasured); 10 borrows systemd-journald's own ``SystemMaxUse``
+# convention for the same reason.
+#
+# ``0`` on EITHER axis disables that axis (all retention, on that axis,
+# forever) — documented plainly here on purpose: Claude Code carries an
+# open report of its own ``cleanupPeriodDays`` knob being ambiguous about
+# what ``0`` means, and this is that precedent deliberately not repeated.
+#
+# ``backend`` (#4496, default "local"): where audit-events are WRITTEN.
+# "local" (default) is unchanged from before this field existed. "discard"
+# (sink-null) writes nothing to disk — subscriber delivery (TUI/AG-UI,
+# hooks, OTEL) and the per-emitter ``audit_seq`` continuity (#4496 PR-1)
+# are UNCHANGED either way, but ``reyn events replay`` / support-bundle /
+# dogfood_trace have nothing to read for a discard run. "network" is not
+# yet a valid value (falls back to "local") — its on-failure semantics
+# are an open design question tracked in #4496.
+#
+# ``agent_delta_coalesce_fragments`` / ``agent_delta_coalesce_interval_ms``
+# (#4960, architect ruling C, defaults 100 / 2000): ``agent_delta`` (one
+# audit-event per streamed reply chunk) is durably written once per this
+# many fragments OR this many milliseconds, whichever comes first, per
+# streaming chain — plus one final record when a stream ends (success,
+# exception, or cancellation; ``RouterLoop.run()``'s own ``finally``).
+# Live TUI/AG-UI delivery is UNAFFECTED — every fragment still dispatches
+# to subscribers unthrottled; this only throttles the durable write.
+# Measured (2000-delta/60KB real streamed reply,
+# ``agent_delta_include_text=true``): unthrottled, ``agent_delta`` was
+# 99.4% of that run's audit file bytes — this figure assumes ``text`` is
+# being written; with ``agent_delta_include_text``'s default (``false``,
+# below), a coalesced record's bytes are smaller and this percentage
+# does not apply as measured. The fragment count governs under normal
+# bursty streaming (measured up to ~1000
+# fragments/s); the interval's PRIMARY role is a process-level death
+# (SIGKILL / OOM-kill / host crash) that the terminal flush cannot catch
+# (a Python ``finally`` never runs then) — the terminal flush itself only
+# covers a SHORT interruption (exception/cancel/normal completion) that
+# ends before either threshold above is reached. See
+# ``src/reyn/core/events/backend.py``'s own module-level constants for
+# the full rationale.
+#
+# ``agent_delta_include_text`` (#4666, owner ruling, default false): a
+# SEPARATE knob from the two above — those govern how OFTEN a durable
+# ``agent_delta`` record is written, this governs whether that record
+# carries the reply's own CONTENT (its ``text`` field). Off (default):
+# the durable record keeps ``chain_id``/``round_index``/
+# ``coalesced_fragment_count``/``audit_seq`` but drops ``text`` — mirrors
+# the OpenTelemetry GenAI convention that prompt/output content is
+# opt-in, default metadata-only. Live TUI/AG-UI delivery and
+# ``history.jsonl`` are UNAFFECTED either way — this only governs the
+# durable write. ``LocalEventBackend.declare_gaps()`` names this gap only
+# while off. ⚠️ Default-behavior change, 2026-08-21: before this field
+# existed, ``text`` was always durably recorded, unconditionally — set
+# this to ``true`` if your workflow depends on that.
+#
+# ``completed_response_include_text`` (#4666②, owner ruling, default
+# false): a SEPARATE knob from ``agent_delta_include_text`` above AND
+# ``user_input_include_text`` below (same verbatim owner instruction: one
+# toggle must never cover more than one content opt-in) — gates the
+# completed model→user text instead of the streaming fragments:
+# ``agent_response_committed`` (new kind — the terminal reply,
+# force-close/wrap-up text, tool_calls-round accompanying text) and
+# ``user_intervention_requested``'s ``question``/``suggestions``/
+# ``options`` (the model's ``ask_user`` question — covered here because
+# it is text the MODEL directed at the user, the same content type
+# ``agent_response_committed`` covers; owner ruling: one knob per
+# content TYPE). ``user_intervention_received``'s ``answer`` (the
+# user's reply to that question) is a DIFFERENT content type and is
+# necessarily gated by ``user_input_include_text`` below instead, not
+# this field — toggling one without the other durably records one side
+# of the exchange but not the other, a deliberate per-operator choice,
+# not a defect. Both events fire unconditionally; off (default),
+# ``LocalEventBackend.write()`` drops only the free-text field(s) —
+# ``chain_id``/``intervention_id`` are always kept. Live TUI/AG-UI
+# delivery and any opt-in OTEL subscriber are UNAFFECTED either way.
+# This field ALSO governs ``ask_user``'s ``question`` on
+# ``tool_called.args`` (#4666 item ③b, a per-tool content-field
+# declaration the dispatcher consults — closes the dispatcher-level
+# leak a PR review found; see ``user_input_include_text`` below for
+# the matching ``answer`` half). See
+# ``docs/reference/runtime/events.md`` for the full commit-point
+# census.
+#
+# ``user_input_include_text`` (#4666 item ③, default false): a THIRD,
+# separate knob — the two above govern the AGENT's own output, this one
+# governs a USER's own typed/chosen text. Covers 6 kinds (AST census —
+# an earlier pass found 3 and undercounted): ``user_submitted`` /
+# ``user_message_received`` (``text``), ``intervention_answer_submitted``
+# (``text``), ``user_answered_intervention`` (``answer_text``),
+# ``user_intervention_received`` (``answer``), ``router_retry_exhausted``
+# (``user_message``, already truncated to 200 chars at the emit site
+# regardless of this flag). No coalescing here — each event is still
+# written individually; off drops only that one content field, every
+# other field on the kind (``chain_id``/``intervention_id``/``msg_id``/
+# etc.) still records that a submission/answer happened. Live subscriber
+# delivery and ``history.jsonl`` are UNAFFECTED either way.
+# ⚠️ Default-behavior change, 2026-08-21: before this field existed,
+# these 6 kinds' content was always durably recorded, unconditionally.
+# This field ALSO governs ``ask_user``'s ``answer`` on
+# ``tool_returned.result`` (#4666 item ③b: a per-tool "this field is
+# conversation content" declaration, ``reyn.core.dispatch.
+# content_declarations`` — closes the dispatcher-level leak where
+# ``ask_user``'s question/answer reached the audit log via the generic
+# ``tool_called``/``tool_returned`` kinds unconditionally, bypassing ②③
+# entirely). Scope, measured, not extended by guess: only ``ask_user``
+# declares any field today; ``mcp_called.args`` was measured and
+# excluded (an MCP tool's args are model-decided call parameters, the
+# same class as any other tool's args, not a dedicated question/answer
+# channel like ``ask_user``'s). A tool that shows the user free text and
+# forgets to declare it leaks that text silently — see
+# ``src/reyn/core/dispatch/content_declarations.py``'s own module
+# docstring for the full disclosure.
+#
+# ``provider_body_include_text`` / ``provider_body_max_chars`` (#4975,
+# architect ruling (c), default false / 4000): gates ``llm_request_error``'s
+# ``provider_body``/``provider_response`` (a provider's own error-response
+# body, which can quote back request content of any of the 3 content
+# classes above — reyn does not control the shape of a provider's own
+# response, so it cannot tell in advance which class a given quote would
+# be). Showing either field requires a LATTICE-MEET: ALL of
+# ``agent_delta_include_text`` AND ``completed_response_include_text`` AND
+# ``user_input_include_text`` above AND this field's own opt-in — the
+# narrowest participant wins, same "compose_resolved is a lattice-meet"
+# idiom this repo's permission resolution already uses. When the meet
+# holds, the field is kept but capped at ``provider_body_max_chars``
+# (``_truncated`` added only when the cap actually cut something).
+# ``error_type``/``status_code`` are always recorded unconditionally;
+# ``provider_body_length``/``provider_response_length`` are also always
+# recorded when a body existed, gate-independent, so "existed but hidden"
+# stays distinguishable from "genuinely absent". Whether providers
+# actually echo conversation content in their error bodies is a separate,
+# unmeasured question tracked in #4975's own issue — this knob only
+# builds the permission surface for when that's confirmed.
+# -----------------------------------------------------------------------------
+# audit_events:
+#   max_bytes: 10485760              # 10 MB
+#   max_age_seconds: 86400           # 1 day
+#   cleanup_period_days: 30          # 0 = never auto-delete by age
+#   max_disk_usage_percent: 10       # 0 = never auto-delete by size
+#   backend: local                   # local | discard
+#   agent_delta_coalesce_fragments: 100     # durable write every N streamed chunks
+#   agent_delta_coalesce_interval_ms: 2000  # or every T ms, whichever first
+#   agent_delta_include_text: false         # keep the reply's own content in the durable record?
+#   completed_response_include_text: false  # keep the completed reply / ask_user question in the durable record?
+#   user_input_include_text: false          # keep the user's own words in the durable record?
+#   provider_body_include_text: false       # keep a provider's own error-response body/text? (lattice-meet, see above)
+#   provider_body_max_chars: 4000           # cap on the kept provider_body/provider_response, when shown
+
+
+# -----------------------------------------------------------------------------
+# artifacts: the artifact-ref table fallback's own row cap (#4601). A
+# remote client's (and a local client right after a restart's, #4584)
+# Artifacts pane consults this durable, append-only, persist-tier table
+# when its live conversation view carries nothing — with no cap of its
+# own it would return an ever-growing, unbounded list. ``remote_fallback_limit``
+# (default 50) caps it to the N newest entries; the pane's own disclosure
+# text still names the full count ("newest N of M") so a truncation is
+# never silent. This is a UX-scale default (how many rows a human would
+# ever scroll through), not a performance one (a single stat() costs
+# order-microseconds) — raise it if your own Artifacts pane usage wants
+# more history visible at once.
+# -----------------------------------------------------------------------------
+# artifacts:
+#   remote_fallback_limit: 50
+
+
+# -----------------------------------------------------------------------------
+# storage: the PROJECT-wide (cross-session) cap on .reyn/memory/history-content/
+# (#5366) — the offloaded tool-result content EVERY session in this project
+# writes. Unlimited (off) by default: no max_bytes at all. A DIFFERENT number
+# from MediaStoreConfig's own per-store history_content_max_bytes (that one
+# bounds a SINGLE session's own directory as a fail-safe; this one bounds the
+# WHOLE tree across every session — the number an operator can actually name,
+# since nobody chooses how many sessions get spawned). ``pin`` names AGENT
+# names (not session ids) whose own content is NEVER an eviction candidate,
+# regardless of process liveness.
+# -----------------------------------------------------------------------------
+# storage:
+#   max_bytes: 10737418240   # 10 GiB; omit (or leave unset) for unlimited
+#   pin: []                  # e.g. ["coder-smith"] — these agents' content is never evicted
+
+
+# -----------------------------------------------------------------------------
+# observability: downstream OpenTelemetry (OTLP) export. OPT-IN and OFF by
+# default — with no ``observability.otel.endpoint`` (and no
+# ``OTEL_EXPORTER_OTLP_ENDPOINT`` env var) the exporter is never attached and
+# behavior is byte-identical to having no OTEL. This is a LOSSY, fire-and-forget
+# downstream: it maps P6 audit-events to OTLP spans/metrics/logs off-loop and
+# fail-open, and NEVER touches the durable ``.reyn/events`` + WAL recovery
+# Source-of-Truth. Requires the OTEL SDK: ``pip install reyn[observability]``.
+#
+# ``capture_content``: SR3 privacy gate. Default ``false`` = refs + token/cost
+# counts only, never a raw prompt/response body in a span or log. Set ``true``
+# to opt into GenAI content capture (only against a trusted collector).
+# -----------------------------------------------------------------------------
+# observability:
+#   otel:
+#     endpoint: "http://localhost:4318"   # OTLP HTTP base URL; "" = not attached
+#     headers:                            # optional per-request headers
+#       Authorization: "Bearer ${OTEL_TOKEN}"
+#     service_name: "reyn"                # service.name resource attribute
+#     capture_content: false              # SR3: raw prompt/response OFF by default
+
+
+# -----------------------------------------------------------------------------
+# cost: budget / rate-limit policy. Each ``CostLimitConfig`` has a
+# ``hard_limit`` (null = unlimited), ``warn_ratio`` (= warn when usage hits
+# this fraction), and ``extension_calls`` (= per-grant extension amount;
+# ``> 0`` opts the dimension into the unified ``safety.on_limit`` flow — the
+# exceed behaviour, ask vs auto-extend vs deny, follows ``safety.on_limit.mode``
+# since #1877; the old per-dimension ``ask_on_exceed`` bool was removed).
+#
+# ``rate_limit_per_minute`` maps model-class → cap on calls per rolling minute.
+# ``rate_limit_warn_ratio`` (default 0.8) controls when the warning fires.
+# -----------------------------------------------------------------------------
+# cost:
+#   per_agent_tokens:
+#     hard_limit: null
+#     warn_ratio: 0.8
+#     extension_calls: 0
+#   per_agent_cost_usd:
+#     hard_limit: null
+#   daily_tokens:
+#     hard_limit: 2000000
+#     extension_calls: 1
+#   daily_cost_usd:
+#     hard_limit: 25.0
+#   monthly_tokens:
+#     hard_limit: null
+#   monthly_cost_usd:
+#     hard_limit: 500.0
+#   rate_limit_per_minute:
+#     standard: 60
+#     strong:   20
+#   rate_limit_warn_ratio: 0.8
+
+
+# -----------------------------------------------------------------------------
+# cost_warn: high-cost model pre-selection awareness (#1830 / FP-0052).
+# Surfaces a [⚠ high-cost model: …] marker in the conv pane when the
+# resolved model's input cost per 1M tokens exceeds the threshold.
+# Fires at /model switch and at session startup (once per model per session).
+# Orthogonal to `cost:` budget caps (= cumulative spend) and
+# ContextBudgetAdvisor (= token ceiling).
+# -----------------------------------------------------------------------------
+# cost_warn:
+#   enabled: true
+#   model_threshold_per_1m_input_usd: 5.0  # warn above $5/1M input tokens
+#   block_on_high_cost: false  # #1867: when true, a /model switch to a high-cost
+#                              # model is held for an interactive confirm (unified
+#                              # safety framework) and applies only on approval; a
+#                              # non-interactive session fail-closes (switch denied).
+#                              # Session startup stays warn-only regardless.
+
+
+# -----------------------------------------------------------------------------
+# offload: opt-in switch for ALL tool-result size gates (tool-result-schema-
+# redesign §5). OFF by default — offloading a large tool result to a file ref
+# only helps if the model reads the ref back, and mid-tier models often act on
+# the truncated preview instead, degrading the result. So by default every
+# tool result is delivered in full and the format (frontmatter + text) is the
+# same either way. Opt in with enabled=true for the cost reduction of
+# capping/offloading large tool results (the text token cap, the structured
+# inline cap, and the media follow-up budget bound); when a single tool result
+# is very large, opting in also prevents an oversized turn.
+# -----------------------------------------------------------------------------
+# The size bounds are tunable too (#3580) — previously the only lever was the
+# boolean and every bound was a fixed constant, so "cap, but less aggressively"
+# was unexpressible. Each defaults to its former constant and falls back
+# independently, so setting one does not reset the rest. All apply only while
+# enabled: true.
+#
+# NOTE max_inline_bytes also feeds the turn budget's force-close reserve (what
+# the OS holds back for "one more increment"), so lowering it lets a turn run
+# longer before force-close fires — it is not only a preview bound.
+# -----------------------------------------------------------------------------
+# offload:
+#   enabled: true                     # opt in to the size gates (default: false)
+#   max_inline_bytes: 16384           # ceiling on what a capped text result leaves inline
+#   preview_head_chars: 6000          # how much of the head that inline keeps
+#   preview_tail_chars: 2000          # …and the tail
+#   cap_ceil_tokens: 4096             # upper clamp on the per-turn token cap
+#   cap_alpha: 0.5                    # budget-relative term of that cap
+#   structured_inline_max_chars: 2000 # size at which a dict/list gets its own ref
+#   structured_preview_chars: 600     # how much of it stays inline beside the ref
+
+
+# -----------------------------------------------------------------------------
+# render_template: output bounds for the render_template op (FP-0055 / #2679).
+# The op renders a Jinja2 template against data into a string; the sandbox blocks
+# template injection but not resource exhaustion, so output is capped DURING
+# generation (a runaway {% for i in range(10**9) %} is truncated, not OOM'd).
+# Omit the block to keep the safe defaults below (behaviour unchanged); raise for
+# a large report, lower to harden a shared host. A non-positive/non-numeric value
+# falls back to that field's default.
+# -----------------------------------------------------------------------------
+# render_template:
+#   max_output_chars: 256000   # streaming char budget — truncate past this
+#   wall_clock_seconds: 5.0    # elapsed-time backstop for a runaway loop
+
+
+# -----------------------------------------------------------------------------
+# read_cap: the per-result inline cap for file.read / load_skill (#4381 PR-5,
+# architect design). A RESOURCE BOUND — unit is BYTES, model-INDEPENDENT
+# (never scaled by the resolved model's context window), protecting memory/
+# transfer, not the model's token budget (that's a separate, budget-bound
+# concern: offload/compaction/reactive-shrink). Omit the block to keep the
+# 10 KiB default below (unchanged behaviour); a non-positive/non-numeric
+# value falls back to that default too.
+#
+# Why 10 KiB: both file.read (char_offset, #4432) and load_skill (defers to
+# read_file(offset=next_offset), #4431) gained a resume mechanism the same
+# night this default was set — a truncated read loses at most one
+# round-trip, not the rest of the content, which is what makes a small
+# default a safe default rather than an arbitrary one.
+# -----------------------------------------------------------------------------
+# read_cap:
+#   inline_bytes: 10240   # 10 KiB — ceiling on a single inline read/load result
+
+
+# -----------------------------------------------------------------------------
+# history_resident: caps Session.history's in-memory footprint (#4387 Phase B
+# ③, #4431's role split). A RESOURCE BOUND — unit is BYTES, model-INDEPENDENT,
+# same role as read_cap above (never the same axis as the on-demand backward-
+# read window, which is in LINES — deliberately kept separate). Omit the
+# block to keep the 256 MiB default below; a non-positive/non-numeric value
+# falls back to that default too.
+#
+# Eviction is NOT information loss: anything evicted stays durable in
+# history.jsonl and reloads on demand via the already-shipped backward-
+# hydrate path (TUI scrollback paging / search / WAL rewind visibility) —
+# it only bounds what stays resident in memory.
+# -----------------------------------------------------------------------------
+# history_resident:
+#   max_bytes: 268435456   # 256 MiB — ceiling on Session.history's resident size
+
+
+# -----------------------------------------------------------------------------
+# image: the fixed row height (in terminal rows/cells) every present-rendered
+# inline image (reyn's own HalfBlockImage renderable, #4474) is shown at.
+# Width is derived from this to preserve the image's real aspect ratio —
+# HalfBlockImage takes an explicit width/height in cells with no
+# aspect-ratio derivation of its own. Omit the block to keep the 20-row
+# default below; a non-positive/non-numeric value falls back to that
+# default too.
+#
+# Why this is operator-configurable rather than a bare constant: the "right"
+# row count is a function of YOUR OWN terminal height and how much
+# scrollback you want a photo to occupy — not something reyn can decide for
+# every environment. 20 is a shipped default (tall enough for real photo
+# detail, short enough not to dominate a typical terminal), not a measured
+# "correct" number.
+# -----------------------------------------------------------------------------
+# image:
+#   row_height_cells: 20   # fixed height every inline image is rendered at
+
+
+# -----------------------------------------------------------------------------
+# tui: operator-tunable inline-TUI presentation thresholds (#4542). Today
+# just the status bar's Telemetry segment (model / agent / cost / context%):
+# the percent at which context-window usage escalates from a bare number
+# (16%) to a labelled one (ctx 82%). Omit the block to keep the 80 default
+# below; a non-numeric value or one outside 0-100 falls back to that default
+# too.
+#
+# Why this is operator-configurable rather than a bare constant: 80 is a
+# shipped default (a plain, unsurprising round number), not a measured
+# "correct" threshold for every operator's own risk tolerance or model/
+# context window — same discipline as image.row_height_cells above.
+# -----------------------------------------------------------------------------
+# tui:
+#   context_usage_warn_percent: 80   # ctx% at/above this gets the "ctx" label
+
+
+# -----------------------------------------------------------------------------
+# tool_use: the chat-layer tool-use scheme x transport selector (#1593;
+# FP-0066 P4b, #3247). ``scheme`` is the PRESENTATION axis (category /
+# enumerate-all / retrieval — how capabilities are shown/discovered);
+# ``transport`` is how the model expresses the chosen action (tool_calls /
+# content_fence). Default: scheme=enumerate-all, transport=tool_calls (#1657
+# — flat-listing actions stops invoke_action name-hallucination). Set
+# scheme=universal-category for a minimal-surface / many-tool catalog
+# (discover-then-call), or scheme=enumerate-all + transport=content_fence for
+# CodeAct (actions expressed as code, not native tool calls). scheme=category +
+# transport=content_fence combines the two: actions expressed as code over the
+# minimal wrapper surface, so the code-API does not grow with the catalog —
+# for a weak model on a large catalog, where CodeAct's full enumeration costs
+# too much. scheme=retrieval + transport=content_fence is the search-first
+# code-API: search_actions / describe_action / invoke_action and NO
+# list_actions, so the model describes what it wants instead of browsing; it
+# needs embedding.enabled: true, and it does the narrowing inside one snippet
+# rather than paying the re-present round trip the tool_calls retrieval cell
+# pays. Every combination of the axis values above is implemented — a pair
+# naming a scheme or transport reyn does not have fails loud at config-parse
+# time.
+#
+# universal_wrappers_enabled: (#4552 PR-3 — moved here from
+# action_retrieval.universal_wrappers_enabled; architect's ruling, a
+# tool_use/presentation-scheme property, not a retrieval setting). True
+# (default) exposes the 4 universal wrappers (list_actions / search_actions
+# / describe_action / invoke_action) whenever scheme resolves to
+# universal-category (= scheme: category above); has no effect under any
+# other scheme.
+# -----------------------------------------------------------------------------
+# tool_use:
+#   scheme: universal-category
+#   transport: tool_calls
+#   universal_wrappers_enabled: true
+
+
+# -----------------------------------------------------------------------------
+# voice: ⚠️ CURRENTLY UNAVAILABLE. This block still parses (no error if set),
+# but has no consumer — it was built for the Ctrl+R Whisper binding in the
+# old Textual TUI, which was deleted and replaced by the inline CUI (which has
+# no voice-input binding). Kept here for schema completeness only; setting
+# these fields today has no effect. See docs/concepts/tools-integrations/voice.md.
+# -----------------------------------------------------------------------------
+# voice:
+#   enabled: true
+#   model: small                # tiny | base | small | medium | large-v3
+#   language: ja                # "" or null = auto-detect
+#   device: cpu                 # cpu | cuda
+#   compute_type: int8          # int8 | float16 | float32
+#   sample_rate: 16000
+#   cpu_threads: 4
+#   num_workers: 1
+#   max_duration_s: 300.0       # auto-cancel recordings longer than this
+
+
+# -----------------------------------------------------------------------------
+# project_context_path: path (relative to project root) of a markdown file
+# whose content is injected into the system prompt for every phase. Default
+# ``"REYN.md"``. Users sharing the project with Claude Code may set this to
+# ``"CLAUDE.md"`` to reuse the same source. Set ``""`` or point at a missing
+# file to disable.
+# -----------------------------------------------------------------------------
+# project_context_path: REYN.md
+
+
+# -----------------------------------------------------------------------------
+# embedding: RAG embedding settings.
+#
+# ``enabled`` is the provider/cost gate — ONE meaning only (#4156): may reyn
+# call an embedding provider at all. OFF by default. Until you set it, the
+# embedding-backed semantic-discovery layer stays dark. Plain ``list_*``
+# discovery and the load / read / invoke verbs are unaffected either way.
+#
+#   embedding:
+#     enabled: true
+#     index:
+#       actions: true          # default — the ~10-entry action/mcp/pipeline catalog
+#       repo_knowledge: false  # default — the repo-wide knowledge index (#4156)
+#
+# ``index.*`` decides WHAT gets embedded, given ``enabled: true`` (#4156 —
+# split out of ``enabled`` after a 5M-TPM incident: an operator opting into
+# the ~10-entry action catalog for ``search_actions`` was also silently
+# opting into an unconditional, repo-size-proportional knowledge-index
+# build). ``index.actions`` defaults ON (negligible TPM); ``index.
+# repo_knowledge`` defaults OFF (the workload that caused the incident) —
+# set it ``true`` explicitly if you want ``knowledge_repo_doc``/
+# ``knowledge_repo_src`` built.
+#
+# Off by default because embedding needs a provider and costs money per call —
+# a predictable-safe default, not an oversight. With it on, the built-in
+# classes cover the common OpenAI path, so ``pip install reyn`` +
+# ``OPENAI_API_KEY`` needs no further edits.
+#
+# Built-in classes:
+#   light, standard → openai/text-embedding-3-small
+#   strong          → openai/text-embedding-3-large
+#   local-mini      → sentence-transformers/all-MiniLM-L6-v2
+#   local-e5        → sentence-transformers/intfloat/multilingual-e5-small
+#
+# ``local-*`` classes require ``pip install 'reyn[local-embed]'``; without
+# the extras they raise ImportError at first ``embed()`` call (= the
+# ``search_actions`` visibility gate falls back to hidden gracefully).
+# -----------------------------------------------------------------------------
+# embedding:
+#   enabled: true                 # ← provider/cost gate; index.* below decides what gets built
+#   index:
+#     actions: true                 # default
+#     repo_knowledge: false         # default
+#   default_class: standard
+#   classes:
+#     light:    openai/text-embedding-3-small
+#     standard: openai/text-embedding-3-small
+#     strong:   openai/text-embedding-3-large
+#     local-mini:
+#       model: sentence-transformers/all-MiniLM-L6-v2
+#     local-e5:
+#       model: sentence-transformers/intfloat/multilingual-e5-small
+#     # ``extends`` resolves against another entry in the same dict — one
+#     # level deep only (no chained / cyclic resolution):
+#     standard-with-prefix:
+#       extends: standard
+#       extra_body:
+#         dimensions: 1536
+#   batch_size: 100               # 1–2048
+#   max_concurrent_batches: 1     # 1–10 (phase 2 will raise this)
+#   max_retries: 3                # 0–10
+#   retry_backoff: exponential    # exponential | linear
+#   timeout: 60.0                 # seconds; caps how long reyn WAITS per attempt —
+#                                 # does not cap how many HTTP requests the provider
+#                                 # receives (the SDK client retries underneath this)
+#   tokenizer: cl100k_base        # tiktoken encoding for chunk-size estimation
+#   cost_warn_threshold: 10000    # ask-user gate fires above this chunk count
+
+
+# -----------------------------------------------------------------------------
+# safety: unified namespace for stop conditions.
+# **Replaces the legacy ``limits:`` / ``multi_agent:`` /
+# ``cost.router_invocations_per_turn`` keys**. ``safety:`` is the single source
+# of truth.
+#
+#   loop:    loop-detection caps (= "agent doing the same thing over and over")
+#   timeout: wall-clock budgets (= "this is taking too long")
+#   on_limit: what happens when a loop / timeout limit fires
+#             (interactive | unattended | auto_extend)
+# -----------------------------------------------------------------------------
+# safety:
+#   loop:
+#     max_router_calls_per_turn: 3
+#     max_router_iterations: 5  # max LLM tool-call iterations per user turn; CLI --max-iterations overrides
+#     max_tool_calls_per_turn: 50  # cost-bound: max tool_calls honoured from ONE completion; 0 = unlimited
+#     max_hook_driven_turns: 25  # #1800 loop valve: cap hook self-continuation per user turn; resets on user turn; 0 = unlimited
+#     max_agent_hops: 3
+#   timeout:
+#     llm_call_seconds: 60.0
+#     llm_max_retries: 3
+#     chain_seconds: 60.0           # ≤0 = disable delegate-reply wait
+#     mcp_probe_seconds: 5.0        # #3475: per-server MCP tools-list probe timeout;
+#                                   # a server slower than this is cached EMPTY for the
+#                                   # session (an mcp_tool_probe_degraded audit-event
+#                                   # names why) — raise under co-located CPU load
+#   on_limit:
+#     mode: interactive             # interactive | unattended | auto_extend
+#     auto_extend_times: 1          # used when mode = auto_extend
+#     ask_timeout_seconds: 0.0      # 0 = wait forever for user response
+#   threat_scan:                    # content-layer prompt-injection scan + fence (#1822)
+#     enabled: true                 # master switch (default-on)
+#     fail_open: true               # scanner error → allow (FN tolerated over FP)
+#     fence_enabled: true           # structurally fence untrusted content as data
+#     block_severity: block         # min severity that blocks at write seams: block | warn
+#     custom_patterns: []           # operator [regex, id, scope, severity] extensions
+#     # #3501 OPT-IN: the CAPABILITY half of the same defense. While
+#     # external_source-tagged content is live in the active context, apply the
+#     # _untrusted profile (deny memory-write / re-delegation / exec / install /
+#     # spawn / pipeline-run). One ordered ladder:
+#     #   off       - default; never engages. The agent keeps the capabilities it
+#     #               started with, whatever enters its context. Predictable.
+#     #   turn      - resolved at each turn boundary, so external content arriving
+#     #               mid-turn narrows from the NEXT turn.
+#     #   iteration - additionally re-resolved every router-loop iteration, so
+#     #               content arriving in round N narrows round N+1 of the SAME
+#     #               turn (closes the same-turn injection window) at the cost of
+#     #               narrowing a legitimate external->privileged flow mid-flow.
+#     #               Monotonic within the turn (a latch survives a compaction
+#     #               evicting the tainted entry, so the taint cannot be
+#     #               laundered); emits an untrusted_narrowing_engaged
+#     #               audit-event on engage.
+#     # An invalid value is rejected at load, not silently downgraded.
+#     capability_narrowing: off
+#   spawn:                          # #2103 C3: operator bounds on the LLM spawn tree (DoS guard)
+#     max_depth: 10                 # max spawn-lineage chain depth (agent_spawn); 0 = unlimited
+#     max_children: 20              # max fan-out: direct children per parent AND topology size; 0 = unlimited
+#     max_pipeline_fan_out_depth: 5 # #2187 for_each: max pipeline for_each fan-out NESTING depth; 0 = unlimited
+#     max_pipeline_spawns: 100      # #2187 for_each: max ephemeral sessions ONE pipeline run may spawn; 0 = unlimited
+
+
+# -----------------------------------------------------------------------------
+# web_fetch: SSL verification for the ``web_fetch`` tool + MCP
+# registry. Priority: ``ca_bundle`` > ``verify_ssl`` > ``SSL_VERIFY`` env >
+# ``litellm.ssl_verify`` > ``SSL_CERT_FILE`` > true.
+#
+# (#4174 T4: this used to be nested under ``web.fetch:`` — ``web:`` was split
+# into this top-level ``web_fetch:`` scalar-namespace and the separate
+# ``gateway:`` block below, since the old key conflated the web_fetch TOOL's
+# settings here with the unrelated ``reyn web`` GATEWAY's own settings.)
+#
+# Set ``ca_bundle`` for corporate MITM / custom PKI; set
+# ``verify_ssl: false`` only in controlled test environments.
+#
+# ``max_download_bytes`` caps how many response bytes ``web_fetch`` will
+# pull off the wire (default 10MB). A response whose ``Content-Length``
+# exceeds it is rejected before download; a chunked / unknown-length body
+# is aborted once the stream passes the ceiling. Guards against an
+# unbounded-body memory blow-up from a hostile / runaway URL. ``<= 0`` or a
+# non-integer falls back to the 10MB default.
+#
+# ``allow_private_ips`` (#1956 SSRF, default false) controls whether
+# ``web_fetch`` / ``safe.http`` may reach PRIVATE RFC1918 / ULA addresses
+# (enterprise internal-fetch opt-in). Link-local, cloud-metadata
+# (169.254.169.254), and loopback are ALWAYS denied regardless of this flag.
+# HTTP redirects are re-validated per hop, so an allowlisted host cannot
+# bounce to an internal target. Also exported to REYN_FETCH_ALLOW_PRIVATE_IPS
+# for the safe.http subprocess + registry clients.
+# -----------------------------------------------------------------------------
+# web_fetch:
+#   verify_ssl: null              # null = delegate to env / litellm fallback
+#   ca_bundle: null               # absolute / cwd-relative PEM path
+#   max_download_bytes: 10485760  # 10MB wire-byte ceiling (DoS guard)
+#   allow_private_ips: false      # #1956 SSRF: opt-in to private IPs (link-local/metadata/loopback always denied)
+
+
+# -----------------------------------------------------------------------------
+# gateway: the ``reyn web`` gateway's own settings — authentication model,
+# WebSocket inbound-frame ceiling, and per-surface mount overrides.
+# (#4174 T4: split from ``web:`` — see the ``web_fetch:`` block above for
+# the other half that key used to conflate.)
+# -----------------------------------------------------------------------------
+# gateway:
+#   ws_max_size: 16777216           # 16MB WebSocket inbound-frame ceiling
+#   default_design: null            # OpenUI host's default design slug (#4317); unset -> env REYN_WEB_DEFAULT_DESIGN -> first alphabetically
+#   auth:                           # reyn web gateway authentication (server-side)
+#     token: null                   # cross-machine (T3) bearer token; REQUIRED for a non-loopback bind (else fail-closed)
+#     require_token_on_loopback: true  # also require the token on loopback TCP (secure default for shared hosts)
+#     tls_certfile: null            # operator TLS cert (T3); null → self-signed TOFU generated at startup
+#     tls_keyfile: null             # operator TLS key (T3); must be set together with tls_certfile
+#   surfaces:                       # FP-0058 P2: per-surface opt-in/opt-out (launch-time-only, never LLM-settable)
+#     enabled:                      # surface name -> explicit override; absent = surface's secure-default applies
+#       a2a: {enabled: true}        # CLI --enable/--disable beats this, which beats the secure-default
+#       mcp: {enabled: true}
+
+
+# -----------------------------------------------------------------------------
+# multimodal: caps binary media
+# size and chooses where multimodal artefacts live on disk.
+#
+#   max_bytes:        decoded-payload byte cap (default 5MB = Anthropic limit)
+#   on_oversize:      ask  → prompt user (default)
+#                     allow → silently accept (trusted pipelines)
+#                     deny  → silently reject (cost-sensitive contexts)
+#   media_dir:        project-relative dir for image binary storage
+#   tool_results_dir: project-relative dir for text-y tool-result dumps
+#   base_url:         optional URL prefix for cross-host ``path_ref`` consumption
+#                     (set when running ``reyn web`` so A2A peers / MCP clients
+#                     can fetch artefacts via the resources router)
+#   model_capability_overrides: (#5509) declares a model's media capability
+#                     when litellm's own catalog doesn't know the model
+#                     string at all — the ORDINARY case for a proxy-routed
+#                     deployment (e.g. ``openai/my-proxy-model``). Without a
+#                     declaration, every attachment for that model silently
+#                     degrades to a lossless path-ref instead of being
+#                     embedded inline. The capability_field name is NOT any
+#                     litellm ``get_model_info`` field — only the ones reyn's
+#                     own code actually queries; see
+#                     ``reyn.llm.model_media_capability.
+#                     QUERIED_CAPABILITY_FIELDS_BY_MODALITY`` for the current
+#                     set (a wider litellm field is accepted but silently
+#                     does nothing).
+# -----------------------------------------------------------------------------
+# multimodal:
+#   max_bytes: 5000000
+#   on_oversize: ask
+#   media_dir: .reyn/media
+#   tool_results_dir: .reyn/tool-results
+#   base_url: null
+#   model_capability_overrides: {}
+#     # openai/my-proxy-model:
+#     #   supports_vision: true
+
+
+# -----------------------------------------------------------------------------
+# sandbox: which enforcement backend to use + what to do when the
+# requested backend isn't available on the host platform, plus the
+# operator-level sandbox policy applied to sandboxed ops.
+#
+#   backend:        auto | seatbelt | landlock | noop
+#                   ``auto`` (default) picks: macOS <26 → seatbelt,
+#                   Linux 5.13+ → landlock, else → noop.
+#   on_unsupported: warn (default, log + fall back to noop)
+#                   error (raise; useful in enforced production)
+#                   ignore (silent fallback)
+#   mode:           #3823 ②: which enumeration DIRECTION the resolved
+#                   policy uses. ``compat`` (default) — a literal empty
+#                   deny-list, nothing blocked by default (audit/events/
+#                   timeout/cancel-teardown still apply). ``strict``/
+#                   ``custom`` are declared but NOT YET WIRED — they raise
+#                   at construction rather than being silently accepted
+#                   and ignored.
+#   policy:         optional — the agent-level (operator) sandbox policy,
+#                   a mapping of SandboxPolicy kwargs (network /
+#                   write_paths / write_deny_paths / read_deny_paths /
+#                   deny_subprocess / env_deny_names / timeout_seconds).
+#                   #3901: every axis except write_paths defaults to full
+#                   compat (nothing extra restricted) — write_paths is the
+#                   one operator-unknowable value the kernel backend
+#                   consumes directly, so it stays closed by default. When
+#                   set, the policy is the deterministic value applied to
+#                   sandboxed ops AND folded into the permission
+#                   intersection on the network/subprocess/env axes —
+#                   WINNING over op-declared fields, so a skill or the LLM
+#                   cannot widen it. Omitted (default) = no agent-level
+#                   restriction.
+#   require_capabilities: #4935, opt-in only, empty (default) = no run
+#                   affected. Named-service capability classes the
+#                   resolved backend must support — today only
+#                   "ipc_named_service" (Seatbelt's com.apple.
+#                   SecurityServer grant, #4937). An unknown name raises.
+#                   A resolved backend that doesn't support a required
+#                   capability triggers on_unsupported (same 3-way knob
+#                   above, not a new vocabulary).
+# -----------------------------------------------------------------------------
+# sandbox:
+#   backend: auto
+#   on_unsupported: warn
+#   mode: compat            # compat | strict — see #3823: mode sets only the
+#                            # default for an axis left unset below; an
+#                            # explicit key here always wins over mode.
+#   policy:
+#     network: true
+#     subprocess: true
+#     allow_write_paths: ["{{workspace}}", "/tmp"]
+#     deny_env_names: []
+#     timeout_seconds: 600
+#   require_capabilities: []
+
+
+# -----------------------------------------------------------------------------
+# hooks: [registry] agent-lifecycle hooks (#1800/#2069, Hook-Event Redesign proposal 0059)
+# — a thin operator layer over the inbox + the P6 lifecycle. A list of
+# entries; each fires at a hook-point (``on``) and carries EXACTLY ONE of
+# FOUR mutually-exclusive schemes:
+#   template_push  — inject an attributed ``[hook:<name>]`` message from a config
+#                    Jinja2 template.
+#   shell_exec     — run an external command as a pure side-effect (output IGNORED,
+#                    command line is STATIC — never Jinja2-templated, a deliberate
+#                    command-injection guard; event data arrives on stdin as JSON).
+#   shell_push     — run a command whose STDOUT is a JSON push-directive → pushed
+#                    via the same path as template_push (stdout is the SOURCE).
+#   pipeline_launch — launch a registered pipeline (async/detached), input
+#                    Jinja2-rendered from the event's template vars.
+#
+#   on:            the builtin points — turn_start | turn_end | session_start |
+#                  session_end | mcp_resource_updated | file_changed |
+#                  cron_fired | webhook_received | task_settled — plus the two
+#                  open namespaces ``composed:<name>`` (a Composer's output,
+#                  below) and, as a Composer INPUT only (never a hook's own
+#                  ``on:``), ``llm:<session_id>:<event_name>`` (LLM-emitted via
+#                  the emit_hook_event op). Full syntax reference + matcher
+#                  grammar + composers: block: docs/concepts/runtime/hooks.md.
+#   template_push: message:   Jinja2 template → the message text
+#                  wake:      true  → start a new turn (self-continuation)  [default]
+#                             false → ride along with the next turn (passive context)
+#                  push_when: Jinja2 → bool; false skips the push (conditional)
+#                  session:   parsed + carried; naming a DIFFERENT session routes
+#                              this push to that session's inbox (cross-session push)
+#   shell_exec:    a static command string (no templating — see above)
+#   shell_push:    a command string; its stdout must be a single JSON object
+#                  {"push_when": bool, "wake": bool, "message": str, "session"?: str}
+#                  (first three required). Pure JSON on stdout; logs → stderr.
+#                  Any failure (non-zero exit, invalid JSON, missing/wrong-typed
+#                  field) skips the push (fail-safe).
+# -----------------------------------------------------------------------------
+# hooks:
+#   - name: next_step          # optional label → the [hook:next_step] attribution
+#     "on": turn_end             #   (absent → defaults to the hook-point, e.g. [hook:turn_end])
+#     template_push:
+#       message: "Turn complete — consider the next step."
+#       wake: false
+#   - "on": session_start
+#     shell_exec: "echo session-started >> /tmp/reyn-hooks.log"
+#   - name: dynamic            # stdout decides whether/what/how to push
+#     "on": turn_end
+#     shell_push: "scripts/decide-next.sh"   # emits e.g. {"push_when":true,"wake":true,"message":"..."}
+#   - "on": composed:deploy_approved   # subscribe to a composer's output (below) — a
+#     shell_exec: "reyn deploy.sh"   # Sync side-effect triggered by the composition.
+
+
+# -----------------------------------------------------------------------------
+# composers: [registry, restart-only — see the header note above] event correlation (Hook-Event Redesign Phase 4b/5, #2880/#2881) — a
+# Composer subscribes to this session's per-process HookBus (independent pub/sub
+# broadcast of every hook-event, NOT the P6 audit-event/WAL-event stream), buffers
+# matching events per its ``op``, and publishes ONE new ``composed:<name>`` event
+# back to the same bus when the op's condition is met. ``on: composed:<name>``
+# (above, in ``hooks:``) subscribes a Sync hook to that output — a composed->wake
+# chain is bounded by the SAME ``max_hook_driven_turns`` loop-valve as any other
+# hook-driven turn (every wake push traverses inbox kind="hook", counted
+# unconditionally). Seven ops: all / any / seq / window / debounce / correlate_by
+# / count — see docs/concepts/runtime/hooks.md § "Async Bus and Composer".
+# -----------------------------------------------------------------------------
+# composers:
+#   - name: deploy_approved
+#     op: all
+#     inputs:
+#       - { kind: builtin:external:mcp_resource_updated, match: { server: "github" } }
+#       - { kind: mcp:approval-server:approved }
+#     policy: { capacity: 10, overflow: reject, ttl: 5m }
+#     emit: { kind: composed:deploy_approved }
+
+
+
+# -----------------------------------------------------------------------------
+# cron: [registry] scheduled execution. Two
+# shapes coexist; pick exactly one per entry:
+#
+#   Message-based (recommended): ``to`` + ``message``. Cron dispatches the
+#     message to the target agent's inbox with ``sender="cron:<name>"``.
+#   Skill-based  (legacy): ``skill``. Cron runs the skill directly via
+#     ``Agent.run``.
+#
+# Runtime-registered cron entries land in ``.reyn/cron.yaml`` and override
+# matching ``name`` here on collision.
+# -----------------------------------------------------------------------------
+# cron:
+#   jobs:
+#     - name: morning_news
+#       to: news_agent
+#       message: "今日の主要ニュースをまとめて"
+#       schedule: "0 9 * * *"
+#       enabled: true
+#     - name: index_events_hourly
+#       skill: index_events
+#       schedule: "0 */6 * * *"
+#       input: {}
+#       enabled: true
+
+
+# -----------------------------------------------------------------------------
+# fs_watch: operator-declared filesystem watch paths (#2608 H4). Each path is
+# watched recursively for create/modify/delete events; a change fires the
+# ``file_changed`` external-event hook (see ``hooks:`` above, ``on:
+# file_changed``, matcher field ``path`` globs via fnmatch).
+#
+# SECURITY: this is the ONLY place watched paths are declared — there is no
+# op/tool verb an agent can use to register or widen a watch (same OUT-set-
+# only gate as ``sandbox:``). Requires the optional ``watchdog`` package
+# (`pip install reyn[fs-watch]`); absent -> the feature logs a warning and
+# stays off, rest of the session unaffected. Empty ``paths`` (default) -> the
+# watcher never starts.
+# -----------------------------------------------------------------------------
+# fs_watch:
+#   paths:
+#     - /repo/src
+#     - /repo/docs
+#   debounce_seconds: 0.2   # coalesce a write-burst on one path into ONE fire
+
+
+# -----------------------------------------------------------------------------
+# external_transports: [registry, restart-only — see the header note above] map external transport names
+# (Slack / LINE / Discord / ...) to the MCP tool that delivers replies, plus
+# an ``args_template`` describing how router output is shaped into the tool's
+# arguments. Empty by default; see ``reyn.runtime.external_routing`` for the
+# full shape and the per-transport contract.
+# -----------------------------------------------------------------------------
+# external_transports:
+#   transports:
+#     slack:
+#       mcp_tool: slack__post_message
+#       args_template:
+#         channel: "${TRANSPORT_DEST}"
+#         text: "${ROUTER_REPLY}"
+#     line:
+#       mcp_tool: line__push_message
+#       args_template:
+#         to: "${TRANSPORT_DEST}"
+#         messages:
+#           - type: text
+#             text: "${ROUTER_REPLY}"
+
+# -----------------------------------------------------------------------------
+# presentations: [registry] named presentation-template registry for the `present` op.
+# A template's value is a blueprint (the same declarative component tree an
+# inline `present` blueprint is). Registering one is an operator/config action
+# (there is no install tool — the model authors inline blueprints only). Merges
+# across config tiers like skills/pipelines; the dynamic
+# .reyn/config/presentations.yaml layer hot-reloads at the turn boundary.
+# -----------------------------------------------------------------------------
+# presentations:
+#   entries:
+#     search_results:
+#       blueprint:
+#         - component: table
+#           rows: {"$bind": "/results"}
+#           columns:
+#             - {header: Author, path: /author}
+#             - {header: Title,  path: /title}
+#       description: "Search results table"   # optional
+#       enabled: true                          # optional, default true

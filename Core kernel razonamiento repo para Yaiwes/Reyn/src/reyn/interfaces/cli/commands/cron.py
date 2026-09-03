@@ -1,0 +1,285 @@
+"""`reyn cron` — cron-driven job scheduling (FP-0009 Component B).
+
+Subcommands:
+  run     Start the foreground cron scheduler (blocks until Ctrl-C).
+  list    Print all configured jobs with next-run time; no scheduler started.
+  status  Like `list` but shows last-run fields too (empty in standalone mode).
+
+The scheduler reads ``cron.jobs`` from reyn.yaml and computes each enabled
+job's cron schedule. Standalone CLI mode has no execution runner; message-based jobs need
+``reyn web``.
+
+v1 limitation: last-run state is in-memory only.  ``reyn cron status``
+shows empty last_run_* fields when invoked standalone (i.e. not while
+``reyn cron run`` is active).  A future web-mode API will allow querying
+the live scheduler.
+"""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import sys
+
+
+def register(sub) -> None:
+    p = sub.add_parser(
+        "cron",
+        help="Manage and run cron-scheduled jobs",
+        description=(
+            "Schedule and dispatch messages on a cron timetable.  "
+            "Configure jobs under the ``cron.jobs`` key in reyn.yaml."
+        ),
+    )
+    csub = p.add_subparsers(dest="cron_cmd", metavar="<subcommand>")
+    csub.required = True
+    p.set_defaults(func=_no_subcommand)
+
+    # --- run ---
+    csub.add_parser(
+        "run",
+        help="Start the foreground cron scheduler (blocks until Ctrl-C)",
+        description=(
+            "Start the cron scheduler in the foreground.  "
+            "Each enabled job in reyn.yaml fires at its cron expression.  "
+            "Press Ctrl-C to stop cleanly."
+        ),
+    ).set_defaults(func=run_run)
+
+    # --- list ---
+    csub.add_parser(
+        "list",
+        help="List configured cron jobs and their next-run time",
+        description=(
+            "Print all jobs from reyn.yaml cron.jobs with their schedule and "
+            "next computed fire time.  No scheduler is started."
+        ),
+    ).set_defaults(func=run_list)
+
+    # --- status ---
+    status_p = csub.add_parser(
+        "status",
+        help="Show cron job status including last-run info (empty in standalone mode)",
+        description=(
+            "Print cron jobs with last-run fields (last_run_at, last_run_status, "
+            "last_run_error).  In v1 these are always empty when invoked standalone "
+            "(i.e. outside a running `reyn cron run` session).  Future versions will "
+            "query the live scheduler via the web API."
+        ),
+    )
+    status_p.set_defaults(func=run_status)
+
+
+def _no_subcommand(args: argparse.Namespace) -> None:  # pragma: no cover
+    print(
+        "Usage: reyn cron <subcommand>  (run | list | status)",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _load_jobs() -> list:
+    """Load CronJobConfig list from reyn.yaml via the standard config path."""
+    from reyn.config import load_config
+    config = load_config()
+    return config.cron.jobs
+
+
+def _jobs_to_cron_jobs(job_configs) -> list:
+    """Convert CronJobConfig entries to CronJob instances.
+
+    ``action="message"`` (default): ``to`` + ``message``, the runner
+    dispatches the message to the target agent's inbox. ``action="hook"``
+    (#5209): ``to`` only — the runner fires ``cron_fired`` on the host
+    session without pushing anything.
+    """
+    from reyn.runtime.cron import CronJob
+    return [
+        CronJob(
+            name=jc.name,
+            schedule=jc.schedule,
+            to=jc.to,
+            message=jc.message,
+            action=jc.action,
+            notify=jc.notify,
+            input=dict(jc.input),
+            enabled=jc.enabled,
+        )
+        for jc in job_configs
+    ]
+
+
+def _compute_next_run(job) -> str:
+    """Return ISO-format next-run time or '-' on invalid expression."""
+    from reyn.runtime.cron import CronScheduler
+    scheduler = CronScheduler(jobs=[job])
+    next_at = scheduler.compute_next_run(job)
+    return next_at.isoformat() if next_at is not None else "-"
+
+
+def _print_list_table(jobs: list, *, show_last_run: bool = False) -> None:
+    """Print jobs in a fixed-width tabular format."""
+    if not jobs:
+        print("(no jobs configured)")
+        return
+
+    # Pre-compute next_run_at for each job. FP-0041 #489 PR-B: the target
+    # column shows the destination agent so operators can tell at a glance
+    # what each job dispatches.
+    rows = []
+    for job in jobs:
+        next_str = _compute_next_run(job)
+        target = f"→{job.to}" if job.to else "-"
+        row = {
+            "name": job.name,
+            "target": target,
+            "schedule": job.schedule,
+            "enabled": "true" if job.enabled else "false",
+            "next_run": next_str,
+        }
+        if show_last_run:
+            row["last_run_at"] = job.last_run_at.isoformat() if job.last_run_at is not None else "-"
+            row["last_run_status"] = job.last_run_status or "-"
+            row["last_run_error"] = job.last_run_error or "-"
+        rows.append(row)
+
+    # Column widths
+    w_name = max(len(r["name"]) for r in rows)
+    w_name = max(w_name, 4)  # "NAME"
+    w_target = max(len(r["target"]) for r in rows)
+    w_target = max(w_target, 6)  # "TARGET"
+    w_sched = max(len(r["schedule"]) for r in rows)
+    w_sched = max(w_sched, 8)  # "SCHEDULE"
+    w_enabled = 7  # "ENABLED"
+    w_next = max(len(r["next_run"]) for r in rows)
+    w_next = max(w_next, 8)  # "NEXT RUN"
+
+    if show_last_run:
+        w_lra = max(len(r["last_run_at"]) for r in rows)
+        w_lra = max(w_lra, 12)  # "LAST RUN AT"
+        w_lrs = max(len(r["last_run_status"]) for r in rows)
+        w_lrs = max(w_lrs, 12)  # "LAST STATUS"
+        w_lre = max(len(r["last_run_error"]) for r in rows)
+        w_lre = max(w_lre, 10)  # "LAST ERROR"
+        header = (
+            f"{'NAME':<{w_name}}  {'TARGET':<{w_target}}  "
+            f"{'SCHEDULE':<{w_sched}}  {'ENABLED':<{w_enabled}}  "
+            f"{'NEXT RUN':<{w_next}}  {'LAST RUN AT':<{w_lra}}  "
+            f"{'LAST STATUS':<{w_lrs}}  {'LAST ERROR':<{w_lre}}"
+        )
+        print(header)
+        print("─" * len(header))
+        for r in rows:
+            print(
+                f"{r['name']:<{w_name}}  {r['target']:<{w_target}}  "
+                f"{r['schedule']:<{w_sched}}  {r['enabled']:<{w_enabled}}  "
+                f"{r['next_run']:<{w_next}}  {r['last_run_at']:<{w_lra}}  "
+                f"{r['last_run_status']:<{w_lrs}}  {r['last_run_error']:<{w_lre}}"
+            )
+    else:
+        header = (
+            f"{'NAME':<{w_name}}  {'TARGET':<{w_target}}  "
+            f"{'SCHEDULE':<{w_sched}}  {'ENABLED':<{w_enabled}}  "
+            f"{'NEXT RUN':<{w_next}}"
+        )
+        print(header)
+        print("─" * len(header))
+        for r in rows:
+            print(
+                f"{r['name']:<{w_name}}  {r['target']:<{w_target}}  "
+                f"{r['schedule']:<{w_sched}}  {r['enabled']:<{w_enabled}}  "
+                f"{r['next_run']:<{w_next}}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Subcommand implementations
+# ---------------------------------------------------------------------------
+
+def run_list(args: argparse.Namespace) -> None:
+    """Print all configured cron jobs with next-run time."""
+    job_configs = _load_jobs()
+    jobs = _jobs_to_cron_jobs(job_configs)
+    _print_list_table(jobs, show_last_run=False)
+
+
+def run_status(args: argparse.Namespace) -> None:
+    """Print cron jobs with last-run fields.
+
+    v1 note: last_run_* fields are always empty when invoked standalone
+    (outside a running ``reyn cron run`` session) because there is no
+    persistent state store in v1.  This limitation is documented in
+    ``docs/reference/cli/cron.md``.
+    """
+    job_configs = _load_jobs()
+    jobs = _jobs_to_cron_jobs(job_configs)
+    _print_list_table(jobs, show_last_run=True)
+
+
+def run_run(args: argparse.Namespace) -> None:
+    """Start the foreground cron scheduler (blocks until Ctrl-C)."""
+    try:
+        asyncio.run(_run_scheduler())
+    except KeyboardInterrupt:
+        pass  # _run_scheduler handles this internally
+
+
+async def _run_scheduler() -> None:
+    """Build scheduler, start jobs, block until Ctrl-C."""
+    from reyn.core.events.asyncio_diagnostics import (
+        install_asyncio_exception_handler,
+    )
+    # `reyn cron run` is a real long-running foreground process (blocks until
+    # Ctrl-C) that starts one background asyncio task per enabled job — a
+    # durable capture point for a job task that raises unnoticed. See
+    # reyn.core.events.asyncio_diagnostics.
+    install_asyncio_exception_handler(asyncio.get_running_loop())
+
+    from reyn.runtime.cron import CronScheduler
+
+    job_configs = _load_jobs()
+    jobs = _jobs_to_cron_jobs(job_configs)
+    enabled = [j for j in jobs if j.enabled]
+
+    if not jobs:
+        print("No jobs configured.  Add jobs under cron.jobs in reyn.yaml.")
+        return
+
+    print(f"Started cron scheduler with {len(enabled)} enabled job(s):")
+    for job in enabled:
+        from reyn.runtime.cron import CronScheduler as _CS
+        _sched = _CS(jobs=[job])
+        next_at = _sched.compute_next_run(job)
+        next_str = next_at.isoformat() if next_at is not None else "(invalid schedule)"
+        print(f"  • {job.name}  ({job.schedule})  next: {next_str}")
+
+    runner = _build_runner()
+    scheduler = CronScheduler(jobs=jobs, runner_fn=runner)
+
+    await scheduler.start()
+    try:
+        await asyncio.Event().wait()  # block until cancelled
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        pass
+    finally:
+        await scheduler.stop()
+        print("\nCron scheduler stopped.")
+
+
+def _build_runner():
+    """Return the async runner function that executes a CronJob.
+
+    Standalone CLI mode wires no runner: message-based jobs need an
+    AgentRegistry context that ``reyn cron run`` (foreground) lacks. The
+    scheduler still runs (``list`` / ``status`` / next-run computation);
+    jobs warn + skip. Use ``reyn web`` for message-based execution.
+    """
+    from reyn.runtime.cron.runners import build_default_runner
+
+    # Standalone CLI has no AgentRegistry: message-based jobs need ``reyn web``.
+    return build_default_runner(
+        inbox_pusher=None,
+    )

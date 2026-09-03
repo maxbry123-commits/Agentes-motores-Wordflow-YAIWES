@@ -1,0 +1,71 @@
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+src/*.egg-info/
+dist/
+build/
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.reyn/
+/reyn/
+.env
+.env.*
+!.env.example
+
+# Local user config — contains api_base / model overrides etc.
+# A `reyn.local.yaml.example` template IS checked in; the real file is not.
+reyn.local.yaml
+!reyn.local.yaml.example
+
+# Personal AI-tool instruction overrides (= industry pattern: Claude Code
+# CLAUDE.local.md / OpenAI Codex AGENTS.override.md 等)。 project-level
+# CLAUDE.md / REYN.md は committed (= team-shared, dogfood reproducible)、
+# personal override は gitignored。
+CLAUDE.local.md
+REYN.local.md
+
+improver_state.json
+# Textual TUI export captures (= screenshots Textual emits via SVG
+# export / --screenshot). Land in repo root by default; never meant to
+# be committed.
+ReynTUIApp_*.svg
+.DS_Store
+.vscode/
+.idea/
+.claude/
+.serena/
+site/
+tmp/
+
+# Built landing page output — regenerated from website/copy.yaml +
+# website/index.html via website/build.py. The source files are tracked;
+# the build artefact is not.
+website/dist/
+
+# 別リポジトリで管理する本書ドラフト (Zenn Books)
+# reyn の reveal を守るため reyn repo には commit しない
+zenn-book/
+scripts/s5_driver_main.py
+artifacts/
+
+# G4 spike runtime output
+spike_results/
+.spike_*/
+
+# Session handoff notes between Claude Code instances (= migration
+# between Desktop / CLI / different sessions).  Git-ignored so private
+# session context does not leak into repo history.
+.handoff/
+
+# Local dogfood/MCP sandbox scratch (traces, replay fixtures, test.db) — never commit
+.mcp-sandbox/
+
+# Dev-team broker MCP config — per-developer, not reyn source
+/.mcp.json
+scratch/
+.reyn-memory-ceiling.log
+.reyn-ci-stall-trace.log

@@ -1,0 +1,1507 @@
+#!/usr/bin/env python3
+"""Test policy compliance auditor — Reyn testing.ja.md automated linter.
+
+Detects 8 categories of Tier 4 violations and policy warnings in test files:
+  1. Missing Tier docstring (ERROR)
+  2. Format pinning via len(...) < N (ERROR)
+  3. Private state assertion via obj._attr (ERROR)
+  4. MagicMock / AsyncMock / patch usage (ERROR)
+  5. Bounded-life test outside tests/scaffold/ (WARNING)
+  6. Snapshot/golden test outside tests/scaffold/ (ERROR)
+  7. Fake attribute on a real object, suppressed via type: ignore (ERROR)
+  8. Private read (obj._x, not just assert obj._x) with a same-class
+     public @property alternative (ERROR)
+
+Usage:
+    python scripts/test_tier_audit.py tests/
+    python scripts/test_tier_audit.py tests/test_foo.py --quiet
+    python scripts/test_tier_audit.py --strict tests/
+    python scripts/test_tier_audit.py --check format-pinning tests/
+    python scripts/test_tier_audit.py --json tests/ | jq .
+"""
+from __future__ import annotations
+
+import argparse
+import ast
+import json
+import re
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Literal
+
+# ---------------------------------------------------------------------------
+# Detection patterns
+# ---------------------------------------------------------------------------
+
+TIER_DOCSTRING_RE = re.compile(r"^Tier [123][abc]?:", re.IGNORECASE)
+
+# #3670: the SAME line-terminator pattern ast._splitlines_no_ff uses
+# internally, inlined here (not imported — that name is private CPython
+# internals we don't want a hard dependency on) so `_cached_source_segment`
+# below can pre-split a file's source ONCE and reuse it across every
+# get_source_segment-equivalent call for that file. `str.splitlines()` is
+# NOT a substitute: it also breaks on form-feed and other unicode line
+# separators the compiler's own tokenizer (and therefore `node.lineno`/
+# `end_lineno`) does not treat as line breaks — using it would silently
+# misalign every AST-based source-segment extraction on a file containing
+# one of those characters.
+_AST_LINE_PATTERN = re.compile(r"(.*?(?:\r\n|\n|\r|$))")
+
+
+def _split_source_lines(source: str) -> list[str]:
+    """Pre-split ``source`` the way the AST compiler counts lines — compute
+    ONCE per file (see module docstring above) instead of letting
+    ``ast.get_source_segment`` re-scan the whole file from the start on
+    every call. Profiled root cause of #3670 (CI's 15-minute test-tier
+    audit job timing out on `main`): 564k `get_source_segment` calls across
+    a full-tree run, each re-splitting its file's source from scratch,
+    consumed 121 of 147 total seconds.
+
+    #3670 review (lead-coder, cross-version CI run): whether ``finditer``'s
+    zero-width ``$`` alternative produces one more trailing ``''`` match at
+    end-of-string differs between Python 3.11 and 3.12 for
+    ``ast._splitlines_no_ff``'s own identical pattern — this function's
+    unnormalized output inherited that version difference. A trailing
+    ``''`` entry is never addressed by any real node (no
+    ``node.lineno``/``end_lineno`` can point past the last real source
+    line, so nothing ever indexes into it), so dropping it here makes this
+    function's OWN output version-independent regardless of which way the
+    underlying ``re`` engine happens to behave — the normalization, not
+    matching either version's incidental quirk, is the actual contract."""
+    lines = [m[0] for m in _AST_LINE_PATTERN.finditer(source)]
+    if lines and lines[-1] == "":
+        lines.pop()
+    return lines
+
+
+def _cached_source_segment(lines: list[str], node: ast.AST) -> str:
+    """Drop-in equivalent of ``ast.get_source_segment(source, node)`` given
+    pre-split ``lines`` (:func:`_split_source_lines`) instead of the raw
+    source string — same byte-offset slicing logic, just reusing an
+    already-computed line list rather than recomputing it. Returns ``""``
+    (matching this script's own ``or ""`` call convention) rather than
+    ``None`` when location info is missing."""
+    try:
+        if node.end_lineno is None or node.end_col_offset is None:  # type: ignore[attr-defined]
+            return ""
+        lineno = node.lineno - 1  # type: ignore[attr-defined]
+        end_lineno = node.end_lineno - 1  # type: ignore[attr-defined]
+        col_offset = node.col_offset  # type: ignore[attr-defined]
+        end_col_offset = node.end_col_offset  # type: ignore[attr-defined]
+    except AttributeError:
+        return ""
+
+    if end_lineno == lineno:
+        return lines[lineno].encode()[col_offset:end_col_offset].decode()
+
+    first = lines[lineno].encode()[col_offset:].decode()
+    last = lines[end_lineno].encode()[:end_col_offset].decode()
+    middle = lines[lineno + 1 : end_lineno]
+    return "".join([first, *middle, last])
+
+# len(...) < N  /  len(...) > N  /  len(...) == N  /  len(...) >= N  etc.
+# Exemption: len(x) > 0  (simple existence check)
+#
+# The leading ``\b`` is load-bearing: without it the bare ``len\(`` matched
+# the ``len(`` *substring* inside suffix-len builtins/helpers like
+# ``cell_len(``, ``str_len(``, ``byte_len(`` — flagging legitimate
+# cell-width invariants (e.g. ``cell_len(ch) <= 1``) as format pins. A word
+# boundary requires a non-word char (or start-of-line) immediately before
+# ``len``; since ``_`` is a word char, ``cell_len`` has no boundary at its
+# inner ``len`` and is correctly excluded, while standalone ``len(`` (after
+# ``(``, space, ``=``, ``[`` …) still matches. (Issue #1082.)
+FORMAT_PIN_RE = re.compile(r"\blen\([^)]+\)\s*[<>=!]+\s*(\d+)")
+
+# Private-state detection is AST-based via ``_find_private_attr_access``
+# below. The prior implementation used a regex ``r"\.\w+\._\w+"`` which
+# required a preceding dot to anchor and silently missed bare
+# ``assert obj._x`` — the most common private-state shape — so violations
+# accumulated unnoticed across the test corpus (= sub-discipline 6-round
+# trap, memory ``feedback_tier4_private_state_repeat_6_round``). Replaced
+# with the AST walk 2026-05-27 (Tier C1 dispatch).
+
+
+def _find_private_attr_access(node: ast.AST) -> list[ast.Attribute]:
+    """Walk *node* and return every ``ast.Attribute`` whose ``attr`` is a
+    single-underscore-prefixed name (= private state).
+
+    Dunder names (``__init__``, ``__class__``, ``__name__``) are excluded —
+    they're language-level surfaces, not private state in the policy sense.
+    Module imports (``from mod._private import X``) and docstring text are
+    not represented as ``ast.Attribute`` nodes in the assertion's value
+    tree, so AST scoping eliminates those false positives automatically.
+    """
+    results: list[ast.Attribute] = []
+    for inner in ast.walk(node):
+        if not isinstance(inner, ast.Attribute):
+            continue
+        attr = inner.attr
+        # Single leading underscore, NOT dunder
+        if attr.startswith("_") and not attr.startswith("__"):
+            results.append(inner)
+    return results
+
+BOUNDED_LIFE_KEYWORDS = (
+    "byte_identical",
+    "byte_equiv",
+    "legacy_compatibility",
+    "pre_migration",
+    "before_refactor",
+)
+
+# Heuristic: assert something == path.read() / assert something == path.read_text()
+SNAPSHOT_RE = re.compile(
+    r"assert\b.*==.*\.(read|read_text)\s*\(",
+    re.DOTALL,
+)
+
+# Exclusion: both sides are dynamic file reads (= file-copy faithfulness
+# invariant, NOT a snapshot pin). Common in tests that verify a preprocessor
+# copies source → target without mutation. Example:
+#   assert copied.read_text() == source.read_text()
+# This is a Tier 2b sub-system invariant (copy correctness), not a snapshot test
+# (which would compare a runtime output against a frozen golden file).
+INVARIANT_FILE_COPY_RE = re.compile(
+    r"assert\b.*\.(read|read_text)\s*\([^)]*\)\s*==.*\.(read|read_text)\s*\(",
+    re.DOTALL,
+)
+
+# LLM boundary patch detection per testing.ja.md "litellm への unittest.mock
+# パッチ" prohibition. Internal code patches (reyn.* paths) inside Tier 2c
+# integration tests are permitted. We flag a patch only when its target looks
+# like an LLM boundary: litellm, call_llm, acompletion, or a *.llm.* path.
+LLM_BOUNDARY_PATCH_RE = re.compile(
+    r"\b(litellm|acompletion|call_llm[\w_]*|\w+\.llm\.[\w.]+)\b"
+)
+
+
+def _is_llm_boundary_patch(patch_src: str) -> bool:
+    """Return True iff patch target string looks like an LLM boundary."""
+    return bool(LLM_BOUNDARY_PATCH_RE.search(patch_src))
+
+# Rule 7 (#4873): an assignment of the shape ``obj.attr = value`` where
+# ``obj`` is a production instance and ``attr`` is NOT one it declares —
+# #3037's own named pattern, "instead of using a Fake, a real object is
+# mock-ified in place." mypy already detects this (it is what
+# ``[attr-defined]`` on an ASSIGNMENT means — the class has no such
+# attribute); the annotation is someone's own trace of having silenced
+# that detection deliberately, so this rule needs no detector of its own,
+# only a ban on the suppression. Scoped to ASSIGNMENT lines only —
+# reading an already-flagged private attribute (``for e in
+# host.events.emitted``) is a different, narrower complaint (a type
+# mypy can't see, not an attribute that doesn't exist) and stays out of
+# scope, per architect's own measurement on #4873.
+#
+# Regex, not the shell's ``grep -E`` — #4873's own investigation found
+# POSIX ERE's ``\b``/``\s`` fail SILENTLY (zero matches, no error) in
+# `git grep -E`, which is why this repo's own earlier counts on this issue
+# were wrong twice before landing. Python's ``re`` module has no such gap
+# (`\b`/`\s` are fully supported there) — the risk this comment guards
+# against is different: missing a WRITING VARIANT of the ignore comment
+# itself (no space after the colon, multiple codes in one bracket, a line
+# continuation) — the capture group below matches everything inside the
+# brackets and splits on comma, so a multi-code form
+# (``# type: ignore[attr-defined, assignment]``) is still caught; a split
+# annotation across a line continuation is NOT covered (unmeasured
+# corpus-wide, per architect's own disclosed gap — not claimed as zero).
+_TYPE_IGNORE_RE = re.compile(r"#\s*type:\s*ignore\[([^\]]*)\]")
+
+
+def _ignore_codes(line: str) -> set[str]:
+    """The set of codes inside a ``# type: ignore[...]`` comment on *line*,
+    or an empty set if the line has no such comment (including a bare
+    ``# type: ignore`` with no bracket — that form suppresses EVERYTHING,
+    which is a different, broader problem this rule does not scope to)."""
+    m = _TYPE_IGNORE_RE.search(line)
+    if not m:
+        return set()
+    return {code.strip() for code in m.group(1).split(",")}
+
+
+RULE_NAMES = {
+    "tier-docstring",
+    "format-pinning",
+    "private-state",
+    "mock",
+    "bounded-life",
+    "snapshot",
+    "fake-attr",
+    "private-read-public-alt",
+    "llm-stub-tier",
+}
+
+# ---------------------------------------------------------------------------
+# Data model
+# ---------------------------------------------------------------------------
+
+Level = Literal["ERROR", "WARNING"]
+
+
+@dataclass
+class Finding:
+    rule: str
+    level: Level
+    line: int
+    message: str
+    suggestion: str = ""
+    policy_ref: str = ""
+
+
+@dataclass
+class TestResult:
+    name: str
+    findings: list[Finding] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return not self.findings
+
+    @property
+    def has_errors(self) -> bool:
+        return any(f.level == "ERROR" for f in self.findings)
+
+    @property
+    def has_warnings(self) -> bool:
+        return any(f.level == "WARNING" for f in self.findings)
+
+
+@dataclass
+class FileReport:
+    path: Path
+    results: list[TestResult] = field(default_factory=list)
+    parse_error: str = ""
+
+    @property
+    def error_count(self) -> int:
+        return sum(
+            1 for r in self.results for f in r.findings if f.level == "ERROR"
+        )
+
+    @property
+    def warning_count(self) -> int:
+        return sum(
+            1 for r in self.results for f in r.findings if f.level == "WARNING"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Auditor
+# ---------------------------------------------------------------------------
+
+
+class TestAuditor:
+    def __init__(self, check_rules: set[str] | None = None) -> None:
+        self.check_rules = check_rules  # None = all rules
+
+    def _rule_active(self, rule: str) -> bool:
+        return self.check_rules is None or rule in self.check_rules
+
+    def audit_file(self, path: Path) -> FileReport:
+        report = FileReport(path=path)
+        try:
+            source = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            report.parse_error = str(exc)
+            return report
+
+        try:
+            tree = ast.parse(source, filename=str(path))
+        except SyntaxError as exc:
+            report.parse_error = f"SyntaxError: {exc}"
+            return report
+
+        source_lines = source.splitlines()
+        ast_lines = _split_source_lines(source)
+        in_scaffold = "tests/scaffold" in str(path).replace("\\", "/")
+
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if node.name.startswith("test_"):
+                    result = self._audit_test(
+                        path, source, source_lines, ast_lines, node, in_scaffold
+                    )
+                    report.results.append(result)
+
+        return report
+
+    def _audit_test(
+        self,
+        path: Path,
+        source: str,
+        source_lines: list[str],
+        ast_lines: list[str],
+        node: ast.FunctionDef | ast.AsyncFunctionDef,
+        in_scaffold: bool,
+    ) -> TestResult:
+        result = TestResult(name=node.name)
+
+        # Extract node source lines (1-indexed in AST)
+        node_lines = source_lines[node.lineno - 1 : node.end_lineno]
+        node_source = "\n".join(node_lines)
+
+        # --- Rule 1: Missing Tier docstring ---
+        if self._rule_active("tier-docstring"):
+            docstring = ast.get_docstring(node)
+            if docstring is None:
+                result.findings.append(
+                    Finding(
+                        rule="tier-docstring",
+                        level="ERROR",
+                        line=node.lineno,
+                        message="no docstring at all — Tier declaration required",
+                        suggestion='Add a docstring starting with """Tier N: ..."""',
+                        policy_ref="testing.ja.md: 各テストの docstring 一行目に Tier の明記",
+                    )
+                )
+            elif not TIER_DOCSTRING_RE.match(docstring.strip()):
+                first_line = docstring.strip().splitlines()[0]
+                result.findings.append(
+                    Finding(
+                        rule="tier-docstring",
+                        level="ERROR",
+                        line=node.lineno,
+                        message=f'docstring does not start with "Tier N:": {first_line!r}',
+                        suggestion='Change first docstring line to """Tier 1/2/3a/3b: ..."""',
+                        policy_ref="testing.ja.md: 各テストの docstring 一行目に Tier の明記",
+                    )
+                )
+
+        # --- Rule 2: Format pinning ---
+        if self._rule_active("format-pinning"):
+            for rel_lineno, line in enumerate(node_lines):
+                for m in FORMAT_PIN_RE.finditer(line):
+                    # Exempt len(x) > 0  (existence check)
+                    n = int(m.group(1))
+                    op_start = m.start()
+                    after_len = line[op_start:].lstrip()
+                    if _is_existence_check_only(line, m):
+                        continue
+                    abs_lineno = node.lineno + rel_lineno
+                    result.findings.append(
+                        Finding(
+                            rule="format-pinning",
+                            level="ERROR",
+                            line=abs_lineno,
+                            message=f"format pinning: {m.group(0).strip()}",
+                            suggestion="Remove this assertion — pin behavior not size/shape",
+                            policy_ref='testing.ja.md Tier 4: "見た目のフォーマット固定（空白、句読点、行数、カラーコード）"',
+                        )
+                    )
+
+        # --- Rule 3: Private state assertion (AST-based, Tier C1 2026-05-27) ---
+        # Earlier regex required a preceding dot anchor and missed bare
+        # ``assert obj._x`` — the most common form. AST detection walks each
+        # ``ast.Assert`` value tree for any ``ast.Attribute`` whose ``attr``
+        # starts with a single underscore (excluding dunder), so it catches
+        # bare, nested, chained, and subscript forms uniformly.
+        if self._rule_active("private-state"):
+            seen_lines: set[int] = set()
+            for stmt in ast.walk(node):
+                if not isinstance(stmt, ast.Assert):
+                    continue
+                # Walk the assertion's test expression for any private attr.
+                # ``ast.walk`` on the whole Assert would re-traverse but
+                # confining to ``stmt.test`` keeps msg expressions (= the
+                # second arg of assert) out of scope, matching policy intent.
+                private_attrs = _find_private_attr_access(stmt.test)
+                if not private_attrs:
+                    continue
+                # One finding per assert (= use the first private access for
+                # the message; line is the assert's line so reviewers find it).
+                first = private_attrs[0]
+                stmt_src = _cached_source_segment(ast_lines, stmt)
+                if stmt.lineno in seen_lines:
+                    continue
+                seen_lines.add(stmt.lineno)
+                result.findings.append(
+                    Finding(
+                        rule="private-state",
+                        level="ERROR",
+                        line=stmt.lineno,
+                        message=(
+                            f"private state assertion (.{first.attr}): "
+                            f"{stmt_src.strip()[:80]}"
+                        ),
+                        suggestion="Use snapshot() or public API instead",
+                        policy_ref="testing.ja.md Tier 4: private state への直接 assert",
+                    )
+                )
+
+        # --- Rule 4: MagicMock / AsyncMock / patch ---
+        if self._rule_active("mock"):
+            # Check imports at module level (only once per file — but we check
+            # inside the function body here; module-level checked separately)
+            _check_mock_in_func(node, ast_lines, result)
+
+        # --- Rule 5: Bounded-life test outside scaffold ---
+        if self._rule_active("bounded-life") and not in_scaffold:
+            for kw in BOUNDED_LIFE_KEYWORDS:
+                if kw in node.name:
+                    result.findings.append(
+                        Finding(
+                            rule="bounded-life",
+                            level="WARNING",
+                            line=node.lineno,
+                            message=f"bounded-life keyword '{kw}' in test name but not in tests/scaffold/",
+                            suggestion="Move to tests/scaffold/ with triggered_by/removed_by metadata",
+                            policy_ref="testing.ja.md Annex: スキャフォールディングテスト",
+                        )
+                    )
+                    break  # one finding per test
+
+        # --- Rule 9 (#5103): @llm_stub test must not declare Tier 3 ---
+        # architect's discriminator (#5294): Tier 3 = the model's OWN output
+        # is the subject under test. @llm_stub always returns the SAME fixed
+        # minimal completion regardless of what was asked, so a test using it
+        # can never legitimately have the model's output as its subject —
+        # declaring Tier 3 there is a false Tier, not a true one (CLAUDE.md
+        # test-review Q6).
+        if self._rule_active("llm-stub-tier"):
+            if _has_llm_stub_marker(node):
+                docstring = ast.get_docstring(node)
+                if docstring is not None:
+                    first_line = docstring.strip().splitlines()[0]
+                    if re.match(r"^Tier 3[abc]?:", first_line, re.IGNORECASE):
+                        result.findings.append(
+                            Finding(
+                                rule="llm-stub-tier",
+                                level="ERROR",
+                                line=node.lineno,
+                                message=(
+                                    "@llm_stub test declares Tier 3, but "
+                                    "@llm_stub always returns the same fixed "
+                                    "completion — the model's output cannot be "
+                                    "this test's subject"
+                                ),
+                                suggestion=(
+                                    "Declare Tier 1 or Tier 2 (the loop/valve/"
+                                    "wiring behavior actually under test), or "
+                                    "switch to @replay(fixture) if the model's "
+                                    "output really is the subject"
+                                ),
+                                policy_ref="#5103 / #5294: Tier 3 ⟺ model output is the subject",
+                            )
+                        )
+
+        # --- Rule 6: Snapshot/golden test outside scaffold ---
+        if self._rule_active("snapshot") and not in_scaffold:
+            for rel_lineno, line in enumerate(node_lines):
+                if SNAPSHOT_RE.search(line):
+                    # Exclude file-copy invariant pattern (both sides .read_text())
+                    if INVARIANT_FILE_COPY_RE.search(line):
+                        continue
+                    abs_lineno = node.lineno + rel_lineno
+                    result.findings.append(
+                        Finding(
+                            rule="snapshot",
+                            level="ERROR",
+                            line=abs_lineno,
+                            message=f"snapshot/golden file comparison: {line.strip()[:80]}",
+                            suggestion=(
+                                "Move to tests/scaffold/ with triggered_by/removed_by, "
+                                "or replace with direct invariant assertion"
+                            ),
+                            policy_ref="testing.ja.md Tier 4: スナップショット／ゴールデンファイルテスト",
+                        )
+                    )
+                    break  # one finding per test
+
+        return result
+
+
+def _has_llm_stub_marker(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    """True iff *node* carries an ``@pytest.mark.llm_stub`` decorator (#5103)."""
+    for dec in node.decorator_list:
+        if (
+            isinstance(dec, ast.Attribute)
+            and dec.attr == "llm_stub"
+            and isinstance(dec.value, ast.Attribute)
+            and dec.value.attr == "mark"
+        ):
+            return True
+    return False
+
+
+def _is_existence_check_only(line: str, m: re.Match) -> bool:
+    """Return True if the len(...) match is a simple > 0 existence check."""
+    after = line[m.end():].lstrip()
+    # Patterns like "> 0" or ">= 1" — but NOT "< 3000" or "> 10"
+    # We consider > 0 and >= 1 as existence checks; anything else is pinning.
+    n = int(m.group(1))
+    op_part = line[m.start():m.end()]
+    # Extract the operator from the full match
+    op_m = re.search(r"len\([^)]+\)\s*([<>=!]+)\s*(\d+)", op_part)
+    if op_m:
+        op = op_m.group(1)
+        val = int(op_m.group(2))
+        if (op == ">" and val == 0) or (op == ">=" and val == 1):
+            return True
+    return False
+
+
+def _check_mock_in_func(
+    node: ast.FunctionDef | ast.AsyncFunctionDef,
+    ast_lines: list[str],
+    result: TestResult,
+) -> None:
+    """Detect @patch decorators and with-patch / MagicMock inside the function.
+
+    Narrow scope per testing.ja.md: prohibition is "litellm への unittest.mock パッチ"
+    (= LLM-boundary patches). Internal code patches (= reyn.* paths) inside
+    Tier 2c integration tests are permitted — they exercise real production code
+    paths through controlled fake dependencies, not LLM contract evasion.
+    """
+    # Check decorators for @patch
+    for dec in node.decorator_list:
+        dec_src = _cached_source_segment(ast_lines, dec)
+        if "patch" in dec_src and "unittest" in dec_src or dec_src.strip().startswith("patch"):
+            if not _is_llm_boundary_patch(dec_src):
+                continue
+            result.findings.append(
+                Finding(
+                    rule="mock",
+                    level="ERROR",
+                    line=dec.lineno,
+                    message=f"@patch decorator (LLM boundary): {dec_src.strip()[:80]}",
+                    suggestion="Use LLMReplay Fake instead of unittest.mock.patch",
+                    policy_ref="testing.ja.md Mock vs Fake: Mock は禁止 — LLMReplay を使う",
+                )
+            )
+
+    # Walk the function body for MagicMock / AsyncMock / with patch. #3670:
+    # get_source_segment() is only called for the ONE branch that actually
+    # uses its result (Import/ImportFrom) — it used to run unconditionally
+    # for every walked node (assigns, calls, expressions, everything), each
+    # call re-scanning the whole file's source from scratch internally
+    # (ast.get_source_segment -> _splitlines_no_ff), which measured as 90%
+    # of this script's full-tree CI runtime (profiled: 564k calls, 121s of
+    # 147s total) for a value thrown away on every node but Import.
+    for stmt in ast.walk(node):
+        if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+            mod = ""
+            if isinstance(stmt, ast.ImportFrom) and stmt.module:
+                mod = stmt.module
+            elif isinstance(stmt, ast.Import):
+                mod = " ".join(a.name for a in stmt.names)
+            if "unittest.mock" in mod or (
+                isinstance(stmt, ast.ImportFrom) and any(
+                    n.name in ("MagicMock", "AsyncMock", "patch") for n in stmt.names
+                )
+            ):
+                stmt_src = _cached_source_segment(ast_lines, stmt)
+                result.findings.append(
+                    Finding(
+                        rule="mock",
+                        level="ERROR",
+                        line=stmt.lineno,
+                        message=f"unittest.mock import: {stmt_src.strip()[:80]}",
+                        suggestion="Use real instances or LLMReplay Fake",
+                        policy_ref="testing.ja.md Mock vs Fake",
+                    )
+                )
+        elif isinstance(stmt, ast.With):
+            # with patch(...) context manager
+            for item in stmt.items:
+                item_src = _cached_source_segment(ast_lines, item.context_expr)
+                if re.search(r"\bpatch\s*\(", item_src):
+                    if not _is_llm_boundary_patch(item_src):
+                        continue
+                    result.findings.append(
+                        Finding(
+                            rule="mock",
+                            level="ERROR",
+                            line=stmt.lineno,
+                            message=f"with patch(...) (LLM boundary): {item_src.strip()[:80]}",
+                            suggestion="Use LLMReplay Fake instead of patch",
+                            policy_ref="testing.ja.md Mock vs Fake",
+                        )
+                    )
+        elif isinstance(stmt, ast.Call):
+            # MagicMock() / AsyncMock() calls
+            func_src = _cached_source_segment(ast_lines, stmt.func)
+            if re.search(r"\b(MagicMock|AsyncMock)\b", func_src):
+                result.findings.append(
+                    Finding(
+                        rule="mock",
+                        level="ERROR",
+                        line=stmt.lineno,
+                        message=f"MagicMock/AsyncMock usage: {func_src.strip()[:80]}",
+                        suggestion="Use real instances or LLMReplay Fake",
+                        policy_ref="testing.ja.md Mock vs Fake",
+                    )
+                )
+
+
+def _check_module_level_mock_imports(
+    path: Path, source: str, tree: ast.Module
+) -> list[Finding]:
+    """Check module-level unittest.mock imports (outside test functions)."""
+    findings: list[Finding] = []
+    ast_lines = _split_source_lines(source)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            # Skip; handled per-function
+            continue
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            mod = ""
+            if isinstance(node, ast.ImportFrom) and node.module:
+                mod = node.module
+            elif isinstance(node, ast.Import):
+                mod = " ".join(a.name for a in node.names)
+            if "unittest.mock" in mod:
+                src = _cached_source_segment(ast_lines, node)
+                findings.append(
+                    Finding(
+                        rule="mock",
+                        level="ERROR",
+                        line=node.lineno,
+                        message=f"module-level unittest.mock import: {src.strip()[:80]}",
+                        suggestion="Remove — use real instances or LLMReplay Fake",
+                        policy_ref="testing.ja.md Mock vs Fake",
+                    )
+                )
+    return findings
+
+
+def _check_fake_attr_assignments(source: str, tree: ast.Module) -> list[Finding]:
+    """Rule 7 (#4873): ``obj.attr = value  # type: ignore[attr-defined]``
+    ANYWHERE in the file — #3037's own named pattern, a real object
+    mock-ified in place instead of using a Fake. Deliberately whole-FILE,
+    not per-``test_*``-function like rules 1-6 above: the 10 real
+    violations #4873 found were mostly inside module-level HELPER functions
+    (``_noop_handler``, ``_fake_resolve_and_validate`` — a fixture a test
+    calls, not the test body itself), which a per-test-function
+    ``ast.walk(node)`` never reaches at all. A first version of this rule
+    scoped to ``test_*`` bodies only and its own "zero across 10,611 tests"
+    result was FALSE — a stale ignore comment on ``tests/tools/test_tool_
+    registry_invariants.py:34`` (inside ``_noop_handler``, called from a
+    test but not itself named ``test_*``) was re-injected to falsify this
+    rule and the scoped version missed it silently. mypy already detects
+    the underlying issue (``[attr-defined]`` on an assignment IS "this
+    class has no such attribute"); the annotation is someone's own trace of
+    having silenced that detection, so this rule needs no detector of its
+    own, only a ban on the suppression — scoped to ASSIGNMENT lines only
+    (reading an already-flagged private attribute, e.g. ``host.events.
+    emitted``, is a narrower, different complaint architect's own #4873
+    measurement put out of scope).
+
+    Known gap (architect, #4873, disclosed not claimed away): a DYNAMIC
+    ``setattr(ns, k, v)`` cannot be seen by any syntax gate — this rule
+    catches the LITERAL ``obj.attr = value`` shape only, per the regex's
+    own comment on ``_TYPE_IGNORE_RE`` above for the suppression-comment
+    side of the same caveat."""
+    findings: list[Finding] = []
+    ast_lines = _split_source_lines(source)
+    for stmt in ast.walk(tree):
+        if isinstance(stmt, ast.Assign):
+            targets = stmt.targets
+        elif isinstance(stmt, ast.AnnAssign):
+            targets = [stmt.target]
+        else:
+            continue
+        attr_targets = [t for t in targets if isinstance(t, ast.Attribute)]
+        if not attr_targets:
+            continue
+        stmt_line = (
+            ast_lines[stmt.lineno - 1] if stmt.lineno - 1 < len(ast_lines) else ""
+        )
+        if "attr-defined" not in _ignore_codes(stmt_line):
+            continue
+        first = attr_targets[0]
+        findings.append(
+            Finding(
+                rule="fake-attr",
+                level="ERROR",
+                line=stmt.lineno,
+                message=(
+                    f"fake attribute (.{first.attr}) on a real object, "
+                    f"suppressed via type: ignore[attr-defined]: "
+                    f"{stmt_line.strip()[:80]}"
+                ),
+                suggestion=(
+                    "The production class does not declare this attribute "
+                    "— use its public API, extend the class, or thread the "
+                    "value through explicitly instead of attaching it "
+                    "post-hoc (#3037)"
+                ),
+                policy_ref="testing.ja.md #3037: a real instance mock-ified in place",
+            )
+        )
+    return findings
+
+
+def _annotation_class_names(node: ast.AST | None) -> set[str]:
+    """Every candidate class name spelled by an annotation node — ``Session``
+    from ``x: Session``, ``"Session"`` from a quoted forward-reference,
+    ``Session`` from ``x: module.Session``, and (load-bearing, not a nicety
+    — see below) BOTH names from a union: ``x: "Session | None"`` and
+    ``x: Optional[Session]`` alike.
+
+    The union case is not speculative completeness: it's the exact shape
+    that made this rule MISS one of architect's own 4 named positive
+    controls on its first pass (#4864 thread) —
+    ``def _op_ctx(tmp_path, session: "Session | None") -> OpContext:`` in
+    ``tests/core/test_2761_pr2_hotreload_immediate_apply.py`` — caught only
+    by re-checking each of the 4 named sites individually against this
+    PR's own findings before writing the PR body, not by any corpus-wide
+    measurement (only that one file was checked this way)."""
+    if node is None:
+        return set()
+    if isinstance(node, ast.Name):
+        return {node.id}
+    if isinstance(node, ast.Attribute):
+        return {node.attr}
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        try:
+            inner = ast.parse(node.value, mode="eval").body
+        except SyntaxError:
+            return set()
+        return _annotation_class_names(inner)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+        return _annotation_class_names(node.left) | _annotation_class_names(
+            node.right
+        )
+    if isinstance(node, ast.Subscript):
+        return _annotation_class_names(node.slice)  # Optional[X] / Union[X, Y]
+    if isinstance(node, ast.Tuple):
+        out: set[str] = set()
+        for elt in node.elts:
+            out |= _annotation_class_names(elt)
+        return out
+    return set()
+
+
+def _annotation_class_name(node: ast.AST | None, class_names: set[str]) -> str | None:
+    """The single name from ``_annotation_class_names(node)`` that is
+    actually one of *class_names* — resolves ``"Session | None"`` to
+    ``"Session"`` (``"None"`` is never a tracked class) without the caller
+    needing to know about unions at all. None if no candidate matches."""
+    candidates = _annotation_class_names(node) & class_names
+    if not candidates:
+        return None
+    return sorted(candidates)[0]
+
+
+def _build_class_property_index(src_root: Path) -> dict[str, tuple[set[str], str]]:
+    """Rule 8 (#4864): for every class in *src_root*, the private attribute
+    names it assigns via ``self._x = ...`` that are ALSO published by a
+    same-class ``@property def x``. Keyed by class name; whole ``src/``
+    scanned ONCE (mirrors #3670's single-index-build precedent — this is
+    shared across every test file the caller audits, not rebuilt per-file).
+
+    Class-SCOPED intersection is load-bearing, not a stylistic choice.
+    architect's own #4864-thread pitfall: ``self._chains = chains`` is
+    assigned in FIVE different classes (SpawnTracker/RouterHostAdapter/
+    ChainTimeoutGlue/InterAgentMessaging/Session), but only ``Session``
+    ALSO defines ``@property def chains``. A global (does this attr name
+    exist as a property ANYWHERE) index would wrongly flag ``_chains``
+    reads on the other four classes too — keying by class name here, and
+    requiring the caller to prove the read's object is THAT SPECIFIC class
+    (see ``_build_function_return_types`` / ``_infer_local_types`` below)
+    is what keeps the false-positive rate at the 0 architect's spec
+    requires.
+
+    Known gap (disclosed, not measured): two classes sharing a bare name
+    in different files collide in this dict (last one scanned wins) —
+    unmeasured corpus-wide, same caveat class as #4873's own disclosed
+    dynamic-``setattr`` gap.
+    """
+    index: dict[str, tuple[set[str], str]] = {}
+    for path in sorted(src_root.rglob("*.py")):
+        try:
+            source = path.read_text(encoding="utf-8")
+            tree = ast.parse(source, filename=str(path))
+        except (OSError, SyntaxError):
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ClassDef):
+                continue
+            private_assigned: set[str] = set()
+            property_names: set[str] = set()
+            for inner in ast.walk(node):
+                if isinstance(inner, (ast.Assign, ast.AnnAssign)):
+                    targets = (
+                        inner.targets
+                        if isinstance(inner, ast.Assign)
+                        else [inner.target]
+                    )
+                    for t in targets:
+                        if (
+                            isinstance(t, ast.Attribute)
+                            and isinstance(t.value, ast.Name)
+                            and t.value.id == "self"
+                            and t.attr.startswith("_")
+                            and not t.attr.startswith("__")
+                        ):
+                            private_assigned.add(t.attr)
+                elif isinstance(inner, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    for dec in inner.decorator_list:
+                        if isinstance(dec, ast.Name) and dec.id == "property":
+                            property_names.add(inner.name)
+            backed = {a for a in private_assigned if a[1:] in property_names}
+            if backed:
+                index[node.name] = (backed, str(path))
+    return index
+
+
+def _build_class_property_return_types(src_root: Path) -> dict[tuple[str, str], str]:
+    """#4906 (false-negative ① of #4864/#4905's gate): ``(class_name,
+    public_property_name) -> the class the property's getter return
+    annotation names`` — resolves ONE LINK of a chained read
+    (``w.f._router_host``, where ``f`` is itself a ``@property`` returning
+    another tracked class, e.g. ``Widget.f -> Session``) so
+    ``_resolve_base_class`` below can walk an attribute chain instead of
+    being restricted to a bare local ``ast.Name`` base.
+
+    tui-coder's own #4905 PR body already disclosed this restriction
+    verbatim: "base object restricted to a bare `ast.Name` … narrower than
+    Rule 3's own walk" — architect reproduced it live afterward
+    (``w.f._router_host`` → 0 findings, real violation). This index is
+    the evidence source that removes the restriction: an entry only exists
+    when the getter's OWN return annotation names a tracked class — never
+    guessed from the property's name.
+
+    Never claims completeness beyond one link at a time: a chain of
+    ``a.b.c._x`` resolves iff EVERY link (``a``'s local type, ``b``'s
+    return annotation, ``c``'s return annotation) is independently
+    evidence-backed; any unresolvable link anywhere in the chain returns
+    ``None`` for the whole chain (see ``_resolve_base_class``), never a
+    partial guess.
+    """
+    class_names: set[str] = set()
+    class_defs: list[tuple[str, ast.ClassDef]] = []
+    for path in sorted(src_root.rglob("*.py")):
+        try:
+            source = path.read_text(encoding="utf-8")
+            tree = ast.parse(source, filename=str(path))
+        except (OSError, SyntaxError):
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef):
+                class_names.add(node.name)
+                class_defs.append((node.name, node))
+
+    index: dict[tuple[str, str], str] = {}
+    for cls_name, node in class_defs:
+        for inner in ast.walk(node):
+            if not isinstance(inner, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if not any(
+                isinstance(d, ast.Name) and d.id == "property"
+                for d in inner.decorator_list
+            ):
+                continue
+            ret_cls = _annotation_class_name(inner.returns, class_names)
+            if ret_cls is not None:
+                index[(cls_name, inner.name)] = ret_cls
+    return index
+
+
+def _resolve_base_class(
+    node: ast.expr,
+    local_types: dict[str, str],
+    property_return_types: dict[tuple[str, str], str],
+) -> str | None:
+    """#4906: the class of an expression used as an ``ast.Attribute``
+    BASE — a bare local ``ast.Name`` (resolved via ``local_types``, the
+    original #4864/#4905 scope) or a CHAIN of public-property reads, each
+    link resolved via ``property_return_types``. Recurses on ``node.value``
+    (strictly smaller each call — terminates at a ``Name`` or an
+    unresolvable node), so a chain of any length works, not just depth 1.
+    Any unresolvable link anywhere returns ``None`` for the whole
+    expression — never a guessed/partial answer."""
+    if isinstance(node, ast.Name):
+        return local_types.get(node.id)
+    if isinstance(node, ast.Attribute):
+        base_class = _resolve_base_class(node.value, local_types, property_return_types)
+        if base_class is None:
+            return None
+        return property_return_types.get((base_class, node.attr))
+    return None
+
+
+def _build_function_return_types(
+    tree: ast.Module, class_names: set[str]
+) -> dict[str, str]:
+    """Same-file function/fixture defs whose return annotation names one of
+    *class_names* — e.g. ``def _make_session(...) -> Session:``. This is
+    how the rule sees through the dominant test-corpus construction idiom
+    (a local ``_make_x`` factory, not a bare ``Session(...)`` call) without
+    ever assuming a naming convention: the evidence is the annotation, not
+    the function's name."""
+    out: dict[str, str] = {}
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            name = _annotation_class_name(node.returns, class_names)
+            if name is not None:
+                out[node.name] = name
+    return out
+
+
+def _tuple_return_class_names(
+    node: ast.expr | None, class_names: set[str],
+) -> list[str | None] | None:
+    """#4906 (false-negative ②): the POSITIONAL class list from a
+    subscripted tuple return annotation — ``-> tuple[Session, StateLog]``
+    or ``-> Tuple[Session, StateLog]`` — one entry per element (``None``
+    where that position's own annotation doesn't resolve to a tracked
+    class), or ``None`` entirely when *node* isn't a tuple-shaped
+    subscript at all (a single-class return stays ``_annotation_class_
+    name``'s job, unchanged).
+
+    A quoted forward-ref (``-> "tuple[Session, StateLog]"``) is parsed
+    into its expression tree first — the dominant real-corpus shape (this
+    file's own return annotations are quoted throughout), not an edge
+    case."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        try:
+            node = ast.parse(node.value, mode="eval").body
+        except SyntaxError:
+            return None
+    if not isinstance(node, ast.Subscript):
+        return None
+    base = node.value
+    base_name = base.id if isinstance(base, ast.Name) else (
+        base.attr if isinstance(base, ast.Attribute) else None
+    )
+    if base_name not in ("tuple", "Tuple"):
+        return None
+    elts = node.slice.elts if isinstance(node.slice, ast.Tuple) else [node.slice]
+    return [_annotation_class_name(e, class_names) for e in elts]
+
+
+def _build_function_tuple_return_types(
+    tree: ast.Module, class_names: set[str],
+) -> dict[str, list[str | None]]:
+    """#4906 (false-negative ①): same-file function defs whose return
+    annotation is a tuple shape (``-> tuple[Session, StateLog]``) — the
+    evidence source ``_infer_local_types`` needs to bind ``a, b =
+    _make_pair()`` (tuple-UNPACKING assignment), which #4864/#4905's
+    original ``_infer_local_types`` could not see at all: its Assign
+    branch only handled ``len(stmt.targets) == 1 and isinstance(stmt.
+    targets[0], ast.Name)``, so an ``ast.Tuple`` target was skipped
+    entirely — tui-coder's own #4905 PR reproduced this live: ``a, b =
+    _make_pair()`` then ``a._router_host`` produced ZERO findings despite
+    ``a`` genuinely being a ``Session``."""
+    out: dict[str, list[str | None]] = {}
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            names = _tuple_return_class_names(node.returns, class_names)
+            if names is not None:
+                out[node.name] = names
+    return out
+
+
+def _infer_local_types(
+    func: ast.FunctionDef | ast.AsyncFunctionDef,
+    class_names: set[str],
+    function_return_types: dict[str, str],
+    function_tuple_return_types: dict[str, list[str | None]] | None = None,
+) -> dict[str, str]:
+    """Best-effort local-variable-name -> class-name map for *func*,
+    evidence-only (never inferred from a variable's own name — a param
+    called ``session`` proves nothing by itself). Accepted evidence:
+
+      - parameter annotation:        def test_x(s: Session): ...
+      - parameter name matches a same-file factory/fixture def whose
+        return annotation names a known class (covers the ``s =`` idiom
+        AND the pytest fixture-injection idiom in one pass, since both
+        are "a same-file def with a typed return, referenced by name")
+      - local annotated assignment:  s: Session = ...
+      - local assignment from a direct constructor or factory call:
+        s = Session(...)  /  s = _make_session(...)  /  s = await _make_session(...)
+      - #4906: TUPLE-UNPACKING assignment from a factory whose return
+        annotation is itself a tuple shape: ``a, b = _make_pair()`` where
+        ``_make_pair() -> tuple[Session, StateLog]`` binds ``a -> Session``,
+        ``b -> StateLog`` positionally. A ``Starred`` element anywhere in
+        the target, or an arity mismatch between target and annotation
+        length, skips the WHOLE assignment (never a partial/guessed bind).
+    """
+    types: dict[str, str] = {}
+    tuple_return_types = function_tuple_return_types or {}
+    all_args = list(func.args.args) + list(func.args.kwonlyargs)
+    if func.args.posonlyargs:
+        all_args = list(func.args.posonlyargs) + all_args
+    for arg in all_args:
+        name = _annotation_class_name(arg.annotation, class_names)
+        if name is not None:
+            types[arg.arg] = name
+        elif arg.arg in function_return_types:
+            types[arg.arg] = function_return_types[arg.arg]
+    for stmt in ast.walk(func):
+        if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+            name = _annotation_class_name(stmt.annotation, class_names)
+            if name is not None:
+                types[stmt.target.id] = name
+            continue
+        if not isinstance(stmt, ast.Assign) or len(stmt.targets) != 1:
+            continue
+        target = stmt.targets[0]
+        value = stmt.value
+        if isinstance(value, ast.Await):
+            value = value.value
+        if not isinstance(value, ast.Call):
+            continue
+        callee = value.func
+        callee_name = None
+        if isinstance(callee, ast.Name):
+            callee_name = callee.id
+        elif isinstance(callee, ast.Attribute):
+            callee_name = callee.attr
+        if isinstance(target, ast.Name):
+            if callee_name in class_names:
+                types[target.id] = callee_name
+            elif callee_name in function_return_types:
+                types[target.id] = function_return_types[callee_name]
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            if callee_name is None or callee_name not in tuple_return_types:
+                continue
+            positions = tuple_return_types[callee_name]
+            elts = target.elts
+            if len(elts) != len(positions) or any(
+                isinstance(e, ast.Starred) for e in elts
+            ):
+                continue  # arity mismatch or *rest — never a partial bind
+            for elt, cls in zip(elts, positions):
+                if isinstance(elt, ast.Name) and cls is not None:
+                    types[elt.id] = cls
+    return types
+
+
+def _check_private_read_with_public_alt(
+    source: str,
+    tree: ast.Module,
+    class_index: dict[str, tuple[set[str], str]],
+    property_return_types: dict[tuple[str, str], str] | None = None,
+) -> list[Finding]:
+    """Rule 8 (#4864): ``obj._x`` READ anywhere (not only inside an
+    ``assert`` — the whole point per the issue's own measurement: routing
+    the private read through a local var one line before the assert made
+    126 sites invisible to Rule 3's assert-scoped AST walk) where *obj* is
+    type-evident (see ``_infer_local_types``) as a class that ALSO
+    publishes ``x`` via ``@property``.
+
+    Repair-obligation, not bare detector (architect, #4864 thread): the
+    message must not stop at "use .x instead" — #4866 is the concrete
+    instance where a fail was closed by ADDING a same-named ``@property``
+    that just republished the private field, "ratif[ying] the
+    encapsulation break instead of closing it" (#4866's own diff wording).
+    So the suggestion also tells the fixer: if no public alternative
+    already answers what the test is actually asking, don't manufacture
+    one to satisfy the gate.
+
+    ``obj`` may be a bare ``ast.Name`` OR a chain of public-property reads
+    (``w.f._router_host`` — #4906, false-negative ②: the original #4864/
+    #4905 restriction to a bare Name was narrower than Rule 3's own walk,
+    reproduced live by architect after tui-coder disclosed it in the #4905
+    PR body). Each link beyond the first needs its OWN evidence
+    (``property_return_types``); an unresolvable link anywhere still
+    yields no finding — the net widens, the zero-false-positive bar does
+    not move."""
+    findings: list[Finding] = []
+    ast_lines = _split_source_lines(source)
+    prop_return_types = property_return_types or {}
+    # #4906: "known classes" (the set a parameter/assignment annotation
+    # must name to bind a local var) can't be JUST class_index's own keys
+    # (classes with a directly-backed private attr) — a class that only
+    # participates as an intermediate CHAIN LINK (e.g. `Widget`, which owns
+    # `.f` but never itself reads a backed private attr) would otherwise
+    # never resolve as a parameter/assignment annotation target, silently
+    # keeping the chained-access fix inert for exactly the shape it exists
+    # to catch (`w.f._router_host` needs `w: Widget` to bind first).
+    class_names = (
+        set(class_index)
+        | {cls for cls, _ in prop_return_types}
+        | set(prop_return_types.values())
+    )
+    function_return_types = _build_function_return_types(tree, class_names)
+    function_tuple_return_types = _build_function_tuple_return_types(tree, class_names)
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        local_types = _infer_local_types(
+            node, class_names, function_return_types, function_tuple_return_types
+        )
+        if not local_types:
+            continue
+        for inner in ast.walk(node):
+            if not isinstance(inner, ast.Attribute):
+                continue
+            # Store context (`client._x = value`) is a WRITE to private
+            # state, not the READ this rule is scoped to — a direct
+            # assignment target is #4873's territory (a different rule),
+            # not this one. A nested Load (`client._x.y = value`, where
+            # `client._x` is READ to reach `.y`) still matches: only the
+            # OUTERMOST node of a chain carries Store, per ast's own ctx
+            # assignment, so this filter affects only the direct-target
+            # case.
+            if not isinstance(inner.ctx, ast.Load):
+                continue
+            attr = inner.attr
+            if not (attr.startswith("_") and not attr.startswith("__")):
+                continue
+            base = inner.value
+            if isinstance(base, ast.Name) and base.id == "self":
+                continue
+            class_name = _resolve_base_class(base, local_types, prop_return_types)
+            if class_name is None:
+                continue
+            backed, class_file = class_index.get(class_name, (set(), ""))
+            if attr not in backed:
+                continue
+            public_name = attr[1:]
+            line_src = (
+                ast_lines[inner.lineno - 1]
+                if inner.lineno - 1 < len(ast_lines)
+                else ""
+            )
+            findings.append(
+                Finding(
+                    rule="private-read-public-alt",
+                    level="ERROR",
+                    line=inner.lineno,
+                    message=(
+                        f"private read (.{attr}) has a public alternative "
+                        f"— {class_name}.{public_name} is a @property "
+                        f"({_rel_path(Path(class_file))}): "
+                        f"{line_src.strip()[:80]}"
+                    ),
+                    suggestion=(
+                        f"Use .{public_name} instead of .{attr}. If no "
+                        f"public alternative actually answers what this "
+                        f"test is asking, do not add a @property just to "
+                        f"silence this gate — that ratifies the "
+                        f"encapsulation break instead of closing it "
+                        f"(#4866); re-examine what the test is asking "
+                        f"instead."
+                    ),
+                    policy_ref=(
+                        "CLAUDE.md: must not depend on private state — "
+                        "use the public surface or a snapshot()-style read"
+                    ),
+                )
+            )
+    return findings
+
+
+# ---------------------------------------------------------------------------
+# File collection
+# ---------------------------------------------------------------------------
+
+
+def collect_files(paths: list[Path]) -> list[Path]:
+    result: list[Path] = []
+    for p in paths:
+        if p.is_file() and p.suffix == ".py":
+            result.append(p)
+        elif p.is_dir():
+            result.extend(sorted(p.rglob("test_*.py")))
+    # deduplicate preserving order
+    seen: set[Path] = set()
+    out: list[Path] = []
+    for f in result:
+        if f not in seen:
+            seen.add(f)
+            out.append(f)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Output rendering
+# ---------------------------------------------------------------------------
+
+TICK = "✓"
+WARN = "⚠️ "
+CROSS = "✗"
+
+
+def _level_icon(level: Level) -> str:
+    return WARN if level == "WARNING" else CROSS
+
+
+def render_text(
+    reports: list[FileReport],
+    quiet: bool = False,
+    strict: bool = False,
+) -> None:
+    total_tests = 0
+    total_ok = 0
+    total_warnings = 0
+    total_errors = 0
+
+    for report in reports:
+        rel = _rel_path(report.path)
+        print(f"\n{rel}:")
+
+        if report.parse_error:
+            print(f"  [PARSE ERROR] {report.parse_error}")
+            continue
+
+        if not report.results:
+            print("  (no test functions found)")
+            continue
+
+        for res in report.results:
+            total_tests += 1
+            if res.ok:
+                total_ok += 1
+                if not quiet:
+                    print(f"  {TICK} {res.name}")
+            else:
+                errors = [f for f in res.findings if f.level == "ERROR"]
+                warnings = [f for f in res.findings if f.level == "WARNING"]
+                if errors:
+                    total_errors += 1
+                    print(f"  {CROSS} {res.name}")
+                elif warnings:
+                    total_warnings += 1
+                    print(f"  {WARN}{res.name}")
+                for f in res.findings:
+                    icon = _level_icon(f.level)
+                    print(f"      line {f.line}: {f.message}")
+                    if f.policy_ref:
+                        print(f"      policy: {f.policy_ref}")
+                    if f.suggestion:
+                        print(f"      suggestion: {f.suggestion}")
+
+    print(
+        f"\nSummary: {total_tests} test{'s' if total_tests != 1 else ''} inspected"
+    )
+    print(f"  {TICK} OK: {total_ok}")
+    print(f"  {WARN}warnings: {total_warnings} (bounded-life candidates)")
+    print(f"  {CROSS} errors: {total_errors} (Tier 4 violations)")
+
+    exit_code = 0
+    if total_errors > 0:
+        exit_code = 1
+    elif strict and total_warnings > 0:
+        exit_code = 1
+    print(f"\nExit code: {exit_code}{' (errors found)' if exit_code else ''}")
+
+
+def render_json(reports: list[FileReport], strict: bool = False) -> None:
+    out: list[dict] = []
+    for report in reports:
+        file_data: dict = {
+            "path": str(report.path),
+            "parse_error": report.parse_error,
+            "tests": [],
+        }
+        for res in report.results:
+            file_data["tests"].append(
+                {
+                    "name": res.name,
+                    "ok": res.ok,
+                    "findings": [
+                        {
+                            "rule": f.rule,
+                            "level": f.level,
+                            "line": f.line,
+                            "message": f.message,
+                            "suggestion": f.suggestion,
+                            "policy_ref": f.policy_ref,
+                        }
+                        for f in res.findings
+                    ],
+                }
+            )
+        out.append(file_data)
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+
+
+def _rel_path(p: Path) -> str:
+    try:
+        return str(p.relative_to(Path.cwd()))
+    except ValueError:
+        return str(p)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Reyn test policy compliance auditor (testing.ja.md)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    parser.add_argument(
+        "targets",
+        nargs="*",
+        metavar="FILE_OR_DIR",
+        help="Files or directories to audit (default: tests/)",
+    )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Treat warnings as errors (exit 1 on any warning)",
+    )
+    parser.add_argument(
+        "--check",
+        metavar="RULE",
+        help=(
+            "Only check one rule: "
+            "tier-docstring / format-pinning / private-state / mock / bounded-life / "
+            "snapshot / fake-attr / private-read-public-alt / llm-stub-tier"
+        ),
+    )
+    parser.add_argument(
+        "--src-root",
+        metavar="DIR",
+        default="src",
+        help=(
+            "Root to scan for Rule 8's class/@property index "
+            "(default: src). Only read when private-read-public-alt runs."
+        ),
+    )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress OK tests; show only warnings and errors",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_output",
+        help="Machine-readable JSON output",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    # Validate --check
+    check_rules: set[str] | None = None
+    if args.check:
+        if args.check not in RULE_NAMES:
+            print(
+                f"Unknown rule: {args.check!r}. Valid: {', '.join(sorted(RULE_NAMES))}",
+                file=sys.stderr,
+            )
+            return 2
+        check_rules = {args.check}
+
+    # Resolve targets
+    target_paths = [Path(t) for t in args.targets] if args.targets else [Path("tests")]
+    files = collect_files(target_paths)
+
+    if not files:
+        # #4577: a non-zero exit, not a zero one. CLAUDE.md tells every author
+        # to run this as `--strict <changed test files>`, so the paths are
+        # hand-typed or shell-expanded — a typo (`test/` for `tests/`), a file
+        # another PR moved, or an empty variable all land HERE, and returning 0
+        # turned "I audited nothing" into a green the author then wrote into a
+        # Test plan as done. Nothing in the repo relied on the old 0: CI
+        # computes its own file list with `git diff` and guards `[ -z ]` before
+        # invoking (test.yml:310), and the main-push arm passes `tests/`, which
+        # never resolves empty. The resolved targets are echoed because the
+        # typo is invisible in the old message and obvious next to the path.
+        print(
+            "Audited NOTHING — the "
+            f"{len(target_paths)} target(s) below resolved to 0 test files. "
+            "This is not a pass; nothing was checked.",
+            file=sys.stderr,
+        )
+        for t in target_paths:
+            print(f"  {t}", file=sys.stderr)
+        return 1
+
+    auditor = TestAuditor(check_rules=check_rules)
+    reports: list[FileReport] = []
+
+    # Rule 8 (#4864): the class/@property index is built ONCE against
+    # --src-root, shared across every test file below — same
+    # single-build-not-per-file precedent as #3670's ``_split_source_lines``.
+    # Only built when the rule is actually active: it's a whole-src-tree
+    # scan, and every other rule here is test-file-only.
+    class_property_index: dict[str, tuple[set[str], str]] = {}
+    class_property_return_types: dict[tuple[str, str], str] = {}
+    if check_rules is None or "private-read-public-alt" in check_rules:
+        class_property_index = _build_class_property_index(Path(args.src_root))
+        # #4906: chained-access evidence (`w.f._router_host`) — see
+        # _build_class_property_return_types's own docstring.
+        class_property_return_types = _build_class_property_return_types(
+            Path(args.src_root)
+        )
+
+    for f in files:
+        report = auditor.audit_file(f)
+
+        # Also check module-level mock imports (injected as a synthetic result)
+        if not report.parse_error and check_rules is None or (
+            check_rules and "mock" in check_rules
+        ):
+            try:
+                source = f.read_text(encoding="utf-8")
+                tree = ast.parse(source, filename=str(f))
+                module_findings = _check_module_level_mock_imports(f, source, tree)
+                if module_findings:
+                    # Attach to a synthetic result named "<module>"
+                    synthetic = TestResult(name="<module-level>")
+                    synthetic.findings.extend(module_findings)
+                    report.results.insert(0, synthetic)
+            except (OSError, SyntaxError):
+                pass
+
+        # Rule 7 (#4873): whole-file, not per-test-function — see
+        # _check_fake_attr_assignments's own docstring for why (helper
+        # functions like `_noop_handler` are not named `test_*`, so a
+        # per-test walk never reaches an assignment inside them).
+        if not report.parse_error and (
+            check_rules is None or "fake-attr" in check_rules
+        ):
+            try:
+                source = f.read_text(encoding="utf-8")
+                tree = ast.parse(source, filename=str(f))
+                fake_attr_findings = _check_fake_attr_assignments(source, tree)
+                if fake_attr_findings:
+                    synthetic = TestResult(name="<module-level>")
+                    synthetic.findings.extend(fake_attr_findings)
+                    report.results.insert(0, synthetic)
+            except (OSError, SyntaxError):
+                pass
+
+        # Rule 8 (#4864): whole-file, same reason as Rule 7 — the reads
+        # this rule targets aren't confined to ``assert`` bodies.
+        if not report.parse_error and (
+            check_rules is None or "private-read-public-alt" in check_rules
+        ):
+            try:
+                source = f.read_text(encoding="utf-8")
+                tree = ast.parse(source, filename=str(f))
+                private_read_findings = _check_private_read_with_public_alt(
+                    source, tree, class_property_index, class_property_return_types
+                )
+                if private_read_findings:
+                    synthetic = TestResult(name="<module-level>")
+                    synthetic.findings.extend(private_read_findings)
+                    report.results.insert(0, synthetic)
+            except (OSError, SyntaxError):
+                pass
+
+        reports.append(report)
+
+    if args.json_output:
+        render_json(reports, strict=args.strict)
+        # Compute exit code
+        has_errors = any(r.error_count > 0 for r in reports)
+        has_warnings = any(r.warning_count > 0 for r in reports)
+    else:
+        render_text(reports, quiet=args.quiet, strict=args.strict)
+        has_errors = any(r.error_count > 0 for r in reports)
+        has_warnings = any(r.warning_count > 0 for r in reports)
+
+    if has_errors:
+        return 1
+    if args.strict and has_warnings:
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,414 @@
+"""Tier 2: file_* ToolDefinition M3 Wave 2 invariants (ADR-0026 M3 Wave 2).
+
+Verifies that READ_FILE, WRITE_FILE, DELETE_FILE, and LIST_DIRECTORY
+ToolDefinitions:
+- Produce byte-identical description/parameters output to the prior ToolSpec
+  literals in router_tools.py (C1-C4 block). Drift would invalidate replay
+  fixtures and change LLM tool affordance.
+- Have gates.router="allow".
+- Have the correct purity: read_only for read_file / list_directory,
+  side_effect for write_file / delete_file.
+- Have category="io" for all four.
+- Are findable via ToolRegistry round-trip.
+- Module-level description/parameter constants match ToolDefinition fields.
+
+No mocks of collaborators. All tests use real ToolDefinition instances.
+No private state assertions.
+"""
+from __future__ import annotations
+
+import asyncio
+
+from reyn.core.events.events import EventLog
+from reyn.data.workspace.workspace import Workspace
+from reyn.tools.file import (
+    _DELETE_FILE_DESCRIPTION,
+    _DELETE_FILE_PARAMETERS,
+    _LIST_DIRECTORY_DESCRIPTION,
+    _LIST_DIRECTORY_PARAMETERS,
+    _READ_FILE_DESCRIPTION,
+    _READ_FILE_PARAMETERS,
+    _WRITE_FILE_DESCRIPTION,
+    _WRITE_FILE_PARAMETERS,
+    DELETE_FILE,
+    LIST_DIRECTORY,
+    READ_FILE,
+    WRITE_FILE,
+)
+from reyn.tools.registry import ToolRegistry
+from reyn.tools.types import ToolContext
+
+# ── 1. LIST_DIRECTORY render_for_router byte-identity ───────────────────────
+
+def test_list_directory_router_render_exact_description():
+    """Tier 2: LIST_DIRECTORY description is byte-identical to the legacy ToolSpec
+    description in router_tools.py C1 block. Any whitespace or punctuation diff
+    is a stop signal that would drift LLMReplay fixtures."""
+    rendered = LIST_DIRECTORY.render_for_router()
+    legacy_description = (
+        "List contents of a directory under the agent's read scope. "
+        "Returns names + types (file/dir)."
+    )
+    assert rendered["function"]["description"] == legacy_description
+
+
+def test_list_directory_router_render_exact_parameters():
+    """Tier 2: LIST_DIRECTORY parameters schema matches the current
+    ``_LIST_DIRECTORY_PARAMETERS`` shape (path + max_results).
+
+    Deliberately widened from the legacy C1-block literal (path only): the
+    handler was silently hard-capping every listing at FileIROp's 50-entry
+    default with no way for a caller to raise it and no error/warning —
+    a silent-truncation hole for directories with more than 50 entries
+    (mirrors the same hole glob_files had, fixed in the same change).
+    ``max_results`` is now exposed so callers can opt out of the cap.
+    """
+    rendered = LIST_DIRECTORY.render_for_router()
+    current_parameters = {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string"},
+            "max_results": {
+                "type": "integer",
+                "description": rendered["function"]["parameters"]["properties"][
+                    "max_results"
+                ]["description"],
+            },
+        },
+        "required": ["path"],
+    }
+    assert rendered["function"]["parameters"] == current_parameters
+
+
+# ── 2. READ_FILE render_for_router byte-identity ─────────────────────────────
+
+def test_read_file_router_render_exact_description():
+    """Tier 2: READ_FILE description is byte-identical to the legacy ToolSpec
+    description in router_tools.py C2 block. Any whitespace or punctuation diff
+    is a stop signal that would drift LLMReplay fixtures."""
+    rendered = READ_FILE.render_for_router()
+    legacy_description = (
+        "Read a file's contents under the agent's read scope. "
+        "Common conventions: README is at project root as "
+        "`README.md`. CLAUDE.md, CHANGELOG.md, and "
+        "configuration files (e.g. `reyn.yaml`, "
+        "`pyproject.toml`) are at project root. Try these "
+        "conventional paths directly instead of asking the "
+        "user where the file lives."
+    )
+    assert rendered["function"]["description"] == legacy_description
+
+
+def test_read_file_router_render_exact_parameters():
+    """Tier 2: READ_FILE parameters schema pins the LLM-visible shape — ``path``
+    is required, optional ``offset`` / ``limit`` / ``char_offset`` expose the
+    line-slice + mid-line-resume capability that already exists in
+    ``op_runtime/file.py``. This shape is the read-side symmetry contract
+    shared with ``reyn_repo_read`` and ``read_memory_body``; widening it
+    should be a deliberate cross-surface decision, not a drift.
+
+    #4381: ``char_offset`` added and ``limit``'s description corrected — it
+    previously claimed "Omit to read through end of file", which
+    ``op_runtime/file.py`` does not actually guarantee (a remaining span
+    too large for the model's context window still gets cut); the
+    corrected text also names ``next_char_offset``, which used to be
+    returned by a truncated read but had no schema field to receive it
+    back on the following call."""
+    rendered = READ_FILE.render_for_router()
+    expected_parameters = {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string"},
+            "offset": {
+                "type": "integer",
+                "description": (
+                    "Line number to start reading from (0-indexed). "
+                    "Omit to start at the beginning of the file."
+                ),
+            },
+            "limit": {
+                "type": "integer",
+                "description": (
+                    "Number of lines to read from `offset`. Omitting it does "
+                    "NOT guarantee reading through end of file — a remaining "
+                    "span too large for the model's context window is still "
+                    "cut. If it is, the result flags it (`status: "
+                    "\"truncated\"`, `_truncated: true`) instead of silently "
+                    "returning a partial file, and carries `next_offset` (and "
+                    "`next_char_offset` when a single line alone was too "
+                    "long) to resume from — pass those back as `offset` (and "
+                    "`char_offset`) on the next call."
+                ),
+            },
+            "char_offset": {
+                "type": "integer",
+                "description": (
+                    "Character position within the line at `offset` to resume "
+                    "from. Only needed when a PREVIOUS truncated read of this "
+                    "same file returned `next_char_offset` (a single line "
+                    "longer than the context window, cut mid-line) — pass "
+                    "that value back here to continue from where it was cut, "
+                    "instead of re-reading the same oversized line from its "
+                    "start and truncating identically again."
+                ),
+            },
+        },
+        "required": ["path"],
+    }
+    assert rendered["function"]["parameters"] == expected_parameters
+
+
+# ── 3. WRITE_FILE render_for_router byte-identity ────────────────────────────
+
+def test_write_file_router_render_exact_description():
+    """Tier 2: WRITE_FILE renders its exact description through render_for_router.
+
+    Frozen drift-guard: a description change must update this pin AND re-check
+    replay fixtures (the rendered tools[] payload is what the LLM sees). #187
+    STEP 1 re-froze it after adding the reciprocal edit_file cross-ref.
+    """
+    rendered = WRITE_FILE.render_for_router()
+    expected_description = (
+        # #1625: reworded scheme-agnostic (WHAT not HOW) — was
+        # "describe_action(...) for its args, then invoke_action" (the universal-
+        # wrapper idiom leaking into the rendered code-API catalog, P7/P8).
+        "Write content to a file under the agent's write scope. "
+        "Creates or overwrites the WHOLE file. For a partial or surgical "
+        "change to an existing file, prefer the `edit_file` action instead of "
+        "rewriting the whole file."
+    )
+    assert rendered["function"]["description"] == expected_description
+
+
+def test_write_file_router_render_exact_parameters():
+    """Tier 2: WRITE_FILE parameters schema is byte-identical to the legacy
+    ToolSpec parameters in router_tools.py C3 block."""
+    rendered = WRITE_FILE.render_for_router()
+    legacy_parameters = {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string"},
+            "content": {"type": "string"},
+        },
+        "required": ["path", "content"],
+    }
+    assert rendered["function"]["parameters"] == legacy_parameters
+
+
+# ── 4. DELETE_FILE render_for_router byte-identity ───────────────────────────
+
+def test_delete_file_router_render_exact_description():
+    """Tier 2: DELETE_FILE description is byte-identical to the legacy ToolSpec
+    description in router_tools.py C4 block."""
+    rendered = DELETE_FILE.render_for_router()
+    legacy_description = (
+        "Delete a file under the agent's write scope."
+    )
+    assert rendered["function"]["description"] == legacy_description
+
+
+def test_delete_file_router_render_exact_parameters():
+    """Tier 2: DELETE_FILE parameters schema is byte-identical to the legacy
+    ToolSpec parameters in router_tools.py C4 block."""
+    rendered = DELETE_FILE.render_for_router()
+    legacy_parameters = {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string"},
+        },
+        "required": ["path"],
+    }
+    assert rendered["function"]["parameters"] == legacy_parameters
+
+
+# ── 5. Gate invariants ────────────────────────────────────────────────────────
+
+def test_read_file_gates_router_allow():
+    """Tier 2: READ_FILE has gates.router="allow".
+    File ops must be advertised to the router."""
+    assert READ_FILE.gates.router == "allow"
+
+
+def test_write_file_gates_router_allow():
+    """Tier 2: WRITE_FILE has gates.router="allow"."""
+    assert WRITE_FILE.gates.router == "allow"
+
+
+def test_delete_file_gates_router_allow():
+    """Tier 2: DELETE_FILE has gates.router="allow"."""
+    assert DELETE_FILE.gates.router == "allow"
+
+
+def test_list_directory_gates_router_allow():
+    """Tier 2: LIST_DIRECTORY has gates.router="allow"."""
+    assert LIST_DIRECTORY.gates.router == "allow"
+
+
+# ── 6. Purity invariants ──────────────────────────────────────────────────────
+
+def test_read_file_purity_read_only():
+    """Tier 2: READ_FILE purity is 'read_only' — no workspace side effect."""
+    assert READ_FILE.purity == "read_only"
+
+
+def test_list_directory_purity_read_only():
+    """Tier 2: LIST_DIRECTORY purity is 'read_only' — no workspace side effect."""
+    assert LIST_DIRECTORY.purity == "read_only"
+
+
+def test_write_file_purity_side_effect():
+    """Tier 2: WRITE_FILE purity is 'side_effect' — modifies workspace."""
+    assert WRITE_FILE.purity == "side_effect"
+
+
+def test_delete_file_purity_side_effect():
+    """Tier 2: DELETE_FILE purity is 'side_effect' — modifies workspace."""
+    assert DELETE_FILE.purity == "side_effect"
+
+
+# ── 7. Category invariant ─────────────────────────────────────────────────────
+
+def test_all_file_tools_category_io():
+    """Tier 2: All four file ToolDefinitions have category='io'."""
+    for tool in (READ_FILE, WRITE_FILE, DELETE_FILE, LIST_DIRECTORY):
+        assert tool.category == "io", f"{tool.name}.category expected 'io', got {tool.category!r}"
+
+
+# ── 8. Registry round-trip — all four appear in for_router ───────────────────
+
+def test_read_file_appears_in_for_router():
+    """Tier 2: READ_FILE appears in for_router() after registration.
+    Guards the allow/allow gate contract for both surfaces."""
+    registry = ToolRegistry()
+    registry.register(READ_FILE)
+    assert READ_FILE in registry.for_router()
+
+
+def test_write_file_appears_in_for_router():
+    """Tier 2: WRITE_FILE appears in for_router() after registration."""
+    registry = ToolRegistry()
+    registry.register(WRITE_FILE)
+    assert WRITE_FILE in registry.for_router()
+
+
+def test_delete_file_appears_in_for_router():
+    """Tier 2: DELETE_FILE appears in for_router() after registration."""
+    registry = ToolRegistry()
+    registry.register(DELETE_FILE)
+    assert DELETE_FILE in registry.for_router()
+
+
+def test_list_directory_appears_in_for_router():
+    """Tier 2: LIST_DIRECTORY appears in for_router() after registration."""
+    registry = ToolRegistry()
+    registry.register(LIST_DIRECTORY)
+    assert LIST_DIRECTORY in registry.for_router()
+
+
+# ── 9. Drift detection — module constants match ToolDefinition fields ─────────
+
+def test_read_file_constants_match_definition():
+    """Tier 2: _READ_FILE_DESCRIPTION and _READ_FILE_PARAMETERS module constants
+    match the READ_FILE ToolDefinition fields. Guards against accidental
+    divergence between the constants and what the object holds."""
+    assert READ_FILE.description == _READ_FILE_DESCRIPTION
+    assert dict(READ_FILE.parameters) == _READ_FILE_PARAMETERS
+
+
+def test_write_file_constants_match_definition():
+    """Tier 2: _WRITE_FILE_DESCRIPTION and _WRITE_FILE_PARAMETERS module constants
+    match the WRITE_FILE ToolDefinition fields."""
+    assert WRITE_FILE.description == _WRITE_FILE_DESCRIPTION
+    assert dict(WRITE_FILE.parameters) == _WRITE_FILE_PARAMETERS
+
+
+def test_write_edit_descriptions_cross_reference_symmetrically():
+    """Tier 2: #187 STEP 1 — write_file and edit_file descriptions reciprocally
+    cross-reference each other (general sibling-cross-ref), so the LLM is pointed
+    from a whole-file write toward a surgical edit and vice versa. Asserts the
+    public surface (concept presence), not exact wording.
+    """
+    from reyn.tools.file import _EDIT_FILE_DESCRIPTION, _WRITE_FILE_DESCRIPTION
+
+    # write → edit: points to the edit action (by its actionable qualified name)
+    # for partial/surgical changes instead of rewriting the whole file.
+    write_l = _WRITE_FILE_DESCRIPTION.lower()
+    assert "edit_file" in _WRITE_FILE_DESCRIPTION, "write desc must name the edit action"
+    assert "edit" in write_l and "whole file" in write_l
+
+    # edit → write: the existing reverse cross-ref (partial edit vs whole-file write).
+    edit_l = _EDIT_FILE_DESCRIPTION.lower()
+    assert "partial" in edit_l and "whole file" in edit_l
+
+
+def test_delete_file_constants_match_definition():
+    """Tier 2: _DELETE_FILE_DESCRIPTION and _DELETE_FILE_PARAMETERS module constants
+    match the DELETE_FILE ToolDefinition fields."""
+    assert DELETE_FILE.description == _DELETE_FILE_DESCRIPTION
+    assert dict(DELETE_FILE.parameters) == _DELETE_FILE_PARAMETERS
+
+
+def test_list_directory_constants_match_definition():
+    """Tier 2: _LIST_DIRECTORY_DESCRIPTION and _LIST_DIRECTORY_PARAMETERS module
+    constants match the LIST_DIRECTORY ToolDefinition fields."""
+    assert LIST_DIRECTORY.description == _LIST_DIRECTORY_DESCRIPTION
+    assert dict(LIST_DIRECTORY.parameters) == _LIST_DIRECTORY_PARAMETERS
+
+
+# ── 8. LIST_DIRECTORY max_results real-dispatch bound tests ─────────────────
+#
+# Strip-falsify note: removing the `max_results=args.get("max_results", 50)`
+# forward in `_handle_list` (tools/file.py) reproduces the exact silent-
+# truncation bug list_directory shared with glob_files — this was verified
+# manually (RED observed: 60 -> 50 with no error) before restoring the fix;
+# not committed as a permanently-broken state per the "no throwaway" rule.
+
+
+def _list_dir_ctx(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    events = EventLog()
+    ws = Workspace(events=events)
+    ws.base_dir = tmp_path
+    return ToolContext(
+        caller_kind="router", events=EventLog(), permission_resolver=None, workspace=ws,
+    )
+
+
+def test_list_directory_default_caps_at_50_when_more_entries_exist(tmp_path, monkeypatch):
+    """Tier 2: list_directory with no max_results caps entries at the 50 default.
+
+    Bound: 60 entries (deliberately ABOVE the 50 cap, not at it — a boundary
+    test placed at exactly 50 would not flip if the cap silently disappeared).
+    """
+    for i in range(60):
+        (tmp_path / f"entry_{i:03d}.txt").write_text("x\n", encoding="utf-8")
+
+    ctx = _list_dir_ctx(tmp_path, monkeypatch)
+    result = asyncio.run(LIST_DIRECTORY.handler({"path": "."}, ctx))
+
+    assert result.get("status") == "ok"
+    assert len(result.get("entries", [])) == 50, (
+        f"Expected default cap of 50, got {len(result.get('entries', []))}"
+    )
+
+
+def test_list_directory_max_results_override_returns_all_60(tmp_path, monkeypatch):
+    """Tier 2: list_directory max_results forwards through _handle_list to FileIROp.max_results
+    (the synthesised internal glob op), letting a caller raise the cap above 60 entries.
+
+    This is the strip-falsify companion to the test above, driven through the real
+    LIST_DIRECTORY.handler tool-dispatch path (not a hand-built FileIROp).
+    """
+    for i in range(60):
+        (tmp_path / f"entry_{i:03d}.txt").write_text("x\n", encoding="utf-8")
+
+    ctx = _list_dir_ctx(tmp_path, monkeypatch)
+    result = asyncio.run(
+        LIST_DIRECTORY.handler({"path": ".", "max_results": 1000}, ctx)
+    )
+
+    assert result.get("status") == "ok"
+    assert len(result.get("entries", [])) == 60, (
+        f"Expected all 60 entries with max_results=1000, got "
+        f"{len(result.get('entries', []))}"
+    )

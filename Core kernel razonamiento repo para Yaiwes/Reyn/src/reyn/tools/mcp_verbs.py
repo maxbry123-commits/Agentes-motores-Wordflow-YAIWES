@@ -1,0 +1,757 @@
+"""MCP verb-object handlers — three-axis install split.
+
+Router-callable MCP verbs under the single ``mcp`` category. The install
+surface is split along the **source axis** (= where the server comes from)
+so each verb has a structurally narrow input and no XOR ambiguity:
+
+  - ``mcp_search_registry``  — search the official MCP registry
+  - ``mcp_install_registry`` — install from the official MCP registry
+                                (paired with ``mcp_search_registry``)
+  - ``mcp_install_package``  — install from a third-party package channel
+                                (npm / pypi / docker / github URL)
+  - ``mcp_install_local``    — install a local command (LLM-authored
+                                script, dev server) by writing a
+                                ``{command, args}`` entry directly
+  - ``list_mcp_servers``     — list installed servers
+                                (existing ``LIST_MCP_SERVERS``)
+  - ``list_mcp_tools``       — list a server's tools as
+                                ``<server>__<tool>`` identifiers
+                                (existing ``LIST_MCP_TOOLS``)
+  - ``mcp_call_tool``        — call a tool by ``<server>__<tool>``
+                                identifier (this module)
+  - ``mcp_drop_server``      — remove an installed server
+                                (existing ``MCP_DROP_SERVER``)
+
+All install paths converge on the same ``.reyn/mcp.yaml`` entry
+shape via op_runtime helpers; the verbs differ only in how they
+obtain the package metadata before that write.
+
+Secret handling for the two registry-aware verbs
+(``mcp_install_registry``, ``mcp_install_package``) is **strict args
++ guide**: when package metadata declares ``isSecret: true`` env-vars
+and the operator has not pre-supplied them (via ``env_overrides`` or
+``reyn secret set``), the install short-circuits with
+``status="needs_secrets"`` + a guide. ``mcp_install_local`` cannot
+auto-detect secrets (= operator supplies ``env_overrides`` inline if
+needed).
+"""
+from __future__ import annotations
+
+from dataclasses import asdict
+from typing import Any, Mapping
+
+from reyn.tools.descriptions import discovery
+from reyn.tools.descriptions import mcp as _mcp_descriptions
+from reyn.tools.mcp import _MCP_TOOL_ARGS_KEY  # #1646: single-source the inner-args key
+from reyn.tools.types import ToolContext, ToolDefinition, ToolGates, ToolResult
+
+# ── mcp_search_registry ──────────────────────────────────────────────────────
+
+# Reviewable in src/reyn/tools/descriptions/discovery.py (Phase 1 of the
+# tool-description package refactor) — this alias keeps the call site
+# unchanged (byte-identical relocation, no LLM-facing text change).
+_MCP_SEARCH_REGISTRY_DESCRIPTION = discovery.mcp_search_registry.text
+
+_MCP_SEARCH_REGISTRY_PARAMETERS: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "text": {
+            "type": "string",
+            "description": discovery.PARAMS["mcp_search_registry"]["text"].text,
+        },
+    },
+    "required": ["text"],
+}
+
+
+async def _handle_mcp_search_registry(
+    args: Mapping[str, Any], ctx: ToolContext,
+) -> ToolResult:
+    """Registry search — uses the same RegistryClient backend as the CLI
+    ``reyn mcp search`` so chat and CLI surfaces stay in lock-step.
+
+    Passes the user's text verbatim to the registry; the registry's own
+    indexing handles multilingual matching. A Japanese→English keyword
+    extraction preprocessor (``_extract_keyword``) was used in the
+    pre-#882 mcp_search handler; that workaround is no longer needed now
+    that this handler runs in the router context with full async HTTP.
+    """
+    text = str(args.get("text", "") or "").strip()
+    if not text:
+        return {
+            "status": "error",
+            "data": {"error": "text is required"},
+        }
+
+    from reyn.core.registry.client import RegistryClient, RegistryError
+
+    try:
+        async with RegistryClient() as client:
+            candidates = await client.search(text, limit=20)
+    except RegistryError as exc:
+        return {
+            "status": "error",
+            "data": {
+                "query": text,
+                "candidates": [],
+                "error": str(exc),
+            },
+        }
+
+    return {
+        "status": "ok",
+        "data": {
+            "query": text,
+            "candidates": [asdict(c) for c in candidates],
+        },
+    }
+
+
+# ── mcp_install_registry ─────────────────────────────────────────────────────
+
+
+# Reviewable in src/reyn/tools/descriptions/mcp.py (Phase 2 of the
+# tool-description package refactor) — this alias keeps the call site
+# unchanged (byte-identical relocation, no LLM-facing text change).
+_MCP_INSTALL_REGISTRY_DESCRIPTION = _mcp_descriptions.mcp_install_registry.text
+
+_MCP_INSTALL_REGISTRY_PARAMETERS: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "server_id": {
+            "type": "string",
+            "description": _mcp_descriptions.PARAMS["mcp_install_registry"]["server_id"].text,
+        },
+        "env_overrides": {
+            "type": "object",
+            "description": _mcp_descriptions.PARAMS["mcp_install_registry"]["env_overrides"].text,
+            "additionalProperties": {"type": "string"},
+        },
+    },
+    "required": ["server_id"],
+}
+
+
+async def _handle_mcp_install_registry(
+    args: Mapping[str, Any], ctx: ToolContext,
+) -> ToolResult:
+    """Install from the official MCP registry by server_id only.
+
+    Strict input: server_id is required, non-registry installs go through
+    mcp_install_package or mcp_install_local instead. Secret handling
+    matches the registry-aware contract — see module docstring.
+    """
+    from reyn.core.op_runtime.mcp_install import handle as mcp_install_handle
+    from reyn.schemas.models import MCPInstallIROp
+    from reyn.security.permissions.permissions import PermissionDecl
+    from reyn.tools.op_context_bridge import build_legacy_op_context
+
+    server_id = str(args.get("server_id") or "")
+    if not server_id:
+        return {
+            "status": "error",
+            "data": {
+                "error": (
+                    "server_id is required. Call mcp_search_registry "
+                    "first to find a candidate, or use "
+                    "mcp_install_package / mcp_install_local for "
+                    "non-registry installs."
+                ),
+            },
+        }
+
+    try:
+        op = MCPInstallIROp(
+            kind="mcp_install",
+            server_id=server_id,
+            scope="local",
+            env_overrides=args.get("env_overrides"),
+            source=None,
+            extra_args=None,
+        )
+    except Exception as exc:
+        return {
+            "status": "error",
+            "data": {"error": f"invalid args: {exc}"},
+        }
+
+    decl = PermissionDecl()
+    decl.file_write = [{"path": ".reyn/config/mcp.yaml"}]
+    decl.http_get = [{"host": "registry.modelcontextprotocol.io"}]
+    decl.secret_write = ["*"]
+
+    # #1442 follow-up: get the OpContext from the SINGLE-SOURCE bridge (the same
+    # one file/compact/web_fetch/sandboxed_exec use), not a hand-built one.
+    # On the chat-router path this yields the real Workspace rooted at the agent's
+    # workspace_base_dir; hand-building from ctx.workspace (None there) wrote the
+    # config to cwd. Only the install-specific decl + actor are overridden.
+    op_ctx = build_legacy_op_context(ctx)
+    op_ctx.permission_decl = decl
+    op_ctx.actor = "mcp_install_registry"
+
+    result = await mcp_install_handle(op, op_ctx)
+    return {"status": "ok", "data": result}
+
+
+# ── mcp_install_package ──────────────────────────────────────────────────────
+
+
+# Reviewable in src/reyn/tools/descriptions/mcp.py (Phase 2 of the
+# tool-description package refactor) — this alias keeps the call site
+# unchanged (byte-identical relocation, no LLM-facing text change).
+_MCP_INSTALL_PACKAGE_DESCRIPTION = _mcp_descriptions.mcp_install_package.text
+
+_MCP_INSTALL_PACKAGE_PARAMETERS: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "kind": {
+            "type": "string",
+            "enum": ["npm", "pypi", "docker", "github"],
+            "description": _mcp_descriptions.PARAMS["mcp_install_package"]["kind"].text,
+        },
+        "identifier": {
+            "type": "string",
+            "description": _mcp_descriptions.PARAMS["mcp_install_package"]["identifier"].text,
+        },
+        "version": {
+            "type": "string",
+            "description": _mcp_descriptions.PARAMS["mcp_install_package"]["version"].text,
+        },
+        "env_overrides": {
+            "type": "object",
+            "description": _mcp_descriptions.PARAMS["mcp_install_package"]["env_overrides"].text,
+            "additionalProperties": {"type": "string"},
+        },
+    },
+    "required": ["kind", "identifier"],
+}
+
+
+def _build_source_string(kind: str, identifier: str, version: str) -> str:
+    """Compose the source_resolver inline string from structured fields."""
+    if kind == "github":
+        return identifier  # URL is the specifier itself
+    if kind == "npm":
+        return f"npm:{identifier}@{version}" if version else f"npm:{identifier}"
+    if kind == "pypi":
+        return f"pypi:{identifier}=={version}" if version else f"pypi:{identifier}"
+    if kind == "docker":
+        return f"docker:{identifier}:{version}" if version else f"docker:{identifier}"
+    return identifier  # pragma: no cover — enum constrains this
+
+
+async def _handle_mcp_install_package(
+    args: Mapping[str, Any], ctx: ToolContext,
+) -> ToolResult:
+    """Install via a structured package specifier.
+
+    Composes an inline ``source`` string the source_resolver understands,
+    then delegates to op_runtime/mcp_install with ``server_id=""`` so the
+    registry HTTP path is skipped.
+    """
+    from reyn.core.op_runtime.mcp_install import handle as mcp_install_handle
+    from reyn.schemas.models import MCPInstallIROp
+    from reyn.security.permissions.permissions import PermissionDecl
+    from reyn.tools.op_context_bridge import build_legacy_op_context
+
+    kind = str(args.get("kind") or "")
+    identifier = str(args.get("identifier") or "")
+    version = str(args.get("version") or "")
+    if kind not in {"npm", "pypi", "docker", "github"}:
+        return {
+            "status": "error",
+            "data": {
+                "error": (
+                    f"kind must be one of npm/pypi/docker/github; "
+                    f"got {kind!r}"
+                ),
+            },
+        }
+    if not identifier:
+        return {
+            "status": "error",
+            "data": {"error": "identifier is required"},
+        }
+
+    source = _build_source_string(kind, identifier, version)
+
+    try:
+        op = MCPInstallIROp(
+            kind="mcp_install",
+            server_id="",
+            scope="local",
+            env_overrides=args.get("env_overrides"),
+            source=source,
+            extra_args=None,
+        )
+    except Exception as exc:
+        return {
+            "status": "error",
+            "data": {"error": f"invalid args: {exc}"},
+        }
+
+    decl = PermissionDecl()
+    decl.file_write = [{"path": ".reyn/config/mcp.yaml"}]
+    decl.secret_write = ["*"]
+
+    # #1442 follow-up: single-source bridge (see _handle_mcp_install_registry) —
+    # real Workspace on the chat path; override only the install-specific fields.
+    op_ctx = build_legacy_op_context(ctx)
+    op_ctx.permission_decl = decl
+    op_ctx.actor = "mcp_install_package"
+
+    result = await mcp_install_handle(op, op_ctx)
+    return {"status": "ok", "data": result}
+
+
+# ── mcp_install_local ────────────────────────────────────────────────────────
+
+
+# Reviewable in src/reyn/tools/descriptions/mcp.py (Phase 2 of the
+# tool-description package refactor) — this alias keeps the call site
+# unchanged (byte-identical relocation, no LLM-facing text change).
+_MCP_INSTALL_LOCAL_DESCRIPTION = _mcp_descriptions.mcp_install_local.text
+
+_MCP_INSTALL_LOCAL_PARAMETERS: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "name": {
+            "type": "string",
+            "description": _mcp_descriptions.PARAMS["mcp_install_local"]["name"].text,
+        },
+        "command": {
+            "type": "string",
+            "description": _mcp_descriptions.PARAMS["mcp_install_local"]["command"].text,
+        },
+        "args": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": _mcp_descriptions.PARAMS["mcp_install_local"]["args"].text,
+        },
+        "env_overrides": {
+            "type": "object",
+            "description": _mcp_descriptions.PARAMS["mcp_install_local"]["env_overrides"].text,
+            "additionalProperties": {"type": "string"},
+        },
+    },
+    "required": ["name", "command", "args"],
+}
+
+
+async def _handle_mcp_install_local(
+    args: Mapping[str, Any], ctx: ToolContext,
+) -> ToolResult:
+    """Register a local MCP server entry by writing .reyn/mcp.yaml directly.
+
+    Bypasses registry + source_resolver. The verb's input maps 1:1 to
+    the loader's stdio-server config shape (``{type, command, args, env}``)
+    so the MCPClient launcher can spawn the process without further
+    metadata.
+    """
+    from reyn.core.op_runtime.mcp_install import (
+        _read_yaml_config,
+        _resolve_write_root,
+        _scope_to_path,
+        _write_yaml_config,
+    )
+    from reyn.security.permissions.permissions import PermissionDecl
+    from reyn.tools.op_context_bridge import build_legacy_op_context
+
+    name = str(args.get("name") or "").strip()
+    command = str(args.get("command") or "").strip()
+    raw_args = args.get("args")
+    if not name:
+        return {"status": "error", "data": {"error": "name is required"}}
+    if not command:
+        return {"status": "error", "data": {"error": "command is required"}}
+    if not isinstance(raw_args, list):
+        return {
+            "status": "error",
+            "data": {"error": "args must be a list of strings"},
+        }
+    cmd_args = [str(a) for a in raw_args]
+    env_overrides = args.get("env_overrides") or {}
+    if not isinstance(env_overrides, Mapping):
+        return {
+            "status": "error",
+            "data": {"error": "env_overrides must be an object"},
+        }
+
+    # The OpContext is built HERE — before the gate AND before project_root — via
+    # the SAME single-source bridge `_handle_mcp_install_registry` /
+    # `_handle_mcp_install_package` use (`build_legacy_op_context`, #1442). The
+    # gate needs the operator's real PermissionDecl + intervention bus off it.
+    #
+    # project_root MUST be resolved from THIS op_ctx's Workspace via
+    # `_resolve_write_root`, not from `ctx.workspace.root` / cwd (the pre-fix
+    # code here): on the chat-router path `ctx.workspace` is None — the real
+    # Workspace (rooted at the agent's `workspace_base_dir`) lives only on the
+    # op_context_factory's OpContext. Hand-building project_root from
+    # `ctx.workspace` silently fell back to `Path.cwd()`, which can differ from
+    # the project root the registry/package install verbs write to — so an
+    # install via THIS verb read/wrote a DIFFERENT `.reyn/config/mcp.yaml` than
+    # the one earlier registry/package installs used, and the merge-read
+    # (`_read_yaml_config`) saw an empty/stale file, silently dropping every
+    # previously-registered server (#3213 item 2: "mcp_install_local clobbers
+    # mcp.yaml" — root cause was a wrong-file read, not a merge bug).
+    _op_ctx = build_legacy_op_context(ctx)
+    project_root = _resolve_write_root(getattr(_op_ctx, "workspace", None))
+    config_path = _scope_to_path("local", project_root)
+
+    # ``.reyn/config/`` is a RECOVERY-CORE write-gate prefix (#2248 PR-C):
+    # deliberately carved OUT of the broad ``.reyn/`` default write zone, so a
+    # write here must be explicitly declared + gated, never silently allowed.
+    # This verb writes ``.reyn/config/mcp.yaml`` directly (bypassing the
+    # mcp_install op), so it must carry that gate itself.
+    #
+    # Three things were wrong and are fixed together, because fixing any one
+    # alone either leaves the hole open or breaks the verb:
+    #
+    # 1. The resolver was read as ``getattr(rs, "permission_resolver", None)`` —
+    #    a field ``RouterCallerState`` has NEVER declared. ``getattr``'s default
+    #    swallowed the miss, so the gate never fired in ANY context. The resolver
+    #    lives on the ToolContext (populated at all three production sites in
+    #    router_loop.py), so that is where it is read from now.
+    # 2. ``decl`` was a bare ``PermissionDecl()`` synthesized here. Gating against
+    #    a decl this function invented is self-granting: it must be the operator's
+    #    real declaration, which is what the OpContext carries.
+    # 3. No ``bus`` was passed, so an ungranted write would hard-deny
+    #    non-interactively — reviving (1)+(2) alone would make every install fail.
+    #    Threading the bus is what turns this into the operator DECISION the
+    #    inert-ship design (#2932 / proposal 0063 R3) intends: in chat the
+    #    operator is prompted; non-interactive callers (bus=None) still deny.
+    resolver = ctx.permission_resolver
+    if resolver is not None:
+        decl = getattr(_op_ctx, "permission_decl", None)
+        if decl is None:
+            decl = PermissionDecl()
+            decl.file_write = [{"path": ".reyn/config/mcp.yaml"}]
+        await resolver.require_file_write(
+            decl,
+            str(config_path),
+            "mcp_install_local",
+            sandbox_policy=getattr(_op_ctx, "sandbox_policy", None),
+            bus=getattr(_op_ctx, "intervention_bus", None),
+        )
+
+    entry: dict[str, Any] = {
+        "type": "stdio",
+        "command": command,
+        "args": cmd_args,
+    }
+    if env_overrides:
+        entry["env"] = {str(k): str(v) for k, v in env_overrides.items()}
+
+    data = _read_yaml_config(config_path)
+    servers = data.setdefault("mcp", {}).setdefault("servers", {})
+
+    # #2761 PR-3: probe-then-commit + path-condition for the PRIMARY local-stdio path.
+    # mcp_install_local writes .reyn/config/mcp.yaml DIRECTLY — a parallel path to the
+    # mcp_install op — so it must carry the same immediate-apply contract, else the
+    # primary local-stdio use would never get same-turn use of its just-installed
+    # server. A PURE ADDITION on a live per-session reloader PROBES the server first
+    # (spawn/connect + list_tools) and writes ONLY on a successful probe (a
+    # failed/cancelled/denied probe leaves nothing written — no half-install); a
+    # same-name overwrite or no per-session reloader keeps the existing deferred
+    # behavior. The per-session reloader (ctx.hot_reloader, #2761 PR-2) is reached
+    # via the router's op-context factory (the single tool→op ctx source); absent
+    # (test / CLI) → deferred. ``_op_ctx`` is built once, above the permission gate
+    # (which needs it too).
+    #
+    # #3552: this is the SIBLING probe call site to ``mcp_install``'s own — same
+    # ``probe_mcp_server``, same pre-#3552 hole (a live connection to a
+    # model/LLM-supplied ``name`` before ``.reyn/config/mcp.yaml`` becomes
+    # authoritative, gated by nothing on the MCP axis). The gate lives INSIDE
+    # ``probe_mcp_server`` itself now, so passing the resolver/bus/contextual here
+    # is what turns it on for this call site too — a fix confined to only the
+    # ``mcp_install`` op's call site would have left this path unlatched.
+    from reyn.core.cancellable import Cancelled
+    from reyn.core.op_runtime.mcp_install import probe_mcp_server
+    from reyn.runtime.hot_reload import dispatch_install_reload, is_pure_addition
+
+    _reloader = getattr(_op_ctx, "hot_reloader", None) if _op_ctx is not None else None
+    _is_addition = is_pure_addition(name, servers)
+    if _is_addition and _reloader is not None:
+        try:
+            _probe_err = await probe_mcp_server(
+                name, entry, agent_id=getattr(_op_ctx, "agent_id", None),
+                # #2813: a Ctrl-C during this probe now interrupts it immediately instead of
+                # waiting out its own call_timeout_seconds (this is the reported-incident path —
+                # mcp_install_local writes .reyn/config/mcp.yaml directly, bypassing the
+                # mcp_install op entirely, so it needs its own cancel_event wiring).
+                cancel_event=getattr(_op_ctx, "cancel_event", None),
+                # #3552: gate the live connection through require_mcp, same as the
+                # mcp_install op's call site.
+                permission_resolver=resolver,
+                bus=getattr(_op_ctx, "intervention_bus", None),
+                contextual=getattr(_op_ctx, "contextual_permission", None),
+            )
+        except Cancelled:
+            # #2813: uniform status:"cancelled" (matches the mcp/resource op cancel surface
+            # + the mcp_install op path); nothing written (commit is strictly after).
+            #
+            # status:"cancelled" MUST live INSIDE data too (not just the outer envelope) —
+            # unwrap_dispatch_envelope peels the {status, data} wrapper down to `data`
+            # before the canonical mapper ever sees this result (mirrors how the SUCCESS
+            # case's data carries no envelope-only fields, and how mcp_install's own op
+            # result already nests status alongside kind). Omitting it here was a co-vet
+            # catch: the mapper's cancelled check (canonical.py's make_status_text_mapper)
+            # would silently miss it and render "Installed local MCP server '...'." for a
+            # cancelled install that wrote NOTHING.
+            events = getattr(_op_ctx, "events", None)
+            if events is not None:
+                events.emit("mcp_install_cancelled", server_name=name)
+            return {
+                "status": "cancelled",
+                "data": {"kind": "mcp_install_local", "status": "cancelled", "name": name},
+            }
+        if _probe_err is not None:
+            return {
+                "status": "error",
+                "data": {
+                    "kind": "mcp_install_local",
+                    "name": name,
+                    "error": (
+                        f"MCP server {name!r} failed its pre-install probe "
+                        f"(nothing written — no half-install): {_probe_err}"
+                    ),
+                },
+            }
+
+    servers[name] = entry
+    _write_yaml_config(config_path, data)
+
+    # #2259 PR-1: record the FULL post-state as a truncation-surviving config
+    # generation — the same call the mcp_install op makes after its own write.
+    # Without it this verb's server was SILENTLY ERASED by config reconstruction:
+    # ``_reconcile_config_as_of_cut`` restores every generation-tracked registry
+    # from its LATEST generation, and once ANY generation exists for
+    # ``config/mcp.yaml`` (i.e. after any op-path install), a rewind / crash
+    # recovery rewrote the file from that generation — dropping every server this
+    # verb had added, because it recorded none. ``.reyn/config/`` is recovery-core
+    # precisely because it is reconstructed; a writer there must contribute its
+    # generation or its writes are recovery-invisible.
+    from reyn.core.events.config_recovery import record_config_generation
+    await record_config_generation(
+        getattr(ctx, "state_log", None), config_path, data,
+    )
+
+    await dispatch_install_reload(
+        _reloader, source="mcp_install_local", is_addition=_is_addition,
+        # #3636: names this specific server so two servers installed back-to-back
+        # don't render as an indistinguishable repeat in state_change history.
+        detail=name,
+    )
+
+    # P6 audit-event. The op path has always emitted ``mcp_server_installed``;
+    # this verb emitted NOTHING on success, so an LLM-initiated install left no
+    # audit trace at all — the operator could not see that a server had been
+    # added to their config. Same event name so both install paths land in one
+    # auditable stream.
+    if ctx.events is not None:
+        ctx.events.emit(
+            "mcp_server_installed",
+            server_id=name,
+            server_name=name,
+            scope="local",
+            runtime="stdio",
+            env_keys_set=sorted(entry.get("env", {})),
+            installed_path=str(config_path),
+            source="mcp_install_local",
+        )
+
+    return {
+        "status": "ok",
+        "data": {
+            "kind": "mcp_install_local",
+            "name": name,
+            "config_path": str(config_path),
+            "entry": entry,
+        },
+    }
+
+
+# ── mcp_call_tool ────────────────────────────────────────────────────────────
+
+
+# Reviewable in src/reyn/tools/descriptions/mcp.py (Phase 2 of the
+# tool-description package refactor) — this alias keeps the call site
+# unchanged (byte-identical relocation, no LLM-facing text change).
+_MCP_CALL_TOOL_DESCRIPTION = _mcp_descriptions.mcp_call_tool.text
+
+_MCP_CALL_TOOL_PARAMETERS: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "tool": {
+            "type": "string",
+            "description": _mcp_descriptions.PARAMS["mcp_call_tool"]["tool"].text,
+        },
+        # #1646: the target tool's params nest under "tool_args", NOT "args" — the
+        # universal-scheme live path is invoke_action(action_name="mcp_call_tool",
+        # args={tool, tool_args:{...}}); a nested "args" here collided with
+        # invoke_action's own "args" (the LLM collapsed it → empty at the MCP call).
+        _MCP_TOOL_ARGS_KEY: {
+            "type": "object",
+            "description": _mcp_descriptions.PARAMS["mcp_call_tool"]["tool_args"].text,
+        },
+    },
+    "required": ["tool"],
+}
+
+
+async def _handle_mcp_call_tool(
+    args: Mapping[str, Any], ctx: ToolContext,
+) -> ToolResult:
+    """Split ``<server>__<tool>`` identifier and dispatch to call_mcp_tool."""
+    tool_id = str(args.get("tool") or "")
+    if "__" not in tool_id:
+        return {
+            "status": "error",
+            "data": {
+                "error": (
+                    f"tool identifier must have form '<server>__<tool>'; "
+                    f"got {tool_id!r}"
+                ),
+            },
+        }
+    server, mcp_tool_name = tool_id.split("__", 1)
+    if not server or not mcp_tool_name:
+        return {
+            "status": "error",
+            "data": {
+                "error": (
+                    f"both <server> and <tool> must be non-empty; "
+                    f"got {tool_id!r}"
+                ),
+            },
+        }
+
+    from reyn.tools.mcp import _handle_call_mcp_tool
+
+    return await _handle_call_mcp_tool(
+        {
+            "server": server,
+            "mcp_tool_name": mcp_tool_name,
+            # #1646: read the LLM's params from tool_args (K3 collision-kill) AND pass
+            # them to mcp.py under the SAME key it now reads (K4 — pre-fix this passed
+            # "args" while mcp.py read tool_args → delegation dropped to {}).
+            _MCP_TOOL_ARGS_KEY: dict(args.get(_MCP_TOOL_ARGS_KEY) or {}),
+        },
+        ctx,
+    )
+
+
+# ── ToolDefinitions ──────────────────────────────────────────────────────────
+
+
+from reyn.core.offload.canonical import (  # noqa: E402
+    mcp_install_local_verb_to_canonical,
+    mcp_install_verb_to_canonical,
+    mcp_search_registry_to_canonical,
+    mcp_to_canonical,
+)
+
+MCP_SEARCH_REGISTRY = ToolDefinition(
+    canonical=mcp_search_registry_to_canonical,
+    name="mcp_search_registry",
+    # #3429: dispatched DIRECTLY by name. Before the qualified spelling was
+    # abolished this tool was reached only through ``invoke_action`` (the
+    # ``"__" in name`` arm of ``_invoke_router_tool``), so it never needed the
+    # flag; with one name, an advertised action that lacks it lands on the
+    # "unhandled tool" safety return. Pinned by
+    # ``test_universal_catalog.py::test_every_catalog_action_is_directly_dispatchable``.
+    router_dispatched=True,
+    description=_MCP_SEARCH_REGISTRY_DESCRIPTION,
+    parameters=_MCP_SEARCH_REGISTRY_PARAMETERS,
+    gates=ToolGates(router="allow"),
+    handler=_handle_mcp_search_registry,
+    category="discovery",
+    purity="read_only",
+    returns_external_content=True,  # FP-0050/#1822: external registry listing
+)
+
+
+MCP_INSTALL_REGISTRY = ToolDefinition(
+    canonical=mcp_install_verb_to_canonical,
+    name="mcp_install_registry",
+    # #3429: dispatched DIRECTLY by name. Before the qualified spelling was
+    # abolished this tool was reached only through ``invoke_action`` (the
+    # ``"__" in name`` arm of ``_invoke_router_tool``), so it never needed the
+    # flag; with one name, an advertised action that lacks it lands on the
+    # "unhandled tool" safety return. Pinned by
+    # ``test_universal_catalog.py::test_every_catalog_action_is_directly_dispatchable``.
+    router_dispatched=True,
+    description=_MCP_INSTALL_REGISTRY_DESCRIPTION,
+    parameters=_MCP_INSTALL_REGISTRY_PARAMETERS,
+    gates=ToolGates(router="allow"),
+    handler=_handle_mcp_install_registry,
+    category="io",
+    purity="side_effect",
+)
+
+
+MCP_INSTALL_PACKAGE = ToolDefinition(
+    canonical=mcp_install_verb_to_canonical,
+    name="mcp_install_package",
+    # #3429: dispatched DIRECTLY by name. Before the qualified spelling was
+    # abolished this tool was reached only through ``invoke_action`` (the
+    # ``"__" in name`` arm of ``_invoke_router_tool``), so it never needed the
+    # flag; with one name, an advertised action that lacks it lands on the
+    # "unhandled tool" safety return. Pinned by
+    # ``test_universal_catalog.py::test_every_catalog_action_is_directly_dispatchable``.
+    router_dispatched=True,
+    description=_MCP_INSTALL_PACKAGE_DESCRIPTION,
+    parameters=_MCP_INSTALL_PACKAGE_PARAMETERS,
+    gates=ToolGates(router="allow"),
+    handler=_handle_mcp_install_package,
+    category="io",
+    purity="side_effect",
+)
+
+
+MCP_INSTALL_LOCAL = ToolDefinition(
+    canonical=mcp_install_local_verb_to_canonical,
+    name="mcp_install_local",
+    # #3429: dispatched DIRECTLY by name. Before the qualified spelling was
+    # abolished this tool was reached only through ``invoke_action`` (the
+    # ``"__" in name`` arm of ``_invoke_router_tool``), so it never needed the
+    # flag; with one name, an advertised action that lacks it lands on the
+    # "unhandled tool" safety return. Pinned by
+    # ``test_universal_catalog.py::test_every_catalog_action_is_directly_dispatchable``.
+    router_dispatched=True,
+    description=_MCP_INSTALL_LOCAL_DESCRIPTION,
+    parameters=_MCP_INSTALL_LOCAL_PARAMETERS,
+    gates=ToolGates(router="allow"),
+    handler=_handle_mcp_install_local,
+    category="io",
+    purity="side_effect",
+)
+
+
+MCP_CALL_TOOL = ToolDefinition(
+    canonical=mcp_to_canonical,
+    name="mcp_call_tool",
+    # #3429: dispatched DIRECTLY by name. Before the qualified spelling was
+    # abolished this tool was reached only through ``invoke_action`` (the
+    # ``"__" in name`` arm of ``_invoke_router_tool``), so it never needed the
+    # flag; with one name, an advertised action that lacks it lands on the
+    # "unhandled tool" safety return. Pinned by
+    # ``test_universal_catalog.py::test_every_catalog_action_is_directly_dispatchable``.
+    router_dispatched=True,
+    description=_MCP_CALL_TOOL_DESCRIPTION,
+    parameters=_MCP_CALL_TOOL_PARAMETERS,
+    gates=ToolGates(router="allow"),
+    handler=_handle_mcp_call_tool,
+    category="io",
+    purity="side_effect",
+    returns_external_content=True,  # FP-0050/#1822: external MCP server result
+)
+
+
+__all__ = [
+    "MCP_SEARCH_REGISTRY",
+    "MCP_INSTALL_REGISTRY",
+    "MCP_INSTALL_PACKAGE",
+    "MCP_INSTALL_LOCAL",
+    "MCP_CALL_TOOL",
+]

@@ -1,0 +1,1176 @@
+"""file kind handler — read/write/glob/grep/delete/edit/regenerate_index/mkdir/move/stat."""
+from __future__ import annotations
+
+import asyncio
+import re
+from collections import defaultdict
+from pathlib import Path
+from typing import Any
+
+from reyn.builtin.docs import read_builtin_body_bytes
+from reyn.data.text_codec import decode_text_or_none, encode_text
+from reyn.plugins.body_read import read_plugin_body_bytes
+from reyn.schemas.models import FileIROp
+
+# Module-level import so tests can monkeypatch the threat-scan callables —
+# same reasoning skill_install.py/load_skill.py state for the identical
+# import (#4701: the SAME strict+block treatment #4699 gave SKILL.md's own
+# body, extended to a skill's reference files under its own directory).
+from reyn.security.content_guard import first_blocking_match, scan_for_threats
+
+from . import register
+from .context import OpContext
+from .context import resolve_path_for_gate as _resolve_for_gate
+from .context import sandbox_policy_from_ctx as _sandbox_policy_from_ctx
+from .path_locks import get_path_lock, locked_paths
+
+# #4701 (lead-coder review, condition③): reuse skill_install.py's own
+# containment check rather than a second, independently-drifting
+# reimplementation of the same resolve+relative_to logic.
+from .skill_install import _contained_under, _resolve_skill_md
+
+_WRITE_OPS = frozenset({"write", "edit", "delete", "regenerate_index", "mkdir", "move"})
+_READ_OPS = frozenset({"read", "glob", "grep", "stat"})
+
+# Issue #365: image extensions that trigger the binary read path.
+# Extension-based detection (= no magic-byte sniff for the initial scope);
+# unknown binaries still fall through to the text path with errors="replace"
+# (= pre-#365 behaviour preserved).
+_IMAGE_EXTENSIONS: dict[str, str] = {
+    ".png":  "image/png",
+    ".jpg":  "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif":  "image/gif",
+    ".webp": "image/webp",
+    ".svg":  "image/svg+xml",
+}
+
+
+def _image_mime_for_path(path: str) -> str | None:
+    """Return the image MIME type for ``path`` if its extension is in
+    ``_IMAGE_EXTENSIONS``, else None (= treat as text).
+    """
+    dot = path.rfind(".")
+    if dot == -1:
+        return None
+    return _IMAGE_EXTENSIONS.get(path[dot:].lower())
+
+# Max nearby-file suggestions returned on a not_found error. Mirrors the
+# ~8-suggestion shape that invoke_action's UnknownActionError emits so the
+# LLM's "did you mean X" narration looks the same across both surfaces.
+_NOT_FOUND_SUGGESTIONS_LIMIT = 8
+
+
+def _skill_reference_provenance(ctx: OpContext, resolved_path: str) -> bool:
+    """#4701: True when *resolved_path* — an ALREADY ``resolve_path_for_gate``d
+    absolute path — is CONTAINED under a registered skill's own directory
+    (the parent of its ``SKILL.md``), i.e. is a ``references/*.md``-shaped
+    file (or any other file) the skill's own body might point a model at.
+
+    Owner ruling (#4701 comment thread, lead-coder): a skill's reference
+    files are the SAME content class as the SKILL.md body itself — both are
+    instructions the model reads and follows — so a reference gets the SAME
+    strict+block treatment ``load_skill.py`` already gives the body, not a
+    weaker one. This is a CONTAINMENT check (directory, not exact path),
+    deliberately broader than ``load_skill.py``'s own
+    ``_config_registered_skill_body_provenance`` (which matches ONLY the
+    SKILL.md file itself) — that sibling function is unaffected and stays
+    exact-match; this one exists for everything ELSE under the same skill's
+    directory tree.
+
+    Enumerated from ``ctx.available_skills`` — the SAME registered-skill
+    snapshot ``load_skill.py``'s own provenance check and ``:skill``
+    invocation resolve against, never a hand-curated path list (the #3194
+    "curated subset diverges from the registry" bug class). ``None``/empty
+    (test/phase-fallback construction) returns ``False`` — no skill is
+    registered at all, so there is no directory to be "under".
+
+    #4701 review (lead-coder), 4 conditions:
+    ① the tag's source is config-derived containment ONLY — never a
+       model-supplied claim about the path.
+    ② an UNDETERMINABLE resolution (an entry's own path fails to resolve —
+       e.g. a broken/malicious symlink somewhere in its chain) returns
+       ``True`` (treat as skill content), never ``False``. The reverse
+       (silently skip an entry whose resolution failed) would let a single
+       broken symlink evade the check entirely — the exact class of gap
+       ``resolve_path_for_gate``'s own #3196 discipline exists to close
+       elsewhere. Only a CONFIDENT non-containment (both sides resolved
+       fine, genuinely different subtrees — ``_contained_under``'s
+       ``ValueError`` branch) counts as a real "no".
+    ③ containment itself reuses ``skill_install.py``'s own
+       ``_contained_under`` (not a second, independently-drifting
+       implementation of the same resolve+relative_to check).
+
+    #4701 follow-up review (lead-coder): ``SkillEntry.path`` is declared
+    "as-is" (``registry.py``'s own docstring) — it may name the SKILL.md
+    file directly OR its containing directory (``skills.md``: "Path to
+    SKILL.md (or its containing directory)"), and the registry does NOT
+    normalize between the two. Taking ``.parent`` unconditionally silently
+    assumed the file form; for a directory-form entry (``path: skills/foo``)
+    that widened ``skill_dir`` by one level (``skills/``), pulling every
+    OTHER sibling skill's files into strict+block scope — safe-DIRECTION
+    (② still errs toward scanning on failure) but excessively WIDE, not the
+    narrow per-skill containment this function promises. Reuses
+    ``skill_install.py``'s own ``_resolve_skill_md`` (the SAME
+    file-vs-directory normalization ``skill_install`` already applies to
+    this exact field) to anchor on the true SKILL.md path before taking
+    ``.parent`` — not a second, independently-drifting normalization.
+    """
+    entries = getattr(ctx, "available_skills", None)
+    if not entries:
+        return False
+    ws = getattr(ctx, "workspace", None)
+    base_dir = ws.base_dir if ws is not None else Path.cwd()
+    try:
+        resolved = Path(resolved_path)
+    except (OSError, ValueError):
+        return True  # ②: cannot even parse the candidate — err toward scanning
+    for entry in entries:
+        entry_path = getattr(entry, "path", None)
+        if not entry_path:
+            continue
+        p = Path(entry_path).expanduser()
+        if not p.is_absolute():
+            p = base_dir / p
+        # Normalize file-vs-directory BEFORE resolving — same helper
+        # skill_install.py itself uses for this exact field.
+        p = _resolve_skill_md(str(p))
+        try:
+            skill_dir = p.resolve().parent
+        except (OSError, RuntimeError):
+            # ②: this entry's OWN path can't resolve — err toward scanning.
+            # RuntimeError, not just OSError: a genuine symlink LOOP (the
+            # exact evasion shape ② names) raises ``RuntimeError("Symlink
+            # loop from ...")`` from ``Path.resolve()``, not ``OSError`` —
+            # confirmed live on the installed Python (pathlib wraps the
+            # underlying ELOOP OSError and re-raises RuntimeError). Catching
+            # only OSError here would let that exact loop propagate
+            # uncaught (crashing the whole read) instead of degrading to
+            # the safe "treat as skill content" default.
+            return True
+        if _contained_under(resolved, skill_dir):  # ③: reused, not reimplemented
+            return True
+    return False
+
+
+def _binary_skipped_result(ctx: OpContext, path: str, byte_size: int) -> dict:
+    """#1449: structured result for a NON-image binary read — the bytes are NOT
+    loaded into context (no garbled dump). Images go through the #365 media path
+    above; this is the catch-all for compiled / archive / unknown binaries."""
+    ctx.events.emit("tool_executed", op="read_file", path=path, mode="binary_skipped")
+    return {
+        "kind": "file",
+        "op": "read",
+        "path": path,
+        "status": "error",
+        "error": (
+            f"binary file ({byte_size} bytes) — not text-loadable; its bytes were "
+            "not loaded into context. If this is an image, it is shown via the "
+            "media follow-up; otherwise it cannot be read as text."
+        ),
+        "binary": True,
+        "byte_size": byte_size,
+        "content": "",
+    }
+
+
+async def _read_image_file(op: FileIROp, ctx: OpContext, *, mime_type: str) -> dict:
+    """Read an image file as bytes, apply the media-size gate, return as
+    a media_blocks-bearing result (issue #365).
+
+    Permission-gate flow: the outer ``handle`` already called
+    ``require_file_read`` against ``op.path`` (= read-zone check). This
+    helper additionally calls ``require_media_load`` for the multi-modal
+    size cap (= shared with web_fetch / user input). When the gate
+    rejects, returns ``status="denied"`` with no media payload.
+    """
+    image_bytes, found = ctx.workspace.read_file_bytes(op.path)
+    if not found:
+        ctx.events.emit("tool_executed", op="read_file", path=op.path, found=False)
+        return {
+            "kind": "file", "op": "read", "path": op.path,
+            "status": "not_found",
+            "error": f"file not found: {op.path}",
+            **_suggestions_fields(ctx.workspace, op.path),
+            "content": "",
+        }
+
+    if ctx.permission_resolver is not None and ctx.multimodal_config is not None:
+        if ctx.intervention_bus is None:
+            raise RuntimeError(
+                "file read of binary image requires intervention_bus on "
+                "OpContext (multimodal gate)"
+            )
+        try:
+            await ctx.permission_resolver.require_media_load(
+                size_bytes=len(image_bytes),
+                source=f"file read {op.path}",
+                mime_type=mime_type,
+                max_bytes=ctx.multimodal_config.max_bytes,
+                on_oversize=ctx.multimodal_config.on_oversize,
+                bus=ctx.intervention_bus,
+            )
+        except PermissionError as exc:
+            ctx.events.emit(
+                "file_read_media_denied",
+                path=op.path, size_bytes=len(image_bytes), mime_type=mime_type,
+            )
+            return {
+                "kind": "file", "op": "read", "path": op.path,
+                "status": "denied", "content_type": mime_type,
+                "size_bytes": len(image_bytes), "error": str(exc),
+            }
+
+    # Issue #383 PR-C: emit path-ref via MediaStore when available;
+    # fall back to inline base64 when not configured.
+    media_block: dict
+    if ctx.media_store is not None:
+        media_block = ctx.media_store.save_media(
+            image_bytes, mime_type=mime_type,
+            chain_id=ctx.run_id or "", tool="file_read", seq=1,
+        )
+    else:
+        import base64
+        data_b64 = base64.b64encode(image_bytes).decode("ascii")
+        media_block = {"type": "image", "data": data_b64, "mimeType": mime_type}
+    ctx.events.emit(
+        "tool_executed", op="read_file", path=op.path,
+        mode="binary", mime_type=mime_type, media_block_count=1,
+        stored_as=("path_ref" if ctx.media_store is not None else "inline_b64"),
+    )
+    return {
+        "kind": "file", "op": "read", "path": op.path,
+        "status": "ok", "content": "",
+        "media_blocks": [media_block],
+    }
+
+
+def _nearest_existing_ancestor(ws, start: str) -> "str | None":
+    """Walk *start*'s parents (project-relative) until one exists as a
+    directory, or return ``None`` if none does — including the workspace
+    root itself in the walk (``Path(...).parents`` always ends at ``"."``).
+
+    #3629: the decision-enabling half of the not-found suggestion fix. A
+    renamed/moved/reinstalled directory means ``path``'s own parent is gone
+    too, not just its siblings — the caller (:func:`_nearby_files`) uses
+    this to distinguish that case ("no parent" — an ancestor is the only
+    thing left to point at) from "no neighbours" (parent exists but is
+    empty, where an empty suggestion list is already the correct, honest
+    answer). Never raises: a denied/erroring ``stat_path`` at any level is
+    treated as "does not exist" and the walk continues upward.
+    """
+    for ancestor in Path(start).parents:
+        candidate = str(ancestor)
+        try:
+            stat = ws.stat_path(candidate)
+        except (PermissionError, OSError):
+            continue
+        if stat is not None and stat.get("is_dir"):
+            return candidate
+    return None
+
+
+def _nearby_files(
+    ws, path: str, *, max_results: int = _NOT_FOUND_SUGGESTIONS_LIMIT
+) -> "tuple[list[str], int]":
+    """List sibling files under the parent of *path*, for use as not_found suggestions.
+
+    Returns ``(suggestions, total_before_cap)`` — project-relative paths from
+    ``Workspace.glob_files_with_total`` when the parent directory exists
+    (possibly empty — "no neighbours" legitimately yields ``([], 0)``).
+    #4431: was the plain (silently-capped) ``glob_files`` — a directory with
+    more than ``_NOT_FOUND_SUGGESTIONS_LIMIT`` siblings always showed exactly
+    8 with no sign more existed. ``_with_total`` is the same #2998 fix the
+    ``glob`` op already uses; the caller reports the cap the same way.
+
+    #3629: when the parent directory itself does NOT exist — a rename, a
+    move, or a plugin reinstall to a different location, exactly the case
+    that leaves an absolute path baked into history pointing at nothing —
+    that is "no parent", not "no neighbours", and an empty list gives the
+    model nothing to recover with (it cannot tell "this directory is simply
+    empty" from "this whole path is gone"). In that case, return the
+    nearest EXISTING ancestor (see :func:`_nearest_existing_ancestor`) as a
+    single suggestion, so the model can discover the current structure
+    on the spot instead of guessing a replacement path. Permission denials
+    and OS errors at any point still degrade to ``([], 0)``, never raise.
+    """
+    parent = str(Path(path).parent) if str(Path(path).parent) not in ("", ".") else "."
+    if parent != ".":
+        try:
+            parent_stat = ws.stat_path(parent)
+        except (PermissionError, OSError):
+            parent_stat = None
+        if parent_stat is None or not parent_stat.get("is_dir"):
+            ancestor = _nearest_existing_ancestor(ws, parent)
+            single = [f"{ancestor}/"] if ancestor is not None else []
+            return single, len(single)
+    pattern = f"{parent}/*" if parent != "." else "*"
+    try:
+        glob_result = ws.glob_files_with_total(pattern, max_results=max_results)
+        return glob_result.matches, glob_result.total
+    except (PermissionError, OSError):
+        return [], 0
+
+
+def _suggestions_fields(ws, path: str) -> dict:
+    """Build the ``suggestions`` (+ optional truncation signal) block shared by
+    every ``not_found`` result. #4431: extracted so the #2998-style truncation
+    report (``suggestions_truncated`` / ``suggestions_total``) is written once,
+    not re-derived at each of the 3 call sites with a chance to drift apart."""
+    suggestions, total = _nearby_files(ws, path)
+    fields: dict = {"suggestions": suggestions}
+    if total > len(suggestions):
+        fields["suggestions_truncated"] = True
+        fields["suggestions_total"] = total
+    return fields
+
+
+def _read_inline_cap(ctx: OpContext) -> int:
+    """The resource-bound inline cap (BYTES) for an unbounded read.
+
+    #4381 PR-5: model-independent (owner ruling) — reuses the shared
+    ``control_ir_inline_cap``, the same cap ``load_skill`` bounds its body
+    against, so both read verbs cut at one place. Reads ``ctx.read_cap_
+    config``; falls back to the fixed default when no config was threaded
+    to this context (see ``control_ir_inline_cap``'s own docstring).
+    """
+    from reyn.core.context_builder import control_ir_inline_cap
+
+    return control_ir_inline_cap(ctx.read_cap_config)
+
+
+async def handle(op: FileIROp, ctx: OpContext) -> dict:
+    # #2913: a builtin skill/pipeline BODY (`reyn.builtin.registry`'s
+    # `path` entries) resolves outside `project_root` in EVERY deploy
+    # (F3a — the path is package-directory-relative, not project-relative),
+    # so the standard out-of-root read-zone gate below would hard-deny it
+    # non-interactively in production. `read_builtin_body_bytes` returns
+    # non-None ONLY when `op.path` falls inside the `reyn.builtin` package
+    # directory (= it IS builtin-provenance content — nothing else lives
+    # there); every operator (non-builtin) path gets None and falls through
+    # to the unmodified `_in_default_read_zone` gate below, unchanged.
+    #
+    # (plugin-body parity, owner+architect firm) a REGISTERED plugin's
+    # `skills/**`/`pipelines/**` body resolves outside `project_root` too
+    # (`~/.reyn/plugins/`, a per-operator global cache) and had no
+    # equivalent short-circuit — `read_plugin_body_bytes` closes that
+    # asymmetry, gated on install-registration
+    # (`plugin_install.is_registered_plugin_root`), never on a hand-placed
+    # `.reyn-plugin/` marker alone. See `reyn.plugins.body_read` for the
+    # full rationale. (FP-0066 P0/#3247: SKILL.md's own dedicated
+    # provenance/expansion/#3196-resolve-once handling has moved to the
+    # `load_skill` op — `file.read` no longer special-cases it; this
+    # builtin/plugin BYPASS stays here because it is general to ANY
+    # builtin/plugin-shipped body file, e.g. a pipeline doc or a skill's
+    # non-SKILL.md reference file, not skill-specific.)
+    #
+    # Resolve `op.path` EXACTLY ONCE for a `read`, into `_resolved_read_path`,
+    # and reuse THIS SAME string for every later decision AND for the actual
+    # byte read below (the permission gate, builtin/plugin detection). This
+    # keeps the read-side half of the #3196 resolve-once discipline for the
+    # (non-skill) builtin/plugin body-bypass check; `load_skill.py` keeps the
+    # skill-specific half.
+    _resolved_read_path: "str | None" = _resolve_for_gate(ctx, op.path) if op.op == "read" else None
+    _builtin_bytes: "bytes | None" = None
+    if _resolved_read_path is not None:
+        _builtin_bytes = read_builtin_body_bytes(_resolved_read_path)
+        if _builtin_bytes is None:
+            _builtin_bytes = read_plugin_body_bytes(_resolved_read_path)
+
+    # Permission check (single point for both frontends). For
+    # `regenerate_index` the file actually written is `output_path`, not
+    # `path`; everything else writes to `path`.
+    if ctx.permission_resolver is not None:
+        # #1199 S3.1c-2: fold the phase sandbox policy into the file gate's ∩ —
+        # the path must also fall within the policy's read/write path caps. None
+        # (no phase default_sandbox_policy) → SandboxLayer is ⊤ (unchanged).
+        _sandbox = _sandbox_policy_from_ctx(ctx)
+        if op.op in _WRITE_OPS:
+            write_target = op.output_path if op.op == "regenerate_index" and op.output_path else op.path
+            await ctx.permission_resolver.require_file_write(
+                ctx.permission_decl, _resolve_for_gate(ctx, write_target), ctx.actor,
+                sandbox_policy=_sandbox, bus=ctx.intervention_bus,
+            )
+            # move also writes to dest_path — gate both source (= the file
+            # being effectively deleted) and dest (= the file being created).
+            if op.op == "move" and op.dest_path:
+                await ctx.permission_resolver.require_file_write(
+                    ctx.permission_decl, _resolve_for_gate(ctx, op.dest_path), ctx.actor,
+                    sandbox_policy=_sandbox, bus=ctx.intervention_bus,
+                )
+        elif op.op in _READ_OPS and _builtin_bytes is None:
+            # read / glob / grep / stat — gate against read scope. Skipped
+            # for a builtin body read (#2913, above) — that content is
+            # code-shipped and non-editable, the same trust tier as the
+            # source code the operator already has repo/package access to.
+            # `op.op == "read"` reuses `_resolved_read_path` (the single
+            # resolve, TOCTOU note above); glob/grep/stat have no such
+            # precomputed value and resolve here as before.
+            await ctx.permission_resolver.require_file_read(
+                ctx.permission_decl,
+                _resolved_read_path if op.op == "read" else _resolve_for_gate(ctx, op.path),
+                ctx.actor,
+                sandbox_policy=_sandbox, bus=ctx.intervention_bus,
+            )
+
+    if op.op == "write":
+        # #1452: write authors NEW content (the author is now the LLM), so it
+        # writes UTF-8 — UNLIKE edit, which preserves a file's existing encoding
+        # in place. (Rationale-backed asymmetry, owner-vetoable: full replacement
+        # vs partial edit. Preserving a legacy encoding on write would surface
+        # not-representable errors for the common case of adding emoji/unicode.)
+        # When OVERWRITING a non-UTF-8 file, surface a note that the encoding
+        # changed. The pre-read is best-effort (skipped if read is denied).
+        _prev_enc: str | None = None
+        _prev_size: int | None = None  # #1466: bytes of the file before overwrite
+        # #2782 path-locking step: hold the SAME per-path lock `edit` holds, so
+        # a concurrent edit's read-modify-write can't interleave with this
+        # blind overwrite (either direction would silently discard the other
+        # op's change — a lost update).
+        async with get_path_lock(_resolve_for_gate(ctx, op.path)):
+            try:
+                _prev_bytes, _existed = ctx.workspace.read_file_bytes(op.path)
+                if _existed:
+                    _, _prev_enc = decode_text_or_none(_prev_bytes)
+                    _prev_size = len(_prev_bytes)  # zero extra I/O — reuse the encoding pre-read
+            except PermissionError:
+                pass
+            _content = op.content or ""
+            ctx.workspace.write_file(op.path, _content)
+        ctx.events.emit("tool_executed", op="write_file", path=op.path)
+        result: dict = {
+            "kind": "file", "op": "write", "path": op.path, "status": "ok",
+            "bytes_written": len(_content.encode("utf-8")),
+        }
+        if _prev_size is not None:
+            result["previous_size_bytes"] = _prev_size
+        if _prev_enc:
+            result["encoding_note"] = (
+                f"overwrote a {_prev_enc}-encoded file; the new content is written "
+                "as UTF-8."
+            )
+        return result
+
+    if op.op == "read":
+        # Issue #365: image extensions → binary path with media-size gate.
+        image_mime = _image_mime_for_path(op.path)
+        if image_mime is not None:
+            return await _read_image_file(op, ctx, mime_type=image_mime)
+
+        # #1449: read bytes so a NON-image binary can be guarded BEFORE it is
+        # decoded into garbled text and dumped into context. (Images already
+        # short-circuited above via the #365 media-blocks path.) Permission
+        # gating is identical — read_file_bytes resolves the read-zone the same
+        # way read_file does.
+        # #2913: a builtin body's bytes come from importlib.resources (see the
+        # short-circuit at the top of `handle`), not the workspace file read —
+        # everything below (decode ladder, offset/limit paging, truncation) is
+        # unchanged either way.
+        if _builtin_bytes is not None:
+            raw_bytes, found = _builtin_bytes, True
+        else:
+            # Reuse `_resolved_read_path` (the single resolve above) rather
+            # than `op.path` — the bytes actually read must come from the
+            # SAME canonical target the builtin/plugin bypass check judged,
+            # not a fresh, independently-resolved lookup.
+            raw_bytes, found = ctx.workspace.read_file_bytes(_resolved_read_path)
+        if not found:
+            ctx.events.emit("tool_executed", op="read_file", path=op.path, found=False)
+            return {
+                "kind": "file",
+                "op": "read",
+                "path": op.path,
+                "status": "not_found",
+                "error": f"file not found: {op.path}",
+                **_suggestions_fields(ctx.workspace, op.path),
+                "content": "",
+            }
+        # #1452 decode ladder (extends the #1449 binary guard): BOM → UTF-8 fast
+        # path → NUL-sniff binary-reject → charset-normalizer detection. Order is
+        # load-bearing: the BOM check runs BEFORE the NUL-sniff because UTF-16/32
+        # ASCII text is NUL-heavy and would be mis-rejected as binary. Returns
+        # (None, None) for a non-text payload (→ the structured binary marker).
+        content, _detected_encoding = decode_text_or_none(raw_bytes)
+        if content is None:
+            return _binary_skipped_result(ctx, op.path, len(raw_bytes))
+
+        # ── #4701: skill-reference threat-scan (strict+block, same content
+        # class as #4699's SKILL.md-body scan) ─────────────────────────────
+        # A skill's own reference file (e.g. `references/*.md`, but ANY path
+        # under the skill's directory) is read through THIS ordinary
+        # read_file op — the model chooses when to open it, per the
+        # SKILL.md body's own text. `load_skill.py`'s strict+block scan
+        # never sees it. Scoped to ONLY the skill's own directory tree
+        # (`_skill_reference_provenance`) — read_file's other callers are
+        # completely unaffected; making every read strict+block would
+        # spread false-positives across all file reading, which the #4701
+        # ruling explicitly rejected. Reuses the SAME event kinds
+        # `load_skill.py` emits (`skill_body_threat_match`/`_blocked`) —
+        # same payload shape, same meaning ("skill content matched a threat
+        # pattern"), regardless of which op the content came through.
+        #
+        # `_is_skill_reference` is also the source of the `_external_source`
+        # tag on every content-bearing return below (fence, #4701 condition
+        # ④/lead-coder review) — computed ONCE here, condition①: the tag's
+        # ONLY source is this config-derived containment check, never a
+        # model-supplied claim about the path.
+        _is_skill_reference = (
+            _resolved_read_path is not None
+            and _skill_reference_provenance(ctx, _resolved_read_path)
+        )
+        if _is_skill_reference:
+            _ts = getattr(ctx, "threat_scan", None)
+            if _ts is not None and getattr(_ts, "enabled", True):  # #4523: shadow default matches ThreatScanConfig.enabled's own declared True
+                _matches = scan_for_threats(content, _ts, scope="strict")
+                if _matches:
+                    for _m in _matches:
+                        ctx.events.emit(
+                            "skill_body_threat_match",
+                            pattern_id=_m.pattern_id,
+                            severity=_m.severity,
+                            scope=_m.scope,
+                        )
+                    _block = first_blocking_match(
+                        _matches, getattr(_ts, "block_severity", "block"),
+                    )
+                    if _block is not None:
+                        ctx.events.emit(
+                            "skill_body_threat_blocked",
+                            pattern_id=_block.pattern_id,
+                            severity=_block.severity,
+                            path=op.path,
+                        )
+                        return {
+                            "kind": "file",
+                            "op": "read",
+                            "path": op.path,
+                            "status": "blocked",
+                            "content": "",
+                            "error": (
+                                f"read blocked: this file is a skill reference "
+                                f"that matched threat pattern '{_block.pattern_id}' "
+                                f"({_block.scope}/{_block.severity}). The content "
+                                "was not loaded into context."
+                            ),
+                        }
+
+        # `encoding` is surfaced ONLY when a non-UTF-8 codec was used (BOM or
+        # charset-normalizer); the plain-UTF-8 fast path keeps the result shape
+        # byte-identical (no `encoding` field) for the common case.
+        _enc_field = {"encoding": _detected_encoding} if _detected_encoding else {}
+
+        # FP-0066 P0 (#3247): `file.read` is a PLAIN read again — the
+        # SKILL.md-specific invocation-time expansion pass (ADR 0064 §3.5,
+        # `${REYN_*}`/`${CLAUDE_*}`/`${env:...}`, #3196 provenance gate,
+        # #3198 env-allowlist) moved OUT to the dedicated `load_skill` op
+        # (`reyn.core.op_runtime.load_skill`). This reverses the #2971
+        # "reading is the invocation, no dedicated verb" choice for skills
+        # specifically (§6 of the retrieval two-groups-two-axes proposal) —
+        # `content` here is always byte-identical to what was decoded off
+        # disk, for every path including a `SKILL.md`-named one.
+        # #2335: read MODE. An explicit LINE window (offset/limit given, no char_offset) is honored
+        # VERBATIM — the LLM's line-based read contract, byte-identical — AS LONG AS its slice fits
+        # the inline cap. Otherwise (an unbounded read, a char_offset mid-line RESUME, OR an explicit
+        # window whose slice exceeds the cap) the read is SELF-BOUNDING (truncate + re-read hint).
+        cap = _read_inline_cap(ctx)
+        explicit_line_window = (
+            op.offset is not None or op.limit is not None
+        ) and op.char_offset is None
+        if explicit_line_window:
+            lines = content.splitlines(keepends=True)
+            start = op.offset or 0
+            sliced = lines[start:start + op.limit] if op.limit is not None else lines[start:]
+            joined = "".join(sliced)
+            # A window that fits the cap is honored verbatim. An OVERSIZED window is NOT offloaded:
+            # file_read's source already lives on disk at op.path, so duplicating it into an offload
+            # file is wasteful (owner steer). Fall through to the self-bounding truncation below —
+            # truncate inline + surface a re-read hint; the full content stays at op.path.
+            # #4381 PR-5: measured in BYTES (the cap's own unit — architect design)
+            # via UTF-8 encoding, not len(str) — a char count drifts up to ~3x for
+            # multi-byte content against a byte-denominated cap.
+            if len(joined.encode("utf-8")) <= cap:
+                ctx.events.emit("tool_executed", op="read_file", path=op.path)
+                _window_result: dict = {
+                    "kind": "file",
+                    "op": "read",
+                    "path": op.path,
+                    "status": "ok",
+                    "content": joined,
+                    **_enc_field,
+                }
+                if _is_skill_reference:  # #4701: fence at the tool-result chokepoint
+                    _window_result["_external_source"] = True
+                return _window_result
+
+        # #1209 read-bounding (keep-in-decide-context, not offloaded-out-of-view) + #2335 char-level
+        # truncation. Accumulate WHOLE lines from (start_line, start_char); a multi-line overflow
+        # stops at the LINE boundary (byte-identical to pre-#2335 — next_char_offset stays absent);
+        # a SINGLE line/segment that alone exceeds the cap is TRUNCATED so `content` is GENUINELY
+        # <= cap (#2335 fix), its tail paged via next_char_offset.
+        #
+        # #4381 PR-5: ``cap`` is now BYTES (architect design — a resource bound protects
+        # memory/transfer, byte-denominated regardless of encoding). ``acc``/the per-segment
+        # overflow checks below measure UTF-8 encoded byte length, never len(str) — a
+        # char-denominated accumulator would silently under-count multi-byte content by up
+        # to ~3x, the exact drift this PR closes. The single-oversized-segment branch uses
+        # ``context_builder.byte_safe_prefix`` (never a raw ``seg[:cap]`` char slice, which
+        # could both overshoot the byte budget AND split a multi-byte codepoint mid-character).
+        from reyn.core.context_builder import byte_safe_prefix
+
+        all_lines = content.splitlines(keepends=True)
+        start_line = op.offset or 0
+        start_char = op.char_offset or 0
+        shown: list[str] = []
+        acc = 0  # bytes
+        next_offset: "int | None" = None
+        next_char_offset: "int | None" = None
+        i = start_line
+        seg_start = start_char
+        while i < len(all_lines):
+            seg = all_lines[i][seg_start:]
+            seg_bytes = len(seg.encode("utf-8"))
+            if shown and acc + seg_bytes > cap:
+                # A subsequent line overflows → stop at the LINE boundary (exclude it; the
+                # continuation is a normal line read at its start). Pre-#2335 behavior.
+                next_offset = i
+                break
+            if not shown and seg_bytes > cap:
+                # #2335/#4381: a single line/segment ALONE exceeds the cap → byte-safe
+                # truncate for an honest bound; its tail resumes mid-line via
+                # next_char_offset (a CHARACTER offset — file.py's own read contract —
+                # derived from the truncated prefix's own char length, not the byte cap
+                # value itself, since those two numbers now differ).
+                truncated = byte_safe_prefix(seg, cap)
+                shown.append(truncated)
+                acc += len(truncated.encode("utf-8"))
+                next_offset = i
+                next_char_offset = seg_start + len(truncated)
+                break
+            shown.append(seg)
+            acc += seg_bytes
+            i += 1
+            seg_start = 0
+
+        if next_offset is not None:
+            # #4381: this read is about to come back truncated — before doing
+            # that, check whether ``op.path`` is itself a tool-result SPILL
+            # (owner-ratified term, distinct from "offload" — a spill is the
+            # unavoidable "didn't fit, had to go out" write; see
+            # ``MediaStore.is_tool_result_spill``'s own docstring). Re-reading
+            # a spill file's FULL content bare can be too big for THIS cap
+            # again, and since this cap (window/char-derived) is independent
+            # of the router's own SEPARATE token-derived spill trigger
+            # (``services/tool_result_cap.py``), truncating and returning it
+            # here can still come back oversized under THAT cap downstream
+            # and get spilled a second time — a real, unbounded chain. Error
+            # instead of truncating, with the exact remedy (not "too big" —
+            # the caller already knows that; the fix is which parameter to
+            # pass next).
+            if ctx.media_store is not None and ctx.media_store.is_tool_result_spill(op.path):
+                ctx.events.emit(
+                    "tool_executed", op="read_file", path=op.path,
+                    truncated=True, spill_reread_blocked=True,
+                )
+                return {
+                    "kind": "file",
+                    "op": "read",
+                    "path": op.path,
+                    "status": "error",
+                    "content": "",
+                    "error": (
+                        f"{op.path!r} is itself the output of a previous tool-result "
+                        "spill (content too large for the model's context window) — "
+                        "reading it whole would spill it again. Specify `offset` (and "
+                        "`char_offset` if a previous read of THIS file returned "
+                        "`next_char_offset`) to read a bounded window instead."
+                    ),
+                }
+            ctx.events.emit(
+                "tool_executed", op="read_file", path=op.path,
+                truncated=True, shown_lines=len(shown), total_lines=len(all_lines),
+            )
+            result: dict = {
+                "kind": "file",
+                "op": "read",
+                "path": op.path,
+                "status": "truncated",
+                "content": "".join(shown),
+                "shown_lines": len(shown),
+                "total_lines": len(all_lines),
+                "next_offset": next_offset,
+                "total_chars": len(content),
+                # Owner: the LLM must recognize the content was cut (not the whole file). Explicit
+                # marker + a plain re-read hint pointing at the on-disk source — no offload copy is
+                # made for a file_read (the full content already lives at op.path).
+                "_truncated": True,
+                "note": (
+                    f"content truncated to fit context ({len(''.join(shown))} of {len(content)} "
+                    f"chars shown); the full file is on disk at {op.path!r} — re-read from "
+                    f"offset {next_offset}"
+                    + (
+                        # #4381: when a SINGLE line was itself truncated (byte-safe,
+                        # #4381 PR-5), plain `offset=next_offset` restarts that same
+                        # line from char 0 and truncates identically — an infinite
+                        # loop. The resume call MUST also pass
+                        # char_offset=next_char_offset; say so.
+                        f" and char_offset {next_char_offset}"
+                        if next_char_offset is not None else ""
+                    )
+                    + " to continue."
+                ),
+                **_enc_field,
+            }
+            if next_char_offset is not None:
+                # #2335: mid-line resume position (set ONLY when a single line was char-truncated).
+                result["next_char_offset"] = next_char_offset
+            if _is_skill_reference:  # #4701: fence at the tool-result chokepoint
+                result["_external_source"] = True
+            return result
+
+        ctx.events.emit("tool_executed", op="read_file", path=op.path)
+        _full_result: dict = {
+            "kind": "file",
+            "op": "read",
+            "path": op.path,
+            "status": "ok",
+            "content": "".join(shown),
+            **_enc_field,
+        }
+        if _is_skill_reference:  # #4701: fence at the tool-result chokepoint
+            _full_result["_external_source"] = True
+        return _full_result
+
+    if op.op == "glob":
+        # #2782: offloaded — pure read (tree-walk), no atomicity concern, safe to
+        # move wholesale to a worker thread. `ctx.events.emit` stays on the event
+        # loop thread (called after the `await`, not inside the threaded call) —
+        # EventStore.write ultimately does an `asyncio.Queue.put_nowait`, which is
+        # NOT thread-safe if called from a to_thread worker thread.
+        #
+        # #2998: `glob_files_with_total` (not the plain `glob_files`) — both
+        # branches of the shared walk already build the full match list before
+        # slicing to `max_results`, so the pre-cap total is free (no second glob
+        # pass) and lets the result signal a silent truncation instead of a
+        # caller-forgot-max_results 51st-file loss.
+        glob_result = await asyncio.to_thread(
+            ctx.workspace.glob_files_with_total,
+            op.path, max_results=op.max_results, absolute=op.absolute,
+        )
+        matches = glob_result.matches
+        ctx.events.emit("tool_executed", op="glob_files", path=op.path, match_count=len(matches))
+        result: dict = {
+            "kind": "file",
+            "op": "glob",
+            "pattern": op.path,
+            "status": "ok",
+            "matches": matches,
+            "count": len(matches),
+        }
+        if glob_result.total > len(matches):
+            # Decision-enabling (#2998): not just "cut" but how many of how many,
+            # and the fix (pass a larger max_results) — mirrors read op's
+            # truncated + next_offset re-read hint.
+            result["truncated"] = True
+            result["total_count"] = glob_result.total
+            result["returned_count"] = len(matches)
+        return result
+
+    if op.op == "delete":
+        # #2782: same per-path lock as edit/write — otherwise a concurrent
+        # edit's read-modify-write can straddle this delete and "resurrect"
+        # the file (edit read before the delete, writes back after it).
+        async with get_path_lock(_resolve_for_gate(ctx, op.path)):
+            deleted = ctx.workspace.delete_file(op.path)
+        ctx.events.emit("tool_executed", op="delete_file", path=op.path, deleted=deleted)
+        return {"kind": "file", "op": "delete", "path": op.path, "status": "ok", "deleted": deleted}
+
+    if op.op == "grep":
+        return await _execute_grep(op, ctx)
+
+    if op.op == "edit":
+        return await _execute_edit(op, ctx)
+
+    if op.op == "regenerate_index":
+        # #2782: lock the SAME per-path key on the actually-written
+        # `output_path` (not the source `path`, which is a directory of
+        # *.md sources being read, not the file being mutated). The
+        # error branches (missing output_path/entry_template) never
+        # touch disk, so they run outside the lock.
+        if op.output_path:
+            resolved_output = _resolve_for_gate(ctx, op.output_path)
+            async with get_path_lock(resolved_output):
+                return _execute_regenerate_index(op, ctx)
+        return _execute_regenerate_index(op, ctx)
+
+    if op.op == "mkdir":
+        try:
+            created = ctx.workspace.make_directory(op.path)
+        except FileExistsError as exc:
+            ctx.events.emit("tool_executed", op="mkdir", path=op.path, status="error")
+            return {
+                "kind": "file", "op": "mkdir", "path": op.path,
+                "status": "error", "error": str(exc),
+            }
+        ctx.events.emit("tool_executed", op="mkdir", path=op.path, created=created)
+        return {
+            "kind": "file", "op": "mkdir", "path": op.path,
+            "status": "ok", "created": created,
+        }
+
+    if op.op == "move":
+        if not op.dest_path:
+            return {
+                "kind": "file", "op": "move", "path": op.path,
+                "status": "error", "error": "dest_path is required for move",
+            }
+        # #2782: move touches TWO paths (source is effectively deleted, dest is
+        # effectively written) — lock BOTH via `locked_paths`, which acquires
+        # them in a fixed sorted order (never src-then-dest vs dest-then-src)
+        # so a move and a reverse move can never deadlock against each other.
+        src_resolved = _resolve_for_gate(ctx, op.path)
+        dst_resolved = _resolve_for_gate(ctx, op.dest_path)
+        async with locked_paths(src_resolved, dst_resolved):
+            moved = ctx.workspace.move_path(op.path, op.dest_path)
+        if not moved:
+            ctx.events.emit("tool_executed", op="move", path=op.path, found=False)
+            return {
+                "kind": "file", "op": "move", "path": op.path,
+                "dest_path": op.dest_path, "status": "not_found",
+                "error": f"source file not found: {op.path}",
+            }
+        ctx.events.emit("tool_executed", op="move", path=op.path, dest_path=op.dest_path)
+        return {
+            "kind": "file", "op": "move", "path": op.path,
+            "dest_path": op.dest_path, "status": "ok", "moved": True,
+        }
+
+    if op.op == "stat":
+        info = ctx.workspace.stat_path(op.path)
+        if info is None:
+            ctx.events.emit("tool_executed", op="stat", path=op.path, found=False)
+            return {
+                "kind": "file", "op": "stat", "path": op.path,
+                "status": "not_found",
+                "error": f"path not found: {op.path}",
+            }
+        ctx.events.emit("tool_executed", op="stat", path=op.path)
+        return {
+            "kind": "file", "op": "stat", "path": op.path,
+            "status": "ok", "info": info,
+        }
+
+    raise ValueError(f"unsupported file op: {op.op!r}")
+
+
+def _execute_grep_sync(op: FileIROp, ctx: OpContext) -> tuple[dict, int | None]:
+    """The I/O-bound core of ``grep`` (tree-walk + per-file read + regex scan) —
+    pure, safe to run wholesale on a worker thread (#2782). Returns
+    ``(result, match_count_to_emit)``; ``match_count_to_emit`` is ``None`` for the
+    validation-error branches (no event was emitted for those before #2782
+    either). The caller emits ``tool_executed`` AFTER the ``to_thread`` call
+    returns, back on the event loop thread — ``ctx.events.emit`` ultimately does
+    an ``asyncio.Queue.put_nowait`` (EventStore's DurabilityWorker), which is NOT
+    thread-safe if called from a worker thread."""
+    if not op.pattern:
+        return {"kind": "file", "op": "grep", "status": "error", "error": "pattern is required for grep"}, None
+    flags = re.IGNORECASE if op.case_insensitive else 0
+    try:
+        regex = re.compile(op.pattern, flags)
+    except re.error as exc:
+        return {"kind": "file", "op": "grep", "status": "error", "error": f"invalid regex: {exc}"}, None
+
+    # FP-0008 #1115 Stage 1: the glob+read+regex scan is an environment-internal
+    # primitive run by the backend (Workspace.grep gates the root + delegates).
+    # The handler keeps presentation: regex compile / error envelopes / relativize.
+    try:
+        result = ctx.workspace.grep(
+            op.path or ".",
+            regex,
+            glob=op.glob,
+            file_type=op.file_type,
+            output_mode=op.output_mode,
+            head_limit=op.head_limit,
+            context_before=op.context_before,
+            context_after=op.context_after,
+        )
+    except PermissionError as exc:
+        return {"kind": "file", "op": "grep", "status": "denied", "error": str(exc)}, None
+
+    def _rel(p: Path) -> str:
+        try:
+            return str(p.relative_to(ctx.workspace.base_dir))
+        except ValueError:
+            return str(p)
+
+    if result.output_mode == "files_with_matches":
+        matched = [_rel(f) for f in result.files]
+        return {"kind": "file", "op": "grep", "status": "ok",
+                "output_mode": "files_with_matches", "files": matched, "count": len(matched)}, len(matched)
+
+    if result.output_mode == "count":
+        return {"kind": "file", "op": "grep", "status": "ok",
+                "output_mode": "count", "count": result.count}, result.count
+
+    matches: list[dict] = []
+    for hit in result.matches:
+        entry: dict[str, Any] = {
+            "path": _rel(hit["path"]),
+            "line_number": hit["line_number"],
+            "content": hit["content"],
+        }
+        if "context" in hit:
+            entry["context"] = hit["context"]
+        matches.append(entry)
+
+    return {"kind": "file", "op": "grep", "status": "ok",
+            "output_mode": "content", "pattern": op.pattern,
+            "matches": matches, "count": len(matches)}, len(matches)
+
+
+async def _execute_grep(op: FileIROp, ctx: OpContext) -> dict:
+    result, match_count = await asyncio.to_thread(_execute_grep_sync, op, ctx)
+    if match_count is not None:
+        ctx.events.emit("tool_executed", op="grep", pattern=op.pattern, match_count=match_count)
+    return result
+
+
+def _changed_region_preview(
+    new_content: str,
+    start_offset: int,
+    new_len: int,
+    *,
+    context_lines: int = 3,
+    max_lines: int = 40,
+) -> str:
+    """A numbered-line view of the changed region for an edit result (#1418).
+
+    **show-not-judge**: renders the lines around where ``new_string`` landed as
+    1-based ``<lineno>\\t<text>`` only — NO syntax check, NO validity verdict, no
+    encoding of "correct". The agent self-assesses (e.g. notices it inserted at
+    indent 0 while the surrounding body is indent 8).
+
+    **language-agnostic**: pure line slicing, no language parsing — works on any
+    text file, not just Python.
+
+    **bounded-by-construction**: capped at ``max_lines`` so a large multi-line
+    insert cannot bloat the result.
+
+    ``start_offset`` is the char offset (in ``new_content``) where the change
+    begins — i.e. ``content.index(old_string)``, which is identical in the old
+    and new content because the prefix is unchanged. ``new_len`` is
+    ``len(new_string)`` (0 for a deletion, which then shows the surrounding
+    context at the seam).
+    """
+    lines = new_content.split("\n")
+    total = len(lines)
+    start_line = new_content.count("\n", 0, start_offset)
+    end_line = new_content.count("\n", 0, start_offset + new_len)
+    lo = max(0, start_line - context_lines)
+    hi = min(total - 1, end_line + context_lines)
+    truncated = False
+    if hi - lo + 1 > max_lines:
+        hi = lo + max_lines - 1
+        truncated = True
+    rendered = "\n".join(f"{i + 1}\t{lines[i]}" for i in range(lo, hi + 1))
+    if truncated:
+        rendered += "\n…\t(preview truncated)"
+    return rendered
+
+
+def _execute_edit_sync(op: FileIROp, ctx: OpContext) -> tuple[dict, int | None, str | None]:
+    """The read-modify-write core of ``edit_file`` — run WHOLESALE on a worker
+    thread (#2782), preserving today's atomicity: no ``await`` used to appear
+    between the read and the write (the whole stretch ran uninterrupted on the
+    event loop), so no ``await`` may appear inside this function either — it
+    must stay one uninterrupted synchronous call, just now off-loop. Splitting
+    the read and the write into separate ``to_thread`` calls would reintroduce
+    an interleaving window (a concurrent session's edit landing between this
+    read and this write) that does not exist today.
+
+    Returns ``(result, replacements_to_emit, written_path)``. NEITHER
+    ``tool_executed`` NOR ``workspace_updated`` may be emitted from inside this
+    function — ``ctx.workspace.write_file_bytes`` transitively emits
+    ``workspace_updated`` unconditionally (a bug caught in review: emitting
+    off-loop doesn't raise, it falls to ``EventStore``'s non-serialized
+    sync-fallback write path, racing the DurabilityWorker's own writes to the
+    same file — see ``write_file_bytes``'s docstring). Called with
+    ``emit=False`` here; the caller emits BOTH events AFTER this returns, back
+    on the event loop thread. See ``_execute_grep_sync``'s docstring for the
+    ``asyncio.Queue.put_nowait`` half of why off-loop emit is unsafe."""
+    if op.old_string is None:
+        return {"kind": "file", "op": "edit", "status": "error", "error": "old_string is required"}, None, None
+    if op.new_string is None:
+        return {"kind": "file", "op": "edit", "status": "error", "error": "new_string is required"}, None, None
+
+    raw_bytes, found = ctx.workspace.read_file_bytes(op.path)
+    if not found:
+        return {
+            "kind": "file",
+            "op": "edit",
+            "path": op.path,
+            "status": "not_found",
+            "error": f"file not found: {op.path}",
+            **_suggestions_fields(ctx.workspace, op.path),
+        }, None, None
+
+    # #1452: decode via the shared codec ladder so a non-UTF-8 text file can be
+    # edited in place (encoding preserved on write-back below). A binary file
+    # cannot be edited as text.
+    content, _encoding = decode_text_or_none(raw_bytes)
+    if content is None:
+        return {
+            "kind": "file", "op": "edit", "path": op.path, "status": "error",
+            "binary": True,
+            "error": "binary file — cannot edit as text (its bytes were not loaded).",
+        }, None, None
+
+    count = content.count(op.old_string)
+    if count == 0:
+        return {"kind": "file", "op": "edit", "status": "error",
+                "error": "old_string not found in file"}, None, None
+    if not op.replace_all and count > 1:
+        return {"kind": "file", "op": "edit", "status": "error",
+                "error": f"old_string appears {count} times; set replace_all=true to replace all occurrences"}, None, None
+
+    new_content = content.replace(op.old_string, op.new_string) if op.replace_all \
+        else content.replace(op.old_string, op.new_string, 1)
+    # #1452: re-encode with the file's ORIGINAL encoding (BOM restored for
+    # utf-8-sig/utf-16/utf-32). If the edit isn't representable in that codec
+    # (e.g. an emoji written into a Shift-JIS file), ERROR and leave the file
+    # untouched — never silently transcode the whole file to UTF-8.
+    encoded = encode_text(new_content, _encoding)
+    if encoded is None:
+        return {
+            "kind": "file", "op": "edit", "path": op.path, "status": "error",
+            "encoding": _encoding or "utf-8",
+            "error": (
+                f"the edit is not representable in the file's encoding "
+                f"({_encoding or 'utf-8'}) — file left unchanged. Some new "
+                "characters cannot be encoded there."
+            ),
+        }, None, None
+    written_path = ctx.workspace.write_file_bytes(op.path, encoded, emit=False)
+    replacements = count if op.replace_all else 1
+    # #1418: an additive, show-not-judge preview of the changed region so the
+    # agent can SEE what landed (and at what indent), not just the count. For
+    # replace_all this shows the first changed region; the count is in
+    # ``replacements``.
+    start_offset = content.index(op.old_string)
+    preview = _changed_region_preview(new_content, start_offset, len(op.new_string))
+    return {
+        "kind": "file", "op": "edit", "path": op.path, "status": "ok",
+        "replacements": replacements, "preview": preview,
+        **({"encoding": _encoding} if _encoding else {}),
+    }, replacements, written_path
+
+
+async def _execute_edit(op: FileIROp, ctx: OpContext) -> dict:
+    # #2782 path-locking step: #2794 made the read-modify-write atomic WITHIN
+    # this one `to_thread` job, but two concurrent `edit_file` (or edit +
+    # write/delete/move) ops on the SAME path now run in different worker
+    # threads — both read, both write, one silently lost (the demonstrated
+    # race). The per-path lock is held across the ENTIRE `to_thread` call
+    # (the whole read-modify-write), so a second same-path writer blocks here
+    # until this one's write has landed.
+    async with get_path_lock(_resolve_for_gate(ctx, op.path)):
+        result, replacements, written_path = await asyncio.to_thread(_execute_edit_sync, op, ctx)
+    if replacements is not None:
+        # Order matches pre-#2782 behavior: write_file_bytes's workspace_updated
+        # emit ran BEFORE the handler's tool_executed emit.
+        if written_path is not None:
+            ctx.events.emit("workspace_updated", path=written_path)
+        ctx.events.emit("tool_executed", op="edit_file", path=op.path, replacements=replacements)
+    return result
+
+
+def regenerate_index_impl(
+    *,
+    dir_path: Path,
+    output_path: Path,
+    entry_template: str,
+    header: str = "",
+) -> int:
+    """Pure helper: rebuild `output_path` from the YAML frontmatter of every
+    `*.md` file in `dir_path`. Returns the number of entries written.
+
+    The OS layer is intentionally format-agnostic — every memory-specific
+    string (the index filename, header text, entry markup) is supplied by
+    the caller. Used by:
+    - the `file/regenerate_index` op handler (LLM-driven regen)
+    - the `reyn memory` CLI (post-mutation sync)
+
+    Behavior:
+    - Scans direct children of `dir_path` matching `*.md`, sorted by name.
+    - Skips any file whose basename equals `output_path.name` so the index
+      doesn't include itself.
+    - Parses YAML frontmatter via `split_frontmatter`. Files with no /
+      malformed frontmatter are skipped silently.
+    - Substitutes `entry_template` placeholders against frontmatter keys
+      plus `slug` (= filename without `.md`). Missing placeholders fall
+      back to empty strings via `defaultdict`, never raise KeyError.
+    - Writes `header + "\\n".join(entries) + "\\n"` (trailing newline only
+      when entries exist).
+    """
+    from reyn.core.frontmatter import split_frontmatter
+
+    output_basename = output_path.name
+    entries: list[str] = []
+    if dir_path.is_dir():
+        for child in sorted(dir_path.glob("*.md")):
+            if child.name == output_basename:
+                continue
+            try:
+                content = child.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            fm, _body = split_frontmatter(content)
+            if not isinstance(fm, dict) or not fm:
+                # No / malformed frontmatter — skip rather than emit a
+                # placeholder-empty entry like `- []() — `.
+                continue
+            ctx_dict: dict = defaultdict(str, **{str(k): "" if v is None else str(v) for k, v in fm.items()})
+            ctx_dict["slug"] = child.stem
+            try:
+                entries.append(entry_template.format_map(ctx_dict))
+            except (KeyError, IndexError, ValueError):
+                continue
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    body_text = "\n".join(entries)
+    output_path.write_text(
+        header + body_text + ("\n" if entries else ""),
+        encoding="utf-8",
+    )
+    return len(entries)
+
+
+def _execute_regenerate_index(op: FileIROp, ctx: OpContext) -> dict:
+    if not op.output_path:
+        return {"kind": "file", "op": "regenerate_index", "status": "error",
+                "error": "output_path is required for regenerate_index"}
+    if not op.entry_template:
+        return {"kind": "file", "op": "regenerate_index", "status": "error",
+                "error": "entry_template is required for regenerate_index"}
+    # Resolve through workspace's permission-aware path methods so reads
+    # outside the project hit the same denylist as the rest of the runtime.
+    dir_resolved = ctx.workspace._resolve_read(op.path)
+    output_resolved = ctx.workspace._resolve_write(op.output_path)
+    n = regenerate_index_impl(
+        dir_path=dir_resolved,
+        output_path=output_resolved,
+        entry_template=op.entry_template,
+        header=op.header or "",
+    )
+    ctx.events.emit(
+        "tool_executed", op="regenerate_index",
+        path=op.path, output_path=op.output_path, entries=n,
+    )
+    return {
+        "kind": "file", "op": "regenerate_index",
+        "path": op.path, "output_path": op.output_path,
+        "status": "ok", "entries": n,
+    }
+
+
+from reyn.core.offload.canonical import file_to_canonical  # noqa: E402
+
+register("file", handle, canonical=file_to_canonical)

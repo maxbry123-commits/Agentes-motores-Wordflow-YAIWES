@@ -1,0 +1,880 @@
+"""mcp_* ToolDefinitions — Wave 2 of M3 (ADR-0026 M3).
+
+Four capabilities are registered here (MCP_OP coarse ToolDef dropped in
+#1240 Wave 2b — see end of file):
+
+  CALL_MCP_TOOL    — gates.router=allow
+  LIST_MCP_SERVERS — gates.router=allow
+  LIST_MCP_TOOLS   — gates.router=allow
+  DESCRIBE_MCP_TOOL — gates.router=allow (FP-0032 D4)
+
+Per ADR-0026 Open Q #6, router-side fine-grained names are canonical:
+call_mcp_tool / list_mcp_servers / list_mcp_tools / describe_mcp_tool.
+
+All four handlers dispatch through the router path only. The phase-side
+dispatch branches were removed alongside the control-IR / phase-dispatch
+executor (#2542): ``ToolContext.caller_kind`` is always "router" at
+runtime, so the handlers run their router logic unconditionally.
+
+#2597 slice ②a adds three MORE capabilities, parallel to the tools surface
+above (list_mcp_tools -> list_mcp_resources; call_mcp_tool's gated-content
+shape -> read_mcp_resource; a resource-templates twin with no tools
+analogue):
+
+  LIST_MCP_RESOURCES         — gates.router=allow (mirrors LIST_MCP_TOOLS)
+  READ_MCP_RESOURCE          — gates.router=allow (mirrors CALL_MCP_TOOL's
+                                external-content + permission-gated shape)
+  LIST_MCP_RESOURCE_TEMPLATES — gates.router=allow
+
+#2597 slice ②b adds TWO more, parallel to the ②a set (the async push
+event-source itself — the resulting notification lands as an
+``mcp_resource_updated`` EventLog event, not through either of these):
+
+  SUBSCRIBE_MCP_RESOURCE    — gates.router=allow (permission-gated like
+                               READ_MCP_RESOURCE — a stateful action against
+                               the server)
+  UNSUBSCRIBE_MCP_RESOURCE  — gates.router=allow
+
+#2597 slice ②c adds TWO more, parallel to the ②a resources set (prompts
+have no subscribe concept, so no ②b-style pair here):
+
+  LIST_MCP_PROMPTS  — gates.router=allow (mirrors LIST_MCP_RESOURCES)
+  GET_MCP_PROMPT    — gates.router=allow (mirrors READ_MCP_RESOURCE's
+                       external-content + permission-gated shape)
+
+## Router-side dispatch
+
+The router-side handlers are thin adapters over the existing session-level
+callbacks (mcp_list_servers / mcp_list_tools / mcp_call_tool / #2597
+mcp_list_resources / mcp_list_resource_templates / mcp_read_resource /
+mcp_list_prompts / mcp_get_prompt). The ToolContext router_state carries the
+host adapter; adapters pull from ctx.router_state.
+
+## DO NOT TOUCH shared files
+
+Per task spec: __init__.py, router_tools.py, and registry.py are NOT modified
+by this file. Registration of these 3 ToolDefinitions into get_default_registry()
+is handled by the caller per ADR-0026 M3 wave pattern.
+"""
+from __future__ import annotations
+
+import copy
+from typing import TYPE_CHECKING, Any, Awaitable, Final, Mapping
+
+from reyn.tools.descriptions import mcp as _mcp_descriptions
+from reyn.tools.types import ToolContext, ToolDefinition, ToolGates, ToolResult
+
+if TYPE_CHECKING:
+    from reyn.tools.types import RouterCallerState
+
+# ── Description constants (byte-identical to router_tools.py D1/D2/D3) ────────
+#
+# Reviewable in src/reyn/tools/descriptions/mcp.py (Phase 2 of the
+# tool-description package refactor) — these aliases keep the call sites
+# unchanged (byte-identical relocation, no LLM-facing text change).
+
+_LIST_MCP_SERVERS_DESCRIPTION = _mcp_descriptions.list_mcp_servers.text
+
+_LIST_MCP_TOOLS_DESCRIPTION = _mcp_descriptions.list_mcp_tools.text
+
+_CALL_MCP_TOOL_DESCRIPTION = _mcp_descriptions.call_mcp_tool.text
+
+_DESCRIBE_MCP_TOOL_DESCRIPTION = _mcp_descriptions.describe_mcp_tool.text
+
+
+# ── Parameters JSON schemas (byte-identical to router_tools.py D1/D2/D3) ──────
+
+_LIST_MCP_SERVERS_PARAMETERS: dict[str, Any] = {
+    "type": "object",
+    "properties": {},
+    "required": [],
+}
+
+# #4686 — the LLM-facing read tool. Takes no params, same shape as
+# list_mcp_servers: it reports across every held connection at once
+# (per-connection, never merged — see the ToolDefinition below), not one
+# server at a time.
+_LIST_MCP_SUBSCRIPTIONS_DESCRIPTION = _mcp_descriptions.list_mcp_subscriptions.text
+
+_LIST_MCP_SUBSCRIPTIONS_PARAMETERS: dict[str, Any] = {
+    "type": "object",
+    "properties": {},
+    "required": [],
+}
+
+_LIST_MCP_TOOLS_PARAMETERS: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "server": {"type": "string"},
+    },
+    "required": ["server"],
+}
+
+# #1646: the target MCP tool's OWN parameters are carried under THIS key —
+# deliberately NOT "args". The universal-scheme live path wraps this verb in
+# invoke_action(action_name="mcp_call_tool", args={...}); a nested "args" here would
+# collide with invoke_action's own "args" (two same-named levels), which the LLM
+# collapsed (params flat beside server/mcp_tool_name, inner level dropped) → empty args
+# at the MCP call (owner-observed). A distinct key kills the collision by construction.
+# Single-sourced so the schema decl + its read sites cannot drift.
+_MCP_TOOL_ARGS_KEY: Final[str] = "tool_args"
+
+_CALL_MCP_TOOL_PARAMETERS: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "server": {
+            "type": "string",
+            "description": _mcp_descriptions.PARAMS["call_mcp_tool"]["server"].text,
+        },
+        "mcp_tool_name": {
+            "type": "string",
+            "description": _mcp_descriptions.PARAMS["call_mcp_tool"]["mcp_tool_name"].text,
+        },
+        _MCP_TOOL_ARGS_KEY: {
+            "type": "object",
+            "description": _mcp_descriptions.PARAMS["call_mcp_tool"]["tool_args"].text,
+        },
+    },
+    "required": ["server", "mcp_tool_name", _MCP_TOOL_ARGS_KEY],
+}
+
+_DESCRIBE_MCP_TOOL_PARAMETERS: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "server": {
+            "type": "string",
+            "description": _mcp_descriptions.PARAMS["describe_mcp_tool"]["server"].text,
+        },
+        "mcp_tool_name": {
+            "type": "string",
+            "description": _mcp_descriptions.PARAMS["describe_mcp_tool"]["mcp_tool_name"].text,
+        },
+    },
+    "required": ["server", "mcp_tool_name"],
+}
+
+
+# ── #2597 slice ②a: resources consumption parameters ──────────────────────────
+
+_LIST_MCP_RESOURCES_DESCRIPTION = _mcp_descriptions.list_mcp_resources.text
+
+_LIST_MCP_RESOURCES_PARAMETERS: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "server": {
+            "type": "string",
+            "description": _mcp_descriptions.PARAMS["list_mcp_resources"]["server"].text,
+        },
+    },
+    "required": ["server"],
+}
+
+_LIST_MCP_RESOURCE_TEMPLATES_DESCRIPTION = _mcp_descriptions.list_mcp_resource_templates.text
+
+_LIST_MCP_RESOURCE_TEMPLATES_PARAMETERS: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "server": {
+            "type": "string",
+            "description": _mcp_descriptions.PARAMS["list_mcp_resource_templates"]["server"].text,
+        },
+    },
+    "required": ["server"],
+}
+
+_READ_MCP_RESOURCE_DESCRIPTION = _mcp_descriptions.read_mcp_resource.text
+
+_READ_MCP_RESOURCE_PARAMETERS: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "server": {
+            "type": "string",
+            "description": _mcp_descriptions.PARAMS["read_mcp_resource"]["server"].text,
+        },
+        "uri": {
+            "type": "string",
+            "description": _mcp_descriptions.PARAMS["read_mcp_resource"]["uri"].text,
+        },
+    },
+    "required": ["server", "uri"],
+}
+
+
+# ── #2597 slice ②b: resource subscriptions parameters ─────────────────────────
+
+_SUBSCRIBE_MCP_RESOURCE_DESCRIPTION = _mcp_descriptions.subscribe_mcp_resource.text
+
+_SUBSCRIBE_MCP_RESOURCE_PARAMETERS: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "server": {
+            "type": "string",
+            "description": _mcp_descriptions.PARAMS["subscribe_mcp_resource"]["server"].text,
+        },
+        "uri": {
+            "type": "string",
+            "description": _mcp_descriptions.PARAMS["subscribe_mcp_resource"]["uri"].text,
+        },
+    },
+    "required": ["server", "uri"],
+}
+
+_UNSUBSCRIBE_MCP_RESOURCE_DESCRIPTION = _mcp_descriptions.unsubscribe_mcp_resource.text
+
+_UNSUBSCRIBE_MCP_RESOURCE_PARAMETERS: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "server": {
+            "type": "string",
+            "description": _mcp_descriptions.PARAMS["unsubscribe_mcp_resource"]["server"].text,
+        },
+        "uri": {
+            "type": "string",
+            "description": _mcp_descriptions.PARAMS["unsubscribe_mcp_resource"]["uri"].text,
+        },
+    },
+    "required": ["server", "uri"],
+}
+
+
+# ── #2597 slice ②c: prompts consumption parameters ────────────────────────────
+
+_LIST_MCP_PROMPTS_DESCRIPTION = _mcp_descriptions.list_mcp_prompts.text
+
+_LIST_MCP_PROMPTS_PARAMETERS: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "server": {
+            "type": "string",
+            "description": _mcp_descriptions.PARAMS["list_mcp_prompts"]["server"].text,
+        },
+    },
+    "required": ["server"],
+}
+
+_GET_MCP_PROMPT_DESCRIPTION = _mcp_descriptions.get_mcp_prompt.text
+
+_GET_MCP_PROMPT_PARAMETERS: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "server": {
+            "type": "string",
+            "description": _mcp_descriptions.PARAMS["get_mcp_prompt"]["server"].text,
+        },
+        "name": {
+            "type": "string",
+            "description": _mcp_descriptions.PARAMS["get_mcp_prompt"]["name"].text,
+        },
+        "arguments": {
+            "type": "object",
+            "description": _mcp_descriptions.PARAMS["get_mcp_prompt"]["arguments"].text,
+        },
+    },
+    "required": ["server", "name"],
+}
+
+
+# ── Handlers ──────────────────────────────────────────────────────────────────
+
+def _mcp_list_error(result: "list | None") -> "str | None":
+    """Detect the shared MCP-listing failure sentinel and return its message,
+    or None when *result* is a normal listing.
+
+    An unresolved server config (roster empty / server not configured /
+    config not a dict) comes back as a single-element ``[{"error": "..."}]``
+    list rather than an exception (see
+    ``RouterHostAdapter._mcp_resolve_server_config``) — that is validation,
+    not a gateway-call failure, so it stays an early-return sentinel rather
+    than a raise. Surface MCP-layer errors so the LLM can diagnose the
+    failure instead of seeing an empty (or one-entry, error-shaped) list
+    with no explanation.
+
+    #3447: the *gateway-call* failure (``Cancelled``/``MCPFault``) used to
+    ALSO reach this sentinel shape, caught inside
+    ``Session._mcp_list_via_gateway``. That catch moved to each
+    ``_handle_list_mcp_*`` call site below (folded into
+    ``RouterHostAdapter``'s own listing methods, which now let the two
+    exceptions propagate) — see ``_call_mcp_list`` just below.
+    """
+    if result and isinstance(result[0], Mapping) and "error" in result[0]:
+        return result[0]["error"]
+    return None
+
+
+async def _call_mcp_list(host_call: "Awaitable[list]") -> "list | dict":
+    """Shared catch point (#3447) for the four gateway-backed
+    ``mcp_list_*`` host methods (tools / resources / resource_templates /
+    prompts — ``mcp_list_servers`` never raises, it has no gateway call).
+
+    ``RouterHostAdapter.mcp_list_*`` now let ``Cancelled``/``MCPFault``
+    propagate (folded off ``Session._mcp_list_via_gateway``'s former
+    in-place catch — architect firm, #3411: no context-manager / audit-emit
+    / pool-teardown step sits between the raise site and either catch
+    position, so moving the catch here is behavior-preserving). Catching
+    here reproduces the exact byte-identical ``{"error": "cancelled"}`` /
+    ``{"error": str(exc)}`` shape the caller previously received as a
+    return value, so every ``_handle_list_mcp_*`` handler below stays
+    unchanged past this point.
+    """
+    from reyn.core.cancellable import Cancelled
+    from reyn.mcp.gateway import MCPFault
+
+    try:
+        return await host_call
+    except Cancelled:
+        return [{"error": "cancelled"}]
+    except MCPFault as exc:
+        return [{"error": str(exc)}]
+
+
+async def _handle_list_mcp_servers(
+    args: Mapping[str, Any], ctx: ToolContext
+) -> ToolResult:
+    """Adapter for list_mcp_servers.
+
+    Delegates to host.mcp_list_servers() via ctx.router_state. The
+    router_state is expected to carry a host object with an async
+    mcp_list_servers() method (= RouterHostAdapter or compatible).
+    """
+    host = _require_host(ctx)
+    result = await host.mcp_list_servers()
+    error = _mcp_list_error(result)
+    if error is not None:
+        return {"error": error}
+    return {"servers": result}
+
+
+async def _handle_list_mcp_subscriptions(
+    args: Mapping[str, Any], ctx: ToolContext
+) -> ToolResult:
+    """Adapter for list_mcp_subscriptions (#4686).
+
+    Delegates to host.mcp_list_subscriptions() via ctx.router_state — mirrors
+    _handle_list_mcp_servers's no-args shape, NOT the gateway-backed
+    _handle_list_mcp_resources shape: this never touches the network
+    (subscription tracking is session-local state, see
+    RouterHostAdapter.mcp_list_subscriptions's own docstring), so there is
+    no _mcp_list_error/_call_mcp_list gateway-failure sentinel to check."""
+    host = _require_host(ctx)
+    result = await host.mcp_list_subscriptions()
+    return {"subscriptions": result}
+
+
+async def _handle_list_mcp_tools(
+    args: Mapping[str, Any], ctx: ToolContext
+) -> ToolResult:
+    """Adapter for list_mcp_tools.
+
+    Delegates to host.mcp_list_tools(server) via ctx.router_state.
+
+    Response shape: ``{"mcp_tools": [{"name": "<server>__<tool>",
+    "description": "...", "inputSchema": {...}}, ...]}``.
+
+    Background:
+      - FP-0032 returned ``mcp_tools`` key (not ``tools``) to avoid
+        structural collision with OpenAI tool-definition shape, and
+        also stripped ``inputSchema`` so the entries could not be
+        mistaken for top-level callable functions.
+      - Issue #879 collapsed MCP dispatch into a single
+        ``mcp_call_tool`` verb whose ``tool`` arg takes a
+        ``<server>__<tool>`` self-contained identifier. In that
+        world the entry name is **not** a callable function name in
+        the router's ``tools=`` array, so the FP-0032 shape-collision
+        concern no longer applies — and the LLM needs the schema
+        directly to construct ``mcp_call_tool``'s ``args`` field
+        without an extra ``describe_mcp_tool`` round-trip. Include
+        ``inputSchema`` in each entry verbatim from the MCP server's
+        declared shape.
+    """
+    host = _require_host(ctx)
+    server = str(args["server"])
+    result = await _call_mcp_list(host.mcp_list_tools(server))
+    error = _mcp_list_error(result)
+    if error is not None:
+        # An error envelope, returned as-is: no key the caller could mistake
+        # for a successful listing.
+        return {"error": error}
+    # Issue #879: rewrite each entry's ``name`` to the
+    # ``<server>__<tool>`` identifier; preserve description + the
+    # tool's declared ``inputSchema`` so the LLM can construct
+    # mcp_call_tool args in a single follow-up turn.
+    rebuilt: list[dict] = []
+    for t in (result or []):
+        if not isinstance(t, Mapping):
+            continue
+        inner_name = t.get("name", "")
+        if not inner_name:
+            continue
+        entry = dict(t)
+        entry["name"] = f"{server}__{inner_name}"
+        rebuilt.append(entry)
+    return {"mcp_tools": rebuilt}
+
+
+async def _handle_list_mcp_resources(
+    args: Mapping[str, Any], ctx: ToolContext
+) -> ToolResult:
+    """Adapter for list_mcp_resources.
+
+    Delegates to host.mcp_list_resources(server) via ctx.router_state —
+    mirrors _handle_list_mcp_tools exactly, minus the #879 name-rewrite
+    (resources are addressed by URI, not a <server>__<name> identifier).
+    """
+    host = _require_host(ctx)
+    server = str(args["server"])
+    result = await _call_mcp_list(host.mcp_list_resources(server))
+    error = _mcp_list_error(result)
+    if error is not None:
+        return {"error": error}
+    return {"resources": list(result or [])}
+
+
+async def _handle_list_mcp_resource_templates(
+    args: Mapping[str, Any], ctx: ToolContext
+) -> ToolResult:
+    """Adapter for list_mcp_resource_templates. Mirrors
+    _handle_list_mcp_resources; an empty list is a normal result (no
+    templates registered), not an error."""
+    host = _require_host(ctx)
+    server = str(args["server"])
+    result = await _call_mcp_list(host.mcp_list_resource_templates(server))
+    error = _mcp_list_error(result)
+    if error is not None:
+        return {"error": error}
+    return {"resource_templates": list(result or [])}
+
+
+async def _handle_read_mcp_resource(
+    args: Mapping[str, Any], ctx: ToolContext
+) -> ToolResult:
+    """Adapter for read_mcp_resource.
+
+    Delegates to host.mcp_read_resource(server, uri) via ctx.router_state.
+    Mirrors _handle_call_mcp_tool's delegation shape; the gated content
+    itself is enforced upstream (require_mcp on the mcp_read_resource op
+    kind), not here.
+    """
+    host = _require_host(ctx)
+    server = str(args["server"])
+    uri = str(args["uri"])
+    return await host.mcp_read_resource(server, uri)
+
+
+async def _handle_subscribe_mcp_resource(
+    args: Mapping[str, Any], ctx: ToolContext
+) -> ToolResult:
+    """Adapter for subscribe_mcp_resource.
+
+    Delegates to host.mcp_subscribe_resource(server, uri) via ctx.router_state.
+    Mirrors _handle_read_mcp_resource's delegation shape; the persistent-
+    connection requirement + permission gate are enforced upstream (session.py
+    ``_mcp_subscribe_resource`` / the ``mcp_subscribe_resource`` op kind), not
+    here.
+    """
+    host = _require_host(ctx)
+    server = str(args["server"])
+    uri = str(args["uri"])
+    return await host.mcp_subscribe_resource(server, uri)
+
+
+async def _handle_unsubscribe_mcp_resource(
+    args: Mapping[str, Any], ctx: ToolContext
+) -> ToolResult:
+    """Adapter for unsubscribe_mcp_resource. Mirrors
+    _handle_subscribe_mcp_resource."""
+    host = _require_host(ctx)
+    server = str(args["server"])
+    uri = str(args["uri"])
+    return await host.mcp_unsubscribe_resource(server, uri)
+
+
+async def _handle_list_mcp_prompts(
+    args: Mapping[str, Any], ctx: ToolContext
+) -> ToolResult:
+    """Adapter for list_mcp_prompts.
+
+    Delegates to host.mcp_list_prompts(server) via ctx.router_state —
+    mirrors _handle_list_mcp_resources exactly (prompts are addressed by
+    name, not URI, but the discovery shape is otherwise identical).
+    """
+    host = _require_host(ctx)
+    server = str(args["server"])
+    result = await _call_mcp_list(host.mcp_list_prompts(server))
+    error = _mcp_list_error(result)
+    if error is not None:
+        return {"error": error}
+    return {"prompts": list(result or [])}
+
+
+async def _handle_get_mcp_prompt(
+    args: Mapping[str, Any], ctx: ToolContext
+) -> ToolResult:
+    """Adapter for get_mcp_prompt.
+
+    Delegates to host.mcp_get_prompt(server, name, arguments) via
+    ctx.router_state. Mirrors _handle_read_mcp_resource's delegation shape;
+    the gated content itself is enforced upstream (require_mcp on the
+    mcp_get_prompt op kind), not here.
+    """
+    host = _require_host(ctx)
+    server = str(args["server"])
+    name = str(args["name"])
+    arguments = dict(args.get("arguments") or {})
+    return await host.mcp_get_prompt(server, name, arguments)
+
+
+async def _handle_call_mcp_tool(
+    args: Mapping[str, Any], ctx: ToolContext
+) -> ToolResult:
+    """Adapter for call_mcp_tool.
+
+    Delegates to host.mcp_call_tool(server, tool, args) via
+    ctx.router_state. This preserves the existing router_loop.py dispatch
+    semantics (= session._mcp_call_tool → execute_op(MCPIROp, ctx)).
+    """
+    host = _require_host(ctx)
+    server = str(args["server"])
+    mcp_tool_name = str(args["mcp_tool_name"])
+    # Dotted form "server.tool_name" → extract the bare tool name for MCPClient.
+    # If the caller passed a bare name (no dot), use it as-is for compatibility.
+    bare_tool = mcp_tool_name.split(".", 1)[-1] if "." in mcp_tool_name else mcp_tool_name
+    tool_args = dict(args.get(_MCP_TOOL_ARGS_KEY) or {})  # #1646: distinct key, no invoke_action collision
+    return await host.mcp_call_tool(server, bare_tool, tool_args)
+
+
+# ── Private helpers ───────────────────────────────────────────────────────────
+
+def _require_host(ctx: ToolContext) -> Any:
+    """Extract host from ctx.router_state.host, raising if absent.
+
+    Production wiring (Phase 3.5-B-mid): RouterLoop sets
+    ``ctx.router_state.host`` to the RouterHostAdapter instance so MCP
+    handlers can call ``host.mcp_list_servers()`` etc. directly. #2567:
+    ``build_resource_caller_state`` populates the same field for any
+    host-holding caller (e.g. a pipeline driver-session), not only a live
+    RouterLoop turn. Note the MCP client pool is per-call
+    (``session.py``'s ``_mcp_call_tool`` opens a fresh ``MCPClientPool``
+    per invocation) — there is no session-level connection cache here to
+    preserve; ``router_state.host`` is just the resource-lookup seam.
+
+    Backward-compat: pre-Phase-3-step-2 tests that assigned
+    ``ctx.router_state = some_host_stub`` (= router_state IS the host
+    duck-type, not a RouterCallerState) still work via the duck-type
+    fallback below.
+    """
+    rs = ctx.router_state
+    if rs is None:
+        raise RuntimeError(
+            "MCP tool handlers require ctx.router_state.host to carry the "
+            "RouterHostAdapter (set by the router dispatcher before calling "
+            "the handler). router_state is None — this is a dispatcher wiring bug."
+        )
+    # Phase 3.5+ path: typed RouterCallerState with .host populated.
+    host = getattr(rs, "host", None)
+    if host is not None:
+        return host
+    # Backward-compat: pre-typed router_state = host stub.
+    if hasattr(rs, "mcp_list_servers"):
+        return rs
+    raise RuntimeError(
+        "MCP tool handlers require ctx.router_state.host to carry the "
+        "RouterHostAdapter (Phase 3.5-B-mid wiring), or for the legacy "
+        "router_state = host stub pattern, the stub must expose "
+        "mcp_list_servers / mcp_list_tools / mcp_call_tool methods."
+    )
+
+
+# ── FP-0032: Schema enricher for call_mcp_tool / describe_mcp_tool ───────────
+
+
+def _enrich_router_schema(rendered: dict, state: "RouterCallerState") -> dict:
+    """Inject server + mcp_tool_name enums from currently-configured MCP servers.
+
+    The enum lists are dynamic: they depend on which MCP servers are wired into
+    the current chat session (= reyn.yaml `mcp` config + per-server tool listings).
+    Without these enums, the LLM could emit arbitrary string values for
+    ``server`` and ``mcp_tool_name``, leading to runtime "unknown server" errors
+    or the FP-0032 bug (LLM emits a bare mcp_tool_name as if it were a
+    top-level tool call).
+
+    ``mcp_servers`` entries: [{name, description, ...}, ...] — may optionally
+    carry a ``tools`` list [{name, ...}, ...] for tool-level enum injection.
+    When ``tools`` is absent (common: tool listing requires async enumeration),
+    the mcp_tool_name enum is omitted and the field stays a plain string.
+
+    Returns a NEW dict — does not mutate the input.
+    """
+    mcp_servers = state.mcp_servers or []
+    server_names = [str(s["name"]) for s in mcp_servers if "name" in s]
+    mcp_tool_names = [
+        f"{s['name']}.{t['name']}"
+        for s in mcp_servers
+        for t in s.get("tools", [])
+        if "name" in s and "name" in t
+    ]
+    new = copy.deepcopy(rendered)
+    props = new["function"]["parameters"]["properties"]
+    server_prop = props.get("server")
+    mcp_tool_prop = props.get("mcp_tool_name")
+    if server_prop is not None:
+        if server_names:
+            server_prop["enum"] = server_names
+        else:
+            server_prop.pop("enum", None)
+    if mcp_tool_prop is not None:
+        if mcp_tool_names:
+            mcp_tool_prop["enum"] = mcp_tool_names
+        else:
+            mcp_tool_prop.pop("enum", None)
+    return new
+
+
+# ── FP-0032 D4: describe_mcp_tool handler ────────────────────────────────────
+
+
+async def _handle_describe_mcp_tool(
+    args: Mapping[str, Any], ctx: ToolContext
+) -> ToolResult:
+    """Return {name, description, input_schema, annotations} for the
+    requested mcp_tool.
+
+    Calls host.mcp_list_tools(server) to get the tool listing, then
+    filters to the requested mcp_tool_name. The dotted form
+    ``<server>.<tool>`` is resolved to the bare tool name for the lookup.
+
+    #4673: ``annotations`` (the MCP SDK's ``ToolAnnotations`` —
+    ``read_only_hint``/``destructive_hint``/``idempotent_hint``/
+    ``open_world_hint``/``title``, all "know before you call" signals)
+    is explicitly included alongside the 3 pre-existing keys — measured
+    (#3329's own follow-up): ``list_mcp_tools`` already carries it
+    verbatim (a shallow ``dict(t)`` copy of the SDK's full tool dict,
+    ``tools/mcp.py``'s own list handler above), so a "詳しく" (describe)
+    call returning LESS than the list it followed up on was the wrong
+    way round. Deliberately still a named, hand-picked key — not a
+    switch to ``dict(t)`` here (lead-coder's own recommendation,
+    #4673): passing through whatever fields the SDK happens to add next
+    is a different, "third-party vocabulary flows through unfiltered"
+    decision this one field addition does not make on its own.
+    """
+    host = _require_host(ctx)
+    server = str(args["server"])
+    mcp_tool_name = str(args["mcp_tool_name"])
+    bare_tool = mcp_tool_name.split(".", 1)[-1] if "." in mcp_tool_name else mcp_tool_name
+    all_tools = await host.mcp_list_tools(server) or []
+    for t in all_tools:
+        if str(t.get("name", "")) == bare_tool:
+            return {
+                "name": t.get("name"),
+                "description": t.get("description", ""),
+                "input_schema": t.get("inputSchema", {}),
+                "annotations": t.get("annotations"),
+            }
+    return {
+        "error": (
+            f"mcp_tool {mcp_tool_name!r} not found on server {server!r}. "
+            "Use list_mcp_tools to see available mcp_tools."
+        )
+    }
+
+
+# ── ToolDefinitions ───────────────────────────────────────────────────────────
+
+from reyn.core.offload.canonical import (  # noqa: E402
+    describe_mcp_tool_to_canonical,
+    list_mcp_prompts_to_canonical,
+    list_mcp_resource_templates_to_canonical,
+    list_mcp_resources_to_canonical,
+    list_mcp_servers_to_canonical,
+    list_mcp_subscriptions_to_canonical,
+    list_mcp_tools_to_canonical,
+    mcp_get_prompt_to_canonical,
+    mcp_read_resource_to_canonical,
+    mcp_subscribe_resource_verb_to_canonical,
+    mcp_to_canonical,
+    mcp_unsubscribe_resource_verb_to_canonical,
+)
+
+LIST_MCP_SERVERS = ToolDefinition(
+    canonical=list_mcp_servers_to_canonical,
+    name="list_mcp_servers",
+    router_dispatched=True,
+    description=_LIST_MCP_SERVERS_DESCRIPTION,
+    parameters=_LIST_MCP_SERVERS_PARAMETERS,
+    gates=ToolGates(router="allow"),
+    handler=_handle_list_mcp_servers,
+    category="discovery",
+    purity="read_only",
+)
+
+LIST_MCP_SUBSCRIPTIONS = ToolDefinition(
+    canonical=list_mcp_subscriptions_to_canonical,
+    name="list_mcp_subscriptions",
+    router_dispatched=True,
+    description=_LIST_MCP_SUBSCRIPTIONS_DESCRIPTION,
+    parameters=_LIST_MCP_SUBSCRIPTIONS_PARAMETERS,
+    gates=ToolGates(router="allow"),
+    handler=_handle_list_mcp_subscriptions,
+    category="discovery",
+    purity="read_only",
+)
+
+LIST_MCP_TOOLS = ToolDefinition(
+    canonical=list_mcp_tools_to_canonical,
+    name="list_mcp_tools",
+    router_dispatched=True,
+    description=_LIST_MCP_TOOLS_DESCRIPTION,
+    parameters=_LIST_MCP_TOOLS_PARAMETERS,
+    gates=ToolGates(router="allow"),
+    handler=_handle_list_mcp_tools,
+    category="discovery",
+    purity="read_only",
+    returns_external_content=True,  # FP-0050/#1822: external server-authored tool descriptions
+)
+
+CALL_MCP_TOOL = ToolDefinition(
+    canonical=mcp_to_canonical,
+    name="call_mcp_tool",
+    router_dispatched=True,
+    description=_CALL_MCP_TOOL_DESCRIPTION,
+    parameters=_CALL_MCP_TOOL_PARAMETERS,
+    gates=ToolGates(router="allow"),
+    handler=_handle_call_mcp_tool,
+    category="discovery",
+    purity="side_effect",  # call_mcp_tool has arbitrary side effects
+    returns_external_content=True,  # FP-0050/#1822: external MCP server result
+    schema_enricher=_enrich_router_schema,
+)
+
+DESCRIBE_MCP_TOOL = ToolDefinition(
+    canonical=describe_mcp_tool_to_canonical,
+    name="describe_mcp_tool",
+    router_dispatched=True,
+    description=_DESCRIBE_MCP_TOOL_DESCRIPTION,
+    parameters=_DESCRIBE_MCP_TOOL_PARAMETERS,
+    gates=ToolGates(router="allow"),
+    handler=_handle_describe_mcp_tool,
+    category="discovery",
+    purity="read_only",
+    returns_external_content=True,  # FP-0050/#1822: external server-authored schema/description
+    schema_enricher=_enrich_router_schema,
+)
+
+
+# ── #2597 slice ②a: resources consumption ToolDefinitions ────────────────────
+# Parallel to LIST_MCP_TOOLS / CALL_MCP_TOOL above — same gates, same
+# schema-enrichment reuse (server enum only; _enrich_router_schema no-ops on
+# the absent mcp_tool_name prop for these three).
+
+LIST_MCP_RESOURCES = ToolDefinition(
+    canonical=list_mcp_resources_to_canonical,
+    name="list_mcp_resources",
+    router_dispatched=True,
+    description=_LIST_MCP_RESOURCES_DESCRIPTION,
+    parameters=_LIST_MCP_RESOURCES_PARAMETERS,
+    gates=ToolGates(router="allow"),
+    handler=_handle_list_mcp_resources,
+    category="discovery",
+    purity="read_only",
+    returns_external_content=True,  # FP-0050/#1822: external server-authored resource listing
+    schema_enricher=_enrich_router_schema,
+)
+
+LIST_MCP_RESOURCE_TEMPLATES = ToolDefinition(
+    canonical=list_mcp_resource_templates_to_canonical,
+    name="list_mcp_resource_templates",
+    router_dispatched=True,
+    description=_LIST_MCP_RESOURCE_TEMPLATES_DESCRIPTION,
+    parameters=_LIST_MCP_RESOURCE_TEMPLATES_PARAMETERS,
+    gates=ToolGates(router="allow"),
+    handler=_handle_list_mcp_resource_templates,
+    category="discovery",
+    purity="read_only",
+    returns_external_content=True,  # FP-0050/#1822: external server-authored template listing
+    schema_enricher=_enrich_router_schema,
+)
+
+READ_MCP_RESOURCE = ToolDefinition(
+    canonical=mcp_read_resource_to_canonical,
+    name="read_mcp_resource",
+    router_dispatched=True,
+    description=_READ_MCP_RESOURCE_DESCRIPTION,
+    parameters=_READ_MCP_RESOURCE_PARAMETERS,
+    gates=ToolGates(router="allow"),
+    handler=_handle_read_mcp_resource,
+    category="discovery",
+    purity="read_only",  # a resource read has no reyn-side side effects (unlike call_mcp_tool)
+    returns_external_content=True,  # FP-0050/#1822: external MCP server resource content
+    schema_enricher=_enrich_router_schema,
+)
+
+
+# ── #2597 slice ②b: resource subscriptions ToolDefinitions ────────────────────
+# Parallel to READ_MCP_RESOURCE above — same gates, same schema-enrichment
+# reuse (server enum only).
+
+SUBSCRIBE_MCP_RESOURCE = ToolDefinition(
+    canonical=mcp_subscribe_resource_verb_to_canonical,
+    name="subscribe_mcp_resource",
+    router_dispatched=True,
+    description=_SUBSCRIBE_MCP_RESOURCE_DESCRIPTION,
+    parameters=_SUBSCRIBE_MCP_RESOURCE_PARAMETERS,
+    gates=ToolGates(router="allow"),
+    handler=_handle_subscribe_mcp_resource,
+    category="discovery",
+    purity="side_effect",  # registers server-side subscription state
+    schema_enricher=_enrich_router_schema,
+)
+
+UNSUBSCRIBE_MCP_RESOURCE = ToolDefinition(
+    canonical=mcp_unsubscribe_resource_verb_to_canonical,
+    name="unsubscribe_mcp_resource",
+    router_dispatched=True,
+    description=_UNSUBSCRIBE_MCP_RESOURCE_DESCRIPTION,
+    parameters=_UNSUBSCRIBE_MCP_RESOURCE_PARAMETERS,
+    gates=ToolGates(router="allow"),
+    handler=_handle_unsubscribe_mcp_resource,
+    category="discovery",
+    purity="side_effect",
+    schema_enricher=_enrich_router_schema,
+)
+
+
+# ── #2597 slice ②c: prompts consumption ToolDefinitions ───────────────────────
+# Parallel to LIST_MCP_RESOURCES / READ_MCP_RESOURCE above — same gates, same
+# schema-enrichment reuse (server enum only; _enrich_router_schema no-ops on
+# the absent mcp_tool_name prop for these two). No subscribe analogue.
+
+LIST_MCP_PROMPTS = ToolDefinition(
+    canonical=list_mcp_prompts_to_canonical,
+    name="list_mcp_prompts",
+    router_dispatched=True,
+    description=_LIST_MCP_PROMPTS_DESCRIPTION,
+    parameters=_LIST_MCP_PROMPTS_PARAMETERS,
+    gates=ToolGates(router="allow"),
+    handler=_handle_list_mcp_prompts,
+    category="discovery",
+    purity="read_only",
+    returns_external_content=True,  # FP-0050/#1822: external server-authored prompt listing
+    schema_enricher=_enrich_router_schema,
+)
+
+GET_MCP_PROMPT = ToolDefinition(
+    canonical=mcp_get_prompt_to_canonical,
+    name="get_mcp_prompt",
+    router_dispatched=True,
+    description=_GET_MCP_PROMPT_DESCRIPTION,
+    parameters=_GET_MCP_PROMPT_PARAMETERS,
+    gates=ToolGates(router="allow"),
+    handler=_handle_get_mcp_prompt,
+    category="discovery",
+    purity="read_only",  # a prompt fetch has no reyn-side side effects (unlike call_mcp_tool)
+    returns_external_content=True,  # FP-0050/#1822: external MCP server prompt content
+    schema_enricher=_enrich_router_schema,
+)
+
+
+# #1240 Wave 2b: the coarse MCP_OP ToolDefinition (kind="mcp") is DROPPED.
+# The router advertises the fine-grained name "call_mcp_tool"; its handler
+# delegates to host.mcp_call_tool (session._mcp_call_tool → execute_op on the
+# op_runtime "mcp" kind). The op_runtime.mcp.handle op-kind handler stays live —
+# it is still invoked by that router dispatch path and by external_routing.py.

@@ -1,0 +1,88 @@
+"""compact ToolDefinition (#272 / #1128) — voluntary history compaction.
+
+Router-callable LLM entry point that lets the model voluntarily
+compact the conversation history when the OS-injected context-size signal
+shows the window filling, instead of waiting for the mandatory retry_loop
+backstop. The handler delegates to ``op_runtime.compact``, which routes to the
+caller-wired ``OpContext.compact_now`` capability and returns the freed tokens +
+free window afterwards in exact tokens.
+
+Per ADR-0026: the ToolDefinition lives here; registration is in
+get_default_registry() in tools/__init__.py.
+"""
+from __future__ import annotations
+
+from typing import Any, Mapping
+
+from reyn.tools.descriptions import context as _context_descriptions
+from reyn.tools.types import ToolContext, ToolDefinition, ToolGates, ToolResult
+
+# Relocated to reyn.tools.descriptions.context (Phase 3 tool-description
+# package refactor — byte-identical, no LLM-facing text change).
+_COMPACT_DESCRIPTION = _context_descriptions.compact.text
+
+_COMPACT_PARAMETERS: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "reason": {
+            "type": "string",
+            "description": _context_descriptions.PARAMS["compact"]["reason"].text,
+        },
+    },
+    "required": [],
+}
+
+
+async def _handle_compact(args: Mapping[str, Any], ctx: ToolContext) -> ToolResult:
+    """Dispatch the compact op via op_runtime.
+
+    Builds a CompactIROp and calls the registered compact handler with the
+    OpContext from ctx.router_state factory, or a minimal context otherwise.
+    The op handler errors cleanly if no compaction capability is wired, so
+    this never silently no-ops.
+    """
+    from reyn.core.op_runtime import execute_op
+    from reyn.core.op_runtime.context import OpContext
+    from reyn.schemas.models import CompactIROp
+    from reyn.security.permissions.permissions import PermissionDecl
+
+    reason = args.get("reason")
+    op = CompactIROp(kind="compact", reason=str(reason) if reason else None)
+
+    if (
+        ctx.router_state is not None
+        and ctx.router_state.op_context_factory is not None
+    ):
+        legacy_ctx = ctx.router_state.op_context_factory()
+    else:
+        # Minimal context (no compaction capability) → the op handler returns
+        # a clear compaction_unavailable error rather than a silent no-op.
+        legacy_ctx = OpContext(
+            workspace=ctx.workspace,
+            events=ctx.events,
+            permission_decl=PermissionDecl(),
+            permission_resolver=ctx.permission_resolver,
+            actor="",
+            subscribers=getattr(ctx.events, "subscribers", []),
+            # #1673: never resolver=None (the bug-class invariant). This minimal
+            # path returns compaction_unavailable (no LLM call), but the uniform
+            # threading keeps the invariant provable.
+            resolver=ctx.resolver,
+        )
+
+    return await execute_op(op, legacy_ctx)
+
+
+from reyn.core.offload.canonical import compact_to_canonical  # noqa: E402
+
+COMPACT = ToolDefinition(
+    canonical=compact_to_canonical,
+    name="compact",
+    router_dispatched=True,
+    description=_COMPACT_DESCRIPTION,
+    parameters=_COMPACT_PARAMETERS,
+    gates=ToolGates(router="allow"),
+    handler=_handle_compact,
+    category="context",
+    purity="side_effect",
+)

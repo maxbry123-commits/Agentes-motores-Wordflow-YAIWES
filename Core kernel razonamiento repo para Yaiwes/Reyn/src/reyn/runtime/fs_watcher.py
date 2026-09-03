@@ -1,0 +1,372 @@
+"""reyn.runtime.fs_watcher — filesystem watcher external-event source (#2608 H4).
+
+The 4th external-event source in the external-event->hooks arc (after H1's MCP
+``resources/updated`` bridge). Mirrors H1's shape — a source fires
+``HookDispatcher.dispatch(point, template_vars)`` for its events, here
+``point="file_changed"`` — but with one load-bearing difference: the producer
+runs on a SEPARATE THREAD, not the session's asyncio task.
+
+Uses the third-party ``watchdog`` library (extras-only — ``pip install
+reyn[fs-watch]``; see ``pyproject.toml``'s ``fs-watch`` extra) to run an OS-level
+filesystem observer. ``watchdog.observers.Observer`` owns a dedicated OS thread;
+every event callback (``on_created``/``on_modified``/``on_deleted``) fires
+ON THAT THREAD. It is therefore UNSAFE to touch an ``asyncio.Queue`` from the
+callback directly (``Queue.put_nowait`` is not thread-safe — no lock protects
+its internal deque against a concurrent ``get()`` on the loop thread). The
+thread->async handoff instead goes through ``loop.call_soon_threadsafe(...)``
+(``loop`` is captured, on the SESSION's own event loop, at :meth:`FsWatcher.start`
+time): the watchdog-thread callback schedules a plain callable onto the loop,
+which is the ONLY thing safe to call from a foreign thread per the asyncio
+docs. That scheduled callable does the actual (loop-thread-only) bounded
+``Queue.put_nowait`` — mirroring H1's ``MCPConnectionService.enqueue_external_event``
+bound+drop+log discipline (``_QUEUE_MAXSIZE``, overflow drops the newest event
++ logs, never grows unboundedly, never blocks the watchdog thread).
+
+Path normalization (#2623): on macOS ``/tmp`` is a symlink to ``/private/tmp``
+(same class of footgun exists anywhere an operator's configured
+``fs_watch.paths`` entry traverses a symlink). Left unhandled, a naive matcher
+written against the operator's CONFIGURED path (e.g. ``matcher: {path:
+'/tmp/x/**'}``) silently never matches, because the reported event path is the
+symlink-resolved ``/private/tmp/x/...``. Worse, the two OS backends disagree on
+how they report/handle a symlinked watch (fsevents reports the realpath;
+inotify's recursive watch on a symlink *root* is inconsistent) — so a naive
+"watch the configured path" is not even portable.
+
+Fixed at registration (:meth:`FsWatcher.start`) by making the behavior UNIFORM:
+each watch is scheduled on the ``os.path.realpath`` of its configured path (safe
+— inotify watches INODES, which the symlink and its realpath target share, and
+fsevents already resolves), and for each path whose ``realpath`` differs from
+its normalized configured form a resolved-path -> configured-path REWRITE is
+recorded (:attr:`_path_rewrites`). Every fired event now arrives under the
+resolved prefix on BOTH platforms, and :meth:`_rewrite_path` maps it back onto
+the operator's configured prefix before it ever reaches ``hook_trigger`` — so
+``matcher: {path: <the path the operator wrote in fs_watch.paths>}`` Just Works,
+and the ``file_changed`` event's ``path`` template var is exactly the configured
+path (not a resolved alias of it). A path with no symlink component is
+unaffected (``resolved == configured``, no rewrite entry, watch scheduled on the
+same path as before).
+
+Debounce (F7-3): editors emit event BURSTS for one logical change (temp files,
+multiple writes, create-then-modify). Coalesced per-path on the watchdog
+thread with a simple leading-edge scheme: :meth:`_FsEventHandler._maybe_fire`
+tracks the last-fired monotonic time per path; an event within
+``debounce_seconds`` of the previous fire for the SAME path is dropped
+(coalesced), so one write-burst = one hook fire. A quiet path that fires again
+after the window elapses is a NEW logical change and fires again. Per-path
+state only — a burst on path A never suppresses path B.
+
+SECURITY (F7-5, do not relitigate): watched paths are OPERATOR-DECLARED via
+``fs_watch.paths`` in ``reyn.yaml``/``reyn.local.yaml`` (see
+``reyn.config.infra.FsWatchConfig`` — OUT-set only, restart-only, never a
+``.reyn/*.yaml`` hot-reload file). There is no op/tool verb anywhere that lets
+an agent register or widen a watch — a filesystem-wide change-notification
+feed is an info-gathering surface, same class of concern as sandbox policy,
+so it gets the same OUT-set-only gate. :class:`FsWatcher` itself has no
+"add a path" method; its watched set is FIXED at construction from the
+config the session was started with.
+
+Session-owned lifecycle (mirrors ``MCPConnectionService``): constructed
+unconditionally by ``Session.__init__`` (cheap — the watchdog ``Observer`` is
+only created inside :meth:`start`), started from ``Session.run()`` right after
+the ``session_start`` hook dispatch (only if ``fs_watch.paths`` is non-empty),
+and stopped in ``run()``'s ``finally`` alongside the ``session_end`` hook via
+:meth:`aclose` (idempotent, ``finally``-guaranteed so a ``CancelledError``
+during teardown can never orphan the drain task or the observer thread — see
+:meth:`aclose`).
+
+Watchdog-optional (graceful degrade): ``fs_watch.paths`` configured but the
+``watchdog`` package not installed -> :meth:`start` logs a warning and returns
+without starting anything (the feature is off; the rest of the session is
+unaffected). ``fs_watch.paths`` empty (the default, no config) -> :meth:`start`
+returns immediately without even importing ``watchdog`` — byte-identical to
+pre-H4 behaviour for every existing build.
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import time
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
+
+from reyn.hooks.ingress import FsIngressAdapter
+
+if TYPE_CHECKING:
+    pass
+
+logger = logging.getLogger(__name__)
+
+# Bound on the thread->async bridge queue — mirrors H1's
+# ``_HOOK_EVENT_QUEUE_MAXSIZE`` (MCPConnectionService). A burst of fs events
+# beyond this is dropped (+logged), never queued unboundedly, never
+# backpressured onto the watchdog thread.
+_QUEUE_MAXSIZE = 32
+
+HookTrigger = Callable[[str, dict], Awaitable[Any]]
+
+# watchdog event class name -> our normalized event_type vocabulary.
+_EVENT_TYPE_BY_WATCHDOG_ATTR = {
+    "on_created": "created",
+    "on_modified": "modified",
+    "on_deleted": "deleted",
+}
+
+
+def _import_watchdog() -> Any:
+    """Import and return the ``watchdog.events``/``watchdog.observers`` modules
+    as a ``(events_mod, observers_mod)`` tuple, or ``None`` if ``watchdog`` is
+    not installed. Isolated behind a function so :meth:`FsWatcher.start` can
+    degrade gracefully (warn + no-op) rather than raising ``ImportError`` at
+    session start."""
+    try:
+        from watchdog.events import FileSystemEventHandler
+        from watchdog.observers import Observer
+    except ImportError:
+        return None
+    return FileSystemEventHandler, Observer
+
+
+class FsWatcher:
+    """Session-owned filesystem watcher — see module docstring for the full
+    thread->async bridge, debounce, and security design.
+
+    Usage (mirrors ``MCPConnectionService``)::
+
+        watcher = FsWatcher(
+            paths=["/repo/src"],
+            hook_trigger=dispatcher.dispatch_external_batch,  # #5516: batch-shaped
+        )
+        await watcher.start()      # no-op if paths=[] or watchdog not installed
+        ...
+        await watcher.aclose()     # session teardown — idempotent
+    """
+
+    def __init__(
+        self,
+        *,
+        paths: "list[str] | None" = None,
+        hook_trigger: "HookTrigger | None" = None,
+        debounce_seconds: float = 0.2,
+        emit_event: "Callable[..., Any] | None" = None,
+    ) -> None:
+        self._paths: list[str] = list(paths or [])
+        self._hook_trigger = hook_trigger
+        self._debounce_seconds = debounce_seconds
+        # #4605: audit-emit sink (session._audit_events.emit), distinct from
+        # hook_trigger — records the ARRIVAL of a file_changed signal even
+        # when no hook is configured to consume it, mirroring
+        # ReynMCPMessageHandler.emit_resource_updated's mcp_resource_updated
+        # precedent (the one of the 4 external points that already did
+        # this). None when the caller hasn't wired one (e.g. unit tests
+        # constructing a bare FsWatcher) — _enqueue no-ops the emit then.
+        self._emit_event = emit_event
+        self._observer: Any = None
+        self._loop: "asyncio.AbstractEventLoop | None" = None
+        # Hook-Event Redesign Phase 2 (proposal 0059 §6.3): the bounded
+        # queue+drain-task in-process bridge now lives in the shared
+        # ``FsIngressAdapter`` (``reyn.hooks.ingress``) — the SAME bridge
+        # shape ``McpIngressAdapter`` uses, no longer duplicated per-source.
+        # Byte-identical behaviour (same maxsize, same drop+log on overflow).
+        self._fs_ingress_adapter = FsIngressAdapter(
+            hook_trigger=hook_trigger, maxsize=_QUEUE_MAXSIZE,
+            # #5521: reuse this watcher's OWN emit_event sink (above) for
+            # the ingress bridge's drain-task-death observation — the
+            # same None-tolerant sink, not a second one.
+            emit_event=emit_event,
+        )
+        self._started = False
+        # #2623: resolved-symlink-path -> operator-configured-path rewrites,
+        # built in :meth:`start` — see module docstring "Path normalization".
+        self._path_rewrites: "list[tuple[str, str]]" = []
+
+    def is_started(self) -> bool:
+        """Read-only introspection for callers/tests — mirrors
+        ``MCPConnectionService.held_servers()``'s public-surface pattern."""
+        return self._started
+
+    async def start(self) -> None:
+        """Start the watchdog observer + the loop-side drain task.
+
+        No-op (returns immediately) when:
+          - ``paths`` is empty (no ``fs_watch:`` config — the default), or
+          - ``hook_trigger`` is None, or
+          - ``watchdog`` is not installed (logs a warning once).
+
+        Idempotent — a second call while already started is a no-op.
+        """
+        if self._started:
+            return
+        if not self._paths or self._hook_trigger is None:
+            return
+        imported = _import_watchdog()
+        if imported is None:
+            logger.warning(
+                "FsWatcher: fs_watch.paths configured (%d path(s)) but the "
+                "'watchdog' package is not installed — filesystem watching is "
+                "DISABLED for this session. Install with `pip install "
+                "reyn[fs-watch]` to enable file_changed hooks.",
+                len(self._paths),
+            )
+            return
+        FileSystemEventHandler, Observer = imported
+
+        self._loop = asyncio.get_running_loop()
+
+        # #2623: schedule each watch on the RESOLVED (symlink-free) path and
+        # build a resolved->configured rewrite table, so the reported event
+        # path is UNIFORM across OS backends and always maps back onto what the
+        # operator wrote in ``fs_watch.paths`` (for a ``matcher: {path:
+        # <configured>}`` to match). Watching the resolved path is the
+        # cross-platform-deterministic choice:
+        #   - inotify (Linux) watches INODES — the symlink and its realpath
+        #     target share one inode, so a write via the configured symlink
+        #     path fires on the realpath-registered watch; but a recursive
+        #     watch scheduled on a symlink *root* reports/handles the tree
+        #     inconsistently (the macOS→Linux CI-RED that motivated this).
+        #   - fsevents (macOS) already reports the realpath in every event.
+        # So: watch realpath everywhere -> events always arrive under the
+        # resolved prefix -> _rewrite_path() maps every one back to the
+        # configured prefix, on both platforms.
+        self._path_rewrites = []
+        handler = _build_handler(FileSystemEventHandler, self)
+        observer = Observer()
+        for configured in self._paths:
+            resolved = os.path.realpath(configured)
+            normalized_configured = os.path.normpath(configured)
+            if resolved != normalized_configured:
+                self._path_rewrites.append((resolved, normalized_configured))
+            observer.schedule(handler, resolved, recursive=True)
+        observer.start()
+        self._observer = observer
+        self._started = True
+
+    def _rewrite_path(self, path: str) -> str:
+        """#2623: rewrite a fired event's (possibly symlink-resolved) path back
+        onto the operator's configured ``fs_watch.paths`` prefix, so
+        ``matcher: {path: <configured>}`` matches regardless of a
+        macOS-``/tmp``-style symlink in the watched path. A path with no
+        matching resolved-prefix (no symlink was involved) passes through
+        unchanged."""
+        for resolved, configured in self._path_rewrites:
+            if path == resolved:
+                return configured
+            if path.startswith(resolved + os.sep):
+                return configured + path[len(resolved):]
+        return path
+
+    # ── thread->async bridge (called from the watchdog OS thread) ──────────
+
+    def _on_fs_event(self, event_type: str, path: str) -> None:
+        """Called synchronously ON THE WATCHDOG THREAD by ``_FsEventHandler``.
+        Never touches ``asyncio`` state directly — schedules
+        :meth:`_enqueue` onto the session's event loop via
+        ``call_soon_threadsafe``, the one thread-safe entry point asyncio
+        exposes for exactly this cross-thread handoff."""
+        loop = self._loop
+        if loop is None:
+            return  # stopped/never started — defensive, should not happen mid-callback
+        # #2623: rewrite the (possibly symlink-resolved) path back onto the
+        # operator's configured prefix BEFORE it ever reaches hook_trigger —
+        # _path_rewrites is built once in start() (loop thread) before the
+        # observer thread is started, so this read-only lookup from the
+        # watchdog thread is race-free (no further writes after start()).
+        path = self._rewrite_path(path)
+        try:
+            loop.call_soon_threadsafe(self._enqueue, event_type, path)
+        except RuntimeError:
+            # Loop already closed (session tearing down concurrently with a
+            # trailing fs event) — drop, never raise from the watchdog thread.
+            logger.warning(
+                "FsWatcher: dropped %r event for %r — event loop already closed",
+                event_type, path,
+            )
+
+    def _enqueue(self, event_type: str, path: str) -> None:
+        """Runs ON THE LOOP THREAD (scheduled via call_soon_threadsafe) — safe
+        to touch the ``FsIngressAdapter``'s queue here.
+
+        Hook-Event Redesign Phase 2 (proposal 0059 §6.3): converts the raw
+        ``(event_type, path)`` signal into a typed ``file_changed``
+        :class:`~reyn.hooks.event.HookEvent` via ``self._fs_ingress_adapter.
+        to_event`` (pure — same ``build_hook_payload`` call as pre-Phase-2,
+        just factored into the adapter), then hands it to the SAME bounded
+        queue+drain-task bridge ``McpIngressAdapter`` uses (``deliver``) — the
+        bound/drop-newest-and-log/drain behaviour is byte-identical, no
+        longer duplicated per-source.
+
+        #4605: also emits a ``file_changed`` AUDIT event via ``emit_event``
+        (distinct from the hook-trigger queue below) — best-effort, a sink
+        fault must never break the drain path."""
+        if self._emit_event is not None:
+            try:
+                self._emit_event("file_changed", path=path, event_type=event_type)
+            except Exception:  # noqa: BLE001 — audit emit is best-effort
+                logger.debug(
+                    "FsWatcher: emit_event failed for %r on %r", event_type, path,
+                    exc_info=True,
+                )
+        event = self._fs_ingress_adapter.to_event(path, event_type)
+        self._fs_ingress_adapter.deliver(event)
+
+    async def aclose(self) -> None:
+        """Stop the observer thread + cancel the drain task. Idempotent — safe
+        to call repeatedly (e.g. a session teardown seam that may run more
+        than once) and safe to call even if :meth:`start` was never called or
+        no-op'd (empty paths / no watchdog)."""
+        await self._fs_ingress_adapter.aclose()
+
+        observer = self._observer
+        self._observer = None
+        if observer is not None:
+            # observer.stop() + join() are synchronous/blocking (thread join) —
+            # run off the loop thread so a slow-to-exit watchdog thread never
+            # stalls the session's event loop during teardown.
+            loop = asyncio.get_running_loop()
+
+            def _stop_and_join() -> None:
+                observer.stop()
+                observer.join(timeout=5.0)
+
+            await loop.run_in_executor(None, _stop_and_join)
+        self._started = False
+        self._loop = None
+
+
+def _build_handler(file_system_event_handler_cls: Any, watcher: FsWatcher) -> Any:
+    """Build a ``watchdog.events.FileSystemEventHandler`` subclass instance
+    bound to ``watcher``. Factored into a function (rather than a module-level
+    class) because ``FileSystemEventHandler`` only exists when ``watchdog`` is
+    importable — a module-level subclass would make the whole module
+    import-fail without ``watchdog`` installed, defeating the graceful-degrade
+    contract :meth:`FsWatcher.start` promises."""
+
+    class _FsEventHandler(file_system_event_handler_cls):  # type: ignore[misc,valid-type]
+        def __init__(self) -> None:
+            super().__init__()
+            # #2608 H4 debounce (F7-3): per-path last-fire monotonic time,
+            # touched ONLY on the watchdog thread (this handler's callbacks all
+            # run there) — no lock needed, single-writer/single-reader on one
+            # thread.
+            self._last_fire: dict[str, float] = {}
+
+        def _maybe_fire(self, event_type: str, src_path: str) -> None:
+            now = time.monotonic()
+            last = self._last_fire.get(src_path)
+            if last is not None and (now - last) < watcher._debounce_seconds:
+                return  # coalesced: part of the same logical-change burst
+            self._last_fire[src_path] = now
+            watcher._on_fs_event(event_type, src_path)
+
+        def on_created(self, event: Any) -> None:
+            if not event.is_directory:
+                self._maybe_fire("created", str(event.src_path))
+
+        def on_modified(self, event: Any) -> None:
+            if not event.is_directory:
+                self._maybe_fire("modified", str(event.src_path))
+
+        def on_deleted(self, event: Any) -> None:
+            if not event.is_directory:
+                self._maybe_fire("deleted", str(event.src_path))
+
+    return _FsEventHandler()

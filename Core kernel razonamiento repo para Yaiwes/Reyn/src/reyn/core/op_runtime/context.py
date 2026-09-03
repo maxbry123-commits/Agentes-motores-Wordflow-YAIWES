@@ -1,0 +1,499 @@
+"""OpContext — execution environment for op handlers.
+
+Bundles the dependencies an op needs from the surrounding frontend
+(workspace, events, permissions, resolver, and sub-run helpers) so the
+handler signatures stay flat. Frontends construct an OpContext once
+and reuse it for the whole run.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import asyncio
+    from collections.abc import Awaitable, Callable, Sequence
+
+    from reyn.config import MultimodalConfig, ReadCapConfig, SandboxConfig, WebFetchConfig
+    from reyn.config.infra import AuthConfig
+    from reyn.core.events.events import EventLog
+    from reyn.core.events.state_log import StateLog
+    from reyn.core.op_runtime.render_template import RenderTemplateBounds
+    from reyn.core.present import PresentationRenderer
+    from reyn.data.workspace.media_store import MediaStore
+    from reyn.data.workspace.workspace import Workspace
+    from reyn.llm.model_resolver import ModelResolver
+    from reyn.mcp.connection_service import MCPConnectionService
+    from reyn.mcp.pool import MCPClientPool
+    from reyn.security.permissions.permissions import PermissionDecl, PermissionResolver
+    from reyn.security.sandbox import SandboxBackend
+    from reyn.security.sandbox.policy import SandboxPolicy
+    from reyn.security.secrets.store import ScopedSecretStore
+    from reyn.user_intervention import RequestBus
+
+
+@dataclass
+class OpContext:
+    """Execution context passed to every op handler."""
+
+    workspace: "Workspace"
+    events: "EventLog"
+
+    # Permissions
+    permission_decl: "PermissionDecl"
+    permission_resolver: "PermissionResolver | None" = None
+    actor: str = ""
+
+    # #4574: the live agent's NAME (the "default"/"worker"-style slug
+    # AgentRegistry keys sessions by — NOT `actor` above, a fixed per-CALLER-
+    # ROLE literal like "chat_router"/"pipeline_run_cli", and NOT `agent_id`
+    # below, the `reyn.yaml` `agent.id` / FP-0016 X-Reyn-Agent-Id host
+    # identity, an entirely different string — see `embed.py`'s own docstring
+    # on why `agent_id` is the WRONG key for a per-agent scope). Root-caused
+    # in #4574's own issue thread: `artifact_payload.build_source_artifact_
+    # payload`'s `mint_ref` call was passing `ctx.actor` ("chat_router",
+    # constant) where the artifact-ref store's OWN per-agent scope (`artifact_
+    # ref.py`'s "Scope is per-agent") needs the real agent name — the SAME
+    # name `resolve_ref` is later called with client-side (`self._agent_name`
+    # on the TUI) — so a mint always wrote under "chat_router" and a resolve
+    # always read under the real agent name: permanently orphaned refs,
+    # `/open` unconditionally "artifact not found". `None` (a router op
+    # context this field's supplier doesn't populate, e.g. the
+    # pipeline_run_cli path) is a real "unknown" — a consumer needing this
+    # falls back to something else rather than crashing on a missing name.
+    agent_name: "str | None" = None
+
+    model: str = "standard"
+    resolver: "ModelResolver | None" = None
+    subscribers: list = field(default_factory=list)
+    output_language: str | None = None
+
+    # MCP
+    mcp_servers: dict = field(default_factory=dict)
+    # #a359 P2: the per-turn structured MCP client pool (owns open+reuse+close in one task). Replaces
+    # the old raw ``mcp_clients`` dict (lazily filled by the op handler, closed by a separate teardown
+    # in a possibly-different task → the cross-SDK-task cancel-scope crash). None outside an MCP
+    # context (non-MCP ops never invoke the mcp handler).
+    mcp_pool: "MCPClientPool | None" = None
+    # #2597 S2a: the session-owned held-open connection service (Option C — one
+    # persistent MCPClient per server, reused for the session's lifetime). When
+    # set, the mcp op handler prefers THIS over ``mcp_pool`` (pool-compatible
+    # ``get()`` — see connection_service.py). None for the ephemeral-session /
+    # one-shot-probe path, which intentionally keeps the per-call ``mcp_pool``
+    # (held connections would just churn for a sub-second-lived session).
+    mcp_connection_service: "MCPConnectionService | None" = None
+    # FP-0016 Component E: agent identity for X-Reyn-Agent-Id header on
+    # outgoing MCP / external HTTP calls. Plumbed from Session's
+    # ReynConfig.agent.id (= `reyn/<hostname>` by default). None
+    # preserves prior behaviour for direct OpContext construction (e.g.
+    # tests that don't simulate a multi-agent identity).
+    agent_id: str | None = None
+
+    # User interventions (ask_user, permission prompts in PR7)
+    intervention_bus: "RequestBus | None" = None
+
+    # FP-0054 PR-B: the surface a `present` op renders to. None = PR-A's null-surface
+    # behavior (no UI reached, resolve_bindings(surface="null")). A wired renderer names
+    # its own `surface_name` (e.g. inline-CUI's OutboxPresentationRenderer = "inline-cui").
+    presentation_renderer: "PresentationRenderer | None" = None
+
+    # FP-0054 PR-C: the operator's named-view registry (from
+    # `.reyn/config/presentations.yaml`) a `present` op resolves `op.view`
+    # (FP-0055 PR-1 rename of `op.template`) against — the §3 fallback chain's
+    # stage 1. A `PresentationRegistry` (duck-typed `.get(name) -> validated
+    # nodes | None`). None = no registry wired (direct/test construction) →
+    # every named view is "unknown" and falls through to the
+    # generic fallback viewer (never a hard error). Sourced fresh per op-ctx build
+    # from the session/adapter's current registry, so a hot-reload swap is picked up
+    # at the next turn boundary.
+    presentation_registry: "object | None" = None
+
+    # FP-0055 PR-2: resource bounds for the `render_template` op (streaming
+    # output-size + wall-clock cap, applied DURING generation). None → the
+    # safety-spirit defaults (RenderTemplateBounds()). The override seam is used by
+    # operator config (future yaml wiring) and by tests that inject a tiny cap; a
+    # production-default None correctly applies the generous defaults in-handler.
+    render_template_bounds: "RenderTemplateBounds | None" = None
+
+    # #272/#1128: voluntary-compaction capability for the `compact` op.
+    # An awaitable zero-arg callable the caller (Session / phase runtime)
+    # wires to its synchronous compaction (force_compact_now), returning
+    # {"freed_tokens", "free_window_after", ...} in exact tokens. None when no
+    # compaction context is available (e.g. preprocessor / direct construction)
+    # → the compact op returns a clear error rather than silently no-op'ing
+    # (same contract as ask_user without an intervention_bus).
+    compact_now: "Callable[[], Awaitable[dict]] | None" = None
+
+    # FP-0063 PC: the calling Session's per-session BudgetGateway — the `embed`
+    # op's SINGLE embedding-cost recording entry point
+    # (``BudgetGateway.record_embedding``). It fans out to all three scopes:
+    # session (itself, read via ``.embedding_cost``) and agent/project (the
+    # process-shared BudgetTracker it holds, read via
+    # ``Registry.agent_embedding_cost`` / ``.project_embedding_cost``).
+    #
+    # Deliberately NOT a raw BudgetTracker field: the tracker keys per-agent
+    # counters by agent NAME, which an op handler cannot supply — ``agent_id``
+    # is the FP-0016 HOST identity (``reyn/<hostname>``), a different value, so
+    # recording from here would file spend under a key no per-scope reader
+    # looks up. The gateway is the only object holding both the tracker and the
+    # agent name, so the fan-out lives there. (A prior ``budget_tracker`` field
+    # existed for ``judge_output``'s cost recording — removed with that op:
+    # it had 0 writers across all OpContext constructions, so its "Threaded by
+    # the OpContext builders" comment was false the whole time.)
+    #
+    # Threaded by ``build_router_op_context``, whose single caller is the
+    # session's ``RouterOpContextSource`` — so it reaches the router-dispatched
+    # `embed` TOOL's factory by construction. None (direct/test
+    # construction) = the call is priced into the returned metadata but not
+    # recorded into any aggregate.
+    budget_gateway: object | None = None
+
+    # PR20: caller provenance threaded from the parent Agent so sub-run
+    # invocations land under the same `events/<caller>/...` tree.
+    # Format: "direct" or "agents/<name>" (validated in Agent).
+    caller: str = "direct"
+
+    # R-D13: nested run lineage. The currently-running runtime sets
+    # this to its own ``run_id`` when constructing OpContext for control
+    # IR execution. Sub-run handlers propagate it to the spawned
+    # child run as ``parent_run_id``, so the snapshot tree records the
+    # parent / child relationship for debug logs and future cascade-discard
+    # semantics. ``None`` means "no parent visible" (e.g. preprocessor-spawned
+    # sub-runs, or runtime invocations that don't track a run_id).
+    parent_run_id: str | None = None
+
+    # FP-0021: the run_id of the currently-executing run.
+    # Threaded from the runtime through the ctx-build seams to OpContext so
+    # event emit helpers can stamp every event with the correct
+    # run scope. None when the OpContext is created outside a run scope
+    # (e.g. chat router, CLI commands).
+    run_id: str | None = None
+
+    # #2259 PR-1: the process-shared WAL, threaded so a recovery-core config op
+    # (mcp_install / mcp_drop / index_drop) can record a config GENERATION (keyed by the
+    # WAL head) after persisting its `.yaml` — making the yaml a derived projection of the
+    # generation truth. None outside a persistence-enabled chat context (tests /
+    # non-chat) → the op skips it (the opt-in contract, same as the step-event gate).
+    state_log: "StateLog | None" = None
+
+    # #2761 PR-2: this SESSION's HotReloader (the #2073 S3 per-session route), so an
+    # install op (skill_install / pipeline_install) can apply its reload IMMEDIATELY
+    # (mid-turn) for a PURE ADDITION — making the just-installed NEW entry resolvable
+    # this turn. A same-name overwrite / no reloader keeps the deferred turn-boundary
+    # path. Per-session (never the process-global get_active_hot_reloader, which is the
+    # last-registered session — a multi-session footgun). None outside a live chat
+    # session (tests / CLI separate-process install) → the op falls back to the deferred
+    # path (unchanged behavior).
+    hot_reloader: "object | None" = None
+
+    # FP-0022 follow-up: declarative SSL config for web_fetch and MCP registry.
+    # Defaults to None (= no override, falls through to env-var chain).
+    # Callers that have a ReynConfig available should pass config.web_fetch
+    # here. #4174 T4: renamed from `web_config: WebConfig | None` (the type
+    # ITSELF is now WebFetchConfig directly, not a `.fetch`-nested wrapper —
+    # WebConfig no longer exists, split into WebFetchConfig + GatewayConfig).
+    # #4274: wired live — reaches every chat-router OpContext via
+    # SessionFactoryConfig.web_fetch_config → Session._web_fetch_config →
+    # RouterOpContextSource → build_router_op_context. BEHAVIOR CHANGE: an
+    # operator's `web_fetch:` block in reyn.yaml (verify_ssl / allow_private_ips /
+    # max_download_bytes) was silently ignored before this and now takes effect.
+    web_fetch_config: "WebFetchConfig | None" = None
+
+    # #4381 PR-5: the resource-bound per-result inline cap (architect
+    # design — bytes, model-independent, config-driven). Consulted by
+    # file.py's read op and load_skill.py via
+    # ``context_builder.control_ir_inline_cap(ctx.read_cap_config)``.
+    # None (no ReynConfig threaded, e.g. a direct-OpContext test
+    # construction) falls back to context_builder's own model-independent
+    # default (``MAX_CONTROL_IR_RESULT_INLINE_BYTES``) — same
+    # backward-compatible shape as ``multimodal_config`` above. Reaches
+    # every chat-router OpContext via SessionFactoryConfig.read_cap_config
+    # → Session._read_cap_config → RouterOpContextSource →
+    # build_router_op_context (mirrors #4274's ``web_fetch_config`` wiring).
+    read_cap_config: "ReadCapConfig | None" = None
+
+    # FP-0017 follow-up: declarative sandbox config for sandboxed_exec op.
+    # Callers that have a ReynConfig available should pass config.sandbox here.
+    # When None, sandboxed_exec falls back to platform auto-detection
+    # (= same as no-config-loaded behavior).
+    sandbox_config: "SandboxConfig | None" = None
+
+    # #5012-A: declarative OAuth provider config for the describe_session op's
+    # auth-status field. Callers that have a ReynConfig available should pass
+    # config.auth here — same narrow-projection shape as sandbox_config above
+    # (architect ruling, #5012 issue thread: OpContext carries a projection of
+    # the relevant config slice, never the whole ReynConfig). None (direct/
+    # test construction, or a non-chat OpContext) → describe_session reports
+    # every provider as declared=False rather than raising.
+    auth_config: "AuthConfig | None" = None
+
+    # #5012-A PR #5038 (lead-coder block, issuecomment-5376729625): the
+    # SAME "remaining turns + max_hook_driven_turns" pair issue #5012's own
+    # field ② names — read LIVE (turn count changes every turn, unlike
+    # auth_config/sandbox_config above, which are static per-session
+    # config), so this is a supplied dict, not a config projection. `None`
+    # (direct/test construction, or a non-chat OpContext) → describe_session
+    # cannot report a budget it has no session to read.
+    hook_driven_turns_budget: "dict | None" = None
+
+    # FP-0050/#1822 S5 (EP4): content-threat scan config. When enabled, the
+    # sandboxed_exec command (argv) is exec-scope scanned before exec — a
+    # block-severity hit denies; warn emits + proceeds. None = no scan.
+    threat_scan: "object | None" = None
+
+    # #1827 S1: per-session contextual capability narrowing (a
+    # ``ContextualPermission``). When set, permission gates add it as one more
+    # restrict-only ∩ layer (ContextualLayer) on top of the static authority —
+    # never-elevate is the structural ``all()`` in EffectivePermission. None =
+    # no contextual narrowing (byte-identical to the pre-#1827 gate). Sourced
+    # per-session from delegation / topology / ephemeral context (later slices).
+    contextual_permission: "object | None" = None
+
+    # FP-0008 C7 #2: runtime backend-instance override for sandboxed_exec.
+    # When set, the sandboxed_exec handler uses this backend INSTANCE verbatim
+    # instead of resolving one by name from sandbox_config. This is the seam for
+    # *stateful* backends bound to a runtime resource (e.g. a
+    # DockerEnvironmentBackend bound to a specific container + host workspace)
+    # that a name-based factory cannot construct. Generic: any caller owning such a resource may inject
+    # one; None preserves the default name-based platform auto-selection.
+    sandbox_backend: "SandboxBackend | None" = None
+
+    # FP-0008 #1115 Stage 2 (D): phase-level default SandboxPolicy (dict of
+    # SandboxPolicy kwargs) declared in the phase frontmatter. When set, the
+    # sandboxed_exec handler builds the policy from this — the ONLY source of
+    # the enforced policy (deterministic + P8-clean; #3907 deleted the op's
+    # own policy fields, which the LLM could set but which never won anyway).
+    # `sandboxed_exec` requires this to be concrete (#1339/#3907① — every real
+    # context-building path resolves one); `None` is still meaningful for the
+    # file/http gates' SandboxLayer ∩ (`sandbox_policy_from_ctx`), where it
+    # means "non-sandboxed caller, layer stays ⊤".
+    default_sandbox_policy: dict | None = None
+
+    # Issue #364: declarative cap on binary media size (= images from
+    # web_fetch / read_file / MCP / user input). When None, the gate
+    # is skipped — direct-OpContext constructions in tests stay
+    # backward-compatible. Callers with a ReynConfig should pass
+    # config.multimodal here.
+    multimodal_config: "MultimodalConfig | None" = None
+
+    # Issue #383 PR-C: flat-file storage for image binary + tool result
+    # text dumps. Tool handlers (web_fetch / read_file / mcp) save
+    # binary via ``ctx.media_store.save_media`` and emit path-ref blocks
+    # in their op result instead of inline base64. When None, handlers
+    # fall back to the pre-#383 inline shape (= backward-compat for
+    # direct-OpContext tests).
+    media_store: "MediaStore | None" = None
+
+    # FP-0016 D: per-run credential scoping. None = unrestricted (= preserves
+    # backward compat for top-level / chat-router / CLI-direct OpContext
+    # construction). When set, restricts secret access to the declared
+    # required_credentials and is passed through Agent → the ctx-build seams.
+    secret_store: "ScopedSecretStore | None" = None
+
+    # #1470: per-turn asyncio.Event fired by cancel_inflight(). When set,
+    # sandboxed_exec backends kill the running subprocess instead of waiting
+    # for it to complete. None = no cancel-awareness (OS-internal ops,
+    # non-interactive callers, pre-#1470 tests).
+    cancel_event: "asyncio.Event | None" = None
+
+    # #3903 a-2 ③: whether the SESSION this op runs in is ephemeral
+    # (``Session._ephemeral`` — set by ``spawn_ephemeral_session``, read
+    # live via a callable the same way ``cancel_event`` isn't but every
+    # other ``_fn``-supplied field on ``RouterOpContextSource`` is).
+    # ``sandboxed_exec.handle`` reads this to pick which ``SandboxPolicy``
+    # timeout pair applies when the LLM's call omits its own ``timeout``.
+    #
+    # NOT a `background` field, deliberately (architect/lead-coder ruling,
+    # #3903 issue thread, 2026-08-11): ephemeral and background are NOT the
+    # same predicate. `spawn_session`'s tool dispatch is fire-and-forget
+    # regardless of mode, so a PERSISTENT spawn is also unwaited-on and used
+    # to still get the foreground pair here — closed by #4193, see
+    # :attr:`attended` below. A single bool cannot represent both axes
+    # correctly, so this field carries only what it actually measures.
+    # Direction of the implication this field licenses: "an ephemeral exec
+    # gets the background timeout pair" is correct; "background-ness is
+    # decided by this field" is NOT — a reader who inverts that direction
+    # will misjudge #4193's persistent-spawn gap as already covered by this
+    # field alone. False by default (direct/test construction, non-chat
+    # OpContext).
+    #
+    # #4193 co-vet correction (2026-08-11, docs-maintainer): an earlier
+    # revision of this comment claimed `run_pipeline_attached`'s driver
+    # session was "ephemeral yet attended" as a second counter-example.
+    # Verified false by direct trace: `_spawn_pipeline_driver_session`
+    # (`session_api.py`) always spawns with `mode="persistent"` (so the
+    # crash-recovery re-wake scan can find it), and `_ephemeral` is set
+    # ONLY at `mode == "ephemeral"`'s one assignment site
+    # (`registry.py`'s `spawn_session_recorded`). That driver session is
+    # therefore never ephemeral — it correctly gets the foreground pair
+    # (attached ⇒ someone is waiting), for the ordinary reason a plain
+    # boolean read would suggest, not despite one.
+    ephemeral: bool = False
+
+    # #4193 ①: whether the caller that spawned this SESSION is itself
+    # waiting on it — a SEPARATE axis from :attr:`ephemeral` (session-sticky,
+    # decided by the spawning CALLER at spawn time, not derived from `mode`).
+    # `session_spawn`'s tool dispatch (`RouterHostAdapter.spawn_session`)
+    # sets this False regardless of mode — it returns a spawn-ack and submits
+    # the task without awaiting completion, so mode="persistent" through
+    # that one path was the exact gap #4193 opened on (persistent ⇏
+    # attended). Every other spawn path (the attached pipeline driver, the
+    # `agent`-step ephemeral worker) leaves the default True. True by
+    # default: the common case (an interactive chat turn, direct/test
+    # construction) has someone waiting.
+    #
+    # `sandboxed_exec.handle` combines this with `ephemeral` as
+    # `ephemeral or not attended` — architect ruling, #4193, 2026-08-11.
+    # ⚠️ THE TWO TERMS ARE NOT REDUNDANT — do not simplify to `not attended`
+    # alone. The true predicate this pair approximates is "is a HUMAN
+    # waiting", and there are three states, not two:
+    #   interactive chat turn   a human waits              → foreground
+    #   agent-step leaf worker  a PROGRAM waits (ephemeral  → background
+    #                           =True, attended=True — MessageBus.request
+    #                           synchronously awaits ONE prompt, but the
+    #                           thing on the other end isn't a human)
+    #   session_spawn           nobody waits (attended=False) → background
+    # `ephemeral` carries the middle row; `not attended` carries the last
+    # row. Removing the `ephemeral` disjunct breaks the middle row: an
+    # agent-step worker's execs would narrow from the background pair
+    # (3600s) to the foreground pair (120s), and an agent step that itself
+    # runs a long exec would start failing — the falsify witness is
+    # `tests/core/test_op_sandboxed_exec.py`'s own
+    # ephemeral-and-attended-still-gets-background case (#4193), which a
+    # naive `not attended`-only rule fails.
+    attended: bool = True
+
+    # #1800 slice 5c: the awaited HookDispatcher (the Session's instance, with the
+    # loaded hooks registry + the _put_inbox/_stage/_run_shell seams from 5b),
+    # threaded down the SAME Session → router / kernel chain as hook_bus. Lifecycle
+    # hook points call ``ctx.hook_dispatcher.dispatch(...)``. None = no-op (direct/test
+    # construction or no hooks) → the dispatch site is skipped.
+    hook_dispatcher: "object | None" = None
+
+    # Hook-Event Redesign Phase 5 part 2 (proposal 0059 §8): this SESSION's
+    # HookBus (Phase 4a, `reyn.hooks.bus.HookBus`), threaded down the SAME
+    # Session -> router / kernel chain as `hook_dispatcher` above (mirrors that
+    # field's threading exactly — same construction site in Session, same
+    # RouterHostAdapter / build_router_op_context seams). The `emit_hook_event`
+    # op handler publishes the LLM-authored `HookEvent` here
+    # (`ctx.hook_bus.publish(event)`); it NEVER routes through
+    # `hook_dispatcher`'s cross-session push seam. None = no bus wired
+    # (direct/test construction, or a non-chat OpContext e.g. CLI/preprocessor)
+    # -> the emit_hook_event handler fails closed (no silent no-op emit).
+    hook_bus: "object | None" = None
+
+    # #1953 slice 3 (rework): the caller's session identity (#1814 per-contextId
+    # routing-key ``Session._session_id``), threaded down the same chain.
+    # ``emit_hook_event`` uses it to build the LLM-authored event's ONLY
+    # permitted namespace (``llm:<session_id>:*``) — never an op field, so
+    # the LLM cannot forge another session's namespace. agent_id (= agent_name)
+    # is too coarse because one agent can own many per-contextId sessions
+    # (#1814). None = no session identity (direct construction / OS-internal
+    # callers).
+    session_id: "str | None" = None
+
+    # proposal 0060 Phase 1 Layer A (A7): the OS-authoritative provenance
+    # classification of THIS turn, threaded down the same Session → ctx-build
+    # seams as session_id. Derived session-side from the turn ``kind``
+    # (session.py `_stamp_execution_context`)
+    # — NEVER LLM-supplied. ``"user_directed"`` only for an explicit ``kind ==
+    # "user"`` turn; every other kind (hook / pipeline_result /
+    # sub-agent agent_request|agent_response / any future unmapped kind)
+    # resolves to the strictER ``"auto_improvement"`` — the fail-safe default
+    # (0060 §2.7: silently falling to "user_directed" would let an unmapped
+    # turn bypass the Phase-4 auto-improvement gate). Install-op handlers
+    # (skill/pipeline/present, A9) stamp `entry["provenance"]` from this field
+    # alone; the op schemas carry no provenance field for the LLM to spoof
+    # (isomorphic to emit_hook_event's ②B ctx-side kind construction, 0059).
+    # None = a non-turn OpContext (direct/test construction, CLI/preprocessor).
+    turn_origin: "str | None" = None
+
+    # #3196: the SAME registered-skill-entry SSoT `:skill` invocation resolves
+    # against (Session/RouterHostAdapter's `_available_skills`, built by
+    # `reyn.data.skills.registry.build_skill_registry` from config) — threaded
+    # here so `file.handle`'s skill-load provenance gate can recognize a
+    # config-registered skill body as trusted WITHOUT hand-listing a curated
+    # path set of its own (the registry stays the single enumeration source).
+    # None (test / phase-fallback construction) → the config-entry provenance
+    # class is simply unavailable there; builtin/plugin provenance still work
+    # via their own package/registry-backed readers, and everything else
+    # correctly fails closed (raw pass-through, no expansion).
+    available_skills: "Sequence[object] | None" = None
+
+
+def resolve_path_for_gate(ctx: "OpContext", path_str: str) -> str:
+    """Resolve an op path against the workspace ``base_dir`` so the permission
+    gate / provenance checks / the actual read all judge the SAME absolute
+    target (shared by ``op_runtime/file.py`` and ``op_runtime/load_skill.py``
+    — #187 B3 originally, generalized here at FP-0066 P0 / #3247 so
+    ``load_skill`` reuses the SAME resolve-once helper file.py's read path
+    already relied on, instead of a second, independently-drifting copy).
+
+    #187 B3: a file-op handler previously passed the raw (often relative)
+    ``op.path`` to ``require_file_*``; the gate's SandboxLayer then resolved
+    it with ``Path(path).resolve()`` against the HOST process cwd — not the
+    workspace base_dir. Under a container backend (base_dir=/testbed) a
+    relative repo write like ``astropy/io/ascii/html.py`` was therefore
+    checked against the host cwd, fell outside the sandbox ``write_paths``
+    cap, and was DENIED even though ``Workspace.write_file`` resolves that
+    same path against /testbed and would land it there. Resolving here closes
+    the base mismatch. Behaviour-preserving for the host case (base_dir ==
+    cwd -> the identical absolute path).
+
+    **#3196 load-bearing invariant for any caller judging trust from the
+    result**: call this EXACTLY ONCE per read and reuse the single returned
+    string for every later decision (permission gate, provenance
+    classification, the actual byte read) — never re-resolve independently
+    for "is this trusted" vs "what do I read". A second, separate resolve
+    reopens the symlink-swap TOCTOU window #3196 closed (see
+    ``load_skill.py``'s module docstring for the full scope note).
+    """
+    ws = getattr(ctx, "workspace", None)
+    if ws is None:
+        return path_str
+    p = Path(path_str).expanduser()
+    if p.is_absolute():
+        return str(p.resolve())
+    return str((ws.base_dir / p).resolve())
+
+
+def sandbox_policy_from_ctx(ctx: "OpContext") -> "SandboxPolicy | None":
+    """Build the ``SandboxPolicy`` from ``ctx.default_sandbox_policy`` (the
+    agent-level operator policy resolved onto the ctx; #1326), or ``None`` when
+    unset.
+
+    #1199 S3.1c-2: the file / http gates fold this into their SandboxLayer ∩.
+    Mirrors the conversion ``sandboxed_exec`` already uses
+    (``SandboxPolicy(**ctx.default_sandbox_policy)``) so the SAME policy governs
+    both the sandboxed_exec subprocess and the OS's in-process file/http ops.
+    ``None`` → the SandboxLayer is ⊤ (non-sandboxed callers unchanged)."""
+    if ctx.default_sandbox_policy is None:
+        return None
+    from reyn.security.sandbox.policy import SandboxPolicy
+
+    return SandboxPolicy(**ctx.default_sandbox_policy)
+
+
+def provenance_from_ctx(ctx: "OpContext") -> str:
+    """The OS-set turn provenance to stamp on an install (proposal 0060 A7/A9).
+
+    **LOAD-BEARING fail-safe (closes a gate-bypass, not merely a default).**
+    Returns ``ctx.turn_origin`` when set (``"user_directed"`` / ``"auto_improvement"``,
+    classified OS-side in ``Session._stamp_execution_context`` — A7), but when
+    ``ctx.turn_origin`` is ``None``/unset it returns the STRICTER
+    ``"auto_improvement"`` — NEVER ``None``, NEVER ``"user_directed"``.
+
+    Why this is load-bearing, not cosmetic: the production router-tool path threads
+    ``turn_origin`` through ``make_router_op_context`` (the ``op_context_factory``
+    bound at ``tools/types.py`` build_router_caller_state), but the
+    ``build_legacy_op_context`` bridge's FALLBACK synthesis path (no bound
+    ``router_state.op_context_factory`` — phase / direct / future bridge callers)
+    constructs an ``OpContext`` with ``turn_origin`` left at its ``None`` default.
+    An install stamped ``provenance=None`` would be UNGATED — it escapes the
+    Phase-4 auto-improvement gate (whose foundation is this provenance value). This
+    helper collapses any such unset path to the stricter ``auto_improvement``, so a
+    provenance-unset install can never bypass the gate by construction (the same
+    fail-safe direction as A7's unmapped-kind → ``auto_improvement`` rule)."""
+    origin = getattr(ctx, "turn_origin", None)
+    return origin if origin is not None else "auto_improvement"

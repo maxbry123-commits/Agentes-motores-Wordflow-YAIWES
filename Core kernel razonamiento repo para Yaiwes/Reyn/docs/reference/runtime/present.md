@@ -1,0 +1,248 @@
+---
+type: reference
+topic: runtime
+audience: [human, agent]
+search_hints: [present op, present reference, presentation, data_ref, data_inline, blueprint, view, catalog component, table, keyvalue, list, code, diff, markdown, image, $bind, JSON pointer, presentations.yaml, presentations.entries, present ack, bindings_dropped, coerced, presented event, replay, recovery gate, expiry placeholder]
+---
+
+# Present op & surface reference
+
+Operator/agent-facing reference for the **present layer** — the `present` op's args, the
+v1 component catalog, path binding, named-view registration, the op ack, the
+`presented` audit event, and the replay/rewind behavior. For the *why* (the axis-B/C
+problem, the LLM-sees-shape/user-sees-content asymmetry, the guard/renderer split), see
+[Concepts: Present layer](../../concepts/runtime/present.md). The op also appears in the
+[Control IR](control-ir.md#present) op catalog.
+
+## The `present` op
+
+```json
+{
+  "kind": "present",
+  "data_ref": ".reyn/cache/tool-results/2026-.../structured.json",
+  "blueprint": [
+    {
+      "component": "table",
+      "rows": {"$bind": "/results"},
+      "columns": [
+        {"header": "Title",  "path": "/title"},
+        {"header": "Author", "path": "/author"}
+      ]
+    }
+  ]
+}
+```
+
+`blueprint` is a **list** of component nodes, rendered top to bottom; a single
+component is a one-element list. The op still accepts a bare component object,
+but the tool schema offered to the model declares an array — the list form is
+the only way to express a sequence, and the Gemini-safe rules forbid declaring
+both (see `runtime/router_tools`).
+
+Exactly one **data source**; **at most one** of `view` / `blueprint` (both omitted is
+valid — see [Optional view/blueprint](#optional-viewblueprint-default-rendering) below):
+
+| Arg | Type | Notes |
+|---|---|---|
+| `data_ref` | string | **XOR** `data_inline`. Any zone-readable path. An offloaded `structured_ref` is **re-hydrated to its full value** (not read from the LLM-visible preview) via `file.read` semantics. |
+| `data_inline` | any | **XOR** `data_ref`. Small data already in the LLM's context (convenience). |
+| `view` | string | At most one of `view` / `blueprint`. A registered presentation name (see registration below). An unknown name is not an error — it falls through the fallback chain. |
+| `blueprint` | object \| array | At most one of `view` / `blueprint`. An inline declarative component tree (a single node or a top-to-bottom list). |
+
+`view` is FP-0055 PR-1's rename of the original `template` arg — a clean break, no
+alias. "Template" now means exclusively the future `render_template` op's Jinja2 text
+templates; the declarative, registered-or-inline presentation description present uses
+is a **view**.
+
+- **Tier 0** (`ask_user`'s sibling), **fire-and-continue** — presenting to the user (the
+  trust root) has no output permission gate, and unlike `ask_user` it does **not** pause
+  the run. The one gate: `data_ref` read authority resolves **identically to `file.read`**
+  — `present` can never read more than the agent's file ops can (`present` denied ⇔
+  `file.read` denied).
+
+## v1 catalog (display-only, non-executable)
+
+All components are read-only. A blueprint node is `{"component": <name>, ...slots}`.
+
+| Component | Slots |
+|---|---|
+| `text` | `text` (bind or literal) |
+| `markdown` | `text` — rendered as CommonMark |
+| `code` | `text`, `language?` |
+| `diff` | `text` — unified diff |
+| `keyvalue` | `rows: [{label, value}]` |
+| `table` | `rows` (bind → array), `columns: [{header, path}]` |
+| `list` | `items` (bind → array), `item_path?` (per-item path) |
+| `image` | `src`, `alt?` — the TUI (`textual_chat`) fetches `src` (owner-decided delivery form C — client fetches the URL itself, #3846) and renders it as half-block Unicode cells (`HalfBlockImage`, #4474 — fixed row height via `image.row_height_cells`, default 20, width derived to preserve aspect ratio). Earlier revisions of this doc described a real-pixel (Kitty/Sixel) path with a half-block fallback; #4474 dropped that path entirely and the `textual-image` dependency with it — Sixel draws relative to the cursor rather than into cells, which a virtualized cell-repainting row model cannot position or clip, and Kitty's placeholder protocol proved undetectably broken on the terminals reyn targets, so the trade-off never actually delivered real pixels in practice. Surfaces without a resolution stage (plain `reyn chat --cui`, `reyn pipe`) show an `[image: <alt>]` dim-text placeholder; a failed fetch/decode shows a distinguishable `[image failed: ...]` state, never the same placeholder text. |
+| `artifact` | An LLM-produced artifact carried **by reference (or inline text), not by rendering** (#4482 PR-2b, naming ratified by architect). The node declares *what it is* (`media_type`) and *where it is* (`source`/`content`) — **how it is shown is the client's decision**: a terminal may offer to open it, a web client may embed it. (Earlier revisions of this doc defined `artifact` negatively, as "what the terminal can't render" — architect's own correction: that definition was explicitly rejected in #4482's design discussion, since today's rendering LIMITS baked into the component's identity would go false the moment a future renderer gains a capability, and a negative definition is unverifiable node-by-node — it depends on the renderer's whole capability set, not the node's own shape. It also self-contradicted the `content` slot, whose text a terminal CAN render.) **Exactly one** of `source` (a real file — a literal path or a `$bind` pointer) or `content` (text the agent hands over directly, no real file exists) — never both, never neither. This is the AGENT's own declaration on the node; it is a distinct axis from what the constructed *payload* ends up carrying — a `source`-backed node's payload (`build_source_artifact_payload`, #4574) always mints a `ref` and, when the file is small and decodable, ALSO attaches an inline text preview alongside it (added for the Art tab's Enter-to-open, #4581 — a `ref`-less inline-only payload left nothing to open). The node-declaration exclusivity above is unchanged by this; it is a payload-construction detail one layer down, not a second `source`/`content` pair on the node itself. `media_type` is allowed only alongside `content`, and required there (with `source`, the OS derives it from the real file — an agent-declared value there could disagree, so it's rejected); it's rejected as missing alongside `content` too (no real file to derive it from). `description?` is always optional. `name` is deliberately not a slot: for `source` the OS fills it from the file's own basename; for `content` there is no real-file identity to name. All 7 structural-validity cases are enforced at op validation, not guessed at render time.
+
+**Client-side behavior (`textual_chat`, #4482 PR-3)** — one client's choice, not `present`'s own contract: the **Artifacts tab** (`Art`, bottom-chrome drawer) lists refs newest-first, derived fresh from the SAME live message entries the conversation pane itself renders (never `Session.history`'s resident buffer, which has its own independent eviction axis and could silently drop a still-visible artifact from the list — the third instance of this exact resource-vs-semantic-layering mistake flagged this session). No new persisted state — no separate on-disk index, no cache kept warm across calls. Selecting a row, or running `/open <ref>`, launches the OS's own default application for the file's extension (`open`/`xdg-open`/`os.startfile` — the same affordance a file manager double-click gives, never a reyn-chosen viewer; the extension is treated as the real permission surface, so this never second-guesses what the OS resolves). The **exact path shown on the row is the exact path opened** (architect's ruling) — a `resolved_path` field distinguishes an artifact from another same-named one in a different directory, since a bare basename alone can't. `/open` is local-sessions-only (launching a local application only makes sense on the machine the user is sitting at). |
+
+There are **no interactive components** (no buttons / forms) in v1.
+
+### Binding — `$bind` / JSON Pointer
+
+Data is joined to a view by **JSON Pointer (RFC 6901)** paths, expressed structurally:
+
+- `{"$bind": "/results/0/title"}` — a pointer string; `""` binds the **whole document**.
+- Anything that is not a `$bind` object is a **literal** (e.g. a `header` string).
+- `table` `columns[].path` and `list` `item_path` resolve **row-relative** (relative to
+  each iterated row).
+
+Binding outcomes (§4): path hit → bind; path miss → **soft-skip** + record
+`path_not_found` in `bindings_dropped`; type mismatch → coerce (a scalar into a
+`table` `rows` slot → a 1-row table; a container into a `text` slot → its JSON
+form) and record `{path, rendered_as}` in **`coerced`** — a coercion is the
+*opposite* outcome of a drop, the value reached the user reshaped rather than
+never reaching it, so it is never counted as a drop (#3664); a leaf
+neutralized/size-capped by the guard → record `guard_stripped` in
+`bindings_dropped`. When **all** bindings miss, the op reports
+`all_bindings_missed` and routes to the fallback chain — never a hard failure.
+
+The structural gate at op validation rejects a **non-catalog component** or a **non-path
+binding** as a hard error (`status="error"`) for an inline blueprint — that is a
+blueprint bug, distinct from a soft binding drop.
+
+## Named-view registration (operator-only)
+
+Named views are registered in **`presentations.yaml`** (`presentations.entries`) — an
+**operator/config action**. There is no install op; the LLM authors inline blueprints only.
+
+```yaml
+presentations:
+  entries:
+    search_results:
+      blueprint:                              # required; inline component tree
+        - component: table
+          rows: {"$bind": "/results"}
+          columns:
+            - {header: Author, path: /author}
+            - {header: Title,  path: /title}
+      description: "Search results table"      # optional
+      enabled: true                            # optional, default true
+```
+
+The blueprint is validated at load; the `<project>/.reyn/config/presentations.yaml` layer
+hot-reloads at the turn boundary. Full field table + merge order:
+[reyn.yaml § presentations](../config/reyn-yaml.md#presentations-block).
+
+## View fallback — 4 stages
+
+Resolution degrades until something renders (never a hard error):
+
+1. **Registered `view`** → 2. **inline `blueprint`** → 3. **default viewer**
+(a recognition ladder: **declared content-type** → diff-sniff → data shape — a
+markdown/code type → `markdown`/`code`; else `list[dict]` → `table`, `dict` →
+`keyvalue`, scalar → `text`, diff-sniff → `diff`) → 4. **generic** (structured →
+YAML into `text`, plain text as-is — always renders).
+
+The declared-content-type step is populated for a `data_ref` source whose canonical
+tool-result producer declared a `content_type`/`mimeType` — carried from the offload
+producer to here as a **renderer-only sidecar** (never the LLM-visible tool-result
+frontmatter): the producer's declared type drives the offload store's `mime_type`
+(the on-disk ref extension), and `present` recovers it back from that extension when
+resolving the ref. Inline data (`data_inline`) has no content-type source and always
+degrades straight to diff-sniff → shape, unchanged.
+
+An object's default view is a `keyvalue` card over its **scalar** keys, followed
+by a `text` label and its own view for each **nested** value — a list of objects
+becomes a `table` there just as it would at the top level. Descent stops after 4
+levels; below that a value goes into a `keyvalue` row, which renders it as JSON
+(the same floor a `table`'s cells have). Before this, the whole object became one
+`keyvalue` card, so any nested value hit that floor immediately and identical
+rows rendered as a table or as a JSON blob depending only on whether the caller
+wrapped them in an object.
+
+The fallback fires on an all-miss view or an unknown view name. The ack reports the
+**requested** view's stats plus a `note` naming the stage that actually rendered.
+
+### Optional view/blueprint — default rendering
+
+`view` and `blueprint` may **both be omitted** (FP-0055 PR-1) — `present(data_ref=...)`
+alone is valid and means "no explicit view; just show it". Resolution then enters
+**directly at stage 3** (the content-type default viewer), skipping stages 1-2 entirely
+— there is no requested view to look up or fall back from. The ack carries `mode:
+"default"` and the default viewer's own stats, with **no `note`** — this is the intended
+rendering, not a fallback. A `note` still appears if stage 3 itself degrades further to
+stage 4 (the default viewer's own bindings all miss), naming that further degradation —
+distinct wording from the "view not registered" / "all bindings missed" notes below,
+since there was no requested view to begin with.
+
+## Ack (op result)
+
+The LLM's only feedback — compact + high-signal:
+
+```yaml
+ok: true
+mode: view        # view | blueprint | default — which input the caller gave
+bindings_resolved: 3
+bindings_dropped:
+  - {path: "/results/0/author", reason: path_not_found}
+  # reason ∈ {path_not_found, guard_stripped} — a type-mismatch coercion is NOT
+  # a drop (#3664); see `coerced` below
+coerced:
+  - {path: "/big", rendered_as: json_text}
+  # rendered_as ∈ {json_text, single_row} — the value WAS displayed, reshaped
+rows: 500          # #3664: every rendered row across every rows-shaped slot
+                    # (table/list AND keyvalue cards), post-cap — the LLM's
+                    # only measure of how much reached the user's screen
+all_bindings_missed: false
+note: "…"        # present only when a fallback stage rendered, or (#3664 (c))
+                  # when the default viewer coerced a container to JSON text
+```
+
+`path_not_found` across many rows → "view doesn't match this data shape";
+`guard_stripped` → "content neutralized by the guard, not a view bug"; a `coerced`
+entry → "right path, wrong component — this reached the user as JSON text or a
+1-row table, not dropped". The agent self-corrects without ingesting the data.
+
+## `presented` event (P6 audit)
+
+Every presentation emits one `presented` event carrying **refs + stats only, never content
+bytes**:
+
+| Field | Meaning |
+|---|---|
+| `data_ref` | the ref path, or `<inline-data>` for a `data_inline` presentation |
+| `view` | the registered name, `blueprint:<hash>` for an inline blueprint (no blueprint bytes), or `null` when neither was given (`mode: "default"`) |
+| `mode` | `view` \| `blueprint` \| `default` — which of the three mutually-exclusive inputs the caller gave |
+| `surface` | list, e.g. `["inline-cui"]` (`["null"]` when no renderer is wired) |
+| `ingested` | `none` \| `partial` \| `full` — **OS-computed** (was the data inline, or does a prior `read_file` on the ref appear earlier in the session?), never LLM-self-reported |
+| `bindings_resolved` | count of resolved bindings |
+| `bindings_dropped` | `[{path, reason}]`, `reason ∈ {path_not_found, guard_stripped}` — values that genuinely never reached the user |
+| `coerced` | `[{path, rendered_as}]`, `rendered_as ∈ {json_text, single_row}` — type-mismatch reshapes; the value WAS displayed (#3664, kept separate from `bindings_dropped`) |
+| `rows` | every rendered row across every rows-shaped slot (table/list AND keyvalue), post-cap (#3664) |
+| `fallback_stage` | `null` \| `content_type_default` \| `generic` — which viewer actually reached the user. `null` = the requested rendering (or the `mode: "default"` stage-3 viewer) rendered directly; a non-null value = the requested view was unknown / all-missed and a synthesized viewer took over. This is what distinguishes a literal-only view rendered as requested (`null`) from an unknown / all-missed fallback — both otherwise carry `bindings_resolved=0, bindings_dropped=[]`. |
+
+## Replay / rewind — presentation as cache
+
+A presentation is a **cache**; the `presented` event is the **truth**. On replay
+(`reyn events <log>`) or rewind, a `presented` event re-renders **best-effort**:
+
+- **Ref still readable** → the content is re-synthesized from the data's shape (the event
+  never stored the bytes, so this uses the default/generic viewer, not the caller's
+  original inline blueprint) and reaches the surface.
+- **Ref gone** (GC'd / unavailable), or the data was **inline** and never persisted → an
+  **expiry placeholder** pointing at the durable `presented` audit event. Never a crash,
+  never a stale render.
+
+`present` pins nothing into a retention window; refs keep their existing lifecycle, and the
+conversation history never contains the presented bytes (nothing new for compaction).
+
+### Recovery-feature gate — not applicable
+
+The CLAUDE.md **recovery-feature truncate-falsify gate** (a PR adding WAL-event-derived
+reconstruction / PITR / rewind-restore state must prove the reconstruction source survives
+WAL truncation) **does not apply** to the present layer. Replay here reconstructs **no
+authoritative state**: it produces a **display-only projection** — a best-effort re-render
+of an already-durable ref, or a placeholder — and `present` writes **no recovery-core
+state**. Nothing derives recoverable state from `presented` events. Were a future revision
+ever to reconstruct authoritative state from `presented` events, that PR would have to
+carry the truncate-falsify test in-arc.
+
+## See also
+
+- [Concepts: Present layer](../../concepts/runtime/present.md)
+- [Control IR](control-ir.md#present) — the op in the catalog
+- [reyn.yaml § presentations](../config/reyn-yaml.md#presentations-block) — registration
+- [Events](../../concepts/runtime/events.md) — replay and the audit log

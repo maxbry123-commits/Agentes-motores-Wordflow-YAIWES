@@ -1,0 +1,230 @@
+"""Tier 2: RetrievalScheme — the RePresent-exemplar scheme (#1593 PR-4, scheme side).
+
+These pin the scheme's 4 methods in isolation (a recording Fake SchemeOps — real
+callables, no mocks): the search-tool-first initial presentation, the refined
+presentation (run search → matched subset + candidates), the terminal presentation
+(search tool dropped → forces Execute), and the **pure** interpret classifier
+(search call → RePresent(query) with NO search I/O; other call → Execute). The OS
+RePresent convergence loop (which consumes Presentation.candidates) is exercised
+end-to-end when it lands in the dispatch RePresent arm (PR-3-sequenced).
+"""
+from __future__ import annotations
+
+import pytest
+
+from reyn.tools.scheme import (
+    ExecContext,
+    Execute,
+    ExecutionResult,
+    RePresent,
+    advertised_entries,
+)
+from reyn.tools.schemes.retrieval import _SEARCH_TOOL_NAME, RetrievalScheme
+
+
+class _Resp:
+    def __init__(self, tool_calls):
+        self.tool_calls = tool_calls
+
+
+def _call(name, **args):
+    import json
+    return {"function": {"name": name, "arguments": json.dumps(args)}}
+
+
+class _FakeOps:
+    """Recording Fake SchemeOps — base/catalog/search return fixtures; the dispatch
+    path delegates are identity-ish."""
+
+    def __init__(self, matches=None, catalog=None):
+        self._matches = matches or []
+        self._catalog = catalog or []
+        self.calls = []
+
+    def base_tools(self, available, layer_ctx):
+        return [{"type": "function", "function": {"name": "respond"}}]
+
+    async def search_actions(self, query, *, top_k=10):
+        self.calls.append(("search", query))
+        return list(self._matches)
+
+    async def catalog_entries(self):
+        return list(self._catalog)
+
+    def resolve(self, llm_response, tool_catalog):
+        return [{"tc": tc, "name": tc["function"]["name"], "args": {}} for tc in llm_response.tool_calls]
+
+    async def dispatch(self, actions, *, call_id: "str | None" = None):
+        return [{"status": "ok", "for": a["name"]} for a in actions]
+
+    def feedback(self, result):
+        # #1608: ops.feedback now receives the enriched ExecutionResult; the Fake
+        # echoes its tool_results so the delegation assertion stays meaningful.
+        return result.tool_results
+
+
+def _tool(name):
+    return {"type": "function", "function": {"name": name, "description": "", "parameters": {}}}
+
+
+@pytest.mark.asyncio
+async def test_initial_presentation_shows_search_tool(tmp_path) -> None:
+    """Tier 2: with no refinement AND a working embedding (search_visible=True),
+    retrieval presents base + the search tool (NOT the whole catalog) — the
+    narrowing-before-call posture."""
+    ops = _FakeOps()
+    pres = await RetrievalScheme().build_presentation({}, {"search_visible": True}, ops)
+    names = [t["function"]["name"] for t in advertised_entries(pres.tools_channel)]
+    assert _SEARCH_TOOL_NAME in names and "respond" in names
+    assert ops.calls == []                                # no search yet (no refinement)
+
+
+@pytest.mark.asyncio
+async def test_initial_presentation_falls_back_to_catalog_when_search_unavailable(tmp_path) -> None:
+    """Tier 2: #2895 fix (b), falsify-pin. When the embedding is unavailable
+    (``search_visible`` False/absent — the SAME D14 gate ``router_loop.py``
+    computes from index/provider/model_class/is_ready), retrieval must NOT
+    present the search tool. Presenting it would let ``ops.search_actions``
+    return ``[]`` on the very first call (the #2895 mechanism), and this
+    scheme's own terminal-on-empty-match rule would then drop the search tool
+    and strand the LLM on base_tools only — a silent dead session with the
+    full catalog never reachable.
+
+    Instead it must degrade like ``enumerate-all``: present the full flat
+    catalog (every action stays reachable) and surface the enable-hint
+    (reused from ``universal_catalog._HIDDEN_STATE_HINT`` — the SAME hint the
+    graceful schemes inject) via ``tool_use_sp['slot_post_catalog']``.
+
+    Falsify by hand: revert the ``if not layer_ctx.get("search_visible",
+    False)`` branch in ``RetrievalScheme.build_presentation`` (retrieval.py)
+    → this test goes RED (search tool appears, catalog + hint disappear).
+    """
+    from reyn.tools.universal_catalog import _HIDDEN_STATE_HINT
+
+    ops = _FakeOps(catalog=[_tool("write_file"), _tool("read_file")])
+    # search_visible absent (defaults False) — mirrors "no embedding configured".
+    pres = await RetrievalScheme().build_presentation({}, {}, ops)
+    names = {t["function"]["name"] for t in advertised_entries(pres.tools_channel)}
+    assert _SEARCH_TOOL_NAME not in names                 # search NEVER offered — would be a dead end
+    assert {"write_file", "read_file"} <= names          # catalog stays fully reachable instead
+    assert "respond" in names                              # base tools still present
+    assert ops.calls == []                                 # no dead search ever attempted
+    assert pres.tool_use_sp.get("slot_post_catalog") == _HIDDEN_STATE_HINT  # enable-hint surfaced
+
+
+@pytest.mark.asyncio
+async def test_refined_presentation_runs_search_and_exposes_candidates(tmp_path) -> None:
+    """Tier 2: given a refinement query, build_presentation runs the search and
+    presents the matched catalog subset + the search tool, exposing the matches as
+    Presentation.candidates (the OS convergence signal)."""
+    ops = _FakeOps(matches=["write_file", "read_file"], catalog=[_tool("write_file"), _tool("read_file"), _tool("web_fetch")])
+    pres = await RetrievalScheme().build_presentation({}, {"refinement": {"query": "edit a file"}}, ops)
+    names = {t["function"]["name"] for t in advertised_entries(pres.tools_channel)}
+    assert {"write_file", "read_file"} <= names         # matched subset presented
+    assert "web_fetch" not in names                      # unmatched NOT presented
+    assert _SEARCH_TOOL_NAME in names                     # search stays (non-terminal)
+    assert pres.candidates == ("write_file", "read_file")  # candidates for OS convergence
+    assert ops.calls == [("search", "edit a file")]       # the dynamic query ran
+
+
+@pytest.mark.asyncio
+async def test_convergence_drops_search_tool(tmp_path) -> None:
+    """Tier 2: the SCHEME self-determines terminal (#1593 ratified seam — the OS arm
+    holds no convergence logic). When the search yields nothing NEW beyond what the
+    OS already threaded in via ``presented`` (matched ⊆ presented ⇒ new == ∅), the
+    presentation is terminal: it drops the search tool → the LLM can only Execute
+    (no re-search) → the OS RePresent loop exits."""
+    ops = _FakeOps(matches=["write_file"], catalog=[_tool("write_file")])
+    pres = await RetrievalScheme().build_presentation(
+        {}, {"refinement": {"query": "edit"}, "presented": ("write_file",)}, ops,
+    )
+    names = {t["function"]["name"] for t in advertised_entries(pres.tools_channel)}
+    assert "write_file" in names
+    assert _SEARCH_TOOL_NAME not in names                 # converged → search dropped → must Execute
+
+
+@pytest.mark.asyncio
+async def test_new_matches_keep_search_tool(tmp_path) -> None:
+    """Tier 2: the contrast — a search that yields a match NOT yet presented
+    (new != ∅) is non-terminal: the search tool stays so the LLM may refine again.
+    Pins that the terminal decision is the scheme's, driven by new-vs-presented."""
+    ops = _FakeOps(matches=["read_file"], catalog=[_tool("read_file"), _tool("write_file")])
+    pres = await RetrievalScheme().build_presentation(
+        {}, {"refinement": {"query": "read"}, "presented": ("write_file",)}, ops,
+    )
+    names = {t["function"]["name"] for t in advertised_entries(pres.tools_channel)}
+    assert _SEARCH_TOOL_NAME in names                     # read_file is new → not converged → search stays
+
+
+@pytest.mark.asyncio
+async def test_initial_presentation_supplies_search_guidance(tmp_path) -> None:
+    """Tier 2: the scheme-owned slot channel — retrieval runs with
+    universal_wrappers_enabled=False (named-gate SP off), so it MUST supply its own
+    search-tool instructions through Presentation.tool_use_sp["slot_post_catalog"].
+    The LLM must see search_actions guidance even when the OS's named-gate block
+    is off."""
+    ops = _FakeOps()
+    pres = await RetrievalScheme().build_presentation({}, {"search_visible": True}, ops)
+    assert isinstance(pres.tool_use_sp, dict)                      # scheme owns SP via slot-map
+    slot = pres.tool_use_sp.get("slot_post_catalog", "")
+    assert slot                                                     # scheme supplies its own
+    assert _SEARCH_TOOL_NAME in slot                                # tells the LLM to search first
+
+
+@pytest.mark.asyncio
+async def test_terminal_presentation_guidance_reflects_dropped_search(tmp_path) -> None:
+    """Tier 2: when the presentation converges to terminal (search tool dropped), the
+    slot_post_catalog guidance flips from "search first" to "call one of the presented
+    matches" — the SP and the tools= stay consistent (no dangling search instruction).
+    Guidance lives in tool_use_sp["slot_post_catalog"]."""
+    ops = _FakeOps(matches=["write_file"], catalog=[_tool("write_file")])
+    pres = await RetrievalScheme().build_presentation(
+        {}, {"refinement": {"query": "edit"}, "presented": ("write_file",)}, ops,
+    )
+    assert isinstance(pres.tool_use_sp, dict)
+    slot = pres.tool_use_sp.get("slot_post_catalog", "")
+    assert slot                                                     # still guided
+    assert _SEARCH_TOOL_NAME not in slot                            # no "call search_actions" — it's gone
+    assert "available" in slot.lower()                              # "matching tools are now available"
+
+
+def test_interpret_search_call_is_represent_pure() -> None:
+    """Tier 2: a search call → RePresent(query), with NO search I/O in interpret
+    (pure classifier — the search runs in build_presentation)."""
+    ops = _FakeOps()
+    interp = RetrievalScheme().interpret(
+        _Resp([_call(_SEARCH_TOOL_NAME, query="edit a file")]), tool_catalog={}, ops=ops,
+    )
+    assert isinstance(interp, RePresent)
+    assert interp.refinement == {"query": "edit a file"}
+    assert ops.calls == []                                # interpret did NOT search (pure)
+
+
+def test_interpret_tool_call_is_execute() -> None:
+    """Tier 2: a non-search tool call → Execute (reuses the shared resolution so the
+    OS exclude-gates pre-dispatch)."""
+    interp = RetrievalScheme().interpret(
+        _Resp([_call("write_file", path="x")]), tool_catalog={}, ops=_FakeOps(),
+    )
+    assert isinstance(interp, Execute)
+    assert [a["name"] for a in interp.actions] == ["write_file"]
+
+
+def test_interpret_no_tool_call_is_plaintext() -> None:
+    """Tier 2: NO tool calls → PlainText — the model answered without searching
+    (#1593 loop-unify binds PlainText as the terminal text-reply for every scheme).
+    Without this, the loop-unified OS would route an empty-actions Execute through
+    the tool path instead of the text reply."""
+    from reyn.tools.scheme import PlainText
+    interp = RetrievalScheme().interpret(_Resp([]), tool_catalog={}, ops=_FakeOps())
+    assert isinstance(interp, PlainText)
+
+
+@pytest.mark.asyncio
+async def test_execute_and_feedback_delegate() -> None:
+    """Tier 2: execute/format_feedback reuse the universal dispatch substrate."""
+    ops = _FakeOps()
+    scheme = RetrievalScheme()
+    res = await scheme.execute(Execute(actions=[{"name": "write_file"}]), ExecContext(), ops)
+    assert res.tool_results == [{"status": "ok", "for": "write_file"}]
+    assert scheme.format_feedback(ExecutionResult(tool_results=res.tool_results), ops) == res.tool_results

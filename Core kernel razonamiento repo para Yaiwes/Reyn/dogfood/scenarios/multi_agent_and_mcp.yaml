@@ -1,0 +1,227 @@
+---
+type: dogfood_scenario_set
+name: multi_agent_and_mcp
+description: >
+  Multi-agent + MCP + A2A coverage (FP-0036 starter set).
+  Exercises MCP registry search, MCP tool dispatch, agent-to-agent
+  delegation, multi-hop fan-out, A2A lifecycle, permission gating,
+  and scheduled-job introspection.
+covers:
+  - multi-agent/agent-registry
+  - multi-agent/delegate-to-agent
+  - multi-agent/messagebus
+  - mcp/mcp-install
+  - mcp/mcp-search
+  - mcp/tool-dispatch
+  - web-protocol/a2a-agent-card
+  - web-protocol/a2a-message-send
+  - permissions/layer-4-interactive-prompt
+
+scenarios:
+  # ── 1. MCP registry search ─────────────────────────────────────────────────
+  # B54 R-5a redesign (2026-05-25): rubric refocused from content quality
+  # ("suggests alternatives" = weak-tier content elaboration) to structural
+  # behavior (= did the registry search run + address the query).
+  # 0V across 5+ batches with old rubric was measuring LLM elaboration
+  # ability, not Reyn behavior.
+  #
+  # #2965 re-point: the `mcp_search` STDLIB SKILL was deleted by #2434/#2438,
+  # so `skill_run_spawned` has had no producer since 2026-07-03 and this
+  # scenario could not pass. The scenario's INTENT survives intact, because
+  # the capability did not move with the skill: the registry search is now
+  # the `mcp_search_registry` tool verb (tools/mcp_verbs.py), dispatched
+  # op-runtime-direct with no skill spawn. So only the dead assertion is
+  # dropped — `routing_decided` (the router resolved a catalog action) plus
+  # `tool_executed` (the verb actually ran) are the structural signals on
+  # the live path, and they keep this scenario testing what it always meant
+  # to test rather than being deleted along with the skill.
+  - id: mcp_search_registry
+    covers:
+      - cli/reyn-mcp
+      - mcp/mcp-search
+      - mcp/mcp-install
+    input: "MCP レジストリで github 関連のサーバーを探して。"
+    expected:
+      reply:
+        kind: judge
+        rubric:
+          - reply addresses the github MCP search query (= lists matches OR honestly reports no matches found)
+          - reply does NOT fabricate non-existent server names (= weak-tier hallucination guard)
+      events:
+        must_emit:
+          - { type: routing_decided, count: ">=1" }
+          - { type: tool_executed, count: ">=1" }
+      outcome_prediction:
+        verified: 0.6
+        inconclusive: 0.25
+        refuted: 0.15
+        blocked: 0.0
+
+  # ── 2. MCP tool call (pre-condition: configured server) ───────────────────
+  - id: mcp_call_remote_tool
+    covers:
+      - mcp/tool-dispatch
+      - control-ir-ops/mcp
+      - os-core/event-system-p6/113-event-types
+    input: "github MCP サーバーを使って最近の PR を一覧して。"
+    expected:
+      reply:
+        kind: judge
+        rubric:
+          - lists recent pull requests OR explains that the github MCP server is not configured
+          - does not silently fail — replies with actionable information either way
+      events:
+        # B28-Q2: LLM may explain MCP not configured inline (chat_turn_completed_inline)
+        # or dispatch via routing_decided. Accept either path.
+        must_emit_any:
+          - { type: routing_decided, count: ">=1" }
+          - { type: chat_turn_completed_inline, count: ">=1" }
+      # outcome_prediction refitted from B27/B28/B30/B32 actuals (H5 ablation, 2026-05-17)
+      outcome_prediction:
+        verified: 0.0
+        inconclusive: 0.25
+        refuted: 0.75
+        blocked: 0.0
+
+  # ── 3. Simple agent delegation ────────────────────────────────────────────
+  # B54 R-5a redesign (2026-05-25): "explains how to create the agent"
+  # content rubric removed — weak-tier reliably reports "agent not found"
+  # but doesn't elaborate on how to create one. Test refocused on dispatch
+  # attempt + honest outcome reporting.
+  - id: agent_delegation_simple
+    covers:
+      - multi-agent/delegate-to-agent
+      - multi-agent/agent-registry
+      - multi-agent/chain-id-propagation
+    input: "researcher エージェントに FP-0001 の概要を要約してもらって。"
+    expected:
+      reply:
+        kind: judge
+        rubric:
+          - reply addresses the delegation request (= delivers FP-0001 summary if delegation succeeded, OR honestly reports researcher agent is missing)
+          - reply does NOT fabricate that delegation completed when no agent_delegated event fired
+      events:
+        must_emit:
+          - { type: routing_decided, count: ">=1" }
+      outcome_prediction:
+        verified: 0.6
+        inconclusive: 0.25
+        refuted: 0.15
+        blocked: 0.0
+
+  # ── 4. Multi-hop agent fan-out ────────────────────────────────────────────
+  - id: multi_agent_topology_route
+    covers:
+      - multi-agent/delegate-to-agent
+      - multi-agent/messagebus
+      - multi-agent/agent-hops-cap
+      - multi-agent/chain-id-propagation
+    prompts:
+      - "researcher エージェントに Reyn の Phase エンジンについて調べてもらって、その結果を教えて。"
+      - "次に writer エージェントに、今の説明を 3 行にまとめてもらって。"
+    expected:
+      reply:
+        kind: judge
+        rubric:
+          - produces a concise 3-line summary OR reports that agent(s) do not exist
+          - if both agents existed, the reply reflects synthesis from two delegation hops
+          - does not return an empty reply
+      events:
+        must_emit:
+          - { type: routing_decided, count: ">=1" }
+      # outcome_prediction refitted from B27/B28/B30/B32 actuals (H5 ablation, 2026-05-17)
+      outcome_prediction:
+        verified: 0.25
+        inconclusive: 0.5
+        refuted: 0.25
+        blocked: 0.0
+
+  # ── 5. A2A task lifecycle polling ─────────────────────────────────────────
+  # B54 R-5a redesign (2026-05-25): test was a knowledge query requiring
+  # weak-tier LLM to recall A2A endpoint shape from training. 100% R for
+  # 5+ batches (= weak LLM doesn't have that level of A2A protocol detail).
+  # Added explicit doc reference + loosened rubric to "addresses A2A
+  # concepts" — let the LLM read the doc rather than recall from training.
+  - id: a2a_task_lifecycle_status_poll
+    covers:
+      - web-protocol/a2a-message-send
+      - web-protocol/a2a-agent-card
+      - web-protocol/a2a-agent-discovery
+      - cli/reyn-web
+    input: >
+      docs/concepts/a2a.md を参考に、 reyn web を起動して A2A
+      エンドポイントにタスクを投げてステータスを確認する流れを
+      説明してください。
+    expected:
+      reply:
+        kind: judge
+        rubric:
+          - reply addresses A2A endpoint usage (= mentions reyn web + at least one of {message/send, GET /a2a/tasks, A2A protocol concepts})
+          - reply does NOT fabricate endpoint shapes not documented in a2a.md
+      events:
+        must_emit: []
+      outcome_prediction:
+        verified: 0.5
+        inconclusive: 0.3
+        refuted: 0.2
+        blocked: 0.0
+
+  # ── 6. MCP install permission gate ───────────────────────────────────────
+  # B54 R-5a redesign (2026-05-25): "mentions permission approval step"
+  # content rubric removed — permission gate fires INSIDE the install
+  # flow, not in the LLM reply. LLM mention of permission was over-strict
+  # content requirement, not a real Reyn behavior test.
+  #
+  # F2 (2026-05-27): post-PR-#918 mcp install 3-verb split removed the
+  # ``mcp_install`` stdlib skill in favour of the
+  # ``mcp_install_registry`` / ``mcp_install_package`` /
+  # ``mcp_install_local`` verb handlers (= op_runtime direct, no skill
+  # spawn). ``skill_run_spawned`` no longer fires for install; structural
+  # signal narrows to ``routing_decided`` + the behavioural rubric. The
+  # ``stdlib-skills/mcp-install`` cover tag is dropped accordingly.
+  - id: mcp_install_permission_gate
+    covers:
+      - mcp/mcp-install
+      - permissions/layer-4-interactive-prompt
+      - control-ir-ops/mcp-install
+    input: "postgres MCP サーバーをインストールして。"
+    expected:
+      reply:
+        kind: judge
+        rubric:
+          - reply addresses the postgres MCP install request (= reports install outcome OR honestly reports server not found / install not attempted)
+          - reply does NOT fabricate that install succeeded when no install events fired
+      events:
+        must_emit:
+          - { type: routing_decided, count: ">=1" }
+      outcome_prediction:
+        verified: 0.5
+        inconclusive: 0.3
+        refuted: 0.2
+        blocked: 0.0
+
+  # ── 7. Scheduled job status introspection ────────────────────────────────
+  # B54 R-5a redesign (2026-05-25): "shows how to configure" content rubric
+  # removed — that's a how-to elaboration weak-tier doesn't reliably
+  # produce when starting from an empty config. Refocused on whether LLM
+  # honestly reports cron context (= no jobs configured / not available)
+  # without fabricating job entries.
+  - id: cron_schedule_status
+    covers:
+      - cli/reyn-run
+      - stdlib-skills/ops-report
+    input: "現在スケジュールされている cron ジョブの一覧を見せて。"
+    expected:
+      reply:
+        kind: judge
+        rubric:
+          - reply addresses the cron jobs query (= lists configured jobs OR honestly reports no cron jobs are configured / scheduled)
+          - reply does NOT fabricate cron job entries that do not exist in reyn.yaml
+      events:
+        must_emit:
+          - { type: routing_decided, count: ">=1" }
+      outcome_prediction:
+        verified: 0.6
+        inconclusive: 0.25
+        refuted: 0.15
+        blocked: 0.0

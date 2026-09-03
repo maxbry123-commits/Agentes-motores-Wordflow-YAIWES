@@ -1,0 +1,365 @@
+"""Tests for the PR35 router system prompt builder.
+
+#1627 Stage 4: ``build_system_prompt`` is a pure slot-injector. Tests that
+need tool-use SP content (Capabilities routing guide, ROUTING RULE, etc.) must
+pass a ``tool_use_sp`` slot-map explicitly — the default (None) yields a bare
+OS frame with no tool-use SP.
+"""
+from __future__ import annotations
+
+from reyn.runtime.router_system_prompt import build_system_prompt
+from reyn.tools.schemes._universal_sp import build_universal_tool_use_slots
+
+
+def _default_slots() -> "dict[str, str]":
+    """Universal-category slot-map (wrappers ON, search on). #1977: these tests
+    assert the wrapper-SP (invoke_action routing), so build with wrappers ON to
+    match that intent — pre-#1977 the wrappers-off SP leaked the wrapper vocab,
+    masking this flag. ON output is byte-identical to the prior behaviour; the
+    wrappers-off (no-wrapper-vocab) path is covered by
+    test_plan_tool_surface_scheme_consistency_1977."""
+    return build_universal_tool_use_slots(
+        universal_wrappers_enabled=True,
+        search_actions_enabled=True,
+        discovery_mandate=False,
+        non_interactive=False,
+    )
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _make_skill(name: str, category: str | None = None) -> dict:
+    d: dict = {"name": name, "description": f"Does {name}"}
+    if category is not None:
+        d["category"] = category
+    return d
+
+
+def _make_agent(name: str, cluster: str | None = None) -> dict:
+    d: dict = {"name": name, "role": f"Agent {name}"}
+    if cluster is not None:
+        d["cluster"] = cluster
+    return d
+
+
+_EMPTY_MEMORY: dict = {"status": "not_found", "content": ""}
+
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+
+class TestEmptyStateRenders:
+    def test_empty_state_renders(self):
+        """Tier 2: build_system_prompt returns a non-empty string with required sections.
+
+        #1627 Stage 4: tool_use_sp must be supplied for Capabilities content.
+        """
+        prompt = build_system_prompt(
+            agent_name="chat",
+            agent_role="general assistant",
+            available_agents=[],
+            memory_index=_EMPTY_MEMORY,
+            tool_use_sp=_default_slots(),
+        )
+        assert isinstance(prompt, str)
+        assert len(prompt) > 0
+        # Header must be present
+        assert "Role: chat router for agent chat" in prompt
+        # Routing guide section present
+        assert "## Capabilities (routing guide)" in prompt
+        # Behaviour section present
+        assert "## Behaviour" in prompt
+
+
+class TestIdentityPreambleScoped:
+    """Tier 2: #1765 — the identity rule is scoped to identity questions.
+
+    Owner bug report: every reply began with "I am a Reyn agent". Root cause was
+    the OS identity preamble pairing a positive self-description rule with an
+    "(always apply)" header, which the LLM over-applied as "open every answer
+    with the identity line". The fix scopes the positive rule to identity
+    questions (with an explicit no-prepend instruction) while keeping the two
+    negative rules genuinely always-apply.
+    """
+
+    def _prompt(self) -> str:
+        return build_system_prompt(
+            agent_name="chat",
+            agent_role="general assistant",
+            available_agents=[],
+            memory_index=_EMPTY_MEMORY,
+            tool_use_sp=_default_slots(),
+        )
+
+    def test_identity_rule_is_scoped_not_always_applied(self):
+        """Tier 2: the positive identity rule is gated to identity questions."""
+        prompt = self._prompt()
+        # The over-applying phrasing is gone: the header no longer hangs
+        # "(always apply)" over the positive self-description rule, and the
+        # "Lead self-descriptions with ..." imperative is removed.
+        assert "Identity rules (always apply):" not in prompt
+        assert "Lead self-descriptions with" not in prompt
+        # The positive rule is now explicitly scoped + carries a no-prepend guard.
+        assert "do NOT prepend it to answers on unrelated topics" in prompt
+        assert 'never with "I am a Reyn agent"' in prompt
+
+    def test_identity_behaviour_when_asked_is_preserved(self):
+        """Tier 2: 'identify as a Reyn agent when asked' is retained."""
+        prompt = self._prompt()
+        assert "When asked who or what you are" in prompt
+        assert '"a Reyn agent"' in prompt
+
+    def test_vendor_negatives_remain_always_apply(self):
+        """Tier 2: the two genuine always-apply negatives are unchanged."""
+        prompt = self._prompt()
+        assert "MUST NOT identify as Google, OpenAI, Anthropic, or any" in prompt
+        assert 'MUST NOT begin with "I am a large language model"' in prompt
+        # The always-apply qualifier now governs the negatives.
+        assert "Always apply: MUST NOT" in prompt
+
+
+class TestJapaneseInRolePreserved:
+    def test_japanese_role(self):
+        """Tier 2: Japanese characters in agent_role are preserved verbatim in the system prompt."""
+        role = "日本語エージェントの役割説明"
+        prompt = build_system_prompt(
+            agent_name="jp_bot",
+            agent_role=role,
+            available_agents=[],
+            memory_index=_EMPTY_MEMORY,
+        )
+        assert role in prompt
+        assert "jp_bot" in prompt
+
+
+# ---------------------------------------------------------------------------
+# Files section: omitted in wrapper-only path
+# ---------------------------------------------------------------------------
+
+class TestFilesSection:
+    def _base_prompt(self, **kwargs) -> str:
+        return build_system_prompt(
+            agent_name="chat",
+            agent_role="assistant",
+            available_agents=[],
+            memory_index=_EMPTY_MEMORY,
+            **kwargs,
+        )
+
+    def test_files_section_omitted_when_no_permissions(self):
+        """Tier 2: ## Files section absent in wrapper-only path (no file_permissions)."""
+        prompt = self._base_prompt()
+        assert "## Files" not in prompt
+
+    def test_files_section_omitted_when_none(self):
+        """Tier 2: ## Files section absent in wrapper-only path (file_permissions=None)."""
+        prompt = self._base_prompt(file_permissions=None)
+        assert "## Files" not in prompt
+
+    def test_files_section_omitted_when_both_empty(self):
+        """Tier 2: ## Files section absent in wrapper-only path (empty permissions)."""
+        prompt = self._base_prompt(file_permissions={"read": [], "write": []})
+        assert "## Files" not in prompt
+
+    def test_files_section_omitted_even_with_read_permissions(self):
+        """Tier 2: ## Files section absent in wrapper-only path even when permissions set.
+
+        Phase 6 cleanup: files section removed from SP — discovery goes through
+        list_actions(category=['file']) at runtime.
+        """
+        prompt = self._base_prompt(
+            file_permissions={"read": ["src", "docs"], "write": []}
+        )
+        assert "## Files" not in prompt
+
+    def test_files_section_omitted_with_full_scope(self):
+        """Tier 2: ## Files section absent in wrapper-only path with full scope."""
+        prompt = self._base_prompt(
+            file_permissions={"read": ["src", "docs"], "write": ["output"]}
+        )
+        assert "## Files" not in prompt
+
+
+# ---------------------------------------------------------------------------
+# MCP servers section: omitted in wrapper-only path
+# ---------------------------------------------------------------------------
+
+class TestMCPSection:
+    def _base_prompt(self, **kwargs) -> str:
+        return build_system_prompt(
+            agent_name="chat",
+            agent_role="assistant",
+            available_agents=[],
+            memory_index=_EMPTY_MEMORY,
+            **kwargs,
+        )
+
+    def test_mcp_section_omitted_when_no_servers(self):
+        """Tier 2: ## MCP servers section absent in wrapper-only path."""
+        prompt = self._base_prompt()
+        assert "## MCP servers" not in prompt
+
+    def test_mcp_section_omitted_when_none(self):
+        """Tier 2: ## MCP servers section absent in wrapper-only path (None)."""
+        prompt = self._base_prompt(mcp_servers=None)
+        assert "## MCP servers" not in prompt
+
+    def test_mcp_section_omitted_when_empty_list(self):
+        """Tier 2: ## MCP servers section absent in wrapper-only path (empty list)."""
+        prompt = self._base_prompt(mcp_servers=[])
+        assert "## MCP servers" not in prompt
+
+    def test_mcp_section_omitted_with_servers(self):
+        """Tier 2: ## MCP servers section absent in wrapper-only path even with servers.
+
+        Phase 6 cleanup: MCP section removed from SP — discovery goes through
+        list_actions(category=['mcp.server','mcp.tool']) at runtime.
+        """
+        prompt = self._base_prompt(
+            mcp_servers=[
+                {"name": "fs", "description": "filesystem"},
+                {"name": "fetch", "description": "web fetch"},
+            ]
+        )
+        assert "## MCP servers" not in prompt
+
+
+# ---------------------------------------------------------------------------
+# Dynamic tool names: absent in wrapper-only path
+# ---------------------------------------------------------------------------
+
+def _base_prompt(**kwargs) -> str:
+    return build_system_prompt(
+        agent_name="chat",
+        agent_role="assistant",
+        available_agents=[],
+        memory_index=_EMPTY_MEMORY,
+        **kwargs,
+    )
+
+
+class TestIntentAxisDynamic:
+    def test_no_file_tool_names_when_no_file_permissions(self):
+        """Tier 2: file-class tools absent from the prompt without an
+        explicit `file.*` declaration.
+
+        Phase 6 cleanup: per-tool SP sections removed; discovery via
+        list_actions(category=['file']) replaces SP enumeration.
+        """
+        prompt = _base_prompt(file_permissions=None)
+        assert "read_file" not in prompt
+        assert "write_file" not in prompt
+        assert "delete_file" not in prompt
+        assert "list_directory" not in prompt
+
+    def test_no_mcp_tool_names_when_no_mcp_servers(self):
+        """Tier 2: MCP tools absent from wrapper-only path SP."""
+        prompt = _base_prompt(mcp_servers=[])
+        assert "list_mcp_servers" not in prompt
+        assert "list_mcp_tools" not in prompt
+        assert "call_mcp_tool" not in prompt
+
+    def test_no_mcp_tool_names_when_mcp_servers_none(self):
+        """Tier 2: MCP tools absent from wrapper-only path SP (None)."""
+        prompt = _base_prompt(mcp_servers=None)
+        assert "list_mcp_servers" not in prompt
+        assert "list_mcp_tools" not in prompt
+        assert "call_mcp_tool" not in prompt
+
+    def test_no_when_clause_annotations(self):
+        """Tier 2: no conditional annotations in wrapper-only SP."""
+        prompt = _base_prompt()
+        assert "(when file scope set)" not in prompt
+        assert "(when mcp configured)" not in prompt
+        assert "(when file write scope set)" not in prompt
+
+    def test_intent_axis_still_renders_without_permissions(self):
+        """Tier 2: Core routing rules remain even with no permissions.
+
+        Phase 6 cleanup: intent-axis row format removed; routing intent
+        encoded in Behaviour section via invoke_action vocabulary.
+        #1627 Stage 4: tool_use_sp slot-map required for routing content.
+        """
+        prompt = _base_prompt(tool_use_sp=_default_slots())
+        assert "ROUTING RULE (ABSOLUTE)" in prompt
+        assert "invoke_action" in prompt
+        assert "NO clarifying questions" in prompt
+        assert "NO text replies" in prompt
+
+
+# ---------------------------------------------------------------------------
+# Behaviour rules (F3 + F9 fix): still present under invoke_action vocab
+# ---------------------------------------------------------------------------
+
+class TestBehaviourRulesAfterF3F9Fix:
+    """Tier 2: pin the Behaviour rules that remain after Phase 6 SP simplification.
+
+    B23-PRE-1 SP role-separation moved per-tool flow details (post-list MUST,
+    post-describe MUST, spawn-ack, task_completed, delegation) to tool
+    descriptions. The SP Behaviour section retains only cross-cutting policies.
+    """
+
+    def test_reply_directly_restricted_to_chitchat(self):
+        """Tier 2: 'Reply directly' rule restricted — only conversation (chitchat).
+        Domain tasks must go to invoke_action. Canonical location: Capabilities
+        routing guide (#1475: Policy 1 removed from Behaviour, single canonical).
+        #1627 Stage 4: tool_use_sp slot-map required for Capabilities content.
+        """
+        prompt = build_system_prompt(
+            agent_name="chat",
+            agent_role="",
+            available_agents=[],
+            memory_index=_EMPTY_MEMORY,
+            tool_use_sp=_default_slots(),
+        )
+        # Conversation → reply directly (canonical in Capabilities routing guide)
+        assert "Conversation" in prompt
+        assert "reply" in prompt
+        assert "`invoke_action`" in prompt or "invoke_action" in prompt
+
+    def test_v3_absolute_routing_rule_present(self):
+        """Tier 2: B13-R3 V3 wording — ABSOLUTE routing rule block is present
+        in the Behaviour section with the required components.
+        #1627 Stage 4: tool_use_sp slot-map required for ROUTING RULE content.
+        """
+        prompt = build_system_prompt(
+            agent_name="chat",
+            agent_role="assistant",
+            available_agents=[],
+            memory_index=_EMPTY_MEMORY,
+            tool_use_sp=_default_slots(),
+        )
+        # ABSOLUTE rule framing must be present
+        assert "ROUTING RULE (ABSOLUTE)" in prompt
+        # Core imperative: call invoke_action immediately
+        assert "invoke_action" in prompt
+        # Explicit prohibitions
+        assert "NO clarifying questions" in prompt
+        assert "NO text replies" in prompt
+
+
+class TestPostInvokeSkillNarrationGuidance:
+    """Tier 2: FP-0034 B23-PRE-1 — spawn-ack and completion-narration content
+    moved from SP to invoke_action.description. The SP Behaviour section retains
+    only the cross-cutting errors/optimism-bias policy.
+
+    The per-tool content (Priority 1 /tasks MUST, task_completed handling,
+    anti-fabrication) is validated in test_tool_description_role_separation.py.
+    """
+
+    def test_anti_optimism_cross_cutting_policy_present(self):
+        """Tier 2: SP Behaviour has cross-cutting anti-optimism policy.
+
+        Errors MUST surface verbatim is a cross-cutting rule that applies
+        regardless of which tool was most recently called.
+        """
+        prompt = build_system_prompt(
+            agent_name="chat",
+            agent_role="assistant",
+            available_agents=[],
+            memory_index=_EMPTY_MEMORY,
+        )
+        assert "Errors MUST surface verbatim" in prompt
+        assert "Optimism bias" in prompt

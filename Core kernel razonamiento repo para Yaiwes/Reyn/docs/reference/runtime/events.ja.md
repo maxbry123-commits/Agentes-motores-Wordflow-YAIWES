@@ -1,0 +1,149 @@
+---
+type: reference
+topic: runtime
+audience: [human, agent]
+---
+
+# Events
+
+Reyn はすべての状態変化に対して構造化イベントを発行します。完全なイベントログは JSONL で、`.reyn/events/<run_id>.jsonl` に書き込まれ、`reyn events <log_file>` でリプレイ可能です。
+
+## Kind vocabulary
+
+`type` フィールドは実装コード側では**閉じた集合**から取られます。本ページはその**主要な kind の一覧**です — 網羅ではありません。したがって「このページに無い kind 向けに書いたハンドラが発火するかどうか」は本ページからは判断できません（判断できるのは英語版だけ — 下記参照）。
+
+SSoT は `src/reyn/core/events/event_schema.py` の `AUDIT_EVENT_KINDS` で、発行側コードと英語版ページの双方に対して CI が双方向に一致を検査します。
+
+**完全な列挙は [英語版 events リファレンス](events.md#kind-vocabulary) にあります。** 列挙をこのページに複製すると二重管理になり、CI が検査するのは英語版だけなので、この日本語ページの複製だけが静かに古くなります（本 issue #3410 が扱った欠陥そのもの）。列挙は 1 箇所だけに置きます。
+
+この集合が**表さない**ものが 2 つあります:
+
+- **`op` の値ではありません。** `read_file` / `write_file` / `grep` などは、共有 kind `tool_executed` の中の `op` フィールドの値であって、独立した kind ではありません。別の軸であり、この語彙には含まれません。
+- **フィールド契約ではありません。** ある kind がどのペイロードフィールドを必須で持つかは別のレジストリ（同モジュールの `EVENT_AUDIT_REQUIREMENTS`、この語彙の部分集合を対象）で、以下の節が散文で説明しています。
+
+## イベントエンベロープ
+
+すべてのイベントは以下を持ちます:
+
+```json
+{
+  "type": "<event_kind>",
+  "timestamp": "2026-04-30T10:00:00.123456+00:00",
+  "data": {
+    ... // kind 固有のペイロード。発行元の EventLog が設定されていれば
+        // agent_id / run_id を含むことがある(下記参照)
+  }
+}
+```
+
+## Agent ID フィールド（全イベント共通）
+
+`reyn.yaml` で `agent_id` が設定されているセッションから発行されるすべてのイベントのペイロードには、自動的に `agent_id` フィールドが付与されます。デフォルト値は `reyn/<hostname>` です。これにより、SOC2 / ISO 27001 / METI v1.1 要件に準拠した RBAC およびマルチエージェント監査証跡が実現されます。
+
+詳細は [コンセプト: マルチエージェント](../../concepts/multi-agent/multi-agent.md) の「Agent ID 伝播」を参照してください。
+
+## LLM とコンテキスト
+
+| 種類 | 主要なペイロード |
+|------|-------------|
+| `llm_called` | `phase`、`model`、`input_tokens`、`output_tokens`、`latency_ms` |
+
+## Control IR
+
+各 Control IR op の種類は独自のイベントを発行します:
+
+| 種類 | タイミング |
+|------|------|
+| `read_file`、`write_file`、`edit_file`、`delete_file`、`glob_files`、`grep`、`regenerate_index` | `file` op のバリアント — すべて `tool_executed`（`op=<sub_op>`）経由 |
+| `sandboxed_exec_started`、`sandboxed_exec_completed` | `sandboxed_exec` op — `started`: `argv`、`argv0_resolved`、`backend`; `completed`: `argv`、`argv0_resolved`、`backend`、`returncode`、`denial_class`。`argv0_resolved`（#2820）は実際に実行された絶対パス: version-manager shim（`~/.pyenv/shims/python3`）は manager の on-disk layout をデータ読取して実バイナリに解決される（part A — filesystem-only、subprocess なし）ため、sandbox は shim ではなく実バイナリを直接実行する（shim の launch-`fork()` は `(deny process-fork)` 下で死ぬ）。非 shim コマンドでは PATH 解決結果に等しく、解決不能時は `argv[0]` のまま（fail-open）。`denial_class` は `(deny process-fork)` 下で PATH 上の launcher/shim（pyenv/asdf/mise/npx/uvx）の内部 fork がブロックされたとき `"fork_denied"`、op 自身の `network` field が unset/false のため outbound `connect()` がブロックされたとき `"network_denied"`（#5244①）、それ以外は `null` — ツール失敗ではなく環境/設定の問題 |
+| `mcp_called`、`mcp_completed`、`mcp_failed`、`mcp_cancelled` | MCP ツール op — `mcp_cancelled`（#2813）は Ctrl-C の `cancel_event` が実行中の呼び出しを完了前に中断したとき、`mcp_completed`/`mcp_failed` の代わりに発火 |
+| `mcp_server_installed` | `mcp_install` op — `name`、キー名のみ（値は含まない） |
+| `mcp_install_cancelled`、`mcp_prompt_get_cancelled`、`mcp_resource_read_cancelled`、`mcp_resource_subscribe_cancelled`、`mcp_resource_unsubscribe_cancelled` | #2813 — Ctrl-C の `cancel_event` が該当 op（install probe / get-prompt / read-resource / subscribe / unsubscribe）を完了前に中断。op は `status:"cancelled"` を返し、何もコミットされない |
+| `web_search_started`、`web_search_completed`、`web_search_failed` | web_search op — `started`: `query`、`backend`; `completed`: `result_count` を追加; `failed`: `error` を追加 |
+| `web_fetch_started`、`web_fetch_completed`、`web_fetch_failed` | web_fetch op — `started`: `url`; `completed`: `url`、`status_code`、`content_length`、`extractor`; `failed`: `url`、`status`（`"timeout"` または `"error"`）、`error` |
+| `semantic_search_embed_failed` | `semantic_search` op（FP-0057 Phase 2a; `recall` から rename）— モデルグループの embed 呼び出しが失敗したとき: `query`、`model`、`error` |
+| `index_dropped` | `index_drop` op — `source`、`chunks_dropped: int` |
+| `control_ir_skipped`、`control_ir_failed` | ディスパッチ失敗（`control_ir_skipped` の理由には `handler_not_implemented` を含む） |
+| `permission_denied` | op がリゾルバーに拒否されたとき |
+
+## MCP
+
+上記の Control IR の `mcp_*` イベント（ツール呼び出し op に紐づく）とは異なり、これらは op ディスパッチとは独立に、MCP 接続 / receive-loop から非同期に発行されます:
+
+| 種類 | トリガー | 主要なペイロード |
+|------|---------|-------------|
+| `mcp_initialized` | （再）接続のたびに、サーバーの `initialize` ハンドシェイクが完了した時点で発行。 | `server`、`negotiated_version`、`capabilities` |
+| `mcp_resource_updated` | 購読中の resource のサーバープッシュ `resources/updated` 通知、またはトランスポート断からの reconnect 後に再購読された URI ごとに発火する合成 resync。フックディスパッチャーにも外部イベントフックポイントとして配線されています — [コンセプト: フック](../../concepts/runtime/hooks.ja.md#外部イベントポイント) 参照。 | `server`、`uri`、`resync`（reconnect resync なら `true`、実際のプッシュなら `false`） |
+| `mcp_elicitation_requested` | サーバーが `elicitation/create` 構造化入力要求を発行。 | `server`、`field_keys`（要求されたスキーマのプロパティ*名*のみ — 値は決して含まない） |
+| `mcp_elicitation_answered` | 要求が `accept` または `decline` に解決される（人間の選択、または `auto_decline` 設定による `decline`）。 | `server`、`field_keys`、`action`（`"accept"` \| `"decline"`） |
+| `mcp_elicitation_timed_out` | `elicitation_timeout_seconds` までに回答が届かなかった。 | `server`、`field_keys` |
+| `mcp_elicitation_auto_declined` | プロンプトせずに decline された — `reason` はサーバーが `elicitation: auto_decline` を設定している場合とヘッドレスコンテキスト（ライブの介入リスナーが無い）を区別する。 | `server`、`field_keys`、`reason`（`"server_configured"` \| `"headless"`） |
+
+これらのイベントはいずれも、人間が入力した回答やフィールドの*値*を一切含みません — 要求されたスキーマのプロパティ名のみです。[コンセプト: MCP § Elicitation](../../concepts/tools-integrations/mcp.ja.md#elicitation-サーバーからの構造化入力要求) で説明されているセンシティブフィールドの扱いと一致します。
+
+## クレデンシャルと OAuth
+
+| 種類 | トリガー | 主要なペイロード |
+|------|---------|-------------|
+| `token_refreshed` | `reyn.secrets.get_valid_token(key)` がプロバイダーのトークンエンドポイント（RFC 6749 §6）に対して OAuth リフレッシュに成功した後に発行されます。 | `key: str` — OAuth トークンキー（`~/.reyn/oauth_tokens.json` エントリと同じ）; `expires_at: str` — 新しいアクセストークンの有効期限の ISO-8601 タイムスタンプ。 |
+| `token_refresh_failed` | `get_valid_token` がトークンエンドポイントから非 2xx レスポンスを受け取るか、レスポンスペイロードが不正な形式の場合に発行されます。`OAuthRefreshError` を raise します。 | `key: str`; `error: str` — 短いエラー説明（HTTP ステータス + 利用可能な場合はプロバイダーエラーコード）。 |
+
+**注記:**
+- `token_refresh_failed` は `token_refreshed` とペアになります — ネットワークリフレッシュを実行する `get_valid_token` 呼び出しごとに、どちらか一方のみ発行されます。
+
+関連情報: [コンセプト: シークレット処理](../../concepts/runtime/secret-handling.md) — OAuth ライフサイクルとクレデンシャルスコープ; [コンセプト: パーミッションモデル](../../concepts/runtime/permission-model.md) — スキルごとのクレデンシャルスコープ。
+
+## アクションカタログルーティング
+
+| 種類 | トリガー | 主要なペイロード |
+|------|---------|-------------|
+| `routing_decided` | router の単一ディスパッチ関門（`RouterLoop._dispatch_resolved`）で、カタログアクションがディスパッチされるたびに発行されます — `invoke_action` ラッパー経由、ARS-salvage された直接呼び出し、あるいは（#3455）reyn.yaml で `tool_use.universal_wrappers_enabled: false`（`action_retrieval:` から移動、#4552 PR-3+4）を設定した場合のフラットな bare-name ディスパッチパスのいずれでも。 | `action_name: str`; `source: str` — `"invoke_action"` \| `"ars_direct"`; `outcome: str` — `"success"` \| `"error"`; `chain_id: str` — クロスコール相関用リクエストチェーン識別子。 |
+
+**注記:** モデルがどの入口を使ったかによらず、カタログアクションのルーティングを監査できます（#3455: 以前は `invoke_action` ラッパー経由にのみ紐づいており、`universal_wrappers_enabled: false` の opt-out 構成ではこのイベントが一度も発行されませんでした）。`chain_id` を使って、アクションのダウンストリームイベントとのクロスコリレーションが行えます。
+
+## ユーザーインタラクション
+
+| 種類 | タイミング |
+|------|------|
+| `user_message_received` | 新しいユーザーターンがランタイムに入ったとき。`chain_id`（`submit_user_text` がミントし、このターンが生成するすべての agent 間メッセージに伝播される uuid）を持つ |
+| `user_intervention_received` | `ask_user` op が回答を受け取ったとき |
+| `chat_started`、`chat_stopped` | chat セッションのライフサイクル |
+
+## agent 間メッセージング
+
+| 種類 | タイミング | 主要なペイロード |
+|------|------|-------------|
+| `agent_message_sent` | `_send_to_agent` または `_send_agent_response` がペイロードを届けたとき | `kind=agent_request\|agent_response`、`from_agent`、`to_agent`、`depth`、`chain_id` |
+| `agent_request_received` | 受信 agent が受信トレイから `agent_request` を取り出したとき | `from_agent`、`depth`、`chain_id` |
+| `agent_response_received` | 発信元 agent が受信トレイから `agent_response` を取り出したとき | `from_agent`、`depth`、`chain_id` |
+| `agent_message_refused` | 送信が拒否されたとき（例: `safety.loop.max_agent_hops` を超えた） | `reason`、`to_agent`、`depth`、`chain_id` |
+| `chain_timeout` | 保留中のチェーンが `safety.timeout.chain_seconds` を超え、上流の合成エラーレスポンスで強制解決されたとき | `chain_id`、`waiting_on`（返信していなかった agent のソート済みリスト）、`timeout_seconds`、`origin_agent` |
+
+`chain_id` は uuid4 hex。トップレベルのユーザー送信ごとに 1 つ、すべてのホップを通じて変更されずに伝播します。クロス agent の再構築は各 agent の `events.jsonl` と `history.jsonl` に対する `grep <chain_id>` です。
+
+## Workspace
+
+| 種類 | タイミング |
+|------|------|
+| `workspace_updated` | 任意の artifact が書き込まれたとき |
+| `tool_executed` | 汎用ツールディスパッチ |
+
+## リプレイ
+
+```bash
+reyn events .reyn/events/<run_id>.jsonl
+```
+
+保存されたログをライブランと同じフォーマットでコンソールに再レンダリングします。LLM は再呼び出しされません。リプレイは検査のみを目的としています。
+
+## すべてがイベントである理由
+
+「すべての状態変化が発行する」から 2 つの帰結が生まれます:
+
+- **再現性。** 保存されたログは実行の完全な記録です。将来のチェックポイント/再開の設計（ロードマップ参照）はこれに基づいて構築されます。
+- **ボルトオンなしの Observability。** 個別のロガー、トレーサー、テレメトリフックなし。同じチャネルがデバッグ出力、リプレイ、（将来的には）eval アナリティクスを動かします。
+
+## 関連情報
+
+- [control-ir.md](control-ir.md) — Control IR op
+- [コンセプト: events](../../concepts/runtime/events.md)

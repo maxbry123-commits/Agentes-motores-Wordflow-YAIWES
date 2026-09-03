@@ -1,0 +1,1331 @@
+"""`reyn mcp` — MCP server lifecycle management + expose Reyn to outer LLM clients.
+
+Subcommands
+-----------
+serve          Expose Reyn agents to outer LLM clients via MCP (inbound, existing).
+search         Search the MCP registry for servers.
+install        Install an MCP server from a --source spec (direct).
+list           List configured MCP servers with status.
+remove         Remove an MCP server from configuration.
+set-secret     Set a secret for an MCP server.
+clear-secret   Clear a secret (or all secrets) for an MCP server.
+"""
+from __future__ import annotations
+
+import argparse
+import getpass
+import os
+import sys
+from pathlib import Path
+
+from reyn.config.chat import TimeoutConfig
+from reyn.runtime.services.mcp_cache_file import (
+    ProbeOutcome,
+    ToolsAnswered,
+    ToolsUnknown,
+    answered_only,
+)
+
+from ..common_args import add_common_args
+from ..invocation_context import InvocationContext
+
+# #3475: THE default for the MCP tools-list per-server probe timeout lives on
+# ``TimeoutConfig.mcp_probe_seconds`` (config-definition side, #3461's
+# ``FileScopes`` precedent) — this module reads it rather than repeating the
+# literal, so this CLI and ``RouterHostAdapter.ensure_mcp_tools_cached`` derive
+# their own defaults from the SAME source instead of two independent ``5.0``s.
+_DEFAULT_MCP_PROBE_SECONDS = TimeoutConfig().mcp_probe_seconds
+
+# ---------------------------------------------------------------------------
+# Scope tier helpers
+# ---------------------------------------------------------------------------
+
+_VALID_SCOPES = ("local", "project", "user")
+
+
+def _scope_path(scope: str, project_root: Path | None) -> Path:
+    """Resolve the yaml file path for a given scope tier."""
+    if scope == "user":
+        return Path.home() / ".reyn" / "config.yaml"
+    if scope == "project":
+        if project_root is None:
+            print(
+                "error: --scope project requires a project root with reyn.yaml. "
+                "Run from inside a Reyn project or use --scope local/user.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        return project_root / "reyn.yaml"
+    # "local" (default)
+    if project_root is None:
+        print(
+            "error: --scope local requires a project root with reyn.yaml. "
+            "Run from inside a Reyn project or use --scope user.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return project_root / "reyn.local.yaml"
+
+
+def _load_yaml_file(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        import yaml
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        return data if isinstance(data, dict) else {}
+    except Exception as exc:
+        print(f"warning: could not parse {path}: {exc}", file=sys.stderr)
+        return {}
+
+
+def _write_yaml_file(path: Path, data: dict) -> None:
+    import yaml
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(yaml.dump(data, allow_unicode=True, default_flow_style=False),
+                    encoding="utf-8")
+
+
+def _get_project_root() -> Path | None:
+    from reyn.config import _find_project_root
+    return _find_project_root(Path.cwd())
+
+
+def _get_servers_from_scope(scope: str, project_root: Path | None) -> dict:
+    """Return mcp.servers dict from a single scope file.
+
+    Returns an empty dict when project_root is None and scope requires it.
+    """
+    if scope in ("project", "local") and project_root is None:
+        return {}
+    path = _scope_path(scope, project_root)
+    data = _load_yaml_file(path)
+    return (data.get("mcp") or {}).get("servers") or {}
+
+
+def _all_servers_with_scope(project_root: Path | None) -> list[tuple[str, str, dict]]:
+    """Return (name, scope, server_cfg) tuples from all scope tiers, deduplicated.
+
+    Later (higher-priority) scopes override earlier ones for the same name.
+    Priority: local > project > user.  Project/local scopes are skipped when
+    project_root is None (i.e. invoked outside any project directory).
+    """
+    merged: dict[str, tuple[str, dict]] = {}
+    for scope in ("user", "project", "local"):
+        if scope in ("project", "local") and project_root is None:
+            continue
+        path = _scope_path(scope, project_root)
+        data = _load_yaml_file(path)
+        servers = (data.get("mcp") or {}).get("servers") or {}
+        for name, cfg in servers.items():
+            merged[name] = (scope, cfg if isinstance(cfg, dict) else {})
+    return [(name, scope, cfg) for name, (scope, cfg) in merged.items()]
+
+
+# ---------------------------------------------------------------------------
+# register
+# ---------------------------------------------------------------------------
+
+
+def register(sub) -> None:
+    p = sub.add_parser(
+        "mcp",
+        help="Model Context Protocol — manage MCP servers and expose Reyn to outer clients",
+    )
+    msub = p.add_subparsers(dest="mcp_command", metavar="<subcommand>")
+    msub.required = True
+
+    # ---- serve (existing, unchanged) ----
+    serve = msub.add_parser(
+        "serve",
+        help="Run an MCP server (stdio) so external clients can chat with agents",
+    )
+    serve.add_argument(
+        "--project", dest="project", default=None, metavar="PATH",
+        help=(
+            "Project root containing reyn.yaml. Defaults to the closest "
+            "ancestor with a reyn.yaml, or the current directory."
+        ),
+    )
+    serve.add_argument(
+        "--timeout", dest="timeout", type=float, default=60.0, metavar="SECONDS",
+        help=(
+            "Maximum blocking time per send_to_agent call (default: 60). "
+            "On timeout the call returns whatever reply has accumulated; the "
+            "agent keeps working in the background."
+        ),
+    )
+    add_common_args(serve)
+    serve.set_defaults(func=run_serve)
+
+    # ---- search ----
+    search = msub.add_parser(
+        "search",
+        help="Search the MCP server registry",
+    )
+    search.add_argument(
+        "query",
+        metavar="QUERY",
+        help="Search query (e.g. 'github', 'filesystem')",
+    )
+    search.set_defaults(func=run_search)
+
+    # ---- install ----
+    install = msub.add_parser(
+        "install",
+        help="Install an MCP server into Reyn configuration",
+    )
+    install.add_argument(
+        "server_id",
+        nargs="?",
+        default=None,
+        metavar="SERVER_ID",
+        help=(
+            "Registry server identifier (e.g. 'io.github.foo/bar-mcp'). "
+            "Mutually exclusive with --source."
+        ),
+    )
+    install.add_argument(
+        "--source",
+        dest="source",
+        default=None,
+        metavar="SOURCE",
+        help=(
+            "Install directly from a source specifier, skipping the registry. "
+            "Supported forms: "
+            "npm:<package>[@version], "
+            "pypi:<package>[==version], "
+            "docker:<image>[:<tag>], "
+            "https://github.com/<owner>/<repo>[/tree/<ref>/...]. "
+            "Mutually exclusive with SERVER_ID."
+        ),
+    )
+    install.add_argument(
+        "--project", dest="project", default=None, metavar="PATH",
+        help=(
+            "Project root containing reyn.yaml. Defaults to the closest "
+            "ancestor with a reyn.yaml, or the current directory. #1442: "
+            "without this, install resolved the target cwd-only."
+        ),
+    )
+    install.add_argument(
+        "--scope",
+        choices=_VALID_SCOPES,
+        default="local",
+        help="Config scope to write into (default: local)",
+    )
+    install.add_argument(
+        "--env",
+        dest="env",
+        action="append",
+        metavar="KEY=VALUE",
+        default=[],
+        help="Pre-supply environment variable (may be repeated)",
+    )
+    install.add_argument(
+        "--args",
+        dest="extra_args",
+        default=None,
+        metavar="ARGS",
+        help=(
+            "Extra arguments appended to the server command after install "
+            "(shell-quoted string). "
+            "Example: --args \"--server pyright --language python\""
+        ),
+    )
+    install.add_argument(
+        "--non-interactive",
+        dest="non_interactive",
+        action="store_true",
+        help="Suppress interactive prompts (for CI use)",
+    )
+    install.set_defaults(func=run_install)
+
+    # ---- list ----
+    lst = msub.add_parser(
+        "list",
+        help="List configured MCP servers and their status",
+    )
+    lst.add_argument(
+        "--probe",
+        action="store_true",
+        help="Handshake with each server to verify liveness (slow; incurs API calls)",
+    )
+    lst.set_defaults(func=run_list)
+
+    # ---- remove ----
+    remove = msub.add_parser(
+        "remove",
+        help="Remove an MCP server from configuration",
+    )
+    remove.add_argument(
+        "name",
+        metavar="NAME",
+        help="Server name as declared in mcp.servers.*",
+    )
+    remove.add_argument(
+        "--scope",
+        choices=_VALID_SCOPES,
+        default=None,
+        help=(
+            "Scope tier to remove from. If omitted, removes from whichever "
+            "scope the server appears in (local first, then project, then user)."
+        ),
+    )
+    remove.set_defaults(func=run_remove)
+
+    # ---- set-secret ----
+    ss = msub.add_parser(
+        "set-secret",
+        help="Set a secret for an MCP server (MCP-aware thin wrapper over 'reyn secret set')",
+    )
+    ss.add_argument(
+        "server",
+        metavar="SERVER",
+        help="Server name as declared in mcp.servers.*",
+    )
+    ss.add_argument(
+        "key_value",
+        metavar="KEY[=VALUE]",
+        help="Secret key or KEY=VALUE pair. Value is prompted if omitted.",
+    )
+    ss.set_defaults(func=run_set_secret)
+
+    # ---- clear-secret ----
+    cs = msub.add_parser(
+        "clear-secret",
+        help="Clear a secret (or all secrets) for an MCP server",
+    )
+    cs.add_argument(
+        "server",
+        metavar="SERVER",
+        help="Server name as declared in mcp.servers.*",
+    )
+    cs.add_argument(
+        "key",
+        nargs="?",
+        default=None,
+        metavar="KEY",
+        help="Secret key to clear. If omitted, clears all secrets declared for the server.",
+    )
+    cs.set_defaults(func=run_clear_secret)
+
+    # ---- refresh ----
+    refresh = msub.add_parser(
+        "refresh",
+        help=(
+            "Re-probe all configured MCP servers and write results to the "
+            "persistent cache file (.reyn/state/mcp_tools_cache.json). "
+            "Active 'reyn chat' sessions pick up the new cache on their "
+            "next turn boundary — no restart required."
+        ),
+    )
+    refresh.add_argument(
+        "--project",
+        dest="project",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Project root containing reyn.yaml. "
+            "Defaults to the closest ancestor with a reyn.yaml."
+        ),
+    )
+    refresh.set_defaults(func=run_refresh)
+
+
+def _anchor_project_root(args: argparse.Namespace) -> Path:
+    """Resolve `reyn mcp serve`'s project root and anchor the process in it.
+
+    MUST run BEFORE the config is loaded (#3368). MCP clients (Claude Desktop,
+    Cursor, …) typically ignore the ``cwd`` field in their server config, so the
+    spawned server process lands in ``/`` — and ``load_config()`` resolves its
+    3-layer cascade from ``Path.cwd()``. Loading the config first therefore read
+    NO ``reyn.yaml`` at all and silently produced the built-in defaults
+    (``models: {}`` + ``model: "standard"``, ``permissions: {}``, default safety
+    / cost / mcp): the unmapped class ``"standard"`` then travelled through
+    ``ModelResolver.resolve``'s sanctioned raw-string passthrough all the way to
+    litellm, which rejected it with ``You passed model=standard`` — the
+    owner-reported symptom, with no ``--model`` flag and no ``/model`` command
+    anywhere in the picture. The ``os.chdir`` below already existed for exactly
+    this reason (relative ``.reyn/...`` paths), but it ran 44 lines AFTER the
+    config load, so it fixed the paths and not the config.
+
+    Extracted as a function so the ordering is structural: the caller cannot
+    obtain a project root without the chdir having happened, and every
+    cwd-derived read after it (config cascade included) sees the project.
+
+    Exits the process with a decision-enabling message when no project root can
+    be determined, or when the resolved root has no ``reyn.yaml``.
+    """
+    from reyn.config import _find_project_root
+
+    if args.project:
+        project_root = Path(args.project).resolve()
+    else:
+        # Note: MCP clients (Claude Desktop, Cursor, …) typically don't
+        # honour a `cwd` field in their server config, so the spawned
+        # process can land in `/`. If no --project was given and no
+        # reyn.yaml is reachable from cwd, fail loudly rather than
+        # silently creating `/.reyn/` (read-only on macOS) or worse.
+        found = _find_project_root(Path.cwd())
+        if found is None:
+            print(
+                "error: no reyn.yaml found from cwd; pass --project "
+                "<path-to-project-root>. MCP clients typically ignore "
+                "the `cwd` field in their config — set --project in "
+                "the args list instead.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        project_root = found
+
+    if not (project_root / "reyn.yaml").exists():
+        print(
+            f"error: {project_root}/reyn.yaml not found. "
+            f"Run `reyn init` there or pass a different --project path.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # MCP clients (Claude Desktop, Cursor, …) spawn the server with cwd=`/`,
+    # which causes any code that uses relative `.reyn/...` paths to try to
+    # write under the filesystem root and crash with a read-only-fs error.
+    # `--project` only fixes the explicit StateLog/budget paths in
+    # ``run_serve``; deeper code paths (Session, Workspace, AgentRegistry)
+    # also use relative paths internally — and the config cascade itself
+    # (#3368). Anchor the whole process at the project root so the same code
+    # that works under `reyn chat` works here unchanged.
+    os.chdir(project_root)
+    return project_root
+
+
+def run_serve(args: argparse.Namespace) -> None:
+    from reyn.config import load_project_context, resolve_project_context_path
+    from reyn.core.events.state_log import StateLog
+    from reyn.llm.llm import run_async
+    from reyn.mcp.server import serve_stdio
+    from reyn.runtime.budget.budget import BudgetTracker
+    from reyn.runtime.factory_config import SessionFactoryConfig
+    from reyn.runtime.presentation_consumer import NullPresentationConsumer
+    from reyn.runtime.profile import AgentProfile
+    from reyn.runtime.registry import AgentRegistry
+    from reyn.runtime.scoped_session_factory import build_scoped_chat_session
+    from reyn.security.permissions.permissions import PermissionResolver
+
+    # #3368: anchor FIRST — the config cascade below is cwd-derived, so it must
+    # not run until the process sits in the project root (see the helper).
+    project_root = _anchor_project_root(args)
+
+    session_cfg = InvocationContext.from_args(args)
+    # #3905: no per-surface startup credential check here. A missing-
+    # credentials run surfaces litellm's own typed exception unmodified on
+    # the first LLM call (the #2708 P3.2b funnel-level pre-check that used to
+    # wrap it was removed — an unnecessary hardcode, owner ruling).
+    model, _ = session_cfg.model_for(args)
+    output_language = session_cfg.output_language_for(args)
+    safety = session_cfg.safety_for(args)
+
+    state_log = StateLog(project_root / ".reyn" / "state" / "wal.jsonl")
+    budget_tracker = BudgetTracker(session_cfg.config.cost)
+    budget_tracker.hydrate(project_root / ".reyn" / "state" / "budget_ledger.jsonl")
+    budget_state_path = project_root / ".reyn" / "state" / "budget_state.json"
+    budget_tracker.load_state(budget_state_path)
+    budget_tracker.set_state_path(budget_state_path)
+
+    perm_config = getattr(session_cfg.config, "permissions", {}) or {}
+    # MCP serve runs non-interactively (no human at this stdin — that's the
+    # MCP client's transport), so the resolver should never block on prompts.
+    perm_resolver = PermissionResolver(
+        config_permissions=perm_config,
+        project_root=project_root,
+        interactive=False,
+    )
+
+    project_context = load_project_context(session_cfg.config, project_root)
+    # #3787: read-only turn-boundary edit-detection watcher target.
+    project_context_path = resolve_project_context_path(session_cfg.config, project_root)
+
+    def _session_factory(profile: AgentProfile, *, presentation_consumer=None, intervention_bridge=None):
+        # #1827 S3: resolve the agent's topology capability_profile (None/∅ unbound).
+        _ctx_perm, _profile_excluded = registry.resolved_profile_for(profile.name)
+        s = build_scoped_chat_session(
+            # #2708 P1: stdio-MCP is a history-harvest surface with no live present drain
+            # — a reviewed NA surface. Null is byte-identical (present was invisible before).
+            # #2708 P3.1: a spawn override (attached pipeline driver) wins when given.
+            presentation_consumer=presentation_consumer or NullPresentationConsumer("mcp"),
+            # #2708 P3.2a: forward the spawn-time intervention bridge (None = self-bound
+            # default). stdio-MCP is a machine surface; the seam is threaded uniformly.
+            intervention_bridge=intervention_bridge,
+            agent_name=profile.name,
+            model=model,
+            resolver=session_cfg.resolver,
+            permission_resolver=perm_resolver,
+            safety=safety,
+            mcp_servers=session_cfg.config.mcp,
+            output_language=output_language,
+            prompt_cache_enabled=session_cfg.config.llm.prompt_cache_enabled,
+            project_context=project_context,
+            project_context_path=project_context_path,
+            agent_role=profile.role,
+            compaction_config=session_cfg.config.chat.compaction,
+            reasoning_config=session_cfg.config.chat.reasoning,  # #1652
+            empty_stop_retry=session_cfg.config.chat.empty_stop_retry,  # #4677
+            registry=registry,
+            allowed_mcp=profile.allowed_mcp,
+            events_config=session_cfg.config.audit_events,
+            state_log=state_log,
+            budget_tracker=budget_tracker,
+            # #2093: the uniform reyn.yaml-derived per-session config bundle. (The same
+            # sandbox_config the A2A/MCP-serve factory once dropped — now it's in the
+            # bundle, so it can't be missed here.)
+            factory_config=SessionFactoryConfig.from_config(session_cfg.config, project_root),
+            # #1402: scoped capability surface, passed EXPLICITLY (required by
+            # build_scoped_chat_session). The stdio-MCP factory's current
+            # behaviour — defaults that document the gaps, NOT new capabilities
+            # (behavior-preserving). Fill = 1-line follow-up when a consumer needs it.
+            agent_id=None,
+            exclude_tools=None,
+            excluded_categories=_profile_excluded,  # #1667 (none here) + #1827 S3 profile view
+            contextual_permission=_ctx_perm,  # #1827 S3: capability_profile enforcement → live tool gate
+            router_max_iterations=session_cfg.config.safety.loop.max_router_iterations,
+            non_interactive=False,  # #1439 Fix #1: stdio-MCP byte-identical (run-once-only fix)
+            environment_backend=None,  # gap: MCP-serve lacks env-backend / container-rooting
+            sandbox_backend=None,
+            # #2415 root 3: host workspace base_dir anchors on the project root (== the permission
+            # zone base), not cwd — else a subdir invocation splits the write-target base from the
+            # approval base. Mirrors build_environment_backend's host return.
+            workspace_base_dir=project_root,
+            # #2427: anchor state dir on project_root too — mirrors env_backend host return.
+            workspace_state_dir=project_root / ".reyn",
+            eager_embedding_build=False,
+        )
+        s.load_history()
+        return s
+
+    registry = AgentRegistry(
+        project_root=project_root,
+        session_factory=_session_factory,
+        state_log=state_log,
+        # #2093: the uniform reyn.yaml-derived registry config bundle.
+        factory_config=SessionFactoryConfig.from_config(session_cfg.config, project_root),
+    )
+
+    timeout = float(getattr(args, "timeout", 60.0) or 60.0)
+
+    async def _main() -> None:
+        # Replay WAL into per-agent snapshots so any stranded in-flight sessions
+        # resume cleanly, the same as `reyn chat` startup. Schema mismatch
+        # surfaces a clean stderr line and exits non-zero.
+        from reyn.core.events.agent_snapshot import SchemaVersionError
+        try:
+            await registry.restore_all()
+        except SchemaVersionError as e:
+            print(f"Schema version mismatch: {e}", file=sys.stderr)
+            sys.exit(1)
+        await serve_stdio(registry, timeout=timeout)
+
+    run_async(_main())
+
+
+# ---------------------------------------------------------------------------
+# run_search
+# ---------------------------------------------------------------------------
+
+def run_search(args: argparse.Namespace) -> None:
+    """Search the MCP registry and display results as a rich table.
+
+    This is a thin CLI wrapper over RegistryClient.search().  No LLM
+    invocation is required for the discovery step.
+    """
+    from reyn.core.registry.client import RegistryClient, RegistryError
+    from reyn.llm.llm import run_async as _run_async
+
+    query = args.query.strip()
+    if not query:
+        print("Error: QUERY must not be empty.", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Searching MCP registry for: {query!r} …")
+
+    async def _do_search():
+        async with RegistryClient() as client:
+            return await client.search(query)
+
+    try:
+        results = _run_async(_do_search())
+    except RegistryError as exc:
+        print(f"Registry error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    if not results:
+        print("No results found.")
+        return
+
+    # Table layout: NAME / RUNTIME / DESCRIPTION / REPO
+    _MAX_DESC = 60
+    _MAX_NAME = 42
+    _MAX_REPO = 50
+
+    def _trunc(s: str, n: int) -> str:
+        return s if len(s) <= n else s[: n - 1] + "…"
+
+    header = (
+        f"{'NAME':<{_MAX_NAME}}  {'RUNTIME':<8}  "
+        f"{'DESCRIPTION':<{_MAX_DESC}}  REPO"
+    )
+    print()
+    print(header)
+    print("─" * len(header))
+    for server in results:
+        name = _trunc(server.name, _MAX_NAME)
+        runtime = server.runtime_hint or "(unknown)"
+        desc = _trunc(server.description, _MAX_DESC)
+        repo_raw = server.repository_url if server.repository_url else "(no repo URL)"
+        repo = _trunc(repo_raw, _MAX_REPO)
+        print(
+            f"{name:<{_MAX_NAME}}  {runtime:<8}  {desc:<{_MAX_DESC}}  {repo}"
+        )
+    print()
+    print(f"{len(results)} result(s). Install with: reyn mcp install <NAME>")
+
+
+# ---------------------------------------------------------------------------
+# run_install
+# ---------------------------------------------------------------------------
+
+def _resolve_install_project_root(project_arg: str | None) -> Path:
+    """#1442 Layer A: resolve the install target project root, fail loud.
+
+    --project overrides; otherwise the closest reyn.yaml ancestor of cwd. When
+    neither yields a project (no --project and no reyn.yaml from cwd), exit with
+    an actionable message rather than silently writing into a non-project cwd
+    (the #1442 defect). Mirrors the `reyn mcp refresh` / `serve` resolution.
+    """
+    from reyn.config import _find_project_root
+
+    if project_arg:
+        project_root = Path(project_arg).resolve()
+    else:
+        found = _find_project_root(Path.cwd())
+        if found is None:
+            print(
+                "error: no reyn.yaml found from the current directory; pass "
+                "--project <path-to-project-root>. (mcp install writes the "
+                "server config under the project's .reyn/ — it will not guess "
+                "a non-project cwd.)",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        project_root = found
+
+    if not (project_root / "reyn.yaml").exists():
+        print(
+            f"error: {project_root}/reyn.yaml not found. "
+            "Run `reyn init` there or pass a different --project path.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return project_root
+
+
+def run_install(args: argparse.Namespace) -> None:
+    """Install an MCP server from a ``--source`` specifier.
+
+    ``--source SPECIFIER`` resolves server metadata from the specifier directly
+    and installs via the IR op handler (permission gate, credential flow, and
+    config write included). Registry-id install (positional ``SERVER_ID``) was
+    removed (former mechanism retired; use source-mode install) — it now
+    prints a message pointing at ``--source``.
+
+    When ``--non-interactive`` is set the ``REYN_MCP_INSTALL_AUTO_APPROVE``
+    environment variable is injected so the IR op suppresses interactive prompts.
+
+    ``--env KEY=VALUE`` pairs are forwarded as pre-supplied environment overrides
+    so the credential-prompt flow is skipped for those keys.
+
+    ``--args ARGS`` is a shell-quoted string of extra arguments appended to the
+    server's args list after installation (e.g. ``--args "--server pyright"``).
+    """
+    import shlex
+
+    server_id_raw: str | None = getattr(args, "server_id", None)
+    source_raw: str | None = getattr(args, "source", None)
+
+    # ── Mutual exclusivity check ──────────────────────────────────────────────
+    has_server_id = server_id_raw is not None and server_id_raw.strip()
+    has_source = source_raw is not None and source_raw.strip()
+
+    if has_server_id and has_source:
+        print(
+            "Error: SERVER_ID and --source are mutually exclusive. "
+            "Provide one or the other, not both.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if not has_server_id and not has_source:
+        print(
+            "Error: provide either a SERVER_ID (registry install) "
+            "or --source <specifier> (direct install).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    source: str | None = source_raw.strip() if has_source else None
+
+    extra_args_raw: str | None = getattr(args, "extra_args", None)
+    extra_args: list[str] | None = shlex.split(extra_args_raw) if extra_args_raw else None
+
+    scope = getattr(args, "scope", "local")
+    if scope not in _VALID_SCOPES:
+        print(f"Error: invalid --scope '{scope}'. Choose from: {', '.join(_VALID_SCOPES)}",
+              file=sys.stderr)
+        sys.exit(1)
+
+    env_pairs: list[str] = getattr(args, "env", []) or []
+    non_interactive: bool = getattr(args, "non_interactive", False)
+
+    # Build a pre-supplied env dict from --env KEY=VALUE pairs.
+    pre_env: dict[str, str] = {}
+    for pair in env_pairs:
+        if "=" not in pair:
+            print(f"Error: --env value must be KEY=VALUE, got: {pair!r}", file=sys.stderr)
+            sys.exit(1)
+        k, _, v = pair.partition("=")
+        pre_env[k.strip()] = v
+
+    if non_interactive:
+        os.environ["REYN_MCP_INSTALL_AUTO_APPROVE"] = "1"
+
+    # #1442 Layer A: resolve the project root ONCE (install was cwd-only +
+    # lacked --project, asymmetric with serve/list/refresh). --project overrides;
+    # else the closest reyn.yaml from cwd. Fail loud rather than silently writing
+    # into a non-project cwd. Threaded to both install paths below.
+    project_root = _resolve_install_project_root(getattr(args, "project", None))
+
+    # ── Source mode: go direct to IR op handler ───────────────────────────────
+    if source:
+        _run_install_from_source(
+            source=source,
+            scope=scope,
+            pre_env=pre_env,
+            non_interactive=non_interactive,
+            extra_args=extra_args,
+            project_root=project_root,
+        )
+        return
+
+    # ── Registry mode (retired) ───────────────────────────────────────────────
+    # Registry-id install has been retired; no replacement implementation exists.
+    # Direct source installs (``--source``) remain fully supported above.
+    print(
+        "error: 'reyn mcp install <registry-id>' (registry mode) "
+        "has been retired.\n"
+        "Install directly from a source instead: "
+        "'reyn mcp install --source <spec>'.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
+def _run_install_from_source(
+    source: str,
+    scope: str,
+    pre_env: dict[str, str],
+    non_interactive: bool,
+    extra_args: list[str] | None = None,
+    *,
+    project_root: Path,
+) -> None:
+    """Install an MCP server directly from a ``--source`` specifier.
+
+    Resolves metadata from the specifier and installs directly via the IR op
+    handler (no registry fetch).  The permission gate, credential flow, and
+    config write are all handled by that op.
+
+    #1442 Layer A: ``project_root`` is the run_install-resolved root (--project
+    or the closest reyn.yaml), no longer re-derived cwd-only here.
+    """
+    import asyncio
+    import json
+
+    from reyn.config import load_config
+    from reyn.core.events.events import EventLog
+    from reyn.core.op_runtime.context import OpContext
+    from reyn.core.op_runtime.mcp_install import handle as _mcp_install_handle
+    from reyn.schemas.models import MCPInstallIROp
+    from reyn.security.permissions.permissions import PermissionDecl, PermissionResolver
+    from reyn.user_intervention import StdinInterventionBus
+
+    config = load_config()
+
+    perm_config = getattr(config, "permissions", {}) or {}
+    perm_resolver = PermissionResolver(
+        config_permissions=perm_config,
+        project_root=project_root,
+        interactive=not non_interactive and sys.stdin.isatty(),
+    )
+
+    events = EventLog()
+    # #1442 Layer B: expose ``base_dir`` (the canonical Workspace attribute the
+    # handler reads — op_runtime/file.py uses ctx.workspace.base_dir), not the
+    # legacy ``root`` the handler special-cased. project_root is now always set.
+    workspace = type("Workspace", (), {"base_dir": str(project_root)})()
+    bus = StdinInterventionBus()
+
+    # #571 collapse arc Phase 5: explicit list axes replace the
+    # former mcp_install bool axis. CLI is the operator-trusted entry
+    # point, so we session-approve the canonical config path up-front.
+    canonical_config = ".reyn/config/mcp.yaml"
+    perm_resolver.session_approve_path(
+        canonical_config, "mcp_install_source", "file.write",
+    )
+    decl = PermissionDecl(
+        file_write=[{"path": canonical_config, "scope": "just_path"}],
+        http_get=[{"host": "registry.modelcontextprotocol.io"}],
+        # #571 Phase 6: wildcard authorises save_secret for the
+        # registry's ``isSecret`` env vars (= determined at runtime).
+        secret_write=["*"],
+    )
+
+    ctx = OpContext(
+        workspace=workspace,
+        events=events,
+        permission_decl=decl,
+        permission_resolver=perm_resolver,
+        actor="mcp_install_source",
+        intervention_bus=bus,
+    )
+
+    # server_id is empty for source installs; the resolved short name is used
+    # as the config key.  We pass a synthetic id for audit clarity.
+    synthetic_id = source
+
+    op = MCPInstallIROp(
+        kind="mcp_install",
+        server_id=synthetic_id,
+        scope=scope,  # type: ignore[arg-type]
+        env_overrides=pre_env or None,
+        source=source,
+        extra_args=extra_args or None,
+    )
+
+    print(f"Installing MCP server from source: {source}")
+    print(f"Scope: {scope}")
+    if pre_env:
+        print(f"Pre-supplied env keys: {', '.join(pre_env.keys())}")
+    # issue #320: warn when /tmp is passed as a server arg on macOS.
+    # /tmp is a symlink to /private/tmp on Darwin; the filesystem MCP
+    # server (and similar path-checking servers) resolve the configured
+    # root to its canonical path but compare LITERAL strings against
+    # tool-call arguments → 'Access denied - path outside allowed
+    # directories'. Surfacing the gotcha at install time saves a debug
+    # round later. Linux unaffected.
+    import platform as _platform  # noqa: PLC0415
+    if extra_args and _platform.system() == "Darwin":
+        tmp_args = [
+            a for a in extra_args
+            if isinstance(a, str) and (a == "/tmp" or a.startswith("/tmp/"))
+        ]
+        if tmp_args:
+            print(
+                "Warning: detected /tmp path(s) in --args on macOS: "
+                f"{tmp_args}. /tmp is a symlink to /private/tmp; some "
+                "path-checking MCP servers (e.g. filesystem) compare "
+                "literal paths and will deny tool calls that reference "
+                "/tmp/... while the configured root resolved to "
+                "/private/tmp/... — use a non-symlink path (e.g. ./.mcp-sandbox "
+                "or ~/mcp-sandbox) to avoid this.",
+                file=sys.stderr,
+            )
+    print()
+
+    try:
+        result = asyncio.run(_mcp_install_handle(op, ctx, "control_ir"))
+    except PermissionError as exc:
+        print(f"\nPermission denied: {exc}", file=sys.stderr)
+        sys.exit(2)
+    except Exception as exc:
+        print(f"\nError during mcp_install (source): {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    print()
+    if result.get("status") != "ok":
+        err = result.get("error", "(unknown error)")
+        print(f"=== mcp_install failed: {err} ===", file=sys.stderr)
+        sys.exit(2)
+
+    server_name = result.get("server_name", "")
+    print(f"Server '{server_name}' installed successfully (source: {source}).")
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+
+
+# ---------------------------------------------------------------------------
+# run_list
+# ---------------------------------------------------------------------------
+
+def run_list(args: argparse.Namespace) -> None:
+    """List configured MCP servers.
+
+    Default (cheap) mode: reads yaml files only, infers STATUS from env-var
+    declarations vs os.environ — no subprocess launched.
+
+    ``--probe``: send an MCP initialize handshake to every server to verify
+    liveness.  This is an explicit opt-in because it consumes API quota and
+    may have audit-log side effects.
+    """
+    probe: bool = getattr(args, "probe", False)
+    project_root = _get_project_root()
+
+    entries = _all_servers_with_scope(project_root)
+
+    if not entries:
+        print("No MCP servers configured.")
+        print(
+            "Add a server with: reyn mcp install <SERVER_ID>  "
+            "or edit reyn.yaml manually."
+        )
+        return
+
+    # Column widths
+    _W_NAME = max((len(n) for n, _, _ in entries), default=4)
+    _W_NAME = max(_W_NAME, 4)
+    _W_TRANSPORT = 9
+    _W_STATUS = 12
+    _W_CREDS = 30
+    _W_SCOPE = 7
+
+    header = (
+        f"{'NAME':<{_W_NAME}}  {'TRANSPORT':<{_W_TRANSPORT}}  "
+        f"{'STATUS':<{_W_STATUS}}  {'CREDENTIALS':<{_W_CREDS}}  SCOPE"
+    )
+    print(header)
+    print("─" * len(header))
+
+    for name, scope, cfg in sorted(entries, key=lambda t: t[0]):
+        transport = _infer_transport(cfg)
+        creds_display = _infer_credentials(cfg)
+        status = _infer_status(cfg) if not probe else _probe_status(name, cfg)
+        print(
+            f"{name:<{_W_NAME}}  {transport:<{_W_TRANSPORT}}  "
+            f"{status:<{_W_STATUS}}  {creds_display:<{_W_CREDS}}  {scope}"
+        )
+
+
+def _infer_transport(cfg: dict) -> str:
+    t = cfg.get("type") or cfg.get("transport") or ""
+    if t:
+        return str(t)
+    if cfg.get("command"):
+        return "stdio"
+    if cfg.get("url"):
+        return "streamable-http"
+    return "(unknown)"
+
+
+def _infer_credentials(cfg: dict) -> str:
+    """Return a short credential status string based on the env declarations."""
+    env_decl: dict = cfg.get("env") or {}
+    if not env_decl:
+        return "(none)"
+    parts: list[str] = []
+    for key in env_decl:
+        present = key in os.environ
+        mark = "✓" if present else "✗"
+        parts.append(f"{key} {mark}")
+    return ", ".join(parts)
+
+
+def _infer_status(cfg: dict) -> str:
+    """Cheap status: 'ready' if all declared env vars are set, else 'missing-cred'."""
+    env_decl: dict = cfg.get("env") or {}
+    if not env_decl:
+        return "ready"
+    for key in env_decl:
+        if key not in os.environ:
+            return "missing-cred"
+    return "ready"
+
+
+def _probe_status(name: str, cfg: dict) -> str:
+    """Active probe: attempt an MCP initialize handshake.  Returns status string."""
+    from reyn.llm.llm import run_async as _run_async
+
+    async def _handshake() -> str:
+        # #2421: probe via the single MCPGateway seam — it opens the server (initialize handshake)
+        # inside the contain-all boundary + task-affine pool and raises only MCPFault, so a server
+        # that dies on connect surfaces as a clean status, never an uncontained BaseExceptionGroup.
+        from reyn.mcp.gateway import MCPFault, MCPGateway
+        try:
+            await MCPGateway().probe(name, cfg)
+            return "ready"
+        except MCPFault as exc:
+            return f"error: {exc}"
+
+    try:
+        return _run_async(_handshake())
+    except Exception as exc:
+        return f"error: {exc}"
+
+
+# ---------------------------------------------------------------------------
+# run_remove
+# ---------------------------------------------------------------------------
+
+def run_remove(args: argparse.Namespace) -> None:
+    """Remove an MCP server from the configuration file for the given scope."""
+    name = args.name.strip()
+    if not name:
+        print("Error: NAME must not be empty.", file=sys.stderr)
+        sys.exit(1)
+
+    scope: str | None = getattr(args, "scope", None)
+    project_root = _get_project_root()
+
+    # Auto-detect scope if not specified: local → project → user.
+    if scope is None:
+        for candidate in ("local", "project", "user"):
+            servers = _get_servers_from_scope(candidate, project_root)
+            if name in servers:
+                scope = candidate
+                break
+        if scope is None:
+            print(
+                f"error: server '{name}' not found in any scope tier "
+                "(local / project / user).",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+    else:
+        # Validate explicit scope.
+        if scope not in _VALID_SCOPES:
+            print(f"Error: invalid --scope '{scope}'. Choose from: {', '.join(_VALID_SCOPES)}",
+                  file=sys.stderr)
+            sys.exit(1)
+        servers = _get_servers_from_scope(scope, project_root)
+        if name not in servers:
+            print(
+                f"error: server '{name}' not found in scope '{scope}'.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+    path = _scope_path(scope, project_root)
+    data = _load_yaml_file(path)
+    data.setdefault("mcp", {}).setdefault("servers", {})
+    if name in data["mcp"]["servers"]:
+        del data["mcp"]["servers"][name]
+    if not data["mcp"]["servers"]:
+        del data["mcp"]["servers"]
+    if not data["mcp"]:
+        del data["mcp"]
+    _write_yaml_file(path, data)
+
+    print(f"Server '{name}' removed from {path}")
+    print(
+        "Note: any currently running subprocess for this server will "
+        "continue until the next 'reyn chat' session restart."
+    )
+    print(
+        "Secrets are not removed automatically. "
+        "Use 'reyn mcp clear-secret " + name + "' to delete associated secrets."
+    )
+
+
+# ---------------------------------------------------------------------------
+# run_set_secret
+# ---------------------------------------------------------------------------
+
+def run_set_secret(args: argparse.Namespace) -> None:
+    """Set a secret for an MCP server (MCP-aware wrapper over 'reyn secret set').
+
+    Reads the server's ``mcp.servers.<name>.env`` declaration to validate that
+    the supplied KEY is expected.  If the KEY is not in the declaration a
+    warning is printed but the operation proceeds (unknown-key warning, not
+    error, so user can pre-set keys for servers not yet installed).
+
+    After writing the secret, ensures that ``mcp.servers.<name>.env.<KEY>``
+    in the local scope yaml has a ``${KEY}`` reference so the value is picked
+    up at runtime.
+    """
+    from reyn.security.secrets.store import save_secret
+
+    server_name = args.server.strip()
+    raw_kv = args.key_value.strip()
+
+    if not server_name:
+        print("Error: SERVER must not be empty.", file=sys.stderr)
+        sys.exit(1)
+
+    # Parse key[=value]
+    if "=" in raw_kv:
+        key, _, value = raw_kv.partition("=")
+        key = key.strip()
+    else:
+        key = raw_kv.strip()
+        value = None
+
+    if not key:
+        print("Error: KEY must not be empty.", file=sys.stderr)
+        sys.exit(1)
+
+    project_root = _get_project_root()
+
+    # Validate against server's env declaration (warn only).
+    known_keys = _server_env_keys(server_name, project_root)
+    if known_keys is not None and key not in known_keys:
+        print(
+            f"warning: '{key}' is not declared in mcp.servers.{server_name}.env. "
+            "Setting it anyway."
+        )
+
+    # Prompt for value if not supplied.
+    if value is None:
+        try:
+            value = getpass.getpass(f"Value for {key}: ")
+        except (EOFError, KeyboardInterrupt):
+            print("\nAborted.", file=sys.stderr)
+            sys.exit(1)
+
+    save_secret(key, value)
+    print(f"Secret '{key}' saved to ~/.reyn/secrets.env")
+
+    # Ensure ${KEY} reference exists in the local scope yaml for this server.
+    _ensure_env_ref(server_name, key, project_root)
+
+
+def _server_env_keys(server_name: str, project_root: Path | None) -> set[str] | None:
+    """Return the set of env keys declared for a server across all scopes.
+
+    Returns None if the server is not found anywhere (so caller can skip
+    the validation altogether for yet-to-be-installed servers).
+    """
+    found = False
+    keys: set[str] = set()
+    for scope in ("user", "project", "local"):
+        servers = _get_servers_from_scope(scope, project_root)
+        if server_name in servers:
+            found = True
+            env_decl = servers[server_name].get("env") or {}
+            keys.update(env_decl.keys())
+    return keys if found else None
+
+
+def _ensure_env_ref(server_name: str, key: str, project_root: Path | None) -> None:
+    """Add ``${KEY}`` reference to local scope yaml if not already present."""
+    # Work in the local scope (gitignored, safe to write credentials-adjacent config).
+    path = _scope_path("local", project_root)
+    data = _load_yaml_file(path)
+    data.setdefault("mcp", {}).setdefault("servers", {}).setdefault(server_name, {})
+    server_cfg = data["mcp"]["servers"][server_name]
+    server_cfg.setdefault("env", {})
+    if key not in server_cfg["env"]:
+        server_cfg["env"][key] = f"${{{key}}}"
+        _write_yaml_file(path, data)
+        print(
+            f"  → Added env.{key}: ${{{key}}} reference to {path}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# run_clear_secret
+# ---------------------------------------------------------------------------
+
+def run_clear_secret(args: argparse.Namespace) -> None:
+    """Clear a secret (or all secrets) for an MCP server.
+
+    If KEY is specified, clears that single secret.
+    If KEY is omitted, clears all secrets declared for the server.
+    The yaml side ``${KEY}`` reference is NOT touched — server config structure
+    is preserved.
+    """
+    from reyn.security.secrets.store import clear_secret
+
+    server_name = args.server.strip()
+    key: str | None = getattr(args, "key", None)
+    if key is not None:
+        key = key.strip() or None
+
+    if not server_name:
+        print("Error: SERVER must not be empty.", file=sys.stderr)
+        sys.exit(1)
+
+    project_root = _get_project_root()
+
+    if key is not None:
+        # Clear a specific key.
+        removed = clear_secret(key)
+        if removed:
+            print(f"Secret '{key}' removed from ~/.reyn/secrets.env")
+        else:
+            print(f"Secret '{key}' not found in ~/.reyn/secrets.env (nothing changed)")
+    else:
+        # Clear all secrets declared for this server.
+        known_keys = _server_env_keys(server_name, project_root)
+        if not known_keys:
+            print(
+                f"No env declarations found for server '{server_name}'. "
+                "Nothing to clear."
+            )
+            return
+        removed_any = False
+        for k in sorted(known_keys):
+            removed = clear_secret(k)
+            if removed:
+                print(f"Secret '{k}' removed from ~/.reyn/secrets.env")
+                removed_any = True
+            else:
+                print(f"Secret '{k}' not found in ~/.reyn/secrets.env (skipped)")
+        if not removed_any:
+            print("No secrets were removed.")
+        else:
+            print(
+                "Note: yaml ${VAR} references in reyn.yaml/reyn.local.yaml "
+                "are NOT removed — server config structure is preserved."
+            )
+
+
+# ---------------------------------------------------------------------------
+# run_refresh
+# ---------------------------------------------------------------------------
+
+
+async def _probe_server_tools(
+    server_name: str, cfg: dict, *, per_server_timeout: float = _DEFAULT_MCP_PROBE_SECONDS,
+) -> "tuple[str, ProbeOutcome]":
+    """Probe a single MCP server's tool list with a per-server timeout.
+
+    Returns ``(server_name, outcome)`` — ``ToolsAnswered`` when the server
+    replied (``tools == []`` meaning it really exposes none), ``ToolsUnknown``
+    when the probe timed out, faulted, or came back as an error entry.
+
+    #3520: this helper is shared by ``run_refresh`` (CLI) and
+    ``RouterHostAdapter.maybe_refresh_mcp_tools_from_yaml`` (session), and both
+    write the SAME file (``.reyn/state/mcp_tools_cache.json``). That sharing is
+    why the distinction has to live here rather than at either call site: if
+    this returned ``[]`` for a failed probe, one ``reyn mcp refresh`` against a
+    slow server would persist "no tools" for every session that later warm-starts
+    from the file — reintroducing the exact defect through the CLI door.
+    """
+    import asyncio
+
+    from reyn.mcp.gateway import MCPFault, MCPGateway
+
+    # #2421: probe tool lists via the single MCPGateway seam (open + list + teardown inside the
+    # contain-all boundary + task-affine pool). The gateway raises only MCPFault — never a bare
+    # BaseExceptionGroup — so a dead server can't crash the probe. The outer ``asyncio.timeout`` keeps
+    # the tight per-server probe bound (< the gateway's own call timeout); its cancellation is genuine
+    # (cancelling() > 0) so it propagates out as a TimeoutError rather than being contained.
+    try:
+        async with asyncio.timeout(per_server_timeout):
+            raw = await MCPGateway(agent_id=None).list_tools(server_name, cfg)
+    except (TimeoutError, asyncio.TimeoutError):
+        return server_name, ToolsUnknown(reason="timeout")
+    except MCPFault as fault:
+        return server_name, ToolsUnknown(reason="exception", detail=repr(fault))
+    # #3520: an error sentinel with no usable tool alongside it is a non-answer
+    # (the gateway told us it failed, not that the catalog is empty). A response
+    # that carries real tools DID measure something, so a stray error entry only
+    # costs that entry.
+    entries = [t for t in (raw or []) if isinstance(t, dict)]
+    cleaned = [t for t in entries if "error" not in t and t.get("name")]
+    if not cleaned and any("error" in t for t in entries):
+        return server_name, ToolsUnknown(reason="exception", detail=repr(entries))
+    return server_name, ToolsAnswered(tools=cleaned)
+
+
+def run_refresh(args: argparse.Namespace) -> None:
+    """Re-probe all configured MCP servers and write the persistent cache.
+
+    Synopsis: reyn mcp refresh [--project PATH]
+
+    Reads the MCP server config from the 3-scope yaml cascade (user-global
+    / project / project-local), probes every server's tool list in parallel
+    with a per-server timeout (``safety.timeout.mcp_probe_seconds``, default
+    5s — #3475), and writes the ANSWERS atomically to
+    ``.reyn/state/mcp_tools_cache.json``.
+
+    #3520: a server whose probe did not answer is reported as a warning and
+    OMITTED from the file — it is not written as an empty list. Writing it
+    would have recorded the failure to measure as the measurement, and since
+    sessions warm-start from this file, that record survives restarts: every
+    later session would be told the server has no tools and would never look
+    again. Omitted means each session live-probes it on its next turn.
+
+    Active ``reyn chat`` sessions will pick up the new cache on their next
+    turn boundary via ``maybe_reload_mcp_tools_cache_from_disk``.
+    """
+    import asyncio
+
+    from reyn.config import load_config
+    from reyn.runtime.services.mcp_cache_file import cache_file_path, write_cache
+
+    if args.project:
+        project_root: Path | None = Path(args.project).resolve()
+    else:
+        project_root = _get_project_root()
+
+    # #3475: same source of truth the session-side probe reads
+    # (`Session._safety.timeout.mcp_probe_seconds`) — one config value drives
+    # both the CLI's and the runtime's per-server probe timeout.
+    per_server_timeout = load_config(project_root).safety.timeout.mcp_probe_seconds
+
+    entries = _all_servers_with_scope(project_root)
+
+    if not entries:
+        # Still write an empty cache so sessions see a "refresh happened" mtime.
+        state_dir = (
+            project_root / ".reyn" / "state"
+            if project_root is not None
+            else Path(".reyn") / "state"
+        )
+        cache_path = cache_file_path(state_dir)
+        write_cache(cache_path, {})
+        print(f"Probed 0 servers; wrote 0 tool entries to {cache_path}")
+        return
+
+    # Build a flat {name: cfg} dict (local > project > user dedup already done).
+    servers_flat = {name: cfg for name, _scope, cfg in entries}
+
+    async def _probe_all() -> "list[tuple[str, ProbeOutcome]]":
+        tasks = [
+            _probe_server_tools(name, cfg, per_server_timeout=per_server_timeout)
+            for name, cfg in servers_flat.items()
+        ]
+        return list(await asyncio.gather(*tasks))
+
+    outcomes = asyncio.run(_probe_all())
+
+    # #3520: warn per UNANSWERED probe. The old condition was `if not tools`,
+    # which also fired for a server that answered "zero tools" — the same
+    # collapse the type now prevents, in the operator-facing text.
+    unanswered = [name for name, outcome in outcomes if isinstance(outcome, ToolsUnknown)]
+    for server_name in unanswered:
+        print(
+            f"warning: {server_name}: probe did not answer "
+            "(timeout / connection error) — omitted from the cache; "
+            "sessions will re-probe it",
+            file=sys.stderr,
+        )
+
+    results = answered_only(outcomes)
+    total_tools = sum(len(entry.tools) for entry in results.values())
+
+    state_dir = (
+        project_root / ".reyn" / "state"
+        if project_root is not None
+        else Path(".reyn") / "state"
+    )
+    cache_path = cache_file_path(state_dir)
+    write_cache(cache_path, results)
+
+    n_servers = len(results)
+    print(f"Probed {n_servers} server(s); wrote {total_tools} tool entries to {cache_path}")
+    if unanswered:
+        print(
+            "One or more servers did not answer. They are absent from the cache, "
+            "so active sessions will live-probe them on their next turn rather "
+            "than treating them as tool-less. Re-run 'reyn mcp refresh' after "
+            "fixing the issue to restore zero-latency warm-start.",
+            file=sys.stderr,
+        )

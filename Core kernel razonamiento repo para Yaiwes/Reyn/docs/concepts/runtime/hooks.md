@@ -1,0 +1,1030 @@
+---
+type: concept
+topic: runtime
+audience: [human, agent]
+---
+
+# Agent lifecycle hooks
+
+Hooks are a thin operator-scoped layer that lets you inject context,
+trigger self-continuation, run a sandboxed side-effect, or launch a pipeline
+at any of the four **lifecycle points** in a reyn session — or, at an
+**external-event point** fired by something outside the session's own
+run-loop (a subscribed MCP resource changing, a watched file changing, a
+cron job firing, or an inbound webhook).
+
+They are built on two mechanisms that already exist: the **unified inbox** (the
+channel that feeds messages into a turn) and the **P6 lifecycle** (the event
+stream). No new OS machinery — a new workflow that uses hooks does not require any
+OS change (P7).
+
+## Syntax quick reference
+
+Everything below is detailed further on; this section is a self-contained
+lookup for authoring a `hooks:` (and, if needed, `composers:`) block without
+reading the rest of the page.
+
+### `on:` values — what a hook's `on:` accepts vs. what a Composer's `inputs[].kind` accepts
+
+**These are two different, non-interchangeable vocabularies** — a value
+valid in one is not necessarily valid in the other:
+
+| Bare form | Namespaced form (also accepted) | Fires | Valid as a hook's `on:`? | Valid as a Composer `inputs[].kind`? |
+|---|---|---|:---:|:---:|
+| `session_start` | `builtin:lifecycle:session_start` | session opens | ✅ | ✅ |
+| `session_end` | `builtin:lifecycle:session_end` | session closes | ✅ | ✅ |
+| `turn_start` | `builtin:lifecycle:turn_start` | a turn begins | ✅ | ✅ |
+| `turn_end` | `builtin:lifecycle:turn_end` | a turn's terminal `stop_reason` | ✅ | ✅ |
+| `mcp_resource_updated` | `builtin:external:mcp_resource_updated` | a subscribed MCP resource pushes an update | ✅ | ✅ |
+| `file_changed` | `builtin:external:file_changed` | a watched path changes ([`fs_watch`](../../reference/config/reyn-yaml.md#fs_watch-block) required) | ✅ | ✅ |
+| `cron_fired` | `builtin:external:cron_fired` | a `cron:` job fires (either `action`, #5209) | ✅ | ✅ |
+| `webhook_received` | `builtin:external:webhook_received` | an inbound webhook resolves to this session | ✅ | ✅ |
+| `task_settled` | `builtin:task:task_settled` | an async task (see below for its producers) reaches a terminal disposition | ✅ | ✅ |
+| — (open) | `composed:<name>` | a Composer (see below) publishes its correlated output | ✅ | ✅ (chaining — another Composer's output) |
+| — (open) | `llm:<session_id>:<event_name>` | the LLM itself emits one via `emit_hook_event` (always its own session) | ❌ **rejected at load** (`HookConfigError`) | ✅ |
+
+**`llm:*` can never be a hook's `on:` value — only a Composer input.** A
+`hooks:` entry only accepts the builtin bare/namespaced forms in the table
+above or a `composed:<name>` prefix; anything else (including a well-formed
+`llm:<session_id>:<event_name>`) is a load-time `HookConfigError`. To react
+to an LLM-emitted event, correlate it through a `composers:` entry into a
+`composed:<name>` event, then put your `hooks:` entry's `on:` on THAT
+composed kind — see the [worked example](#llm-authored-hook-events-emit_hook_event)
+below. The bare/namespaced-form duality only applies within the builtin
+points listed in the table — it does not extend `on:`'s acceptance to `llm:*`.
+
+### The 4 config schemes — every field
+
+A hook entry sets exactly one scheme. Every scheme accepts the two
+top-level fields `on` (required, see above) and `name` (optional string,
+defaults to the `on` value — becomes the `[hook:<name>]` attribution prefix)
+plus the optional `matcher` (see [below](#matcher-narrowing-which-events-fire-a-hook)).
+
+**`template_push`** — a Jinja2-templated inbox push:
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `message` | str (Jinja2) | _required_ | Rendered text of the pushed `[hook:name]` message. |
+| `wake` | bool \| str (Jinja2 → bool) | `true` | `true` starts a new turn (self-continuation, **E**); `false` rides passively into the next turn (context-inject, **C**). |
+| `push_when` | str (Jinja2 → bool) | `"true"` | `false` skips the push entirely (conditional push). |
+| `session` | str \| None | `None` (current session) | Routes the push to a *different* session's inbox — [cross-session push](#cross-session-push). |
+
+**`exec`** — a sandboxed side-effect argv (renamed from `shell_exec` in #3226
+Phase 4 — naming honesty, not a security change: this scheme never ran
+`/bin/sh -c <string>`; it always executed a tokenized argv with `shell=False`.
+The rename removes the misleading `shell_` prefix and — a clean break, not a
+compat alias — collapses the payload to **argv-list-only**):
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `exec` | `list[str]` (**static** — not Jinja2) | _required_ | The argv. Non-empty list of non-empty strings. stdout/stderr are ignored; the event is written to the process's stdin as JSON. |
+
+**`exec` is deliberately NOT templated.** Unlike `message`/`input_template`
+above, the argv is run as-is, one process-arg per list item — event/context
+data is never interpolated into it. This is an intentional command-injection
+guard, not an oversight: if you need the firing event's data inside the
+command, read it from **stdin**, which always carries the event's payload as
+JSON (e.g. a composed event's `{"inputs": [...], "correlation_key": ...}`) —
+the command must read and parse stdin itself, never expect `{{ ... }}`
+substitution in its own argv.
+
+**Migration from the pre-Phase-4 shell-command string**: `shell_exec: "scripts/cleanup.sh --force"`
+becomes `exec: ["scripts/cleanup.sh", "--force"]` — split the command line into
+one argv entry per token yourself (the runtime no longer does this via
+`shlex.split`).
+
+**`exec_capture`** — a sandboxed argv whose stdout IS a push directive
+(renamed from `shell_push` in #3226 Phase 4 — same naming-honesty rationale
+and argv-list-only payload as `exec` above):
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `exec_capture` | `list[str]` | _required_ | The argv. Non-empty list of non-empty strings. stdout must be pure JSON: `{"push_when": bool, "wake": bool, "message": str, "session"?: str}` (first three required). **Rule, not an enumeration** (architect note, #5210 doc follow-up — an enumerated list of failure causes goes stale the day a new one is added; this doesn't): pushes ONLY when a well-formed directive is obtained from stdout — every other outcome skips, fail-safe, e.g. non-zero exit / invalid JSON / missing or wrong-typed field / a decoded-stdout token count exceeding a live context-budget-derived cap (#5210). Never a truncated/partial directive — a cut JSON payload would fail to parse and be indistinguishable from a clean no-push run. |
+
+**`pipeline_launch`** — launch a registered pipeline, async/detached:
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `name` | str | _required_ | The pipeline's registered name, resolved at dispatch time. Unregistered → warning + skip, lifecycle point still completes. |
+| `input_template` | dict \| str \| None | `None` | `dict`: every string leaf (recursively) is Jinja2-rendered. `str`: rendered once, output parsed as a JSON object. `None`: launches with no input. |
+
+### `matcher` grammar
+
+`matcher: {field: pattern, ...}` — evaluated against the firing event's
+template vars before the hook's action runs.
+
+- Match rule by field **name**: `uri` and `path` use a shell-style glob
+  (`fnmatch`); every other field name is exact string equality.
+- Absent or empty `matcher` → the hook always fires.
+- For a builtin point, a matcher field outside that point's payload
+  (a typo, or a field the point never carries) is a **load-time
+  `HookConfigError`** — rejected before the hook can ever run.
+- For a hook's `matcher` on a `composed:*` `on:` target, or a Composer
+  input's `match` on an `llm:*` `inputs[].kind` (neither has a builtin
+  schema entry — the open set), a field the event doesn't carry never
+  matches at runtime (nothing to validate against at load time).
+
+### `composers:` block — every field
+
+A Composer correlates multiple Bus events into one derived `composed:<name>`
+event, independent of the `hooks:` block (see
+[Async Bus and Composer](#async-bus-and-composer-event-correlation) below
+for the full model):
+
+```yaml
+composers:
+  - name: deploy_approved          # required, unique
+    op: all                        # required: all | any | seq | window | debounce | correlate_by | count
+    inputs:                        # required, non-empty list
+      - kind: builtin:external:mcp_resource_updated   # required
+        match: {server: "github"}                     # optional — same field->pattern grammar as `matcher`
+      - kind: mcp:approval-server:approved
+    emit:
+      kind: composed:deploy_approved   # required, MUST start with `composed:`
+    policy:                         # optional
+      capacity: 10                  # int, default 10
+      overflow: reject               # drop_oldest (default) | drop_newest | reject
+      ttl: 5m                        # duration: plain seconds, or "<N>s"/"<N>m"/"<N>h" — default 5m
+    correlate_by: request_id        # required IFF op: correlate_by — the payload field to key on
+    count: 3                        # required IFF op: count — the threshold
+```
+
+- `inputs[].kind` names a builtin namespaced kind (`builtin:lifecycle:*` /
+  `builtin:external:*`), an `llm:<session_id>:<event_name>` kind an LLM emits
+  via `emit_hook_event` in that same session, a `composed:*` kind from
+  another Composer (chaining — cycles are rejected at load time), or an
+  external-plugin kind (`mcp:<server>:<event>`, etc.). The LLM can only ever
+  *produce* an `llm:*` event (via `emit_hook_event`); it cannot author a
+  `composers:` block itself (that's an operator-owned config), only supply
+  the events one correlates on.
+- `inputs[].source`, if present, must be omitted or `"builtin"` — anything
+  else is a load-time error (the Bus only ever carries `source="builtin"`;
+  correlate on a payload field instead).
+- The 8 `op` values: `all` (every input arrived), `any` (first arrival,
+  stateless), `seq` (inputs' kinds arrive in the declared order), `window`
+  (fire after `ttl` from the FIRST match, with everything buffered),
+  `debounce` (fire `ttl` after the LAST match with no newer one), `correlate_by`
+  (like `all`, keyed by a payload field), `count` (N matching events per key),
+  `deadline` (issue #3166 — fire when its `until` pattern does NOT arrive
+  within `ttl` of its `on` pattern, per key; see [reyn-yaml § `composers`
+  block](../../reference/config/reyn-yaml.md#composers-block) for its
+  distinct `on`/`matcher`/`until` shape and its stricter — **crash-durable by
+  default** — reliability posture). Unlike the other 7 ops, which all
+  compose things that DID happen, `deadline` is the only one that fires on
+  absence — read a `deadline` fire as "X was expected but never arrived",
+  never as an error in itself.
+- **`inputs` arity**: `seq` requires **at least 2** inputs (a load-time
+  error otherwise) — every other op accepts a **single** input, including
+  `all`/`any` (both fire immediately on that one input's first arrival) and
+  `count` (fires once `count` matching events of that one kind have arrived).
+  A single-input Composer is the common shape for reacting to just one
+  `llm:*` signal:
+  ```yaml
+  composers:
+    - name: deploy_ready
+      op: any                       # any/all are equivalent with 1 input
+      inputs:
+        - kind: llm:main:deploy_ready
+      emit: { kind: composed:deploy_ready }
+  ```
+- **What the composed event carries.** `_emit_composed` builds the emitted
+  event's payload as `{"inputs": [<matched event's payload dict>, ...],
+  "correlation_key": <key or "__default__">}` — so a downstream hook's
+  template vars are `{{ inputs }}` (a list) and `{{ correlation_key }}`, NOT
+  the original event's fields flattened at the top level. **Order caveat**:
+  `inputs[]` is in ARRIVAL order, not declared-config order, for every op
+  except `seq` (whose whole point is enforcing the declared order) — and
+  each entry is the bare payload dict with no `kind` tag to identify which
+  declared input it came from. So `{{ inputs[0].<field> }}` is only reliably
+  "the first *declared* input's field" when the Composer uses `op: seq`, or
+  has exactly one input (nothing else can arrive first).
+- A `composed:<name>` event becomes a normal Sync `on:` target — add a
+  `hooks:` entry with `on: composed:deploy_approved` to react to it (see the
+  worked example [below](#async-bus-and-composer-event-correlation)).
+
+### `emit_hook_event` — LLM-authored hook-events
+
+The LLM's own tool for putting an event onto its session's Bus — see
+[LLM-authored hook-events](#llm-authored-hook-events-emit_hook_event) below
+for the full syntax, autonomy boundary, and a worked example.
+
+## Lifecycle points
+
+Hooks fire at four lifecycle points, one for each combination of scope and direction:
+
+| Scope   | `_start` | `_end` |
+|---------|----------|--------|
+| session | `session_start` | `session_end` |
+| turn    | `turn_start` | `turn_end` |
+
+Every point is an **awaited dispatch**: the hook completes (shell exits, push is
+queued) before the lifecycle point continues. This is what gives shell hooks
+synchronous access to the moment — a session_start shell hook finishes before
+the first turn begins.
+
+Implementation anchors:
+
+- `turn_end` fires at the terminal `stop_reason`
+
+## External-event points
+
+Unlike the four lifecycle points above — fired from the session's own
+turn run-loop — an **external-event point** is fired by something
+outside that loop: today, a subscribed MCP resource changing.
+
+### `mcp_resource_updated`
+
+Fires when a server pushes a `resources/updated` notification for a resource
+this session subscribed to (see
+[Resource subscriptions](../tools-integrations/mcp.md#resource-subscriptions-the-async-push-event-source)).
+Delivered from the MCP receive-loop task through a bounded queue drained on
+the session's own event loop — not from the agent's own turn/task machinery
+— so it can fire between turns, not only at a turn/task boundary.
+
+**Auto-subscribe at session start (#5167).** Declaring an `mcp_resource_updated`
+hook whose `matcher` names a CONCRETE `server` and a non-glob `uri` subscribes
+that resource automatically when the session starts — no `subscribe_mcp_resource`
+tool call, and no LLM turn, ever required. This closes a gap the mechanism
+originally shipped with: subscribing was previously reachable ONLY through the
+LLM-facing tool, so a declared hook whose agent happened never to call it
+silently never fired, with no warning anywhere — a declaration's effect
+depending on the agent's own turn-to-turn behaviour, the opposite of this
+system's usual "declared = honored deterministically" contract.
+
+A matcher with a *glob* `uri` (e.g. `{"server": "docs", "uri":
+"orch://job/*/progress"}`) is still valid and still narrows which pushes the
+hook reacts to — but it is not something reyn can auto-subscribe to (an MCP
+`resources/subscribe` request needs one exact URI). Same for a matcher missing
+`server`/`uri` entirely, or naming an unconfigured server. In every such case
+the agent's own explicit `subscribe_mcp_resource` tool call still works exactly
+as before; auto-subscribe never invents an ambiguous subscription, it only
+removes the LLM-turn dependency for the unambiguous case. Every case
+auto-subscribe cannot honor — including a genuine permission denial or a
+subscribe-level failure — emits a `mcp_hook_subscribe_not_applied` warning +
+audit-event naming the hook (see [Reference: events § MCP](../../reference/runtime/events.md#mcp)),
+so a declaration's non-effect is never silent.
+
+Template vars available to `template_push` / `pipeline_launch` rendering:
+
+| Var | Meaning |
+|-----|---------|
+| `server` | The MCP server name the resource belongs to. |
+| `uri` | The updated resource's URI. |
+| `resync` | `true` if this firing is a reconnect resync (see below), `false` for a real server push. |
+
+**Resync on reconnect.** Reyn keeps no resource-content cache, so a dropped
+connection could silently miss updates that happened while disconnected.
+After a transport-death reconnect re-establishes every previously-tracked
+subscription, this hook-point fires once per re-subscribed URI with
+`resync: true` — a conservative "this may have changed while you were
+disconnected, re-read if you care" signal, using the exact same hook-point
+and template-var shape as a real push. It never fires on a session's very
+first connection (there is nothing to resync).
+
+### `file_changed`
+
+Fires when a file under an operator-declared watch path is created, modified,
+or deleted. Requires the `watchdog` extra (`pip install reyn[fs-watch]`) and
+at least one path under `fs_watch.paths` in `reyn.yaml`:
+
+```yaml
+fs_watch:
+  paths:
+    - /repo/src
+    - /repo/docs
+  debounce_seconds: 0.2   # coalesce a write-burst on one path into ONE fire
+```
+
+Full field reference: [reyn-yaml § `fs_watch` block](../../reference/config/reyn-yaml.md#fs_watch-block).
+Without either the extra or a configured path, the feature is off (a clear
+warning is logged once if paths are configured but the extra is missing; no
+config at all is silently byte-identical to a build with no watcher).
+
+Template vars:
+
+| Var | Meaning |
+|-----|---------|
+| `path` | The changed file's path. |
+| `event_type` | `created`, `modified`, or `deleted`. |
+
+Watched paths are declared once, at startup, in the OUT-set (`reyn.yaml` /
+`reyn.local.yaml`) — there is no op or tool verb that lets an agent register
+or widen a watch; a filesystem-wide change feed is treated as the same class
+of concern as sandbox policy. Bursts of events for one logical change (an
+editor's temp-file dance, a create-then-modify) are debounced per path — one
+burst fires the hook once, not once per underlying filesystem event.
+
+### `cron_fired`
+
+Fires on every `cron:` job's fire, on its own resolved `cron:<job_name>`
+session — for both `action: message` (the message also delivers to the
+inbox, separately) and `action: hook` (#5209 — this hook fire is the ONLY
+thing that happens; no message is ever delivered). See the `cron` block
+reference (`docs/reference/config/reyn-yaml.md#cron-block`) for `action`.
+
+Template vars:
+
+| Var | Meaning |
+|-----|---------|
+| `job_name` | The fired job's configured name. |
+| `to` | The target agent name (the job's host session). |
+| `action` | `"message"` or `"hook"` (#5209) — lets a hook branch on which kind of fire this was, e.g. `matcher: {action: "hook"}`. |
+
+### `webhook_received`
+
+Fires when an inbound webhook (Slack, LINE, a generic plugin) resolves to a
+session.
+
+Template vars:
+
+| Var | Meaning |
+|-----|---------|
+| `transport` | The logical transport (`slack`, `line`, `webhook`, ...). |
+| `sender` | The full routing sender string (`"<transport>:<external_id>"`). |
+
+The template context deliberately carries only this routing metadata —
+**never the raw inbound request body**, which may carry tokens or PII the
+operator never intended a hook action to see. Contrast `cron_fired`'s
+`job_name`/`to`, which are operator-authored config, never end-user-supplied.
+
+Both `cron_fired` and `webhook_received` are **non-blocking relative to their
+ingress**: the cron job's own inbox delivery and the webhook's HTTP response
+never wait on a hook action — dispatch is scheduled as a fire-and-forget
+background task, so a slow hook (e.g. a multi-second `exec`) can never
+stall the ingress that triggered it.
+
+## Task points
+
+A **task point** is neither a session lifecycle transition nor an external
+ingress signal — it fires when an async unit of work reaches a terminal
+disposition. Proposal 0067 P3 adds the first (and today, only) one.
+
+### `task_settled`
+
+Fires when a `run_pipeline`-launched async pipeline's task reaches a
+terminal disposition — **independent of whether delivery to the issuing
+session actually succeeded** (ADR-0040 D4④). A task's `on_settle`
+disposition (`"deliver"` | `"<pipeline name>"` | `"drop"`) executes first,
+then `task_settled` fires unconditionally, even when delivery was dropped
+by a fail-safe (the reply agent no longer exists, or the reply session
+isn't loaded) or when the disposition itself was `"drop"`. This is
+deliberate: a Composer's `all` combinator waits for every one of N tasks to
+settle, and if the hook were gated on delivery success, a single dropped
+or undeliverable task would mean `all` never fires — composition rests on
+"settled", not on "delivered". `delegate_to_agent` retired in proposal 0067
+P6 (#3978) with no replacement producer for its own chain-resolve
+completion path, so folding it into this point never happens for that
+specific mechanism (architect ruling, #3978) — `run_prompt(collect="async")`
+is this hook point's real second producer (P4e, landed): its own settle
+branch, in `InterAgentMessaging.handle_agent_response`, fires through the
+SAME `task_settled` schema/kind as the pipeline-async path above, no new
+kind added.
+
+Template vars:
+
+| Var | Meaning |
+|-----|---------|
+| `task_id` | The settled task's handle. |
+| `kind` | The task kind (e.g. `pipeline`). |
+| `status` | The terminal status the task settled with. |
+| `session` | The issuing session. |
+| `result` | The task's own LLM-authored output. **Not** `context_safe` (ADR-0040 D3) — cannot be interpolated into a `template_push`'s `message`; use `include` (below) to carry it as fenced, attributed content instead. |
+
+## Matcher: narrowing which events fire a hook
+
+A hook may set `matcher`, a `dict[str, str]` of field → pattern, evaluated
+against the firing event's template vars **before** the hook's action runs:
+
+```yaml
+hooks:
+  - "on": mcp_resource_updated
+    matcher: {server: "github", uri: "file:///repo/**"}
+    template_push:
+      message: "{{ uri }} changed on {{ server }}."
+```
+
+- Every named field must match: **exact string equality**, except `uri` and
+  `path`, which match via a shell-style glob (`fnmatch`) — so
+  `file:///repo/**` matches any URI under that prefix, and `/repo/src/**`
+  matches any watched path under that directory.
+- For a **builtin** hook point (the lifecycle + external + task points listed
+  in the table above), a matcher field must be one the point's builtin schema
+  actually carries — a typo'd or nonexistent
+  field name (e.g. a lifecycle point's matcher naming `server`/`uri`, or
+  `payload.srever`) is a **load-time `HookConfigError`**, rejected before the
+  hook can ever run (a schema-external matcher would otherwise never fire —
+  fail-loud replaces that silent footgun).
+- For a **future or custom point with no builtin schema entry** (the
+  schema-driven open set), a field the firing event doesn't carry still
+  **never matches at runtime** — the pre-schema behavior, since there is
+  nothing to validate against at load time.
+- **Absent or empty matcher → the hook always fires** — the default, and the
+  behavior every pre-`matcher` hook keeps unchanged.
+
+The rule is keyed off the field *name* (`uri`/`path` glob, everything else is
+exact), not the hook-point — so a future external-event source that also
+emits a `uri`- or `path`-shaped field gets glob matching for free.
+
+## Four config schemes
+
+Each entry carries **exactly one** of four mutually-exclusive schemes:
+
+- **`template_push`** — a push directive built from config Jinja2 templates.
+- **`exec`** — a sandboxed argv run as a pure side-effect (output ignored).
+  Renamed from `shell_exec` in #3226 Phase 4 (naming honesty, argv-list-only
+  payload — see [above](#the-4-config-schemes-every-field)).
+- **`exec_capture`** — a sandboxed argv whose **stdout is a JSON push-directive**,
+  pushed via the same path as `template_push` (the only difference is the
+  directive's source: captured stdout vs a Jinja2 render). Renamed from
+  `shell_push` in #3226 Phase 4.
+- **`pipeline_launch`** — launch a registered [pipeline](pipelines.md) with
+  input rendered from the event's template vars. See
+  [Pipeline launch](#pipeline-launch-pipeline_launch) below.
+
+## Four capabilities
+
+Those schemes deliver four behavioral capabilities, uniformly:
+
+### C — context inject (a push with `wake: false`)
+
+A passive `[hook:name]` system message is queued into the unified inbox. It
+rides along with the **next** turn — no extra turn is triggered. Use it to
+append read-only context (metrics, timestamps, retrieved facts) that the LLM
+sees in the conversation without being asked to act on it immediately. Produced
+by a `template_push` or an `exec_capture` whose directive sets `wake: false`.
+
+### E — self-continuation (a push with `wake: true`)
+
+Same as C, but the `wake: true` flag signals the run-loop to open a new turn
+immediately. This is the differentiating capability: a `turn_end` hook can
+restart the agent without any human input. Bounded by the [loop valve](#loop-valve).
+Produced by a `template_push` or an `exec_capture` with `wake: true`.
+
+### F — external side-effect (`exec`)
+
+A sandboxed command is executed. Reyn writes a JSON event to the command's
+stdin; its stdout and stderr are **ignored**. Use it to update external
+state — write a log entry, emit a metric, post to a webhook. See
+[Sandbox](#sandbox) for the safety model.
+
+### Computed push (`exec_capture`)
+
+A sandboxed command whose **stdout** is a single JSON object
+`{"push_when": bool, "wake": bool, "message": str, "session"?: str}` (first
+three required). stdout is parsed into the same push directive a `template_push`
+produces, then dispatched via the identical C/E path — so the command *decides
+at runtime* whether to push (`push_when`), how (`wake`), and what (`message`).
+stdout must be pure JSON (logs go to stderr). Any failure — non-zero exit,
+invalid JSON, or a missing / wrong-typed field — **skips the push** (fail-safe);
+the lifecycle point always proceeds. `session` names the target session for
+**cross-session push** (see below) — omitted, it defaults to the current
+session.
+
+### Pipeline launch (`pipeline_launch`)
+
+Launches a registered [pipeline](pipelines.md) by name, with an `input`
+built from the firing event's template vars:
+
+```yaml
+hooks:
+  - "on": mcp_resource_updated
+    matcher: {uri: "file:///repo/docs/**"}
+    pipeline_launch:
+      name: reindex_docs
+      input_template: {uri: "{{ uri }}"}
+```
+
+- `name` — the pipeline's registered name, resolved at dispatch time. If it
+  isn't registered, the hook logs a warning and skips the launch — the
+  lifecycle/external-event point still completes normally, exactly like any
+  other hook failure.
+- `input_template` — optional. A `dict`'s string leaves (recursively) are
+  each Jinja2-rendered against the template vars; a plain string is rendered
+  once and its output parsed as a JSON object (mirroring `exec_capture`'s
+  "stdout is JSON" contract); omitted, the pipeline launches with no input.
+- **Async/detached**, works from any hook-point (lifecycle or
+  `mcp_resource_updated`): the launch is the same
+  [`run_pipeline(name=..., collect="async")`](../../reference/runtime/pipeline-dsl.md#registered-launch)
+  path — the hook fires-and-continues, the pipeline runs in its own
+  crash-recoverable driver-session, and the result arrives later on this
+  session's own inbox as a `pipeline_result` message.
+
+**Worked example — behavioral anomaly detector (#5221)**: `turn_end`'s event
+carries `sensitive_op_count` / `sensitive_op_kinds_csv` (#5221) — a
+closed-vocabulary tally of "sensitive" audit-event kinds that fired during
+the turn (never raw message text; see
+`reyn.runtime.turn_behavior_tally`). The shipped
+`src/reyn/data/pipelines/behavior_anomaly.yaml` pipeline reads these to
+decide, deterministically, whether to escalate to an LLM judge (constrained
+to a typed clean/suspicious verdict, zero capabilities) — opt-in, nothing
+runs until BOTH entries below are registered:
+
+```yaml
+pipelines:
+  entries:
+    behavior_anomaly:
+      path: src/reyn/data/pipelines/behavior_anomaly.yaml
+hooks:
+  - "on": turn_end
+    pipeline_launch:
+      name: behavior_anomaly.check
+      input_template: |
+        {"chain_id": "{{ event.chain_id }}", "sensitive_op_count": {{ event.sensitive_op_count }}, "sensitive_op_kinds_csv": "{{ event.sensitive_op_kinds_csv }}"}
+```
+
+See [Events § Behavioral anomaly detector](../../reference/runtime/events.md)
+for the `behavior_anomaly_judged` audit-event this produces, its
+asymmetric-trust reading, and why `turn_end` firing after the turn means
+this detects, it does not prevent.
+
+### Cross-session push
+
+A `template_push` or `exec_capture` directive's `session` field routes the
+push to a *different* session's inbox instead of the current one — the
+target session processes it exactly as it would its own hook push (`wake`
+rides along: `true` triggers a turn there, `false` rides passively into its
+next turn). Naming the current session, omitting `session` entirely, or
+running in a context with no cross-session routing capability all fall back
+to the local (current-session) push.
+
+## wake flag and the run-loop
+
+`wake` (default `true`) is what splits C from E. The run-loop drains the inbox
+after each turn:
+
+1. Collect all queued hook messages.
+2. Any `wake: false` messages are included as context in the upcoming turn (or
+   held for the next human-driven turn if no `wake: true` is present).
+3. The loop fires **one** new turn if at least one `wake: true` is present —
+   all `wake: false` messages from the same batch ride along as context in that
+   same turn.
+
+If no hooks are configured or none match the current lifecycle point, the loop
+is byte-identical to a hooks-free session. Zero overhead on the happy path.
+
+**A slash command typed while waiting for a `wake: true` trigger does not
+consume the staged `wake: false` context.** Slash commands are handled
+entirely client-side (#3595 S5) and never enter the turn machinery that
+drains staged hook messages, so they structurally cannot swallow context
+meant for the eventual triggered turn — the staged messages survive intact.
+
+## Fidelity
+
+Pushes are **new** attributed `[hook:name]` system messages added to the
+conversation. They do not mutate existing history — object identity is preserved
+on every existing message. This is tested at the object-identity level, not just
+content equality.
+
+Shell output is intentionally ignored. Reyn does not support transform-hooks
+(hooks that rewrite the context or the artifact stream). Real redaction,
+truncation, and content fencing stay at the OS layer where they are visible,
+evented, and auditable (see
+[secret-handling](secret-handling.md) and
+[content-layer defense](../../reference/config/reyn-yaml.md#safetythreat_scan-fields)).
+
+## Awaited-dispatch architecture
+
+Hooks are dispatched by `HookDispatcher`, a first-class synchronous awaited call
+at each lifecycle point. This is **not** an EventLog subscriber:
+
+| Mechanism | Timing | Use |
+|-----------|--------|-----|
+| `HookDispatcher` | awaited first-class | hooks — must complete before the lifecycle point continues |
+| EventLog subscriber | sync-inline, no await | real-time console render, analytics |
+| WAL | append-only durable log | crash recovery |
+| P6 audit event | async-tolerant | audit trail, replay, eval |
+
+Subscribers are sync-inline and cannot `await` — they are fire-and-forget at
+emit time. A shell hook that needs to wait for a process to exit cannot be
+implemented as a subscriber. `HookDispatcher` solves this.
+
+Each hook is wrapped in its own `try/except` block. A hook failure is logged and
+attributed to the hook by name; it does not abort the lifecycle point or
+propagate to the LLM output.
+
+## Loop valve
+
+`E` (self-continuation) is bounded to prevent runaway hook-driven sessions:
+
+- **Counter**: `safety.loop.max_hook_driven_turns` (default `25`) counts
+  hook-driven turns since the last human user turn.
+- **Reset**: the counter resets to zero on every human turn.
+- **On cap**: the configured `safety.on_limit` action fires —
+  `warn` → `ask_user` → `abort`. All three leave the session alive (no silent
+  kill).
+- **Unlimited**: set `max_hook_driven_turns: 0` to disable the cap entirely.
+
+The valve is a backstop, not an obstruction. A well-designed self-continuation
+hook will finish before the cap; the cap catches runaway loops that a bug or
+unexpected workflow behavior would otherwise leave open.
+
+## Sandbox
+
+`exec`/`exec_capture` hooks run inside the same backend-agnostic sandbox abstraction as
+Control IR `sandboxed_exec` ops: Seatbelt (macOS), Landlock/seccomp (Linux), Noop
+(unsupported platforms), or a container backend.
+
+A hook shell's sandbox is scoped **per hook**. Three axes start at a floor and
+only an explicit key on that hook moves them
+([`hooks:` block](../../reference/config/reyn-yaml.md#hooks-block)):
+
+| Axis | Floor | The operator's key |
+|---|---|---|
+| fork | no subprocess spawning | `subprocess: true` |
+| network | outbound network blocked | `network: true` |
+| writes | no writable paths | `write_paths: [...]` |
+
+Omitting a key keeps that floor, so a hook that declares nothing is as bounded
+as it has always been. Each axis is deliberately per-hook rather than global:
+what a hook needs from the sandbox is a property of the operator's own command.
+A `git`/`npm` hook forks; a pure-python one does not — so there is no safe
+blanket default (contrast a stdio MCP server's `subprocess:`, which defaults
+*on* because such a server forks to exist). A command that forks internally — a
+bare command resolving to a `pyenv`/`asdf`/`mise` shim, or an `npx`/`uvx`
+launcher — is denied under the floor and logged with `denial_class=fork_denied`,
+naming it an environment/config problem rather than a command failure.
+
+Two boundaries hold regardless of the keys:
+
+- The sensitive-file read deny-list (`~/.ssh`, `~/.aws`, …) applies to
+  `exec`/`exec_capture` hooks as it does to any other sandboxed run, and a
+  `write_paths` grant does not pierce it — the deny wins over an overlapping
+  grant.
+- Consent is fail-closed: if the sandbox backend cannot be confirmed, the
+  hook is refused rather than run unsandboxed.
+
+### Why the agent-level `sandbox.policy` is not the hook's policy
+
+The agent-level [`sandbox.policy`](../../reference/config/reyn-yaml.md#sandbox-block)
+governs sandboxed ops and the OS's in-process file/http gates. It does **not**
+reach a hook shell. That is a structural choice, not an oversight: a hook is a
+small declarative reaction to a lifecycle event, so its floor should not move
+because a run's *ops* are deliberately unsandboxed. The hook site is where a
+hook's sandbox is decided.
+
+What the OS does not do is ignore you. If the agent-level policy declares one of
+the three axes above and an `exec`/`exec_capture` hook does not re-declare it, the run logs a
+WARNING naming the per-hook key that reaches it and emits a
+`sandbox_policy_not_applied` audit-event recording what was configured, what
+actually applied, and which hook. Declaring the key on the hook — to *any*
+value, including the floor — is your decision on that axis, and a decision is
+never reported. The invariant: an operator's expressed will is applied or
+refused, never silently dropped.
+
+### Consent and allowlist
+
+`exec`/`exec_capture` argv require operator consent before they run. The consent flow depends on whether a live intervention listener is attached:
+
+- **Interactive chat session** (inline CUI) — consent routes through the unified intervention bus and renders as a closed-set intervention in the above-input region: "Shell hook `<name>` wants to run a command" (the hook's configured `name:` field, or a generic message if unnamed; the prompt text still says "shell hook" — a UI-label detail, not a config field name). Three choices:
+  - **[A]lways** — allow and persist to the allowlist (`~/.reyn/shell-hooks-allowlist.json`, override via `REYN_SHELL_HOOKS_ALLOWLIST`). Future runs of the same command are auto-approved.
+  - **[y]es** — allow this run only.
+  - **[n]o** — skip (fail-closed).
+- **Non-interactive** (`reyn run`, `mcp-serve`, headless) — falls back to the pre-bus behavior: TTY stdin prompt when available, or refused when stdin is not a TTY.
+- **Allowlist hit** — any command already in the allowlist runs silently without a prompt (auto-approved on all surfaces).
+
+Consent is fail-closed throughout: if the sandbox backend cannot be confirmed, the hook is refused rather than run unsandboxed. An unanswered/empty consent-bus response (e.g. an intervention parked stalled because its origin channel closed) also fails closed — the hook is skipped, not run and not left hanging.
+
+**`REYN_ACCEPT_HOOKS=1` short-circuits the whole consent flow above**, including the bus path — the hook runs and the bus is never consulted, taking precedence even over an attached listener. This is the CI/automation escape hatch for environments where no operator is present to answer a prompt.
+
+**`has_active_listener` is re-checked on every dispatch, not cached (`#2095`).** Listeners attach and detach over a session's lifetime — a TUI mount, an A2A request window opening and closing — independently of when the `HookDispatcher` was constructed. Checking the listener state once at construction and caching the routing decision would let a later dispatch route a consent prompt to a listener that has since detached (a hang, or a silently dropped prompt) instead of correctly falling through to the non-interactive path (`REYN_ACCEPT_HOOKS` / fail-closed, or the `reyn run` stdin prompt on a TTY). The consent-bus wiring at this call site is byte-identical to the pre-`#2095` fallback matrix in every case EXCEPT that the routing decision (bus vs `None`) is now made per-dispatch against live listener state rather than frozen at construction — the per-dispatch check itself lives in the dispatcher, not at this construction site.
+
+See [sandbox](sandbox.md) for the full backend model and [permission model](permission-model.md) for the broader consent architecture.
+
+### P6 event: `hook_shell_executed`
+
+Every `exec`/`exec_capture` hook run — including silently auto-approved runs — emits a `hook_shell_executed` P6 event (under the "tool" group; the event kind name itself is unchanged by #3226 Phase 4 — only the `mode` value below was renamed), recording:
+
+```
+exec: <command> [rc=N]
+```
+
+(`exec_capture:` prefix for push-mode hooks — renamed from `shell_exec:`/`shell_push:` in #3226 Phase 4.) The return code suffix is omitted when the command exits 0. This gives the operator a complete audit trail of exec-hook activity regardless of consent path.
+
+## Configuration
+
+Hooks are declared under the `hooks:` key in `reyn.yaml`. See the
+[reyn-yaml reference § hooks block](../../reference/config/reyn-yaml.md#hooks-block)
+for the full schema.
+
+Brief example — a `turn_end` self-continuation `template_push`, a `session_start`
+`exec`, a `turn_end` `exec_capture` whose stdout decides the push, and a
+matcher-narrowed `mcp_resource_updated` `pipeline_launch`:
+
+```yaml
+hooks:
+  - "on": turn_end
+    template_push:
+      message: "Run complete. Check for pending tasks."
+      wake: true
+
+  - "on": session_start
+    exec: ["touch", "/tmp/reyn-session-started"]   # argv only — no shell redirection (">>")
+
+  - name: dynamic
+    "on": turn_end
+    exec_capture: ["scripts/decide-next.sh"]   # emits {"push_when":true,"wake":true,"message":"..."}
+
+  - "on": mcp_resource_updated
+    matcher: {server: "github", uri: "file:///repo/docs/**"}
+    pipeline_launch:
+      name: reindex_docs
+      input_template: {uri: "{{ uri }}"}
+```
+
+The `wake: true` on the first hook triggers a new turn after each `turn_end`,
+with the message injected as the system context. The `exec` on
+`session_start` runs its argv as a pure side-effect; its output is discarded
+(argv is executed directly — no shell, so a literal `>>` redirect token would
+NOT redirect; use a script or an explicit `["sh", "-c", "..."]` argv if you
+need shell semantics). The `exec_capture`
+runs its argv, parses stdout, and pushes only if the directive says so.
+The last hook only fires for a `github`-server resource under
+`docs/` — and, when it does, launches the `reindex_docs` pipeline
+asynchronously with the changed URI as input.
+
+## Async Bus and Composer — event correlation
+
+Everything above is the **Sync** path: an awaited, per-hook dispatch at each
+lifecycle/external point. reyn also has a per-Session **Async Bus** —
+independent pub/sub broadcast of the same events, with no consume semantics
+(every subscriber observes the same broadcast simultaneously) — and, built on
+top of it, a **Composer** that correlates multiple events into one derived
+"composed" event.
+
+**Scope is per-Session by DEFAULT (Hook-Event Redesign Phase 4a, proposal `0059` §3.2/§3.3).** Each Session constructs its own `HookBus` instance, feeding its own `HookDispatcher`; a Bus is never shared across Sessions. This is a deliberate v1 scope limit, not an oversight — by default there is no cross-session event observation or correlation. Concretely, `HookBus.publish` delivers to every subscriber attached to that instance; two Sessions sharing one Bus would let a subscriber on one Session observe events published from the other. No subscriber attaches to a fresh Bus until something explicitly calls `session._hook_bus.subscribe()` — the Composer (Phase 4b) is the first consumer that does; until then `publish()` hits its zero-subscriber path and is a no-op.
+
+**#4215② (2026-08-12) added one narrow, opt-in exception**: a spawned pipeline driver's Bus can bridge to its ATTACHED parent's Bus (`reyn.hooks.bus.bridge_child_bus_to_parent`, wired only at `session_api._spawn_pipeline_driver_session`'s ATTACHED spawn path). The corrected framing (owner ruling, #4215): the concern was never "a parent must not observe a child" but "there must be a choice, not a structural impossibility." The bridge subscribes to the child's Bus and re-publishes directly onto the parent's — never through either session's `HookDispatcher` (re-publishing a bus-originated event back onto a bus is a documented double-delivery hazard, see `dispatch_bus_event`'s own docstring). The default is unchanged for every other session pair: nothing subscribes across Sessions unless a spawn site explicitly chooses this routing, and an unsubscribed Bus still costs nothing (the same zero-subscriber happy path above).
+
+A **Composer** watches the Bus, buffers matching events per its configured
+op, and — once the op's condition is met — publishes ONE new event with
+`kind = "composed:<name>"` back to the same Bus. Eight ops:
+
+| Op | Fires when |
+|---|---|
+| `all` | every one of N distinct inputs has arrived (per correlation key) |
+| `any` | the first matching input arrives (stateless) |
+| `seq` | the inputs' kinds arrive in the CONFIGURED order (an out-of-order arrival resets progress) |
+| `window` | `ttl` seconds have elapsed since the FIRST matching event — fires with everything buffered |
+| `debounce` | `ttl` seconds have elapsed since the LAST matching event with no newer one in between |
+| `correlate_by` | like `all`, but keyed by a payload field (e.g. a request id) instead of one global bucket |
+| `count` | `threshold` matching events have arrived (per key) |
+| `deadline` | its `until` pattern has NOT arrived within `ttl` of its `on` pattern arming (per key) — issue #3166, the only op that fires on absence, not occurrence |
+
+```yaml
+composers:
+  - name: deploy_approved
+    op: all
+    inputs:
+      - { kind: builtin:external:mcp_resource_updated, match: { server: "github" } }
+      - { kind: mcp:approval-server:approved }
+    policy: { capacity: 10, overflow: reject, ttl: 5m }
+    emit: { kind: composed:deploy_approved }
+```
+
+**Correlate on payload, never on `source`.** Every event on the Bus carries
+`source="builtin"` — `kind` already encodes the source TYPE
+(`mcp_resource_updated` vs `file_changed` vs ...) and `payload` already
+carries the source INSTANCE (`payload.server` / `payload.path` /
+`payload.job_name` / `payload.transport`). A Composer input naming a
+`source` other than `"builtin"` can never match anything the Bus carries and
+is rejected at config-load time (the same typo-resistance posture the
+matcher's schema validation already has for payload fields).
+
+**Reliability posture — best-effort, not a recovery feature.** A Composer's
+in-flight correlation state is held in memory only and is lost on a process
+crash (a partially-matched `all`/`seq`/`correlate_by` simply never fires).
+This is a deliberate v1 scope decision, not an oversight: the Bus itself is
+already lossy under backpressure (a slow subscriber drops the oldest
+unread event), so a Composer built on top of it cannot promise more
+reliability than its input. Overflow of a Composer's own pending state
+follows one of three policies — `drop_oldest` / `drop_newest` / `reject`
+(no publisher-blocking backpressure) — and every drop, whether from
+overflow or a `ttl`-aged incomplete correlation, is surfaced as a
+`composer_dropped` P6 event (metadata only: composer name + correlation key
++ reason, never the buffered payload content) so a composition that quietly
+never fires is never silent. A successful fire is `composer_fired`
+(same metadata-only shape).
+
+**Composed events reach Sync via a dedicated bridge, never `HookDispatcher.
+dispatch()` itself.** A `composed:<name>` event is published ONLY to the
+Bus by the Composer (invariant #5 above stays true — a Composer never calls
+`HookDispatcher.dispatch()`/`hooks_for()` directly). Hook-Event Redesign
+Phase 5 part 1 ([#2881](https://github.com/tya5/reyn/issues/2881)) opened
+`composed:<name>` as a subscribable Sync `on:` target — a
+`reyn.hooks.composed_consumer.ComposedEventConsumer` subscribes to the same
+session `HookBus` and, for every observed `composed:*` event, runs any
+Sync-registered hook whose `on:` names that kind
+(`HookDispatcher.dispatch_bus_event`) — WITHOUT re-publishing to the bus
+(re-broadcasting an already-bus-delivered event would double-deliver it to
+any sibling Composer correlating on the same kind). A composer config that
+would create a composition cycle (composer A depends on composer B's output
+which depends on A's) is still rejected at config-load time, never
+discovered at runtime — that DAG check is independent of, and unaffected
+by, this Sync consumer.
+
+```yaml
+hooks:
+  - "on": composed:deploy_approved      # a composed event as a Sync on: target
+    exec: ["reyn", "deploy.sh"]
+
+composers:
+  - name: deploy_approved
+    op: all
+    inputs:
+      - { kind: builtin:external:mcp_resource_updated, match: { server: "github" } }
+      - { kind: mcp:approval-server:approved }
+    policy: { capacity: 10, overflow: reject, ttl: 5m }
+    emit: { kind: composed:deploy_approved }
+```
+
+A Session reads `composers:` from the SAME 4-layer additive combine as
+`hooks:` (`reyn.yaml` startup ∪ `.reyn/config/hooks.yaml` runtime ∪
+per-agent ∪ per-session) and starts every configured Composer automatically
+(`start_composers`, called from `run()` alongside the filesystem watcher's
+own start) — no manual wiring required. Composers are **startup-only**: a
+config change takes effect on the next session start, not via the hooks
+hot-reload seam (a live Composer's in-flight `PendingStore` correlation
+state has no reload-time reconciliation yet).
+
+### Crash durability of pending state
+
+A Composer's per-key pending state lives behind the `PendingStore` seam, and
+which implementation a composer gets is a per-composer decision (`durable:`,
+defaulting to **true for `op: deadline` and false for every other op**):
+
+| | Store | On a process crash |
+|---|---|---|
+| `durable: false` (default for 7 ops) | `InMemoryPendingStore` | in-flight correlations are dropped — costs at most one buffered notification |
+| `durable: true` (default for `deadline`) | `DurablePendingStore` | the armed set is restored **with its original arm instants**, so a missed deadline still fires at `armed_at + ttl` |
+
+`deadline` is the asymmetric case, which is why it alone defaults to durable:
+losing a `debounce` buffer costs one notification, but losing an armed
+`deadline` costs the *monitoring itself* — and whatever the dead-man switch was
+watching is very likely inside the same crash. Restoring the arm **instant** is
+the load-bearing half: a monitor re-armed with a fresh clock reports healthy
+while silently sliding its deadline forward by the entire downtime.
+
+`DurablePendingStore` is a full-state JSON snapshot at
+`<per-session state dir>/composer_pending.json`, rewritten atomically on every
+arm/disarm — deliberately **not** WAL-events. WAL-derived state that is not
+snapshot-backed is silently lost when the WAL is truncated below its source
+events (the [#2259 config-recovery class](../../reference/runtime/reyn-dir-layout.md#recovery-core)),
+and a dead-man switch that silently fails to re-arm is the worst instance of
+that. Because the store never reads the WAL, it survives truncation
+structurally rather than by argument.
+
+Setting `durable: false` on a `deadline` composer is allowed — an in-process
+nudge does not need an fsync per arm — but emits a load-time `UserWarning`, so
+a dead-man switch that dies with its process is never a silent posture.
+
+**The composed→wake loop-valve bound.** A `composed:<name>` hook's
+wake=true push lands in the inbox via the exact same `kind="hook"` E-path
+every other hook-driven wake uses, so a self-stimulating composed→wake
+chain (a composer counting a lifecycle point its own consumer hook's next
+turn re-triggers — e.g. `turn_end`) is bounded by the session's existing
+`max_hook_driven_turns` loop-valve with **zero new bounding logic**: every
+wake path, composed→wake included, is counted by the same
+`_hook_driven_turns` cap check. This is the architect-ratified "structural
+non-reentry → valve-metered allow" transition (proposal
+[0059](../../deep-dives/proposals/0059-hook-event-redesign.md) §9 item 3) —
+pinned by a flip-witness Tier-2 test that drives a chain whose natural turn
+count is unbounded and asserts the force-close fires at the cap.
+
+## Agent self-directed hooks (`hooks_add`)
+
+Everything above is authored by the operator in `reyn.yaml` (the OUT-set,
+restart-only) or emitted by the OS/Composer. `hooks_add` is the tool that lets
+the agent add a hook to **its own runtime layer** at any point during a
+session — self-directed continuation (`wake: true`) or recurring injected
+context (`wake: false`), without a restart.
+
+```json
+{"kind": "hooks_add", "on": "turn_end", "message": "Check the deploy status.", "wake": true}
+```
+
+- `on` (required) — one of the lifecycle points above: `turn_start`,
+  `turn_end`, `session_start`, `session_end`.
+- `message` (required) — the push message (Jinja2 template allowed).
+- `wake` (optional, default `true`) — `true` starts a new turn
+  (self-continuation, bounded by `safety.loop.max_hook_driven_turns`); `false`
+  rides along as context with the next turn.
+- `push_when` (optional) — a Jinja2 → bool guard; the push is skipped when it
+  renders false.
+- `name` (optional) — a label surfaced as a `[hook:name]` attribution prefix
+  in history.
+
+**Write target and gating**: the hook is written to exactly one hardcoded
+target — never derived from LLM input, only from the CALLING SESSION's own
+identity (#4215①, superseding #2088's scope-aware write):
+
+- **every session — named agent or default, "main" or spawned — writes ITS
+  OWN per-session layer**, `<session_state_dir>/hooks.yaml` (#2285's "4th,
+  most-specific" COMBINE layer), never a layer any OTHER session (of the
+  same agent or a different one) also writes to or reads from.
+
+This is a deliberate isolation guarantee, not merely a path choice: hooks
+are reyn's one *reactive* corner (the OS acting on someone else's
+registration, not the agent's own decision), so a session's own
+self-expanded hooks must never leak into — or be leaked into by — a sibling
+session. #2088 gave a NAMED agent its own per-agent layer, but that layer was
+still SHARED across every session of that agent, and the default/unnamed
+agent still wrote the GLOBAL layer, shared across every session, named or
+not — #4215① closes both leaks.
+
+This structurally can never touch `reyn.yaml` (the OUT-set), the GLOBAL
+runtime layer, or any other session's per-agent/per-session layer. The
+per-session hook joins the other layers (startup, global runtime, per-agent)
+ADDITIVELY — none override one another — and takes effect at the next turn
+boundary. The tool itself is write-gated (`permissions.tool`) and can be
+denied per-agent via a capability profile's `tool_deny`. Full hot-reload
+mechanics — the layered COMBINE, validate-before-apply, boot resilience —
+are covered in [Concepts: Config hot-reload](config-hot-reload.md).
+
+**The operator-facing GLOBAL (`.reyn/config/hooks.yaml`) and per-agent
+(`.reyn/agents/<name>/hooks.yaml`) layers are unchanged and still read** — an
+operator can still hand-place hooks in either, and they still combine in.
+`hooks_add` simply no longer writes to either.
+
+## LLM-authored hook-events (`emit_hook_event`)
+
+Everything above is fired by the OS (a lifecycle point, an external-event
+source) or by a Composer's correlation logic. `emit_hook_event` is the ONE
+Control-IR op that lets the LLM itself put an event onto its own session's
+Bus — the first LLM-reachable producer in an otherwise OS-internal pipeline.
+
+```json
+{"kind": "emit_hook_event", "event_name": "deploy_ready", "payload": {"artifact": "build-42"}}
+```
+
+- `event_name` (str, required) — the emitted kind is ALWAYS
+  `llm:<session_id>:<event_name>`; the session component comes solely from
+  the caller's own session at execution time — there is no field the LLM
+  can set to target a different session.
+- `payload` (dict, optional, default `{}`) — carried on the event for a
+  `matcher` / Composer to inspect. Never itself rendered into a hook
+  message template by this op.
+
+**The autonomy boundary — a static ALLOW-list, not a deny-list.** Only this
+session's own `llm:<session_id>:*` namespace may ever be emitted:
+
+- `builtin:*` is rejected — an LLM cannot spoof Reyn's own
+  lifecycle/external-event kinds.
+- `composed:*` is rejected — an LLM cannot spoof a Composer's *correlated*
+  output; forging one would fire a `composed:*`-gated hook (e.g. an
+  approval-gated deploy) without the Composer's actual correlation logic
+  ever running.
+- `webhook:*` / `mcp:*` (or any other session's `llm:*`) are rejected — an
+  LLM cannot spoof external ingress or another session's identity.
+
+**An emitted `llm:*` event only reaches a `hooks:` entry through a
+Composer** — there is no direct Sync path from a raw `llm:*` Bus event to a
+`hooks:` `on:` entry (only `composed:*` events are bridged to Sync dispatch;
+see [Async Bus and Composer](#async-bus-and-composer-event-correlation)).
+So `emit_hook_event`'s output is always consumed as a Composer
+`inputs[].kind`, never directly as a hook's `on:`. **The `inputs[].kind`
+value must name the actual session id**, not just the event name — the
+default session's id is `main` (see [Sessions](../multi-agent/sessions.md)
+for named/multi-session setups). Worked example — the LLM signals it
+finished preparing a deploy (with the artifact id in `payload`); a Composer
+waits for that alongside an external approval, then a Sync hook reacts to
+the correlated result and reads the artifact id back out. Using `op: seq`
+here (not `all`) is deliberate — it's the one op that GUARANTEES `inputs[]`
+lands in the declared order, so `inputs[0]` is reliably the `llm:*` event's
+payload, not whichever of the two happened to arrive first:
+
+```yaml
+composers:
+  - name: deploy_approved
+    op: seq                              # order-guaranteed — inputs[0] is always the llm:* event below
+    inputs:
+      - kind: llm:main:deploy_ready       # the default session's id is "main"
+      - kind: mcp:approval-server:approved
+    emit: { kind: composed:deploy_approved }
+
+hooks:
+  - "on": composed:deploy_approved
+    template_push:
+      message: "Deploy artifact {{ inputs[0].artifact }} approved — proceeding."
+      wake: false
+```
+
+## Deferred
+
+The following capabilities are designed but not yet implemented:
+
+- **Agent-level and phase-level hooks** — fine-grained points inside a turn
+  (rare use cases; session/turn covers the common ones).
+- **valve-persist** — `_hook_driven_turns` (the loop-valve counter) is
+  in-memory-only (resets on crash); a separate, recovery-gated follow-up
+  would make it snapshot-backed. Flagged as more load-bearing now that the
+  Composer/Bus redesign adds new hook-driven-turn-generating paths.
+
+## See also
+
+- [Workspace](workspace.md) — the single source of truth that hook push messages land in
+- [Events](events.md) — the P6 audit trail that records hook dispatch
+- [Permission model](permission-model.md) — the consent flow for shell hooks
+- [Sandbox](sandbox.md) — the backend-agnostic execution environment for shell hooks
+- [reyn-yaml § hooks](../../reference/config/reyn-yaml.md#hooks-block) — full config reference
+- [MCP § Resource subscriptions](../tools-integrations/mcp.md#resource-subscriptions-the-async-push-event-source) — the source of the `mcp_resource_updated` external-event point
+- [Pipelines](pipelines.md) — what a `pipeline_launch` hook launches

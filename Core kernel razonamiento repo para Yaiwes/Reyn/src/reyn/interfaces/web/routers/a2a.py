@@ -1,0 +1,961 @@
+"""A2A (Agent2Agent) protocol router — expose Reyn agents as A2A endpoints.
+
+Sister to ``reyn.interfaces.web.routers.mcp`` — same backing implementation
+(``reyn.mcp.server.send_to_agent_impl``), different wire protocol.
+
+  - **MCP** (Model Context Protocol): an *outer LLM client* (Claude
+    Desktop, Cursor, …) treats Reyn as a tool provider. Tools are
+    ``list_agents`` / ``send_to_agent``.
+  - **A2A** (Agent2Agent): peer agents (LangGraph, CrewAI, custom
+    agents speaking A2A) treat each Reyn agent as an addressable peer.
+    Discovery happens via Agent Cards; conversation happens via
+    JSON-RPC 2.0 ``message/send``.
+
+Surface (FP-0001 + MVP):
+
+  - ``GET /a2a/agents`` — list all Reyn agents (server-level discovery).
+  - ``GET /a2a/agents/{name}/.well-known/agent-card.json`` — A2A Agent
+    Card per agent (the canonical discovery URL in the A2A spec).
+  - ``POST /a2a/agents/{name}`` — JSON-RPC 2.0 endpoint per agent.
+    Method: ``message/send``. Three operating modes:
+    1. **Answer injection** (``params.task_id`` present): deliver an
+       answer to a pending ask_user intervention on a running async task.
+    2. **Async mode** (``params.async_mode=true`` OR ``params.webhook_url``
+       set): spawn a background task, return A2A Task envelope immediately.
+    3. **Synchronous** (default): return final reply as A2A Message.
+  - ``GET /a2a/tasks/{run_id}`` — poll async task status.
+  - ``POST /a2a/tasks/{run_id}/cancel`` — cancel a running task.
+  - ``GET /a2a/tasks/{run_id}/events`` — SSE stream of task history.
+
+P7: this module contains no domain-specific strings. Each Reyn agent's
+``role`` text flows through opaquely into the Agent Card description;
+the request body's ``message.parts[].text`` is forwarded to
+``send_to_agent_impl`` as-is.
+
+Spec reference: https://google.github.io/A2A/
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import uuid
+from typing import Any
+
+from fastapi import APIRouter, Depends, HTTPException, Request
+
+from reyn.core.events.progress_lifecycle import (
+    PROGRESS_LIFECYCLE_EVENTS,
+    format_progress_message,
+)
+from reyn.interfaces.web.a2a_task_view import to_a2a_task
+from reyn.interfaces.web.deps import (
+    get_a2a_webhook_registry,
+    get_registry,
+    get_run_registry,
+)
+from reyn.mcp.server import DEFAULT_SEND_TIMEOUT_SECONDS, send_to_agent_impl
+from reyn.runtime.a2a_routing import (
+    a2a_context_id,
+    a2a_session_id,
+    resolve_a2a_session,
+)
+from reyn.runtime.session_pure import new_chain_id
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(tags=["a2a"])
+
+# ── A2A protocol constants ──────────────────────────────────────────────────
+
+# JSON-RPC 2.0 standard error codes.
+_PARSE_ERROR = -32700
+_INVALID_REQUEST = -32600
+_METHOD_NOT_FOUND = -32601
+_INVALID_PARAMS = -32602
+_INTERNAL_ERROR = -32603
+
+# Reyn's reported A2A protocol version. Bump when we add streaming / task
+# lifecycle support so peers can capability-negotiate.
+_A2A_PROTOCOL_VERSION = "0.2.0"
+
+# Reyn's own version string (= surfaced in Agent Card so peers can spot
+# a stale Reyn instance during interop debugging).
+_REYN_A2A_VERSION = "0.1.0"
+
+# A2A AgentProvider (#1811) — the service provider of these agents. The v0.2.0
+# AgentCard's optional `provider` (organization + url, both required when present)
+# was the one discovery-metadata field still missing. Sourced from the project
+# metadata (pyproject [project.urls] Homepage), kept as constants in the same
+# style as the version constants above. (preferredTransport / additionalInterfaces
+# do NOT exist in the v0.2.0 schema reyn declares — they are later-0.2.x additions
+# that would require a protocolVersion bump, so they are intentionally omitted.)
+_PROVIDER_ORGANIZATION = "Reyn"
+_PROVIDER_URL = "https://tya5.github.io/reyn/"
+
+
+# ── helpers ─────────────────────────────────────────────────────────────────
+
+
+def _jsonrpc_error(req_id: Any, code: int, message: str, data: Any = None) -> dict:
+    """Construct a JSON-RPC 2.0 error response envelope."""
+    err: dict = {"code": code, "message": message}
+    if data is not None:
+        err["data"] = data
+    return {"jsonrpc": "2.0", "id": req_id, "error": err}
+
+
+def _jsonrpc_result(req_id: Any, result: Any) -> dict:
+    """Construct a JSON-RPC 2.0 success response envelope."""
+    return {"jsonrpc": "2.0", "id": req_id, "result": result}
+
+
+def _build_agent_card(agent_name: str, role: str, base_url: str) -> dict:
+    """Construct the A2A Agent Card for a single Reyn agent.
+
+    The card is what peer agents read to decide whether and how to talk
+    to this one. We surface:
+
+      * ``name`` — the Reyn agent name (= addressable identity).
+      * ``description`` — the agent's ``role`` text from profile.yaml.
+      * ``url`` — the JSON-RPC endpoint to POST to.
+      * ``capabilities`` — issue #267 Gap 3 Z-c re-elevation. With
+        Gap 1 (= SSE producer wiring, PR #288) and Gap 2 (= webhook
+        trigger expansion, PR #286) both landed, the two surfaces now
+        produce events backing the claims. Re-elevated to ``True``:
+
+          - ``streaming``: ``GET /a2a/tasks/{run_id}/events`` SSE stream
+            backed by ``_A2AProgressBridge`` fan-out into
+            ``RunEntry.history_events`` (PR #288) +
+            ``A2AInterventionBus.deliver`` appending input-required
+            audit-events (= peers see lifecycle + ask_user inline).
+          - ``pushNotifications``: webhook fires on each forwarded
+            lifecycle audit-event (= ``PROGRESS_LIFECYCLE_EVENTS``, via
+            PR #286) plus the original ``completed`` / ``failed`` /
+            ``input-required`` triggers. The two-sink bridge means
+            webhook and SSE consumers see identical payloads.
+
+        ``stateTransitionHistory`` remains ``False`` (= no plans to
+        implement). Each claim is pinned to an in-source wire by the
+        Tier 2 contract test so a future refactor that removes the
+        producer without flipping the claim back fails immediately —
+        same pattern as PR #284's MCP capability/wire AST-pin
+        calibration (= prevents the #267 Z-b "claim/reality mismatch"
+        regression by construction).
+      * ``skills`` — A2A's ``skill`` is an outward-facing capability,
+        not Reyn's internal skill graph. We expose a single coarse-
+        grained skill (``chat``) since each Reyn agent's actual
+        capabilities are expressed through its underlying Reyn skill
+        catalogue, which the OS routes to internally — opaque to the
+        A2A peer by design (P7).
+    """
+    return {
+        "name": agent_name,
+        "description": role or f"Reyn agent {agent_name!r}",
+        "url": base_url,
+        # A2A v0.2.0 optional `provider` (#1811) — the service provider metadata
+        # peers read during discovery. organization + url are both required when
+        # `provider` is present.
+        "provider": {
+            "organization": _PROVIDER_ORGANIZATION,
+            "url": _PROVIDER_URL,
+        },
+        "version": _REYN_A2A_VERSION,
+        "protocolVersion": _A2A_PROTOCOL_VERSION,
+        "capabilities": {
+            # issue #267 Gap 3 Z-c re-elevation: Gap 1 (PR #288 SSE
+            # producer) + Gap 2 (PR #286 webhook trigger expansion)
+            # both landed → claims backed by in-source wires.
+            # Tier 2 contract test pins each claim to its wire so a
+            # regression flipping these back to False without removing
+            # the producer (or vice versa) fails immediately.
+            "streaming": True,
+            "pushNotifications": True,
+            "stateTransitionHistory": False,
+        },
+        "defaultInputModes": ["text/plain"],
+        "defaultOutputModes": ["text/plain"],
+        "skills": [
+            {
+                "id": "chat",
+                "name": "Chat with agent",
+                "description": (
+                    f"Converse with the Reyn agent {agent_name!r}. "
+                    "The agent decides internally how to respond; "
+                    "multi-turn history persists across calls."
+                ),
+                "tags": ["chat", "conversation"],
+                "inputModes": ["text/plain"],
+                "outputModes": ["text/plain"],
+            },
+        ],
+    }
+
+
+def _extract_text_from_parts(parts: list) -> str:
+    """Pull the concatenated ``text`` out of an A2A message ``parts`` list.
+
+    A2A allows multiple part kinds (``text``, ``file``, ``data``). For
+    MVP we forward only text — non-text parts are silently skipped so a
+    peer that sends a mixed message still gets a sensible reply. Future
+    work: support ``file`` parts via Reyn's workspace upload path.
+    """
+    chunks: list[str] = []
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        kind = part.get("kind") or part.get("type")
+        if kind == "text":
+            text = part.get("text", "")
+            if isinstance(text, str) and text:
+                chunks.append(text)
+    return "\n".join(chunks)
+
+
+def _build_message_response(
+    reply_text: str, partial: bool, context_id: str | None = None,
+) -> dict:
+    """Wrap the agent's reply in an A2A Message envelope.
+
+    A2A's ``message/send`` returns either a Task (= async, polled later)
+    or a Message (= synchronous reply). We always return Message because
+    Reyn's MCP-symmetric backing is synchronous-with-timeout.
+
+    If the underlying call timed out (``partial=True``) the final part
+    carries a metadata flag the peer can surface to its own user; the
+    message text itself is whatever ``send_to_agent_impl`` produced
+    (typically a "still working" placeholder).
+
+    #1814: ``context_id`` (the per-conversation routing key) is echoed back so a
+    caller that did not supply one can continue the conversation by reusing the
+    server-assigned id.
+    """
+    parts = [{"kind": "text", "text": reply_text}]
+    msg: dict = {
+        "kind": "message",
+        "role": "agent",
+        "parts": parts,
+        "messageId": uuid.uuid4().hex,
+        "metadata": {"partial": partial} if partial else {},
+    }
+    if context_id is not None:
+        msg["contextId"] = context_id
+    return msg
+
+
+# ── GET /a2a/agents — server-level discovery ────────────────────────────────
+
+
+@router.get("/a2a/agents")
+async def list_a2a_agents(request: Request, registry=Depends(get_registry)) -> dict:
+    """List all A2A-addressable agents on this Reyn instance.
+
+    Not part of the A2A spec proper (which expects each agent to be at
+    its own well-known URL), but a convenience for peers that want to
+    enumerate what's available before fetching individual cards.
+    """
+    base = str(request.base_url).rstrip("/")
+    out = []
+    for name in registry.list_active_names():  # #1954: hide archived agents
+        try:
+            profile = registry.load_profile(name)
+            role = profile.role or ""
+        except Exception as e:  # noqa: BLE001 — defensive
+            logger.warning("a2a list: profile load failed for %r: %s", name, e)
+            role = ""
+        out.append({
+            "name": name,
+            "role": role,
+            "agentCardUrl": f"{base}/a2a/agents/{name}/.well-known/agent-card.json",
+            "endpoint": f"{base}/a2a/agents/{name}",
+        })
+    return {"agents": out, "protocolVersion": _A2A_PROTOCOL_VERSION}
+
+
+# ── GET /a2a/agents/{name}/.well-known/agent-card.json ──────────────────────
+
+
+@router.get("/a2a/agents/{agent_name}/.well-known/agent-card.json")
+async def get_agent_card(
+    agent_name: str, request: Request, registry=Depends(get_registry),
+) -> dict:
+    """Return the A2A Agent Card for ``agent_name``.
+
+    This URL pattern (``.well-known/agent-card.json``) is the canonical
+    A2A discovery endpoint. Peers fetch it before sending any
+    ``message/send`` request to learn the agent's capabilities and the
+    JSON-RPC URL to POST to.
+    """
+    if not registry.exists(agent_name):
+        raise HTTPException(
+            status_code=404,
+            detail=f"Reyn agent {agent_name!r} not found on this server.",
+        )
+    try:
+        profile = registry.load_profile(agent_name)
+        role = profile.role or ""
+    except Exception as e:  # noqa: BLE001 — defensive
+        logger.warning("a2a card: profile load failed for %r: %s", agent_name, e)
+        role = ""
+
+    base = str(request.base_url).rstrip("/")
+    endpoint = f"{base}/a2a/agents/{agent_name}"
+    return _build_agent_card(agent_name, role, endpoint)
+
+
+# ── POST /a2a/agents/{name} — JSON-RPC 2.0 endpoint ─────────────────────────
+
+
+@router.post("/a2a/agents/{agent_name}")
+async def a2a_jsonrpc(
+    agent_name: str,
+    request: Request,
+    registry=Depends(get_registry),
+    run_registry=Depends(get_run_registry),
+    webhook_registry=Depends(get_a2a_webhook_registry),
+) -> dict:
+    """JSON-RPC 2.0 endpoint for one Reyn agent.
+
+    Supported method: ``message/send``. (#2839 Phase 1: ``tasks/list``
+    dropped — owner-approved; A2A's Task-listing surface is retired along
+    with the decouple from the internal Task backend.)
+
+    ``message/send`` has three modes:
+
+    1. **Answer injection** (``params.task_id`` present): deliver an
+       answer to a pending ask_user intervention on a running async task.
+       Returns ``{"task_id": ..., "answered": True/False}``.
+
+    2. **Async mode** (``params.async_mode=true`` OR ``params.webhook_url``
+       set): spawn a background task and return an A2A Task envelope
+       immediately. Poll ``GET /a2a/tasks/{run_id}`` for status.
+
+    3. **Synchronous** (default — existing behaviour): submit a user
+       message, await the agent's final reply, return as an A2A Message
+       envelope.
+
+    Unsupported methods return JSON-RPC ``-32601 Method not found``.
+    """
+    # Parse body. JSON parse errors are -32700; anything else short of a
+    # well-formed envelope is -32600.
+    try:
+        body = await request.json()
+    except Exception:
+        return _jsonrpc_error(None, _PARSE_ERROR, "Parse error: invalid JSON body")
+
+    if not isinstance(body, dict):
+        return _jsonrpc_error(None, _INVALID_REQUEST, "Invalid Request: body must be an object")
+
+    req_id = body.get("id")
+    if body.get("jsonrpc") != "2.0":
+        return _jsonrpc_error(req_id, _INVALID_REQUEST, "Invalid Request: jsonrpc must be '2.0'")
+
+    method = body.get("method")
+    if not isinstance(method, str):
+        return _jsonrpc_error(req_id, _INVALID_REQUEST, "Invalid Request: method must be a string")
+
+    # Route to handlers.
+    if method == "message/send":
+        return await _handle_message_send(
+            req_id, body.get("params") or {}, agent_name, registry, run_registry,
+            webhook_registry=webhook_registry,
+        )
+
+    return _jsonrpc_error(
+        req_id,
+        _METHOD_NOT_FOUND,
+        f"Method not found: {method!r}. Supported: message/send.",
+    )
+
+
+async def _handle_message_send(
+    req_id: Any,
+    params: dict,
+    agent_name: str,
+    registry,
+    run_registry,
+    *,
+    webhook_registry=None,
+) -> dict:
+    """Backing for ``message/send``.
+
+    Three modes (checked in priority order):
+
+    1. **Answer injection** — ``params.task_id`` non-empty: resolve a
+       pending ask_user on an existing async run.
+    2. **Async mode** — ``params.async_mode is True`` OR
+       ``params.webhook_url`` set: spawn background task, return Task.
+    3. **Synchronous** (default): blocking send, return Message.
+    """
+    if not isinstance(params, dict):
+        return _jsonrpc_error(req_id, _INVALID_PARAMS, "params must be an object")
+
+    # ── Mode 1: answer injection ──────────────────────────────────────────
+    task_id = params.get("task_id")
+    if task_id and isinstance(task_id, str):
+        return await _handle_answer_injection(
+            req_id, task_id, params, registry, run_registry,
+        )
+
+    # ── Shared: extract text from message parts ───────────────────────────
+    message = params.get("message")
+    if not isinstance(message, dict):
+        return _jsonrpc_error(req_id, _INVALID_PARAMS, "params.message is required")
+
+    parts = message.get("parts")
+    if not isinstance(parts, list) or not parts:
+        return _jsonrpc_error(
+            req_id, _INVALID_PARAMS, "params.message.parts must be a non-empty array",
+        )
+
+    text = _extract_text_from_parts(parts)
+    if not text.strip():
+        return _jsonrpc_error(
+            req_id,
+            _INVALID_PARAMS,
+            "params.message.parts must contain at least one non-empty text part. "
+            "(Non-text parts are not yet supported by this Reyn endpoint.)",
+        )
+
+    # #1814: per-contextId session routing. The caller's ``contextId`` identifies
+    # the conversation; a request without one is assigned a fresh server-side id
+    # (A2A-spec) and it is RETURNED in the response so the caller continues by
+    # echoing it. Every downstream resolve/session-id uses this exact value, so
+    # the sync / async / escalation / answer-injection paths act on the SAME
+    # per-contextId session — different contextIds never interfere.
+    import uuid as _uuid  # noqa: PLC0415
+    context_id = params.get("contextId") or _uuid.uuid4().hex
+
+    # ── Mode 2: async mode ────────────────────────────────────────────────
+    async_mode = params.get("async_mode")
+    webhook_url = params.get("webhook_url") or None
+    if async_mode is True or webhook_url:
+        return await _handle_async_mode(
+            req_id, text, agent_name, registry, run_registry, webhook_url,
+            context_id=context_id,
+            webhook_registry=webhook_registry,
+        )
+
+    # ── Mode 3: synchronous (default) ────────────────────────────────────
+    # #1814: run the delegation on the agent's PER-CONTEXTID a2a session
+    # (isolated from "main" + from other callers' contextIds) — resolve-or-spawn
+    # it (no run-loop; driven inline by MessageBus.request). The per-contextId
+    # session keeps the sync→Task escalation / continuation intact per conversation.
+    try:
+        resolve_a2a_session(registry, agent_name, context_id)
+    except (FileNotFoundError, KeyError):
+        pass  # unknown agent → send_to_agent_impl raises ValueError below
+    try:
+        result = await send_to_agent_impl(
+            registry,
+            agent_name=agent_name,
+            message=text,
+            timeout=DEFAULT_SEND_TIMEOUT_SECONDS,
+            sid=a2a_session_id(context_id),
+        )
+    except ValueError as e:
+        # Unknown agent: surface as JSON-RPC error rather than HTTP 404
+        # so peers parsing the JSON-RPC envelope get a uniform shape.
+        return _jsonrpc_error(req_id, _INVALID_PARAMS, f"Unknown agent: {e}")
+    except Exception as e:  # noqa: BLE001 — defensive
+        logger.exception("a2a message/send: backing impl raised")
+        return _jsonrpc_error(req_id, _INTERNAL_ERROR, f"Internal error: {e}")
+
+    reply_text = result.get("reply", "")
+    reply_msg = _build_message_response(
+        reply_text=reply_text,
+        partial=bool(result.get("partial", False)),
+        context_id=context_id,
+    )
+    return _jsonrpc_result(req_id, reply_msg)
+
+
+async def _handle_answer_injection(
+    req_id: Any,
+    task_id: str,
+    params: dict,
+    registry,
+    run_registry,
+) -> dict:
+    """Deliver an answer to a pending ask_user intervention on an async task.
+
+    Extracts text from ``params.message.parts`` (same as normal send),
+    then routes to ``Session.answer_pending_intervention`` (= issue
+    #292 α path).
+
+    issue #267 Gap 4: also extracts ``choice_id`` for closed-set prompts
+    (= permission.* / safety.limit.*). Resolution order, top → bottom:
+
+      1. ``params.choice_id`` — top-level convenience (= simplest peer impl).
+      2. ``params.message.metadata.choice_id`` — A2A-spec-conforming
+         structured-metadata channel.
+
+    Free-text ``ask_user`` answers omit ``choice_id`` and travel unchanged.
+
+    issue #292 (α): pre-#292 this called
+    ``run_registry.answer_intervention`` which resolved a separate iv
+    future owned by RunRegistry. Post-α, the iv lives in Session's
+    ``_interventions._active`` and the agent's
+    ``answer_pending_intervention`` is the single authoritative entry
+    point — R-D12's persistent answer buffer applies automatically so
+    a restart between peer-POST and run-resume is now survivable.
+    The RunEntry is only consulted to find the owning agent.
+    """
+    from reyn.user_intervention import InterventionAnswer  # noqa: PLC0415
+
+    # Extract answer text from message parts (if provided).
+    message = params.get("message")
+    answer_text = ""
+    choice_id: str | None = None
+    if isinstance(message, dict):
+        parts = message.get("parts") or []
+        if isinstance(parts, list):
+            answer_text = _extract_text_from_parts(parts)
+        metadata = message.get("metadata")
+        if isinstance(metadata, dict):
+            md_choice = metadata.get("choice_id")
+            if isinstance(md_choice, str) and md_choice:
+                choice_id = md_choice
+
+    # Top-level params.choice_id wins over message.metadata.choice_id when
+    # both are present (= explicit top-level wins by convention).
+    top_choice = params.get("choice_id")
+    if isinstance(top_choice, str) and top_choice:
+        choice_id = top_choice
+
+    # Look up the owning agent via RunEntry → load Session →
+    # authoritative answer delivery.
+    entry = run_registry.get(task_id)
+    if entry is None:
+        return _jsonrpc_result(req_id, {
+            "task_id": task_id, "answered": False, "reason": "not found",
+        })
+
+    try:
+        # #1814: the run lives on its per-contextId a2a session — resolve THAT
+        # (the contextId recovered from the stored core session_id) so the pending
+        # ask_user is answered on the right session, not a different contextId's.
+        session = resolve_a2a_session(
+            registry, entry.agent_name, a2a_context_id(entry.session_id),
+        )
+    except Exception:  # noqa: BLE001 — defensive (agent missing / load failure)
+        logger.exception(
+            "answer_injection: failed to load agent %r for task %r",
+            entry.agent_name, task_id,
+        )
+        return _jsonrpc_result(req_id, {
+            "task_id": task_id, "answered": False,
+            "reason": "agent unavailable",
+        })
+
+    answer = InterventionAnswer(text=answer_text, choice_id=choice_id)
+    delivered = await session.answer_pending_intervention(task_id, answer)
+
+    if delivered:
+        # Mirror status back to "running" on the RunEntry for peer
+        # polling. The actual iv resolution already happened in
+        # Session (#292 α — iv lives in Session, NOT a Task); this is just
+        # the public-status mirror, and (#2839 Phase 1) the ONLY status
+        # mirror GetTask consults.
+        run_registry.update(task_id, status="running")
+        result = {"task_id": task_id, "answered": True}
+    else:
+        result = {
+            "task_id": task_id, "answered": False,
+            "reason": "already answered or no pending intervention",
+        }
+
+    return _jsonrpc_result(req_id, result)
+
+
+class _A2AProgressBridge:
+    """Forwards selected chat audit-events of one agent to A2A peer surfaces.
+
+    Two sinks, one subscriber:
+
+      - **SSE buffer** (= ``run_registry.append_event``): events land
+        in ``RunEntry.history_events`` so ``GET /a2a/tasks/{run_id}/events``
+        replays them. Always wired (issue #267 Gap 1).
+      - **Webhook POST** (= ``post_webhook``): same payload pushed to
+        the registered peer URL. Opt-in — only fires when
+        ``webhook_url`` is non-None (issue #267 Gap 2, landed in PR
+        #286 with webhook-only bridge; this revision adds the SSE
+        sink alongside).
+
+    Mirrors ``mcp.server._MCPProgressBridge`` for the audit-event-scope
+    side: both hold :data:`PROGRESS_LIFECYCLE_EVENTS` and both render with
+    :func:`format_progress_message`, so a peer applies one parser to either
+    transport. Ordinal counter and dispatch shape are per-protocol; two
+    instances (= MCP + A2A) is below the rule-of-three threshold, so a future
+    third instance is the trigger to lift the common ``subscribe / filter /
+    format / dispatch`` shape into a shared base.
+
+    Lifecycle: subscribe via ``attach()`` once, ``detach()`` in a
+    try/finally so the subscriber doesn't outlive the call. Any sink
+    failure during a fire is swallowed independently — progress is
+    best-effort; the A2A task's terminal ``completed`` / ``failed``
+    signal (= SSE ``event: end`` + webhook POST from
+    ``_handle_async_mode._run``) is the authoritative outcome.
+    """
+
+    # The single declaration lives in reyn.core.events.progress_lifecycle so
+    # this bridge and the MCP one cannot drift apart (#3357).
+    TRACKED_EVENTS = PROGRESS_LIFECYCLE_EVENTS
+
+    def __init__(
+        self,
+        *,
+        session: "object",
+        run_id: str,
+        webhook_url: str | None,
+        agent_name: str,
+        run_registry: "object",
+    ) -> None:
+        self._session = session
+        self._run_id = run_id
+        self._webhook_url = webhook_url
+        self._agent_name = agent_name
+        self._run_registry = run_registry
+        self._ordinal = 0
+        self._detached = False
+        self._tasks: set[asyncio.Task[None]] = set()
+
+    @property
+    def webhook_url(self) -> str:
+        """Read-only accessor for the webhook URL the bridge posts to."""
+        return self._webhook_url
+
+    @property
+    def detached(self) -> bool:
+        """Read-only accessor for the bridge's detached flag.
+
+        Tests verify the attach / detach lifecycle via this surface.
+        Mutation continues to go through ``self._detached`` so the
+        lifecycle call sites in ``detach`` stay visible.
+        """
+        return self._detached
+
+    @property
+    def tracked_task_count(self) -> int:
+        """Read-only accessor for the number of in-flight notification tasks.
+
+        Each scheduled task discards itself from ``_tasks`` on completion
+        (#3390), so this stays bounded by concurrency, not by how many
+        audit-events the bridge has ever forwarded. Tests assert this
+        directly rather than reaching into ``_tasks``, following the
+        ``detached`` precedent above.
+        """
+        return len(self._tasks)
+
+    def attach(self) -> None:
+        events = getattr(self._session, "_audit_events", None)
+        if events is not None:
+            # #5260: declare the fixed interest at registration instead of
+            # letting every OTHER event reach on_event just to be filtered
+            # at its own top (the ``event_type not in self.TRACKED_EVENTS``
+            # check there — kept as a defensive no-op, not removed, since a
+            # narrowed declaration must never be the ONLY thing enforcing
+            # the filter).
+            events.add_subscriber(self.on_event, kinds=self.TRACKED_EVENTS)
+
+    def detach(self) -> None:
+        if self._detached:
+            return
+        self._detached = True
+        events = getattr(self._session, "_audit_events", None)
+        if events is not None:
+            events.remove_subscriber(self.on_event)
+        # Snapshot before cancelling: a done callback discards its task
+        # from ``_tasks`` (#3390), and that discard is delivered via
+        # call_soon — never synchronously inside this loop — so iterating
+        # the live set would already be safe, but iterating a copy keeps
+        # this loop correct even if a future change made completion
+        # synchronous.
+        for task in list(self._tasks):
+            if not task.done():
+                task.cancel()
+
+    def on_event(self, event: "object") -> None:
+        # Sync callback from EventLog dispatcher. Filter by type, build
+        # payload, schedule async POST.
+        if self._detached:
+            return
+        event_type = getattr(event, "type", None)
+        if event_type not in self.TRACKED_EVENTS:
+            return
+        data = getattr(event, "data", {}) or {}
+        message = format_progress_message(event_type, data)
+        self._ordinal += 1
+        ordinal = self._ordinal
+        try:
+            task = asyncio.ensure_future(
+                self._send(ordinal, event_type, message),
+            )
+        except RuntimeError:
+            # No running loop (= EventLog dispatched outside async context).
+            return
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def _send(
+        self, ordinal: int, event_type: str, message: str,
+    ) -> None:
+        payload = {
+            "run_id": self._run_id,
+            "status": "in-progress",
+            "progress": ordinal,
+            "event": event_type,
+            "message": message,
+            "agent_name": self._agent_name,
+        }
+        # Sink 1: SSE buffer (always). The append failure is logged
+        # implicitly and must not block the webhook fire below.
+        try:
+            self._run_registry.append_event(self._run_id, payload)
+        except Exception:  # noqa: BLE001 — sse buffer is best-effort
+            pass
+        # Sink 2: webhook POST (opt-in + liveness-gated, issue #269
+        # Phase 2). Skip if the per-run ChannelState marked the URL
+        # dead from earlier sustained failures; record each attempt
+        # outcome so subsequent fires (= more progress events,
+        # terminal completed / failed) share the inference.
+        if self._webhook_url is not None:
+            # Defensive getattr so stub registries (= test fakes that
+            # only implement append_event) still work with the bridge.
+            channel_state = None
+            get_state = getattr(
+                self._run_registry, "webhook_channel_state", None,
+            )
+            if get_state is not None:
+                try:
+                    channel_state = get_state(self._run_id)
+                except Exception:  # noqa: BLE001
+                    channel_state = None
+            if channel_state is not None and not channel_state.is_alive():
+                return
+            from reyn.interfaces.web.notifications import post_webhook  # noqa: PLC0415
+            from reyn.runtime.channel_state import (  # noqa: PLC0415
+                DeliveryOutcome,
+                DeliveryResult,
+            )
+            try:
+                result = await post_webhook(self._webhook_url, payload)
+            except Exception as exc:  # noqa: BLE001 — progress is best-effort
+                result = DeliveryResult(
+                    outcome=DeliveryOutcome.RETRYABLE_FAILURE,
+                    error=str(exc),
+                )
+            if channel_state is not None:
+                channel_state.record_attempt(result)
+
+
+async def _handle_async_mode(
+    req_id: Any,
+    text: str,
+    agent_name: str,
+    registry,
+    run_registry,
+    webhook_url: str | None,
+    *,
+    context_id: str | None = None,  # #1814: per-contextId session
+    webhook_registry=None,
+) -> dict:
+    """Spawn a background asyncio task and return an A2A Task envelope.
+
+    #2839 Phase 1: ``RunEntry`` is now the single canonical A2A work-unit
+    authority (GetTask / Cancel / disposition all read ``RunRegistry``
+    directly — the internal Task backend + its terminal-reflection dance
+    are retired). The webhook channel (``contextId → webhook_url``) is
+    registered directly here rather than through the removed
+    ``_create_a2a_task`` shim.
+    """
+    from reyn.interfaces.web.a2a_intervention import A2AInterventionBus  # noqa: PLC0415
+
+    chain_id = new_chain_id()
+    entry = run_registry.create(
+        agent_name=agent_name,
+        chain_id=chain_id,
+        webhook_url=webhook_url,
+        session_id=a2a_session_id(context_id),  # #1814 core routing-key
+    )
+    run_id = entry.run_id
+
+    if webhook_url and webhook_registry is not None:
+        webhook_registry.register_webhook(context_id, webhook_url)
+
+    bus = A2AInterventionBus(run_id, run_registry)
+
+    async def _run() -> None:
+        # issue #267 Gap 1 + Gap 2: subscribe a progress bridge to the
+        # agent's chat audit-event log for the lifetime of this call. The
+        # bridge fans out the lifecycle audit-events named by
+        # PROGRESS_LIFECYCLE_EVENTS to two sinks:
+        #   - SSE buffer (always): append to RunEntry.history_events so
+        #     GET /a2a/tasks/{run_id}/events replays progression.
+        #   - Webhook POST (opt-in): when webhook_url is registered,
+        #     same payload pushed to the peer URL.
+        # Bridge attach is best-effort — failure to load the session or
+        # subscribe must NOT block the main call (= progress is
+        # decoration; the answer is the contract).
+        bridge: "_A2AProgressBridge | None" = None
+        try:
+            # FP-0043 S4b-4 (B): the async run also lives on the shared a2a session.
+            session = resolve_a2a_session(registry, agent_name, context_id)
+            bridge = _A2AProgressBridge(
+                session=session,
+                run_id=run_id,
+                webhook_url=webhook_url,
+                agent_name=agent_name,
+                run_registry=run_registry,
+            )
+            bridge.attach()
+        except Exception:  # noqa: BLE001 — defensive
+            bridge = None
+        try:
+            result = await send_to_agent_impl(
+                registry,
+                agent_name=agent_name,
+                message=text,
+                timeout=DEFAULT_SEND_TIMEOUT_SECONDS,
+                intervention_override=bus,
+                # #1814: the async background run executes on the SAME per-contextId
+                # session as the sync send / escalation / answer-injection (the
+                # a2a_session_id docstring's invariant). The bare ``a2a_session_id()``
+                # here both raised (the arg is required) and — once defaulted — would
+                # mis-route to the native session; the assignee CAS for the
+                # status-reflection relies on this being the contextId session.
+                sid=a2a_session_id(context_id),
+            )
+            run_registry.update(
+                run_id,
+                status="completed",
+                result=result.get("reply", ""),
+            )
+            if webhook_url:
+                from reyn.interfaces.web.notifications import post_webhook  # noqa: PLC0415
+                await post_webhook(
+                    webhook_url,
+                    {
+                        "run_id": run_id,
+                        "status": "completed",
+                        "result": result.get("reply", ""),
+                    },
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("a2a async task %r raised", run_id)
+            run_registry.update(run_id, status="failed", error=str(exc))
+            if webhook_url:
+                from reyn.interfaces.web.notifications import post_webhook  # noqa: PLC0415
+                await post_webhook(
+                    webhook_url,
+                    {"run_id": run_id, "status": "failed", "error": str(exc)},
+                )
+        finally:
+            if bridge is not None:
+                bridge.detach()
+
+    task = asyncio.create_task(_run())
+    run_registry.attach_task(run_id, task)
+
+    # #2839 Phase 1: the RunEntry IS the canonical A2A work-unit — no
+    # separate Task creation to fall back around.
+    return _jsonrpc_result(req_id, to_a2a_task(entry))
+
+
+# ── GET /a2a/tasks/{run_id} — poll task status ───────────────────────────────
+
+
+@router.get("/a2a/tasks/{run_id}")
+async def get_task(
+    run_id: str,
+    run_registry=Depends(get_run_registry),
+) -> dict:
+    """A2A GetTask — poll a run's status from ``RunRegistry`` (#2839 Phase 1:
+    re-based off ``RunRegistry`` — the internal Task backend is no longer
+    consulted). Returns the spec A2A Task envelope. The path param is the
+    ``run_id``. A terminal run returns its envelope (a cancelled run →
+    status=canceled), a tombstone rather than 404; a genuinely-unknown id is
+    404."""
+    entry = run_registry.get(run_id)
+    if entry is None:
+        raise HTTPException(404, f"Task {run_id!r} not found")
+    return to_a2a_task(entry)
+
+
+# ── POST /a2a/tasks/{run_id}/cancel — cancel a running task ─────────────────
+
+
+@router.post("/a2a/tasks/{run_id}/cancel")
+async def cancel_task(
+    run_id: str,
+    run_registry=Depends(get_run_registry),
+) -> dict:
+    """A2A CancelTask — the external requester's remove-op (#2839 Phase 1:
+    re-based off ``RunRegistry.cancel`` — the internal Task backend's
+    ``abort`` cooperative-terminal is no longer consulted). ``RunRegistry.
+    cancel`` does strictly more than the retired path: it marks the entry
+    ``cancelled`` AND cancels the live ``asyncio.Task`` (the internal Task
+    backend's cooperative-terminal abort could only mark state, never stop
+    the coroutine). The A2A client owns the contextId/run as its external
+    requester. Returns the cancelled run's A2A envelope (status=canceled).
+    The path param is the ``run_id``; an unknown id is 404."""
+    entry = run_registry.get(run_id)
+    if entry is None:
+        raise HTTPException(404, f"Task {run_id!r} not found")
+    run_registry.cancel(run_id)
+    return to_a2a_task(run_registry.get(run_id))
+
+
+# ── GET /a2a/tasks/{run_id}/events — SSE stream ──────────────────────────────
+
+
+@router.get("/a2a/tasks/{run_id}/events")
+async def stream_task_events(
+    run_id: str,
+    run_registry=Depends(get_run_registry),
+):
+    """SSE stream of the run's progress events.
+
+    Replays the buffered progress events (the RunEntry ``history_events``
+    sub-channel — execution telemetry, #1981) on connect; then polls every
+    0.5s until ``RunEntry.status`` reaches a terminal state, and closes.
+    Returns a FastAPI StreamingResponse with media_type='text/event-stream'.
+
+    #2839 Phase 1: the terminal decision now reads ``RunEntry.status``
+    directly (the internal Task backend is retired). Pre-Phase-1, an A2A
+    ``Cancel`` archived the Task without touching ``RunEntry.status``,
+    which required consulting the Task as the terminal authority — that
+    asymmetry is gone because ``cancel_task`` now calls ``RunRegistry.cancel``
+    directly, so ``RunEntry.status`` itself is authoritative again.
+    """
+    import json  # noqa: PLC0415
+
+    from fastapi.responses import StreamingResponse  # noqa: PLC0415
+
+    from reyn.interfaces.web.run_registry import RunStatus  # noqa: PLC0415
+
+    _terminal = frozenset({
+        RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED,
+    })
+
+    async def gen():
+        if run_registry.get(run_id) is None:
+            yield 'event: error\ndata: {"error": "not_found"}\n\n'
+            return
+        seen = 0
+        while True:
+            entry = run_registry.get(run_id)
+            if entry is None:
+                yield 'event: error\ndata: {"error": "gone"}\n\n'
+                return
+            for ev in entry.history_events[seen:]:
+                yield f"data: {json.dumps(ev)}\n\n"
+            seen = len(entry.history_events)
+            if entry.status in _terminal:
+                yield f"event: end\ndata: {json.dumps(entry.to_public_dict())}\n\n"
+                return
+            await asyncio.sleep(0.5)
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+__all__ = ["router"]

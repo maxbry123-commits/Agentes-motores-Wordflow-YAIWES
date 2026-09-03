@@ -1,0 +1,256 @@
+"""Git worktree + web-server lifecycle helpers."""
+from __future__ import annotations
+
+import os
+import subprocess
+import time
+from pathlib import Path
+
+# #268: scripts/ is on sys.path (g4_spike inserts it); _reyn_web_proc is the
+# shared managed-spawn helper that guarantees reyn web teardown on signals.
+from _reyn_web_proc import spawn_reyn_web, stop_reyn_web
+
+from spike_lib.http import get_url
+
+
+def worktree_path(branch: str) -> Path:
+    """Return the /tmp worktree path for a given branch name."""
+    safe = branch.replace("/", "-").replace(".", "-")
+    return Path(f"/tmp/reyn-spike-{safe}")
+
+
+def ensure_worktree(project_root: Path, branch: str, worktree: Path) -> Path:
+    """Create git worktree (always isolated under /tmp).
+
+    Earlier versions reused project_root when the operator was on the
+    target branch — but that polluted the operator's checkout with
+    spike-* agents and prevented per-condition mcp_server.py patches.
+    Now ALWAYS use a dedicated /tmp worktree; for the conflict case
+    (= operator currently on `branch`) we use ``--detach`` to point
+    at the same commit without taking a branch lock.
+    """
+    if worktree.exists():
+        return worktree
+
+    # Prune stale worktree registrations (= directory was rm'd but git
+    # still has a record). Otherwise `git worktree add` fails with
+    # "missing but already registered".
+    subprocess.run(
+        ["git", "worktree", "prune"],
+        cwd=str(project_root), capture_output=True, text=True,
+    )
+
+    head = subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        cwd=str(project_root), capture_output=True, text=True,
+    )
+    detach = head.returncode == 0 and head.stdout.strip() == branch
+
+    if detach:
+        # operator is on `branch`; use detached HEAD at the same commit
+        print(
+            f"[worktree] creating {worktree} as detached HEAD at branch "
+            f"{branch!r} (operator's checkout holds the branch)",
+            flush=True,
+        )
+        cmd = ["git", "worktree", "add", "--detach", str(worktree), branch]
+    else:
+        print(
+            f"[worktree] creating {worktree} for branch {branch!r}",
+            flush=True,
+        )
+        cmd = ["git", "worktree", "add", str(worktree), branch]
+
+    result = subprocess.run(
+        cmd, cwd=str(project_root), capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"git worktree add failed for branch {branch!r}:\n"
+            f"  stdout: {result.stdout.strip()}\n"
+            f"  stderr: {result.stderr.strip()}"
+        )
+
+    # Patch the worktree's mcp_server.py to use the same 300s A2A timeout
+    # as the spike branch, so weak-baseline doesn't hit the production
+    # 60s default and confound timeout-vs-narrator measurement. This
+    # touches /tmp/<worktree> only — operator's project_root is untouched.
+    mcp_server_py = worktree / "src" / "reyn" / "mcp_server.py"
+    if mcp_server_py.exists():
+        content = mcp_server_py.read_text(encoding="utf-8")
+        if "DEFAULT_SEND_TIMEOUT_SECONDS: float = 60.0" in content:
+            new_content = content.replace(
+                "DEFAULT_SEND_TIMEOUT_SECONDS: float = 60.0",
+                "DEFAULT_SEND_TIMEOUT_SECONDS: float = 300.0  # spike-only patch",
+            )
+            mcp_server_py.write_text(new_content, encoding="utf-8")
+            print(
+                f"[worktree] patched A2A timeout 60s → 300s in {mcp_server_py}",
+                flush=True,
+            )
+
+    # Patch PermissionResolver to default trusted_python_allowed=True so
+    # stdlib skills with mode: trusted (mcp_search, skill_improver,
+    # eval_builder, index_docs, mcp_install) can run via reyn web's A2A
+    # endpoint. Pure/trust gate is structurally broken pending
+    # R-PURE-MODE-REDEFINE; bypassing for spike duration to unblock
+    # narration measurement.
+    perms_py = worktree / "src" / "reyn" / "permissions" / "permissions.py"
+    if perms_py.exists():
+        content = perms_py.read_text(encoding="utf-8")
+        if "trusted_python_allowed: bool = False," in content:
+            new_content = content.replace(
+                "trusted_python_allowed: bool = False,",
+                "trusted_python_allowed: bool = True,  # spike-only bypass (R-PURE-MODE-REDEFINE pending)",
+            )
+            perms_py.write_text(new_content, encoding="utf-8")
+            print(
+                f"[worktree] patched trusted_python_allowed True (spike-only) in {perms_py}",
+                flush=True,
+            )
+
+    print(f"[worktree] created {worktree}", flush=True)
+    return worktree
+
+
+def write_model_override(worktree: Path, model_class: str, strong_model: str) -> None:
+    """Inject reyn.local.yaml to point at the local LiteLLM proxy + override
+    the model mapping.
+
+    The committed `reyn.yaml` does NOT carry `api_base` (= per project policy,
+    proxy URL is local-only and lives in `reyn.local.yaml`). Worktrees inherit
+    only committed files from the branch, so without injecting `api_base` here
+    the reyn web subprocess falls back to the upstream OpenAI API and times
+    out / returns empty text. Inject for ALL conditions, not just strong, so
+    the entire spike runs through the same proxy.
+    """
+    local_yaml = worktree / "reyn.local.yaml"
+    content = (
+        f"# Auto-generated by dogfood_g4_spike.py — do not edit by hand.\n"
+        f"api_base: {os.environ.get('LITELLM_API_BASE', 'http://localhost:4000')}\n"
+        f"model: {model_class}\n"
+        f"models:\n"
+        f"  light:    openai/gemini-2.5-flash-lite\n"
+        f"  standard: openai/gemini-2.5-flash-lite\n"
+        f"  strong:   {strong_model}\n"
+        f"\n"
+        f"# Pre-approved permissions for spike scenarios. The spike runs in a\n"
+        f"# disposable /tmp worktree against narration-quality test scenarios;\n"
+        f"# blanket grants are acceptable here. python.trusted is intentionally\n"
+        f"# NOT granted because (G13) reyn web does not honour it from config —\n"
+        f"# scenarios that need trusted python (= narr-1 mcp_search, narr-4\n"
+        f"# skill_improver) must be skipped via 'enabled: false' until\n"
+        f"# R-WEB-TRUSTED-PYTHON adds the CLI flag.\n"
+        f"permissions:\n"
+        f"  python.pure: allow\n"
+        f"  file.read: allow\n"
+        f"  file.write: allow\n"
+    )
+    local_yaml.write_text(content, encoding="utf-8")
+
+
+def remove_model_override(worktree: Path) -> None:
+    """Remove the injected reyn.local.yaml if present."""
+    local_yaml = worktree / "reyn.local.yaml"
+    if local_yaml.exists():
+        local_yaml.unlink()
+
+
+def _kill_port_holders(port: int) -> None:
+    """Kill any process listening on ``port`` so the next bind succeeds.
+
+    Prior driver runs that crashed without clean shutdown leave stale
+    `reyn web` subprocesses holding the port. The next driver run's
+    bind silently fails and health check hits the stale server, leading
+    to confusing 500s.
+    """
+    try:
+        result = subprocess.run(
+            ["lsof", "-ti", f":{port}"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except Exception:
+        return
+    pids = [p.strip() for p in result.stdout.split() if p.strip().isdigit()]
+    for pid in pids:
+        try:
+            subprocess.run(["kill", "-TERM", pid], timeout=5)
+        except Exception:
+            pass
+    if pids:
+        time.sleep(0.5)
+
+
+def start_web_server(
+    worktree: Path, port: int, env_extras: dict[str, str]
+) -> subprocess.Popen:  # type: ignore[type-arg]
+    """Spawn reyn web in the worktree.
+
+    Bug 1 fix: ``cwd=worktree`` is NOT enough. ``reyn`` is installed
+    via ``pip install -e .`` against project_root, so the subprocess'
+    ``import reyn`` resolves to project_root/src/reyn — i.e. the
+    operator's main checkout — regardless of cwd. The git worktree
+    on disk has the spike branch's session.py but no Python ever
+    loads it. The result: spike branch code changes are silently
+    invisible to spike runs (= every condition behaves like main).
+
+    Override by injecting ``PYTHONPATH=<worktree>/src`` so the
+    subprocess imports the spike branch's reyn package first,
+    shadowing the editable install. The worktree's source tree is
+    self-contained (= same layout as project_root) so a single path
+    suffices.
+    """
+    # Port collision guard: kill any stray reyn web on the target port
+    # so the new subprocess gets a clean bind. Otherwise health check
+    # hits a stale server with stale state and the new subprocess silently
+    # fails — yielding cryptic 500s with empty logs.
+    _kill_port_holders(port)
+
+    pythonpath = str(worktree / "src")
+    existing_pythonpath = os.environ.get("PYTHONPATH", "")
+    if existing_pythonpath:
+        pythonpath = f"{pythonpath}{os.pathsep}{existing_pythonpath}"
+    # Disable Python output buffering in subprocess so logs flush
+    # synchronously to file. Uvicorn defaults to line-buffered stdout
+    # but uses Python's sys.stdout which buffers when not a TTY.
+    env = {
+        **os.environ, **env_extras,
+        "PYTHONPATH": pythonpath,
+        "PYTHONUNBUFFERED": "1",
+    }
+    # Redirect stderr/stdout to per-port log files so the operator can
+    # tail them post-run for debugging.
+    log_path = Path(f"/tmp/reyn-spike-server-{port}.log")
+    log_fh = open(log_path, "w", buffering=1)  # noqa: SIM115
+    # #268: spawn via the managed helper (own process group + atexit/signal
+    # teardown) so a signal-killed driver doesn't leak orphaned reyn web on
+    # ports across worktrees — the g4_spike loop spawns one per worktree/port.
+    proc = spawn_reyn_web(
+        ["reyn", "web", "--port", str(port)],
+        cwd=str(worktree),
+        env=env,
+        stdout=log_fh,
+        stderr=log_fh,
+    )
+    proc._spike_log_path = log_path  # type: ignore[attr-defined]
+    proc._spike_log_fh = log_fh  # type: ignore[attr-defined]
+    return proc
+
+
+def wait_for_server(port: int, timeout_s: float = 30.0) -> bool:
+    url = f"http://localhost:{port}/health"
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if get_url(url, timeout=2.0):
+            return True
+        time.sleep(1.0)
+    return False
+
+
+def stop_web_server(proc: subprocess.Popen) -> None:  # type: ignore[type-arg]
+    # #268: delegate to the managed helper so we group-kill (reap any children
+    # reyn web forked) and deregister from the atexit/signal cleanup list.
+    stop_reyn_web(proc)
+    log_fh = getattr(proc, "_spike_log_fh", None)
+    if log_fh is not None and not log_fh.closed:
+        log_fh.close()

@@ -1,0 +1,227 @@
+---
+type: reference
+topic: cli
+audience: [human, agent]
+applies_to: [reyn agent]
+---
+
+# `reyn agent`
+
+Manage persistent agents — long-lived Session instances each with their own profile, history, memory layer, and inbox.
+
+The auto-created `default` agent always exists; `reyn agent new` creates additional named agents. See [concepts/multi-agent](../../concepts/multi-agent/multi-agent.md) for the model.
+
+## Synopsis
+
+```
+reyn agent <subcommand> [args]
+```
+
+Subcommands: `list`, `new`, `show`, `rm`.
+
+## `reyn agent list`
+
+Print all **active** (non-archived) agents (alphabetical), with last-activity timestamp and the first line of each profile's `role`. Archived agents are hidden from this listing. Pass `--all` to include archived agents, shown as `<name> (archived)`, so you can see / recover / purge them.
+
+```bash
+reyn agent list          # active agents only
+reyn agent list --all    # also show archived agents
+```
+
+```
+NAME        LAST ACTIVITY     ROLE
+default     2026-05-01 13:00  
+researcher  2026-05-01 12:55  deep technical research, prefers primary sources
+writer      2026-04-30 18:20  concise long-form prose
+```
+
+## `reyn agent new <name> [--role TEXT] [--base-dir PATH] [--project-context-path PATH]`
+
+Create a new agent under `.reyn/agents/<name>/`. The directory is provisioned with a `profile.yaml`; `history.jsonl`, `events.jsonl`, `memory/`, and `runs/` are created on first activity.
+
+```bash
+reyn agent new researcher --role "deep technical research, prefers primary sources"
+reyn agent new worker --base-dir repos/worker
+reyn agent new coder1 --project-context-path coder1-context.md
+```
+
+`<name>` must match the agent name regex: 1–32 characters of `[a-z0-9_-]` starting with `[a-z0-9]`.
+
+The `--role` text is injected into the agent's LLM system prompt — keep it short and specific. `allowed_mcp`, `preferences`, and `bounding` have no CLI declaration surface yet — configure those by editing `profile.yaml` directly after creation; see profile-yaml reference.
+
+`--base-dir` (#5080) sets this agent's own working-directory override — restrict-only, must resolve inside the project workspace (relative paths resolve against it); a path outside is rejected, never clamped. Omitted, the agent falls back to the project's own base_dir. A session-spawn's own `base_dir` (`spawn_session`'s LLM-facing argument) still takes precedence over this agent-level default when both are set.
+
+`--project-context-path` (#5111, same restrict-only shape as `--base-dir`) sets this agent's own `REYN.md`/`AGENTS.md` override, replacing the project-wide file for this agent's sessions. Omitted, the agent falls through to the project-wide file.
+
+## `reyn agent show <name>`
+
+Print profile metadata and resolved fields:
+
+```bash
+reyn agent show researcher
+```
+
+```
+name:        researcher
+created_at:  2026-05-01T12:00:00+00:00
+workspace:   /path/to/project/.reyn/agents/researcher
+role:
+  deep technical research, prefers primary sources
+```
+
+## `reyn agent rm <name> [--purge] [--yes]`
+
+**Archive** the agent by default (soft-delete — data preserved, not destroyed). Pass `--purge` for a hard-delete that permanently destroys the agent directory and all rewind history.
+
+```bash
+reyn agent rm researcher            # archive (prompted)
+reyn agent rm researcher --yes      # archive, skip prompt
+reyn agent rm researcher --purge    # hard-delete (prompted, irreversible)
+reyn agent rm researcher --purge --yes
+```
+
+The `default` agent cannot be removed.
+
+### Archive (default)
+
+The agent's `.reyn/agents/<name>/` directory is **kept in place** — the data is not destroyed. This is the key distinction from `--purge`:
+
+- **PITR generations are preserved**: the WAL-derived checkpoint history survives, so the data is recoverable.
+- **Topology membership is preserved**: no cascade fires. The agent's team/network membership is not removed.
+- A tombstone marker is written recording the archival WAL seq (the WAL-window GC hinge).
+- The agent is **hidden from active surfaces**: `reyn agent list`, the TUI Agents tab, default-topology routing, and A2A `can_send` checks all skip archived agents. It is dormant, not destroyed.
+
+**WAL-window auto-purge**: when the WAL retention window advances past the archival seq, the archived agent's directory is hard-deleted automatically (the soft-delete left the rewind window — the data is no longer recoverable). At that point the topology cascade fires and removes the agent from all topologies.
+
+### Purge (`--purge`)
+
+Immediately hard-deletes `.reyn/agents/<name>/` and destroys all PITR generations. Time-travel to before the purge is intentionally unsupported. The topology cascade fires immediately (agent removed from all topologies; team topologies whose leader is purged are deleted entirely).
+
+Use `--purge` when you want a clean, permanent delete and do not need the recovery window.
+
+## Workspace layout
+
+Each agent owns `.reyn/agents/<name>/`:
+
+| Path | Purpose |
+|------|---------|
+| `profile.yaml` | name / role / created_at / allowed_mcp / preferences / bounding / base_dir / project_context_path |
+| `history.jsonl` | append-only conversation + agent message log |
+| `events.jsonl` | runtime event audit log |
+| `memory/MEMORY.md` + body files | agent-scoped memory layer |
+| `runs/<run_id>/` | per-workflow-spawn workspace |
+
+## `preferences` (#4206 slice 1) — the ③ axis: free-override, not restrict-only
+
+A `preferences:` mapping in `profile.yaml` sets an agent-layer override for
+one or more of a fixed set of dotted config keys
+(`reyn.runtime.preferences.PREFERENCE_KEYS`) — today: `output_language`,
+`chat.reasoning.display`, one `warn_ratio` per `cost.*` dimension
+(`per_agent_tokens` / `per_agent_cost_usd` / `daily_tokens` /
+`daily_cost_usd` / `monthly_tokens` / `monthly_cost_usd`), and
+`cost.rate_limit_warn_ratio`.
+
+```yaml
+# .reyn/agents/researcher/profile.yaml
+name: researcher
+role: deep technical research, prefers primary sources
+created_at: "2026-08-14T00:00:00+00:00"
+preferences:
+  output_language: ja
+```
+
+**Free override, unlike `allowed_mcp`'s restrict-only intersection**: an
+agent-layer preference REPLACES the project-level default outright — there
+is no "child can only narrow" check, because this axis (owner/lead-coder
+classification, #4206) covers settings that don't consume a shared,
+bounded resource (unlike `model`, which is ② bounding — see #4206). A
+session spawned under this agent can further override the SAME key in its
+own `<session-state-dir>/config.yaml` `preferences:` mapping — session
+wins over agent wins over the project default.
+
+An unrecognized key under `preferences:` (a typo, or a key retired from
+`PREFERENCE_KEYS`) fails LOUDLY at load time (`reyn.runtime.preferences.
+UnknownPreferenceKeyError`) rather than silently doing nothing — the same
+discipline #4655 established for config-schema dict-leaves.
+
+**Scope**: read/resolve only, all 9 keys now wired (#4206 Slices 1/2/B).
+`output_language`/`chat.reasoning.display` are live `Session` properties
+(`Session.output_language` / `Session.reasoning_display`) re-resolving the
+session/agent/project composition on every access. The 7 `cost.*.warn_ratio`
+keys use a DIFFERENT shape ("Design C", #4724): `BudgetTracker` is
+process-shared (one instance across every agent/session in a process, built
+once from the project-level config), so it never resolves a session/agent
+identity itself — instead `Session.warn_ratio_overrides()` resolves the ③
+composition (the SAME session/agent-preference files, collected into a
+`dict[str, float]` of only the keys actually overridden at either layer)
+and the CALLER (`RouterLoop`, via `RouterHostAdapter.warn_ratio_overrides()`,
+and the `/budget` display via `BudgetGateway`) passes that resolved mapping
+straight into `BudgetTracker.check_pre_llm`/`record_llm`/`format_budget_full`
+as an explicit argument. The tracker's own counters (token/cost totals)
+stay PROCESS-SHARED and unaffected by this — only the RATIO that decides
+WHEN to warn about an already-shared number is caller-resolvable; an
+unknown key in the mapping raises `UnknownPreferenceKeyError` the same way
+`validate_preferences` does. No `preferences`-specific CLI/slash write
+surface exists yet for any key — set an agent-layer value by editing
+`profile.yaml` directly (the same existing pattern `allowed_mcp` already
+uses); a session-layer value by whatever spawns the session passing a
+`narrowing` dict whose own `preferences` sub-key is set
+(`AgentRegistry.spawn_session`'s existing `narrowing=` parameter — no new
+API).
+
+## `bounding` (#4206 ②) — restrict-only: a child may narrow, never widen
+
+A `bounding:` mapping in `profile.yaml` sets an agent-layer CEILING for one
+or more of a fixed set of dotted config keys
+(`reyn.runtime.bounding.BOUNDING_KEYS`) — today: `model` only. Unlike
+`preferences:` above, this axis exists BECAUSE the key it covers consumes
+a shared, bounded resource (the process-shared `BudgetTracker`'s
+daily/monthly quota) — a free override here would let a child exhaust the
+parent's own budget, so the composition is restrict-only instead.
+
+```yaml
+# .reyn/agents/researcher/profile.yaml
+name: researcher
+role: deep technical research, prefers primary sources
+created_at: "2026-08-14T00:00:00+00:00"
+bounding:
+  model: light
+```
+
+**Narrowest wins, restrict-only**: the EFFECTIVE `model` ceiling a session
+enforces (`Session.model_class_ceiling`) is the narrowest (cheapest, per
+`reyn.llm.model_resolver.STANDARD_CLASSES`' own `light < standard < strong`
+order) of three layers — the project's own `llm.model_max_class`, this
+agent's `bounding.model`, and (session wins over agent, same precedence
+③ uses) the spawned session's own `<session-state-dir>/config.yaml`
+`bounding.model`. A layer that declares a WIDER class than a layer above
+it never widens the effective ceiling — only a NARROWER declaration moves
+it. A layer that declares no ceiling at all, or a class outside the 3
+standard tiers, is simply ignored (not comparable), the same "not an
+error, just not a narrowing" shape `model_class_exceeds_ceiling` itself
+already has for an incomparable value.
+
+An unrecognized key under `bounding:` (a typo, or a key outside
+`BOUNDING_KEYS`) fails LOUDLY at load time (`reyn.runtime.bounding.
+UnknownBoundingKeyError`) rather than silently doing nothing — the same
+discipline `preferences:` above uses.
+
+**Enforcement**: the composed ceiling reaches the SAME #1190 chokepoint
+(`recorded_acompletion`) #4206 T1 already enforced a project-only ceiling
+at — a call whose resolved class exceeds it is REJECTED
+(`ModelClassExceedsCeilingError`) before `litellm.acompletion` is ever
+invoked. ②'s own change is only WHERE the ceiling value comes from: a
+live per-call 3-layer composition instead of a value read once at
+`RouterLoop` construction.
+
+**Scope**: `model` only — `timeout`/`router_max_iterations` are explicitly
+OUT of `BOUNDING_KEYS` for now (no driving reason measured yet for
+`timeout`, and `router_max_iterations` has no config key at all today).
+
+## See also
+
+- Reference: profile-yaml
+- [Reference: chat CLI](chat.md)
+- [Reference: topology CLI](topology.md)
+- [Concepts: multi-agent](../../concepts/multi-agent/multi-agent.md)
+- [Concepts: time-travel](../../concepts/runtime/time-travel.md) — rewind + PITR mechanics

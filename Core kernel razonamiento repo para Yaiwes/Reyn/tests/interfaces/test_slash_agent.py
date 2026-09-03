@@ -1,0 +1,316 @@
+"""Tier 2: /agent new <name> creates an agent and triggers attach.
+
+Pins the new command's registry membership + the create-then-attach
+behaviour against a real ``AgentRegistry`` constructed on tmp_path.
+No mocking of internal collaborators (per ``testing.ja.md`` "Use real
+instances or the LLMReplay Fake").
+"""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import pytest
+
+from tests._support.paths import REPO_ROOT
+
+_SRC = REPO_ROOT / "src"
+if str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
+
+from reyn.interfaces.slash import REGISTRY
+from reyn.runtime.outbox import OutboxMessage
+from tests._support.slash import slash_ctx
+
+
+def _ctx(session):
+    """The context the production dispatch hands a slash handler.
+
+    The transport IS this test's display recorder — ``reply()`` writes
+    through the client seam now, so the list the assertions read is the
+    one the transport fills.
+    """
+    return slash_ctx(session, recorder=session.outbox_calls)
+
+
+class _FakeSession:
+    """Minimal session stub for the /agent flow.
+
+    Exposes only what the slash handler reads (``_registry``,
+    ``_put_outbox``, ``agent_name``, ``_agent_role``). Captures
+    emitted outbox messages so the test can assert on the
+    ``__attach_request__`` sentinel.
+    """
+
+    def __init__(self, registry, *, agent_name: str = "default", agent_role: str = "") -> None:
+        self._registry = registry
+        self.agent_name = agent_name
+        # Mirror the real Session's surface: ``_agent_role`` is the
+        # mutable backing field (production code writes here), and
+        # ``agent_role`` is the public read-only accessor (tests assert
+        # through this). Keep the two-attribute shape so the slash
+        # handler's ``session._agent_role = ...`` works against the fake
+        # exactly as it does against Session.
+        self._agent_role = agent_role
+        self.outbox_calls: list[OutboxMessage] = []
+
+    @property
+    def agent_role(self) -> str:
+        return self._agent_role
+
+    async def _put_outbox(self, msg: OutboxMessage) -> None:
+        self.outbox_calls.append(msg)
+
+
+def _build_real_registry(tmp_path: Path):
+    """Construct a real ``AgentRegistry`` rooted at tmp_path."""
+    from reyn.runtime.registry import AgentRegistry
+
+    # Minimal session_factory — registry.create() doesn't invoke it,
+    # it just persists the AgentProfile to disk. The factory is for
+    # later session construction which we don't exercise here.
+    def _factory(profile):
+        return object()
+
+    return AgentRegistry(
+        project_root=tmp_path,
+        session_factory=_factory,
+        state_log=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_slash_is_registered():
+    """Tier 2: ``/agent`` is in the slash registry, summary mentions ``new``."""
+    cmd = REGISTRY.get("agent")
+    assert cmd is not None
+    assert "new" in cmd.summary.lower()
+
+
+@pytest.mark.asyncio
+async def test_agent_new_creates_and_requests_attach(tmp_path):
+    """Tier 2: ``/agent new <name>`` creates the agent and asks the
+    transport to attach to it (#4534 PR-2 — the retired
+    ``__attach_request__`` sentinel's named-operation replacement).
+
+    Drives the slash handler through a real registry on tmp_path so the
+    create half is exercised end-to-end; the attach REQUEST itself is
+    asserted through the transport (the real attach-flow is
+    tests/interfaces/test_4534_pr1_request_attach_switch.py's own claim).
+    """
+    from reyn.interfaces.slash.agent import _create_agent
+
+    registry = _build_real_registry(tmp_path)
+    session = _FakeSession(registry)
+    ctx = _ctx(session)
+
+    await _create_agent(ctx, "beta")
+
+    # Profile file landed on disk via the real registry.
+    assert registry.exists("beta"), "agent profile must persist on disk"
+    assert ctx.transport.attach_requests == ["beta"]
+
+
+@pytest.mark.asyncio
+async def test_agent_new_through_execute_slash_command_confirms_the_attach(tmp_path):
+    """Tier 2: #4884 — driven through the REAL public entrypoint
+    (``execute_slash_command``, what every client actually calls), not
+    ``_create_agent`` directly. Production wraps ``ctx.transport`` in
+    ``_ErrorWatchingTransport`` for the duration of the handler
+    (``dispatch.py``'s ``execute_slash_command``); the test above never
+    goes through that wrapper, which is exactly why 4 missing
+    delegations (including ``request_attach``) went undetected — a
+    genuinely successful attach still read back ``False`` through the
+    wrapper, and ``/agent new`` always replied "could not confirm the
+    attach" even though it happened."""
+    from reyn.interfaces.slash.dispatch import execute_slash_command
+
+    registry = _build_real_registry(tmp_path)
+    session = _FakeSession(registry)
+    ctx = _ctx(session)
+
+    ran = await execute_slash_command(ctx, "agent", "new gamma")
+
+    assert ran is True
+    assert registry.exists("gamma"), "agent profile must persist on disk"
+    assert ctx.transport.attach_requests == ["gamma"], (
+        "the handler must still ask the (wrapped) transport to attach"
+    )
+    texts = [m.text for m in ctx.transport.displayed]
+    assert any("attaching…" in t for t in texts), (
+        f"a genuinely successful attach (RecordingTransport.request_attach "
+        f"always returns True) must produce the confirming reply, not "
+        f"'could not confirm the attach' — the silent-failure shape #4884 "
+        f"exists to close: {texts!r}"
+    )
+    assert not any("could not confirm" in t for t in texts), (
+        f"attach was NOT actually unconfirmed here, so this wording must "
+        f"not appear: {texts!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_new_rejects_duplicate(tmp_path):
+    """Tier 2: creating an existing agent surfaces a recoverable error,
+    NOT a Python stack trace."""
+    from reyn.interfaces.slash.agent import _create_agent
+
+    registry = _build_real_registry(tmp_path)
+    registry.create("dup")
+
+    session = _FakeSession(registry)
+    await _create_agent(_ctx(session), "dup")
+
+    # No attach should have been emitted on the failure path.
+    assert all(
+        m.kind != "__attach_request__" for m in session.outbox_calls
+    )
+    # An error outbox message should have been queued.
+    error_msgs = [m for m in session.outbox_calls if m.kind == "error"]
+    assert error_msgs, f"expected an error reply; got {session.outbox_calls}"
+
+
+@pytest.mark.asyncio
+async def test_agent_new_rejects_invalid_name(tmp_path):
+    """Tier 2: invalid names (= regex violation) surface a clean error."""
+    from reyn.interfaces.slash.agent import _create_agent
+
+    registry = _build_real_registry(tmp_path)
+    session = _FakeSession(registry)
+
+    # Uppercase / starts-with-hyphen / too-long all fail the regex.
+    await _create_agent(_ctx(session), "BAD-Name-Mixed-Case")
+
+    assert all(
+        m.kind != "__attach_request__" for m in session.outbox_calls
+    )
+    error_msgs = [m for m in session.outbox_calls if m.kind == "error"]
+    assert error_msgs
+
+
+# ── /agent edit role ──────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_agent_edit_role_persists_to_profile_and_session(tmp_path):
+    """Tier 2: ``/agent edit role <text>`` writes the new role to disk
+    and updates ``session.agent_role`` so the next turn sees it."""
+    from reyn.interfaces.slash.agent import _edit_role
+    from reyn.runtime.profile import AgentProfile
+
+    registry = _build_real_registry(tmp_path)
+    registry.create("gamma", role="old role")
+    session = _FakeSession(registry, agent_name="gamma", agent_role="old role")
+
+    await _edit_role(_ctx(session), "  new persona text  ")
+
+    # Disk side: profile.yaml carries the new role (stripped).
+    reloaded = AgentProfile.load(tmp_path / ".reyn" / "agents" / "gamma")
+    assert reloaded.role == "new persona text"
+    # In-memory: session attribute mutated for next-turn pickup.
+    assert session.agent_role == "new persona text"
+    # Confirmation message landed on outbox (system kind, not error).
+    successes = [m for m in session.outbox_calls if m.kind == "system"]
+    assert successes, f"expected system reply; got {session.outbox_calls}"
+
+
+@pytest.mark.asyncio
+async def test_agent_edit_role_preserves_other_profile_fields(tmp_path):
+    """Tier 2: role edit MUST NOT clobber name / created_at / allowed_mcp."""
+    from reyn.interfaces.slash.agent import _edit_role
+    from reyn.runtime.profile import AgentProfile
+
+    registry = _build_real_registry(tmp_path)
+    registry.create("delta", role="initial")
+    # Hand-write an allowed_mcp config the create() flow doesn't set,
+    # to verify the edit doesn't drop it.
+    agent_dir = tmp_path / ".reyn" / "agents" / "delta"
+    profile = AgentProfile.load(agent_dir)
+    from dataclasses import replace
+    enriched = replace(
+        profile,
+        allowed_mcp=["mcp_x"],
+    )
+    enriched.save(agent_dir)
+    original_created_at = enriched.created_at
+
+    session = _FakeSession(registry, agent_name="delta", agent_role="initial")
+    await _edit_role(_ctx(session), "edited persona")
+
+    reloaded = AgentProfile.load(agent_dir)
+    assert reloaded.role == "edited persona"
+    assert reloaded.name == "delta"
+    assert reloaded.created_at == original_created_at
+    assert reloaded.allowed_mcp == ["mcp_x"]
+
+
+@pytest.mark.asyncio
+async def test_agent_edit_role_empty_value_errors(tmp_path):
+    """Tier 2: empty / whitespace role → error message, no disk change."""
+    from reyn.interfaces.slash.agent import _edit_role
+    from reyn.runtime.profile import AgentProfile
+
+    registry = _build_real_registry(tmp_path)
+    registry.create("eps", role="keep me")
+    session = _FakeSession(registry, agent_name="eps", agent_role="keep me")
+
+    await _edit_role(_ctx(session), "   ")
+
+    errors = [m for m in session.outbox_calls if m.kind == "error"]
+    assert errors
+    # On-disk role unchanged.
+    assert AgentProfile.load(tmp_path / ".reyn" / "agents" / "eps").role == "keep me"
+    # In-memory role unchanged.
+    assert session.agent_role == "keep me"
+
+
+@pytest.mark.asyncio
+async def test_agent_edit_unknown_field_errors(tmp_path):
+    """Tier 2: ``/agent edit <field> ...`` with field ≠ ``role`` errors.
+
+    Drives the dispatcher (= ``_edit_agent``) so the sub-routing
+    layer is covered, not only the leaf handler."""
+    from reyn.interfaces.slash.agent import _edit_agent
+
+    registry = _build_real_registry(tmp_path)
+    session = _FakeSession(registry, agent_name="default", agent_role="r")
+
+    await _edit_agent(_ctx(session), "name newname")
+
+    errors = [m for m in session.outbox_calls if m.kind == "error"]
+    assert errors
+    assert any("role" in m.text for m in errors)
+
+
+@pytest.mark.asyncio
+async def test_agent_edit_no_args_errors(tmp_path):
+    """Tier 2: bare ``/agent edit`` (= no sub-field) errors."""
+    from reyn.interfaces.slash.agent import _edit_agent
+
+    registry = _build_real_registry(tmp_path)
+    session = _FakeSession(registry, agent_name="default", agent_role="r")
+
+    await _edit_agent(_ctx(session), "")
+
+    errors = [m for m in session.outbox_calls if m.kind == "error"]
+    assert errors
+
+
+@pytest.mark.asyncio
+async def test_agent_dispatcher_routes_edit_to_handler(tmp_path):
+    """Tier 2: the top-level ``agent_cmd`` dispatches ``edit role <text>``
+    through to the leaf handler (= ``_edit_role``)."""
+    from reyn.interfaces.slash.agent import agent_cmd
+    from reyn.runtime.profile import AgentProfile
+
+    registry = _build_real_registry(tmp_path)
+    registry.create("zeta", role="before")
+    session = _FakeSession(registry, agent_name="zeta", agent_role="before")
+
+    await agent_cmd(_ctx(session), "edit role after")
+
+    assert (
+        AgentProfile.load(tmp_path / ".reyn" / "agents" / "zeta").role
+        == "after"
+    )
+    assert session.agent_role == "after"

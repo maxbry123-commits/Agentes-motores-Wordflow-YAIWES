@@ -1,0 +1,68 @@
+# Reyn project configuration
+# Committed to git. For personal overrides, use reyn.local.yaml (gitignored).
+# api_base (proxy URL) belongs in reyn.local.yaml or ~/.reyn/config.yaml.
+# API keys must be set as environment variables — never in config files —
+# e.g. OPENAI_API_KEY. litellm resolves your provider's own variable
+# automatically; see https://docs.litellm.ai/docs/providers.
+
+# #4174 T3: `model:`/`models:` live under `llm:` — a top-level `model:`/
+# `models:` here was silently ignored (a WARNING, not an error), which
+# #4349's own resolve() fix turns into a hard startup failure for THIS
+# repo's own `reyn chat` (lead-coder catch, #4357: the same class of drift
+# #4349 found in test_cli_pipe.py's fixture and the dogfood fixtures,
+# 5th instance).
+llm:
+  # Default model class when --model is not specified
+  model: standard
+
+  # Model class → LiteLLM model string
+  # Three standard tiers. Add custom classes as needed.
+  # #4349: the deleted built-in catalog also carried reasoning_effort for
+  # these Gemini reasoning models (#1654) — restored explicitly here so
+  # migrating off the catalog shorthand doesn't silently drop it.
+  models:
+    light:
+      model: gemini/gemini-2.5-flash-lite
+      reasoning_effort: low
+    standard:
+      model: gemini/gemini-2.5-flash-lite
+      reasoning_effort: low
+    strong:
+      model: gemini/gemini-2.5-pro
+      reasoning_effort: medium
+
+# Project-wide context injected into the system prompt for every phase.
+# Use this for stable background that all skills should implicitly know
+# (project goals, domain glossary, coding conventions, etc.). Pointing this
+# at CLAUDE.md is a valid pattern when sharing context with Claude Code.
+# Set to "" or a non-existent path to disable.
+# project_context_path: REYN.md
+
+# Pre-approve safe-mode Python preprocessor steps. The chat router uses one
+# (`slice_chat_history`) to slice the chat history; safe mode is
+# sandboxed (no file I/O, no untrusted imports) so auto-allow is safe.
+# Unsafe-mode steps still require --allow-unsafe-python.
+#
+# FP-0014 renamed python.pure → python.safe and python.trusted → python.unsafe.
+# The implementation only honours the post-rename keys; legacy python.pure
+# entries are silently ignored.
+permissions:
+  python.safe: allow
+
+# Chat session settings. The compaction policy implements the Head/Body/Tail
+# strategy: head + tail of the conversation are kept raw (sized by token budget
+# via component_weights), the middle is folded into a structured rolling summary
+# capped at body_token_cap. Compaction fires at the window-relative elide point
+# (effective_trigger); see PR4 in plans/abstract-knitting-moonbeam.md.
+# #1128: head_size/tail_size (turn-count) + trigger_total_tokens/min_compact_batch
+# were removed — head/tail sizing is now token-budget via component_weights, and
+# auto-compaction is window-relative (no 30K-absolute background trigger).
+chat:
+  compaction:
+    body_token_cap: 1500            # Total cap across all summary sections
+    section_token_caps:
+      topic_arc: 200
+      decisions: 400
+      pending: 400
+      session_user_facts: 200
+      artifacts_referenced: 300
