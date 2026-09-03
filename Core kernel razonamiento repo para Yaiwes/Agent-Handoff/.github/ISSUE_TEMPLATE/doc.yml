@@ -1,0 +1,24 @@
+name: Documentation
+description: Improve documentation
+title: "Docs: "
+labels:
+  - docs
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Documentation problem
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+    validations:
+      required: true
+  - type: textarea
+    id: related
+    attributes:
+      label: Related page or file
+    validations:
+      required: false

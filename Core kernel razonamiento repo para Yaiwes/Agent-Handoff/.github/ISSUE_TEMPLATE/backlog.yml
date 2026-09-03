@@ -1,0 +1,24 @@
+name: Backlog
+description: Future work
+title: "Backlog: "
+labels:
+  - backlog
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+    validations:
+      required: true
+  - type: textarea
+    id: reason
+    attributes:
+      label: Reason
+    validations:
+      required: true
+  - type: textarea
+    id: related
+    attributes:
+      label: Related context
+    validations:
+      required: false

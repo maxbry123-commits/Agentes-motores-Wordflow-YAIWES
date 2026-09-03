@@ -1,0 +1,48 @@
+name: Refactoring
+description: Code cleanup or restructuring
+title: "Refactor: "
+labels:
+  - refactoring
+body:
+  - type: textarea
+    id: code_area
+    attributes:
+      label: Code area
+    validations:
+      required: true
+  - type: textarea
+    id: current_problem
+    attributes:
+      label: Current problem
+    validations:
+      required: true
+  - type: textarea
+    id: target_state
+    attributes:
+      label: Target state
+    validations:
+      required: true
+  - type: textarea
+    id: non_goals
+    attributes:
+      label: Non-goals
+    validations:
+      required: true
+  - type: textarea
+    id: risk
+    attributes:
+      label: Risk
+    validations:
+      required: true
+  - type: textarea
+    id: checks
+    attributes:
+      label: Required checks
+    validations:
+      required: true
+  - type: textarea
+    id: related
+    attributes:
+      label: Related files or PRs
+    validations:
+      required: false

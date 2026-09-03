@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640" role="img" aria-label="Agent Handoff social preview">
+  <rect width="1280" height="640" fill="#0d1117"/>
+  <circle cx="1080" cy="120" r="220" fill="#1f6feb" opacity="0.22"/>
+  <circle cx="160" cy="520" r="180" fill="#8957e5" opacity="0.20"/>
+  <rect x="90" y="90" width="1100" height="460" rx="34" fill="#161b22" stroke="#30363d" stroke-width="3"/>
+  <text x="140" y="205" font-family="Arial, Helvetica, sans-serif" font-size="76" font-weight="700" fill="#f0f6fc">Agent Handoff</text>
+  <text x="140" y="285" font-family="Arial, Helvetica, sans-serif" font-size="34" fill="#c9d1d9">GitHub-native context handoff for AI coding agents</text>
+  <text x="140" y="345" font-family="Arial, Helvetica, sans-serif" font-size="28" fill="#8b949e">Issues → Work Claim → Draft PR → Checks → Handoff</text>
+  <g transform="translate(140 410)">
+    <rect x="0" y="0" width="170" height="54" rx="14" fill="#21262d" stroke="#58a6ff"/>
+    <text x="24" y="35" font-family="Arial, Helvetica, sans-serif" font-size="22" fill="#f0f6fc">GitHub</text>
+    <rect x="210" y="0" width="130" height="54" rx="14" fill="#21262d" stroke="#58a6ff"/>
+    <text x="248" y="35" font-family="Arial, Helvetica, sans-serif" font-size="22" fill="#f0f6fc">Git</text>
+    <rect x="380" y="0" width="190" height="54" rx="14" fill="#21262d" stroke="#58a6ff"/>
+    <text x="410" y="35" font-family="Arial, Helvetica, sans-serif" font-size="22" fill="#f0f6fc">AI memory</text>
+    <rect x="610" y="0" width="180" height="54" rx="14" fill="#21262d" stroke="#58a6ff"/>
+    <text x="638" y="35" font-family="Arial, Helvetica, sans-serif" font-size="22" fill="#f0f6fc">Handoffs</text>
+  </g>
+</svg>
