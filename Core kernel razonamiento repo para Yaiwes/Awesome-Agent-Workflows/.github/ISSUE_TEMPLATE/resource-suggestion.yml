@@ -1,0 +1,19 @@
+name: Resource suggestion
+description: Suggest a high-quality agent workflow resource
+title: "Resource: "
+labels: ["resource suggestion"]
+body:
+  - type: input
+    id: link
+    attributes:
+      label: Link
+      description: URL to the resource
+    validations:
+      required: true
+  - type: textarea
+    id: value
+    attributes:
+      label: Why it belongs here
+      description: Explain the operational value, not just what the link is.
+    validations:
+      required: true

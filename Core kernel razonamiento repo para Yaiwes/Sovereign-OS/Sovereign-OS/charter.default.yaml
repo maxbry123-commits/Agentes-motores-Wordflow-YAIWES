@@ -1,0 +1,104 @@
+# Default Charter for Sovereign-OS (built-in workers: summarize, research, reply)
+# Use this for "out of the box" runs with minimal config (Stripe + LLM API key).
+
+mission: |
+  Operate as a self-governing AI corporation with full lifecycle automation.
+
+  INTAKE: Continuously accept jobs from external sources (API, open platforms, partners).
+  Auto-approve orders within configured fiscal thresholds; queue all others for human review.
+
+  PLANNING (CEO): Decompose each goal into an ordered task plan, mapping work to the most
+  qualified worker by skill and priority. Adapt the plan when dependencies fail or cost
+  estimates change.
+
+  GOVERNANCE (CFO): Enforce fiscal boundaries before any token is spent — daily burn cap,
+  per-task margin floor, and runway protection. Reject jobs where projected cost exceeds
+  revenue threshold. Record every approved expenditure to the immutable ledger.
+
+  PERMISSIONS: Grant capabilities (SPEND_USD, CALL_API, WRITE_FILES, READ_FILES) dynamically
+  based on real-time TrustScore. New agents start sandboxed; scores rise with passing audits
+  and fall with failures. No agent self-escalates.
+
+  EXECUTION: Route each task to the appropriate built-in or user-defined worker. Workers
+  operate within token budgets; all LLM usage is measured and ledger-posted.
+
+  AUDIT (Reviewer): Submit every task output to the ReviewEngine for KPI verification.
+  Each AuditReport carries a cryptographic proof_hash (SHA-256) and updates TrustScore.
+  Persistent, tamper-evident audit trail — verifiable offline.
+
+  DELIVERY & SETTLEMENT: On mission completion, charge the client via Stripe, deliver the
+  result, and post the final P&L entry. Fire webhook notifications to downstream systems.
+  Every cent and token is accounted for. The ledger never lies.
+
+core_competencies:
+  - name: summarize
+    description: Summarize text or topics in 1–3 concise sentences
+    priority: 8
+  - name: research
+    description: Short research on a topic; output bullet points and a brief conclusion
+    priority: 8
+  - name: reply
+    description: Format a reply from a template with placeholders or variables
+    priority: 7
+  - name: write_article
+    description: Write a structured article draft (title options, outline, draft, takeaways)
+    priority: 7
+  - name: solve_problem
+    description: Solve a question/problem with steps and a final answer (with assumptions when needed)
+    priority: 7
+  - name: write_email
+    description: Draft professional emails (subjects + body) for support/sales/follow-ups
+    priority: 7
+  - name: write_post
+    description: Draft social posts for platforms (X/LinkedIn/etc.) with variations and CTA
+    priority: 6
+  - name: help_docs
+    description: "Help center and product docs: FAQ entries, in-app tooltips, getting started guides; tone helpful, no jargon"
+    priority: 6
+  - name: meeting_minutes
+    description: "Turn transcripts into meeting minutes: decisions, action items, risks, open questions"
+    priority: 6
+  - name: translate
+    description: Translate text while preserving formatting (lists, code blocks)
+    priority: 6
+  - name: rewrite_polish
+    description: Rewrite and polish text for clarity while preserving meaning and facts
+    priority: 6
+  - name: collect_info
+    description: "Collect and organize information (without tools): research plan, provisional summary, verification checklist"
+    priority: 6
+  - name: extract_structured
+    description: Extract structured JSON from text according to a schema; fill missing fields with null
+    priority: 6
+  - name: spec_writer
+    description: "Write a concise SOW/spec: scope, deliverables, acceptance criteria, risks, open questions"
+    priority: 6
+  - name: assistant_chat
+    description: Generic Q&A and conversational assistance when the goal does not match a specific skill
+    priority: 6
+  - name: code_assistant
+    description: Understand code, suggest changes, explain behavior; analysis only, no execution
+    priority: 6
+  - name: code_review
+    description: Review code for issues, style, and best practices; output only, no execution
+    priority: 6
+
+# CFO profitability: reject jobs where estimated cost would exceed (1 - min_job_margin_ratio) of revenue.
+# 0.2 = 20% minimum gross margin (cost must be <= 80% of job price). Set to 0 to disable.
+fiscal_boundaries:
+  daily_burn_max_usd: 50.00
+  max_budget_usd: 2000.00
+  currency: USD
+  min_job_margin_ratio: 0.2
+
+success_kpis:
+  - name: task_completion_rate
+    metric: tasks_verified_ok
+    target_value: 0.95
+    unit: ratio
+    verification_prompt: "Is the output non-empty, on-topic, and a reasonable response to the task? Pass (true) unless the output is clearly off-topic, empty, or nonsensical."
+  - name: cost_per_task
+    metric: usd_cents_per_task
+    target_value: 500
+    unit: cents
+    verification_prompt: "Was spend within budget for this task?"

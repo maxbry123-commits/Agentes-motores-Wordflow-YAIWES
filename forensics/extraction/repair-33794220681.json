@@ -1,0 +1,472 @@
+{
+  "schema": "yaiwes.extraction.guardian.v2",
+  "run_id": "33794220681",
+  "archive_groups": 167,
+  "processed": [
+    {
+      "slug": "Agent-Zero",
+      "target": "Core kernel razonamiento repo para Yaiwes/Agent-Zero",
+      "status": "EXTRACTED_VERIFIED",
+      "parts": 3,
+      "part_sha256": {
+        "Download code/archivos/Agent-Zero_0001.zip": "d88da49e07b50d5b44df7d9f8c429b79a7b25385fc3bc00115f3974d2b1ffc60",
+        "Download code/archivos/Agent-Zero_0002.zip": "45505b3d86aa0dd3bb1eb99af1a987d0dd658b555f12f937f861a83a63f22562",
+        "Download code/archivos/Agent-Zero_0003.zip": "73dd2763f6f306f4fb3d40652f703a0693841210e8fc5c127e550834c120b4e8"
+      },
+      "copied": 2972,
+      "mirrors": [],
+      "files": 2972,
+      "bytes": 47999434,
+      "tree_sha256": "5a7ac159937de78e861276fd37cb807c4153301523a74d4178a076517037e916"
+    },
+    {
+      "slug": "Agent-Capability-Standard",
+      "target": "Core kernel razonamiento repo para Yaiwes/Agent-Capability-Standard",
+      "status": "EXTRACTED_VERIFIED",
+      "parts": 1,
+      "part_sha256": {
+        "Download code/archivos/Agent-Capability-Standard_0001.zip": "6d131fdeac334f9e4046c3e229b5575c4ecc18c3b5248e113cb6cf71b2b168f1"
+      },
+      "copied": 458,
+      "mirrors": [],
+      "files": 458,
+      "bytes": 5269159,
+      "tree_sha256": "204da4fadaba165fec34247cb3951ae2e5e334c9295e3c446b8e291bf86bcfc6"
+    },
+    {
+      "slug": "OpenDev",
+      "target": "Core kernel razonamiento repo para Yaiwes/OpenDev",
+      "status": "EXTRACTED_VERIFIED",
+      "parts": 2,
+      "part_sha256": {
+        "Download code/archivos/OpenDev_0001.zip": "f2dfaf5f40dedc1c375a25aceaf20a402e7f290f50f69aed64719ffd2f927644",
+        "Download code/archivos/OpenDev_0002.zip": "affcba6b2a8a0175ce3b679d31dae58f41d40e51d2eaab1362d261407e28bc62"
+      },
+      "copied": 1184,
+      "mirrors": [],
+      "files": 1184,
+      "bytes": 19876797,
+      "tree_sha256": "ff23a8ac01fd78633e1c420c4d17f3b5910c7bcb099ae483a02d57d4e698d4b7"
+    },
+    {
+      "slug": "GLM-skills",
+      "target": "Core kernel razonamiento repo para Yaiwes/GLM-skills",
+      "status": "EXTRACTED_VERIFIED",
+      "parts": 1,
+      "part_sha256": {
+        "Download code/archivos/GLM-skills_0001.zip": "c2d8f80c81c41ee7462e9a3b6ef1cf74baa033663b36673da2b51c738069131b"
+      },
+      "copied": 71,
+      "mirrors": [],
+      "files": 71,
+      "bytes": 652660,
+      "tree_sha256": "b3eb5b8d30ed77086d215c77cdd09f9005be41fdd3e7c9fa30dcc63556d91cfd"
+    },
+    {
+      "slug": "Kimi-K2.5",
+      "target": "Core kernel razonamiento repo para Yaiwes/Kimi-K2.5",
+      "status": "EXTRACTED_VERIFIED",
+      "parts": 1,
+      "part_sha256": {
+        "Download code/archivos/Kimi-K2.5_0001.zip": "89d6377a040aebce54b35c1c5d53260eedb926b473a64ab060c568233f8e9fba"
+      },
+      "copied": 7,
+      "mirrors": [],
+      "files": 7,
+      "bytes": 8756766,
+      "tree_sha256": "d866237a5938cc333d15ed69485458802e510e0d9462591aea7b0b06abfd4448"
+    },
+    {
+      "slug": "Microsoft-Agent-Framework",
+      "target": "Core kernel razonamiento repo para Yaiwes/Microsoft-Agent-Framework",
+      "status": "EXTRACTED_VERIFIED",
+      "parts": 2,
+      "part_sha256": {
+        "Download code/archivos/Microsoft-Agent-Framework_0001.zip": "c90ec5abbf6a43dd1d6bf45ca877e462e8f845ea8b405b22d76e97599ef5c2bc",
+        "Download code/archivos/Microsoft-Agent-Framework_0002.zip": "bee9cda1150b1093256a8d582729c19ac4451a36f46537509e7d74302d8a3eb3"
+      },
+      "copied": 5108,
+      "mirrors": [],
+      "files": 5108,
+      "bytes": 47907968,
+      "tree_sha256": "94c27d6e6fa4bd8e3e9458d7f642bb92f94dfc948526f5a32acdb83c1feffbea"
+    },
+    {
+      "slug": "Sovereign-OS",
+      "target": "Core kernel razonamiento repo para Yaiwes/Sovereign-OS",
+      "status": "EXTRACTED_VERIFIED",
+      "parts": 2,
+      "part_sha256": {
+        "Download code/archivos/Sovereign-OS_0001.zip": "4c20fa1389a15ab41fda64707328b96d1e774fec5a30e131c8b2548e43459540",
+        "Download code/archivos/Sovereign-OS_0002.zip": "4b06abf5998f627c7d33de35112ef92b2f284fce77af262d0d04f10c482427fb"
+      },
+      "copied": 266,
+      "mirrors": [],
+      "files": 266,
+      "bytes": 16046311,
+      "tree_sha256": "bcf3ba74d28214d5f3aea0d42b5a8b08e9976fb2548105bf6774952e37cd23d0"
+    },
+    {
+      "slug": "Meta-OpenEnv",
+      "target": "Core kernel razonamiento repo para Yaiwes/Meta-OpenEnv",
+      "status": "EXTRACTED_VERIFIED",
+      "parts": 6,
+      "part_sha256": {
+        "Download code/archivos/Meta-OpenEnv_0001.zip": "33ef2b03be4623b758c2a2260b57b393242a5f9899349c054f6dce709ece1bfd",
+        "Download code/archivos/Meta-OpenEnv_0002.zip": "a3130dbc330379b7a7a1ae11402d66146c88474671db2c40462261aef4d466d9",
+        "Download code/archivos/Meta-OpenEnv_0003.zip": "9bc6a2fa3d840626692dfd2bf60e3056eb4fe68935275b17e1c8b549ee7850ad",
+        "Download code/archivos/Meta-OpenEnv_0004.zip": "e688bbd45133061bd7b6ee21cdf20485f145a2890803682a62438b0db6f15bcc",
+        "Download code/archivos/Meta-OpenEnv_0005.zip": "a8f3fb4bd41c17106c622c9bd59a21c6c3cfb5460ae541cdd62a0d2df206e17b",
+        "Download code/archivos/Meta-OpenEnv_0006.zip": "095c2a9a6a64b0076ec44f0c97dc5090be3a424263a3ad9d234d8a195d03c542"
+      },
+      "copied": 1314,
+      "mirrors": [],
+      "files": 1314,
+      "bytes": 96204250,
+      "tree_sha256": "571d45c7ad6cbc9ae44cb9e8501ea84346f1d0fceb9ba80dfa6615e60fd5f1f1"
+    },
+    {
+      "slug": "Haystack",
+      "target": "Core kernel razonamiento repo para Yaiwes/Haystack",
+      "status": "EXTRACTED_VERIFIED",
+      "parts": 3,
+      "part_sha256": {
+        "Download code/archivos/Haystack_0001.zip": "7724ef75ab1b9475f3ee8e5b4696ddb0d1fd8e88f0d0e719d41022a7be043d06",
+        "Download code/archivos/Haystack_0002.zip": "f28f4d6935ebe7beef6ef6041b61377bf6074a55fd9deeb7ff9380188409c152",
+        "Download code/archivos/Haystack_0003.zip": "68bad75bfbfe55cf799ac0dbe9f3d054d446a5191f16748eeb6b50e15fd6dfb4"
+      },
+      "copied": 10733,
+      "mirrors": [],
+      "files": 10733,
+      "bytes": 93655181,
+      "tree_sha256": "985ab85b3c7a8a90d351468458f809f83cb23b321587220c163df3346b219bc7"
+    },
+    {
+      "slug": "Awesome-Agent-Workflows",
+      "target": "Core kernel razonamiento repo para Yaiwes/Awesome-Agent-Workflows",
+      "status": "EXTRACTED_VERIFIED",
+      "parts": 1,
+      "part_sha256": {
+        "Download code/archivos/Awesome-Agent-Workflows_0001.zip": "2e416dd24d2d7ef35c7a9ea4d04ff3d00fef0b2d9415afbefdc5652fc87c59f1"
+      },
+      "copied": 76,
+      "mirrors": [],
+      "files": 76,
+      "bytes": 362108,
+      "tree_sha256": "a60389cc854941dac16744fea81f8c789d6e815521fe1fef4cd7ee7977765256"
+    }
+  ],
+  "failures": [],
+  "remaining_gaps": [
+    {
+      "slug": "AutoGen",
+      "target": "Core kernel razonamiento repo para Yaiwes/AutoGen",
+      "mirror": null
+    },
+    {
+      "slug": "Shofer",
+      "target": "Core kernel razonamiento repo para Yaiwes/Shofer",
+      "mirror": null
+    },
+    {
+      "slug": "NVIDIA-NeMo-Agent-Toolkit",
+      "target": "Core kernel razonamiento repo para Yaiwes/NVIDIA-NeMo-Agent-Toolkit",
+      "mirror": null
+    },
+    {
+      "slug": "Kaji",
+      "target": "Core kernel razonamiento repo para Yaiwes/Kaji",
+      "mirror": null
+    },
+    {
+      "slug": "Agent-Skill-Lab",
+      "target": "Core kernel razonamiento repo para Yaiwes/Agent-Skill-Lab",
+      "mirror": null
+    },
+    {
+      "slug": "Agno",
+      "target": "Core kernel razonamiento repo para Yaiwes/Agno",
+      "mirror": null
+    },
+    {
+      "slug": "AI-Agent-Lab",
+      "target": "Core kernel razonamiento repo para Yaiwes/AI-Agent-Lab",
+      "mirror": null
+    },
+    {
+      "slug": "Agent-Handoff",
+      "target": "Core kernel razonamiento repo para Yaiwes/Agent-Handoff",
+      "mirror": null
+    },
+    {
+      "slug": "Oh-My-Agents",
+      "target": "Core kernel razonamiento repo para Yaiwes/Oh-My-Agents",
+      "mirror": null
+    },
+    {
+      "slug": "SETA",
+      "target": "Core kernel razonamiento repo para Yaiwes/SETA",
+      "mirror": null
+    },
+    {
+      "slug": "Zuora-Coding-Agent",
+      "target": "Core kernel razonamiento repo para Yaiwes/Zuora-Coding-Agent",
+      "mirror": null
+    },
+    {
+      "slug": "MetaAgent",
+      "target": "Core kernel razonamiento repo para Yaiwes/MetaAgent",
+      "mirror": null
+    },
+    {
+      "slug": "Codex-Security",
+      "target": "Core kernel razonamiento repo para Yaiwes/Codex-Security",
+      "mirror": null
+    },
+    {
+      "slug": "Temporal",
+      "target": "Core kernel razonamiento repo para Yaiwes/Temporal",
+      "mirror": null
+    },
+    {
+      "slug": "Open-Verification-Kernel",
+      "target": "Core kernel razonamiento repo para Yaiwes/Open-Verification-Kernel",
+      "mirror": null
+    },
+    {
+      "slug": "Research-Agent-Lab",
+      "target": "Core kernel razonamiento repo para Yaiwes/Research-Agent-Lab",
+      "mirror": null
+    },
+    {
+      "slug": "SwarmClaw",
+      "target": "Core kernel razonamiento repo para Yaiwes/SwarmClaw",
+      "mirror": null
+    },
+    {
+      "slug": "Agent-Checkpoint",
+      "target": "Core kernel razonamiento repo para Yaiwes/Agent-Checkpoint",
+      "mirror": null
+    },
+    {
+      "slug": "MiMo-V2-Flash",
+      "target": "Core kernel razonamiento repo para Yaiwes/MiMo-V2-Flash",
+      "mirror": null
+    },
+    {
+      "slug": "IntentKit",
+      "target": "Core kernel razonamiento repo para Yaiwes/IntentKit",
+      "mirror": null
+    },
+    {
+      "slug": "Bound",
+      "target": "Core kernel razonamiento repo para Yaiwes/Bound",
+      "mirror": null
+    },
+    {
+      "slug": "ToolOrchestra",
+      "target": "Core kernel razonamiento repo para Yaiwes/ToolOrchestra",
+      "mirror": null
+    },
+    {
+      "slug": "EvolveR",
+      "target": "Core kernel razonamiento repo para Yaiwes/EvolveR",
+      "mirror": null
+    },
+    {
+      "slug": "OpenHands",
+      "target": "Core kernel razonamiento repo para Yaiwes/OpenHands",
+      "mirror": null
+    },
+    {
+      "slug": "LangGraph",
+      "target": "Core kernel razonamiento repo para Yaiwes/LangGraph",
+      "mirror": null
+    },
+    {
+      "slug": "Solace-Agent-Mesh",
+      "target": "Core kernel razonamiento repo para Yaiwes/Solace-Agent-Mesh",
+      "mirror": null
+    },
+    {
+      "slug": "Kimi-CLI",
+      "target": "Core kernel razonamiento repo para Yaiwes/Kimi-CLI",
+      "mirror": null
+    },
+    {
+      "slug": "Loop-Engineer",
+      "target": "Core kernel razonamiento repo para Yaiwes/Loop-Engineer",
+      "mirror": null
+    },
+    {
+      "slug": "NVIDIA-OpenShell",
+      "target": "Core kernel razonamiento repo para Yaiwes/NVIDIA-OpenShell",
+      "mirror": null
+    }
+  ],
+  "retryable_gaps": [
+    {
+      "slug": "Kaji",
+      "target": "Core kernel razonamiento repo para Yaiwes/Kaji",
+      "mirror": null
+    },
+    {
+      "slug": "Agent-Skill-Lab",
+      "target": "Core kernel razonamiento repo para Yaiwes/Agent-Skill-Lab",
+      "mirror": null
+    },
+    {
+      "slug": "Agno",
+      "target": "Core kernel razonamiento repo para Yaiwes/Agno",
+      "mirror": null
+    },
+    {
+      "slug": "AI-Agent-Lab",
+      "target": "Core kernel razonamiento repo para Yaiwes/AI-Agent-Lab",
+      "mirror": null
+    },
+    {
+      "slug": "Agent-Handoff",
+      "target": "Core kernel razonamiento repo para Yaiwes/Agent-Handoff",
+      "mirror": null
+    },
+    {
+      "slug": "Oh-My-Agents",
+      "target": "Core kernel razonamiento repo para Yaiwes/Oh-My-Agents",
+      "mirror": null
+    },
+    {
+      "slug": "SETA",
+      "target": "Core kernel razonamiento repo para Yaiwes/SETA",
+      "mirror": null
+    },
+    {
+      "slug": "Zuora-Coding-Agent",
+      "target": "Core kernel razonamiento repo para Yaiwes/Zuora-Coding-Agent",
+      "mirror": null
+    },
+    {
+      "slug": "MetaAgent",
+      "target": "Core kernel razonamiento repo para Yaiwes/MetaAgent",
+      "mirror": null
+    },
+    {
+      "slug": "Codex-Security",
+      "target": "Core kernel razonamiento repo para Yaiwes/Codex-Security",
+      "mirror": null
+    },
+    {
+      "slug": "Temporal",
+      "target": "Core kernel razonamiento repo para Yaiwes/Temporal",
+      "mirror": null
+    },
+    {
+      "slug": "Open-Verification-Kernel",
+      "target": "Core kernel razonamiento repo para Yaiwes/Open-Verification-Kernel",
+      "mirror": null
+    },
+    {
+      "slug": "Research-Agent-Lab",
+      "target": "Core kernel razonamiento repo para Yaiwes/Research-Agent-Lab",
+      "mirror": null
+    },
+    {
+      "slug": "SwarmClaw",
+      "target": "Core kernel razonamiento repo para Yaiwes/SwarmClaw",
+      "mirror": null
+    },
+    {
+      "slug": "Agent-Checkpoint",
+      "target": "Core kernel razonamiento repo para Yaiwes/Agent-Checkpoint",
+      "mirror": null
+    },
+    {
+      "slug": "MiMo-V2-Flash",
+      "target": "Core kernel razonamiento repo para Yaiwes/MiMo-V2-Flash",
+      "mirror": null
+    },
+    {
+      "slug": "IntentKit",
+      "target": "Core kernel razonamiento repo para Yaiwes/IntentKit",
+      "mirror": null
+    },
+    {
+      "slug": "Bound",
+      "target": "Core kernel razonamiento repo para Yaiwes/Bound",
+      "mirror": null
+    },
+    {
+      "slug": "ToolOrchestra",
+      "target": "Core kernel razonamiento repo para Yaiwes/ToolOrchestra",
+      "mirror": null
+    },
+    {
+      "slug": "EvolveR",
+      "target": "Core kernel razonamiento repo para Yaiwes/EvolveR",
+      "mirror": null
+    },
+    {
+      "slug": "OpenHands",
+      "target": "Core kernel razonamiento repo para Yaiwes/OpenHands",
+      "mirror": null
+    },
+    {
+      "slug": "LangGraph",
+      "target": "Core kernel razonamiento repo para Yaiwes/LangGraph",
+      "mirror": null
+    },
+    {
+      "slug": "Solace-Agent-Mesh",
+      "target": "Core kernel razonamiento repo para Yaiwes/Solace-Agent-Mesh",
+      "mirror": null
+    },
+    {
+      "slug": "Kimi-CLI",
+      "target": "Core kernel razonamiento repo para Yaiwes/Kimi-CLI",
+      "mirror": null
+    },
+    {
+      "slug": "Loop-Engineer",
+      "target": "Core kernel razonamiento repo para Yaiwes/Loop-Engineer",
+      "mirror": null
+    },
+    {
+      "slug": "NVIDIA-OpenShell",
+      "target": "Core kernel razonamiento repo para Yaiwes/NVIDIA-OpenShell",
+      "mirror": null
+    }
+  ],
+  "blocked_gaps": [
+    {
+      "slug": "AutoGen",
+      "target": "Core kernel razonamiento repo para Yaiwes/AutoGen",
+      "mirror": null,
+      "code": "SOURCE_LFS_POINTER_GAP",
+      "detail": "SOURCE_LFS_POINTER_GAP:AutoGen/dotnet/website/images/articles/DynamicGroupChat/dynamicChat.gif,AutoGen/dotnet/website/images/articles/PrintMessageMiddleware/streamingoutput.gif,AutoGen/dotnet/website/images/articles/SequentialGroupChat/SearcherSummarizer.gif",
+      "evidence": "forensics/extraction/repair-33790627875.json"
+    },
+    {
+      "slug": "Shofer",
+      "target": "Core kernel razonamiento repo para Yaiwes/Shofer",
+      "mirror": null,
+      "code": "SOURCE_LFS_POINTER_GAP",
+      "detail": "SOURCE_LFS_POINTER_GAP:src/assets/docs/demo.gif",
+      "evidence": "forensics/extraction/repair-33791739225.json"
+    },
+    {
+      "slug": "NVIDIA-NeMo-Agent-Toolkit",
+      "target": "Core kernel razonamiento repo para Yaiwes/NVIDIA-NeMo-Agent-Toolkit",
+      "mirror": null,
+      "code": "SOURCE_LFS_POINTER_GAP",
+      "detail": "SOURCE_LFS_POINTER_GAP:docs/source/_static/a2a_agent_card.png,docs/source/_static/agent_with_reasoning_wrapper.png,docs/source/_static/agent_without_reasoning_wrapper.png,docs/source/_static/banner.png,docs/source/_static/concurrency_vs_p95_analysis.png,docs/source/_static/concurrency_vs_p95_simple.png,docs/source/_static/config_to_workflow.png,docs/source/_static/cursor_rules_demo/add_tool.gif,docs/source/_static/cursor_rules_demo/create_workflow.gif,docs/source/_static/cursor_rules_demo/find_tool.gif,docs/source/_static/cursor_rules_demo/install.gif,docs/source/_static/cursor_rules_demo/react_agent.gif,docs/source/_static/cursor_rules_demo/run_workflow.gif,docs/source/_static/dual_node_agent.png,docs/source/_static/dynatrace-trace.png,docs/source/_static/hitl_prompt.png,docs/source/_static/hitl_result.png,docs/source/_static/hitl_settings.png,docs/source/_static/hybrid_control_flow.png,docs/source/_static/main_nv_logo_square.png",
+      "evidence": "forensics/extraction/repair-33791739225.json"
+    }
+  ],
+  "counts": {
+    "remaining": 29,
+    "retryable": 26,
+    "blocked": 3,
+    "processed": 10
+  },
+  "verdict": "GAPS_PENDING"
+}

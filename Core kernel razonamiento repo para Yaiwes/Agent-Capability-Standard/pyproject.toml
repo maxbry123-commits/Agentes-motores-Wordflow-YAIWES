@@ -1,0 +1,115 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "grounded-agency"
+version = "0.1.0"
+description = "Claude Agent SDK integration for Grounded Agency capability standard"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+authors = [
+    { name = "Grounded Agency Team" },
+]
+keywords = [
+    "ai",
+    "agents",
+    "claude",
+    "sdk",
+    "safety",
+    "capabilities",
+    "ontology",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+]
+dependencies = [
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+sdk = [
+    "claude-agent-sdk",
+]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+    "mypy>=1.0",
+    "ruff>=0.1.0",
+    "types-PyYAML>=6.0",
+    "hypothesis>=6.0",
+    "jsonschema>=4.0",
+    "claude-agent-sdk",
+]
+all = [
+    "grounded-agency[sdk,dev]",
+]
+
+[project.scripts]
+acs = "tools.scaffold:main"
+
+[project.urls]
+Homepage = "https://github.com/synaptiai/agent-capability-standard"
+Documentation = "https://github.com/synaptiai/agent-capability-standard/blob/main/docs/integrations/claude_agent_sdk.md"
+Repository = "https://github.com/synaptiai/agent-capability-standard"
+
+[tool.hatch.build.targets.wheel]
+packages = ["grounded_agency"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/grounded_agency",
+    "/schemas",
+    "/skills",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "benchmarks/tests"]
+asyncio_mode = "auto"
+addopts = "-v"
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+exclude = [
+    "^.venv/",
+    "^_archive/",
+]
+
+[[tool.mypy.overrides]]
+module = "claude_agent_sdk.*"
+ignore_missing_imports = true
+
+[tool.ruff]
+target-version = "py310"
+line-length = 88
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "C4",  # flake8-comprehensions
+    "UP",  # pyupgrade
+]
+ignore = [
+    "E501",   # line too long (handled by formatter)
+    "UP038",  # isinstance(x, (A, B)) — unsafe to auto-convert for bool subclass
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["grounded_agency"]

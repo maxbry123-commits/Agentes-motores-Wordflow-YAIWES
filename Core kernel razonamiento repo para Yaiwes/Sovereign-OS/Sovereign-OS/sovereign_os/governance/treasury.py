@@ -1,0 +1,334 @@
+"""
+Treasury: The CFO Mind — fiscal gatekeeping and model selection.
+
+Integrates with UnifiedLedger to approve/deny task budgets and to choose
+cost-effective models by task complexity. Runs winner determination for
+RFP auctions: Utility = (Confidence_Score / Estimated_Cost) * Priority_Multiplier,
+with TrustScore discount. Can negotiate (e.g. smaller context) to fit runway.
+"""
+
+import logging
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING, Any
+
+from sovereign_os.governance.exceptions import FiscalInsolvencyError, HumanApprovalRequiredError, UnprofitableJobError
+from sovereign_os.ledger.unified_ledger import UnifiedLedger
+from sovereign_os.models.charter import Charter
+
+logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from sovereign_os.agents.auth import SovereignAuth
+    from sovereign_os.compliance.hooks import ComplianceHook, ComplianceResult
+    from sovereign_os.governance.auction import Bid
+
+
+# Default minimum reserve (cents) to keep in the ledger before approving new spend
+DEFAULT_MIN_RESERVE_CENTS = 0
+
+
+def _start_of_today_utc() -> datetime:
+    now = datetime.now(timezone.utc)
+    return now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+class Treasury:
+    """
+    CFO logic: budget approval and token-hedging (model selection).
+
+    - approve_task: enforces balance vs min_reserve and daily burn cap.
+    - get_optimal_model: returns model ID by task complexity (high -> o1, low -> gpt-4o-mini).
+    """
+
+    def __init__(
+        self,
+        charter: Charter,
+        ledger: UnifiedLedger,
+        *,
+        min_reserve_cents: int = DEFAULT_MIN_RESERVE_CENTS,
+        compliance_hook: "ComplianceHook | None" = None,
+        spend_threshold_cents: int = 0,
+        compliance_auto_proceed: bool = False,
+        budget_policy: "Any | None" = None,
+    ) -> None:
+        self._charter = charter
+        self._ledger = ledger
+        self._min_reserve_cents = min_reserve_cents
+        self._compliance_hook = compliance_hook
+        self._spend_threshold_cents = spend_threshold_cents
+        self._compliance_auto_proceed = compliance_auto_proceed
+        self._budget_policy = budget_policy
+
+    @property
+    def _daily_burn_max_cents(self) -> int:
+        return int(self._charter.fiscal_boundaries.daily_burn_max_usd * 100)
+
+    @property
+    def _max_task_cost_cents(self) -> int:
+        return int(getattr(self._charter.fiscal_boundaries, "max_task_cost_usd", 0.0) * 100)
+
+    def approve_task(self, estimated_cost_cents: int, *, task_id: str = "", purpose: str = "", skill: str = "") -> None:
+        """
+        Check fiscal constraints for a task. Raises FiscalInsolvencyError if denied.
+
+        - Ensures current_balance - estimated_cost >= min_reserve.
+        - Ensures daily_spend + estimated_cost <= charter.fiscal_boundaries.daily_burn_max_usd (in cents).
+        """
+        balance_cents = self._ledger.total_usd_cents()
+        max_task_cents = self._max_task_cost_cents
+        if max_task_cents > 0 and estimated_cost_cents > max_task_cents:
+            msg = (
+                f"CFO denied budget: estimated task cost {estimated_cost_cents} cents exceeds "
+                f"per-task ceiling {max_task_cents} cents."
+            )
+            logger.warning("GOVERNANCE CFO: %s", msg)
+            raise FiscalInsolvencyError(
+                msg,
+                balance_cents=balance_cents,
+                requested_cents=estimated_cost_cents,
+            )
+
+        # Category-aware ceiling (when a budget policy is configured): the tighter
+        # of the flat per-task cap and the task's category ceiling wins.
+        if self._budget_policy is not None and skill:
+            cat_ceiling = self._budget_policy.ceiling_cents(skill=skill)
+            if cat_ceiling > 0 and estimated_cost_cents > cat_ceiling:
+                msg = (
+                    f"CFO denied budget: estimated cost {estimated_cost_cents} cents exceeds the "
+                    f"'{skill}' category ceiling {cat_ceiling} cents."
+                )
+                logger.warning("GOVERNANCE CFO: %s", msg)
+                raise FiscalInsolvencyError(msg, balance_cents=balance_cents, requested_cents=estimated_cost_cents)
+        if balance_cents - estimated_cost_cents < self._min_reserve_cents:
+            msg = (
+                f"CFO denied budget: balance {balance_cents} cents - estimated cost {estimated_cost_cents} cents "
+                f"would fall below min reserve {self._min_reserve_cents} cents."
+            )
+            logger.warning("GOVERNANCE CFO: %s", msg)
+            raise FiscalInsolvencyError(
+                msg,
+                balance_cents=balance_cents,
+                requested_cents=estimated_cost_cents,
+            )
+
+        daily_spend_cents = self._ledger.usd_debits_since(_start_of_today_utc())
+        if self._daily_burn_max_cents > 0 and daily_spend_cents + estimated_cost_cents > self._daily_burn_max_cents:
+            msg = (
+                f"CFO denied budget: daily spend {daily_spend_cents} + estimated {estimated_cost_cents} "
+                f"exceeds daily cap {self._daily_burn_max_cents} cents."
+            )
+            logger.warning("GOVERNANCE CFO: %s", msg)
+            raise FiscalInsolvencyError(
+                msg,
+                balance_cents=balance_cents,
+                requested_cents=estimated_cost_cents,
+            )
+
+        floor_days = getattr(self._charter.fiscal_boundaries, "runway_floor_days", 0)
+        if floor_days and floor_days > 0:
+            projected = self.projected_runway_days(after_spend_cents=estimated_cost_cents)
+            if projected is not None and projected < floor_days:
+                msg = (
+                    f"CFO denied budget: approving {estimated_cost_cents} cents would cut projected "
+                    f"runway to {projected} day(s), below the {floor_days}-day floor."
+                )
+                logger.warning("GOVERNANCE CFO: %s", msg)
+                raise FiscalInsolvencyError(
+                    msg,
+                    balance_cents=balance_cents,
+                    requested_cents=estimated_cost_cents,
+                )
+
+        if self._compliance_hook and estimated_cost_cents >= self._spend_threshold_cents and self._spend_threshold_cents > 0:
+            from sovereign_os.compliance.hooks import ComplianceResult
+
+            result = self._compliance_hook.check(
+                "SPEND_USD",
+                {"amount_cents": estimated_cost_cents, "task_id": task_id, "purpose": purpose},
+            )
+            if result == ComplianceResult.DENY:
+                msg = f"Compliance hook denied spend of {estimated_cost_cents} cents (task_id={task_id})."
+                logger.warning("GOVERNANCE CFO: %s", msg)
+                raise FiscalInsolvencyError(msg, balance_cents=balance_cents, requested_cents=estimated_cost_cents)
+            if result == ComplianceResult.REQUEST_HUMAN_APPROVAL:
+                if self._compliance_auto_proceed:
+                    logger.info(
+                        "GOVERNANCE CFO: compliance_auto_proceed=True — allowing spend of %s cents (above threshold) without human approval.",
+                        estimated_cost_cents,
+                    )
+                else:
+                    msg = f"Human approval required for spend of {estimated_cost_cents} cents (above threshold {self._spend_threshold_cents})."
+                    logger.warning("GOVERNANCE CFO: %s", msg)
+                    raise HumanApprovalRequiredError(msg, amount_cents=estimated_cost_cents, task_id=task_id)
+
+        usd = estimated_cost_cents / 100.0
+        logger.info(
+            "GOVERNANCE CFO: Approved $%.2f budget for task (task_id=%s, purpose=%s).",
+            usd,
+            task_id or "unknown",
+            purpose or "unspecified",
+        )
+
+    def approve_job_profitability(self, job_revenue_cents: int, total_estimated_cost_cents: int) -> None:
+        """
+        Unit economics check: reject job if estimated cost would exceed allowed share of revenue
+        (min margin floor). Top-company CFO practice: do not accept unprofitable deals.
+        Raises UnprofitableJobError when cost > revenue * (1 - min_job_margin_ratio).
+        Skips when min_job_margin_ratio is 0 or job_revenue_cents <= 0.
+        """
+        if job_revenue_cents <= 0:
+            return
+        ratio = getattr(
+            self._charter.fiscal_boundaries,
+            "min_job_margin_ratio",
+            0.0,
+        )
+        # Net the revenue down by settlement fees (x402 facilitator/network, Stripe, etc.)
+        # so the margin check reasons about funds that actually land in the treasury.
+        fee_ratio = getattr(self._charter.fiscal_boundaries, "settlement_fee_ratio", 0.0)
+        fee_ratio = min(1.0, max(0.0, fee_ratio))
+        net_revenue_cents = int(job_revenue_cents * (1.0 - fee_ratio))
+        if ratio <= 0:
+            # Margin floor disabled, but a settlement fee can still make a job lose money.
+            if fee_ratio > 0 and total_estimated_cost_cents > net_revenue_cents:
+                msg = (
+                    f"CFO denied job: estimated cost {total_estimated_cost_cents} cents exceeds "
+                    f"net revenue {net_revenue_cents} cents after {fee_ratio * 100:.1f}% settlement fee."
+                )
+                logger.warning("GOVERNANCE CFO: %s", msg)
+                raise UnprofitableJobError(
+                    msg,
+                    job_revenue_cents=job_revenue_cents,
+                    estimated_cost_cents=total_estimated_cost_cents,
+                    min_margin_ratio=ratio,
+                )
+            return
+        max_cost_cents = int(net_revenue_cents * (1.0 - ratio))
+        if total_estimated_cost_cents > max_cost_cents:
+            margin_pct = ratio * 100
+            fee_note = f" after {fee_ratio * 100:.1f}% settlement fee" if fee_ratio > 0 else ""
+            msg = (
+                f"CFO denied job: estimated cost {total_estimated_cost_cents} cents exceeds "
+                f"max allowed {max_cost_cents} cents (net revenue {net_revenue_cents} cents{fee_note}, "
+                f"min margin {margin_pct:.0f}%). Unprofitable deal rejected."
+            )
+            logger.warning("GOVERNANCE CFO: %s", msg)
+            raise UnprofitableJobError(
+                msg,
+                job_revenue_cents=job_revenue_cents,
+                estimated_cost_cents=total_estimated_cost_cents,
+                min_margin_ratio=ratio,
+            )
+        logger.info(
+            "GOVERNANCE CFO: Job profitability OK (revenue=%d, net=%d, cost=%d, margin >= %.0f%%).",
+            job_revenue_cents,
+            net_revenue_cents,
+            total_estimated_cost_cents,
+            ratio * 100,
+        )
+
+    def projected_runway_days(
+        self, *, window_days: int = 7, after_spend_cents: int = 0
+    ) -> int | None:
+        """
+        Project remaining runway (days) from the *actual* recent burn rate.
+
+        Burn rate = total USD debits over the trailing `window_days`, averaged per day.
+        Returns balance (minus an optional pending spend) divided by that daily burn.
+        Returns None when there is no measurable burn yet (infinite/undefined runway).
+        """
+        from datetime import timedelta
+
+        window_days = max(1, window_days)
+        since = datetime.now(timezone.utc) - timedelta(days=window_days)
+        window_burn_cents = self._ledger.usd_debits_since(since)
+        if window_burn_cents <= 0:
+            return None
+        daily_burn = window_burn_cents / window_days
+        balance = self._ledger.total_usd_cents() - max(0, after_spend_cents)
+        if balance <= 0:
+            return 0
+        return int(balance / daily_burn)
+
+    def get_optimal_model(self, task_complexity: str) -> str:
+        """
+        Return the most cost-effective model ID for the given complexity.
+
+        Returns real, priced model ids (present in the pricing table) so the same
+        value can be used for pre-flight cost estimates. Overridable per deployment
+        via SOVEREIGN_COST_MODEL_HIGH / SOVEREIGN_COST_MODEL_LOW.
+
+        - High priority / complex -> capable model (default gpt-4o).
+        - Low priority / simple   -> cheap model (default gpt-4o-mini).
+        """
+        import os
+
+        c = (task_complexity or "").strip().lower()
+        if c in ("high", "complex", "critical", "reasoning"):
+            return os.getenv("SOVEREIGN_COST_MODEL_HIGH", "gpt-4o")
+        return os.getenv("SOVEREIGN_COST_MODEL_LOW", "gpt-4o-mini")
+
+    # -------------------------------------------------------------------------
+    # Auction: winner determination and dynamic budgeting
+    # -------------------------------------------------------------------------
+
+    def _priority_multiplier(self, priority: str) -> float:
+        """Priority multiplier for utility: high -> 1.5, low -> 1.0."""
+        return 1.5 if (priority or "").strip().lower() in ("high", "complex", "critical") else 1.0
+
+    def select_winner(
+        self,
+        bids: list["Bid"],
+        task_priority: str = "low",
+        *,
+        auth: "SovereignAuth | None" = None,
+    ) -> "Bid | None":
+        """
+        Select winner by Utility Score = (Confidence_Score / Estimated_Cost) * Priority_Multiplier.
+        Agents with lower TrustScore get a discount (utility *= TrustScore/100), so audit failures
+        make future bids less competitive.
+        """
+        if not bids:
+            return None
+        mult = self._priority_multiplier(task_priority)
+        best: tuple[float, Bid] = (0.0, bids[0])
+        for bid in bids:
+            cost = max(1, bid.estimated_cost_cents)
+            utility = (bid.confidence_score / cost) * mult
+            if auth is not None:
+                trust = auth.get_trust_score(bid.agent_id)
+                utility *= trust / 100.0
+            if utility > best[0]:
+                best = (utility, bid)
+        logger.info(
+            "GOVERNANCE CFO: Winner %s (utility=%.4f) for task priority=%s.",
+            best[1].agent_id,
+            best[0],
+            task_priority,
+        )
+        return best[1]
+
+    def negotiate(
+        self,
+        bid: "Bid",
+        remaining_runway_cents: int,
+        *,
+        min_cents: int = 1,
+    ) -> "Bid":
+        """
+        Dynamic budgeting: if bid cost exceeds remaining runway, suggest a smaller
+        context (e.g. suggested_max_tokens) so the agent can fit the budget.
+        Returns the same bid with suggested_max_tokens set if negotiation applied.
+        """
+        if bid.estimated_cost_cents <= remaining_runway_cents or remaining_runway_cents < min_cents:
+            return bid
+        # Scale down: suggest tokens proportional to runway (rough: 1k tokens ~ 10 cents)
+        suggested_tokens = max(256, (remaining_runway_cents * 1000) // 10)
+        negotiated = bid.model_copy(update={"suggested_max_tokens": suggested_tokens})
+        logger.info(
+            "GOVERNANCE CFO: Negotiated bid from %s: suggested_max_tokens=%d to fit runway %d cents.",
+            bid.agent_id,
+            suggested_tokens,
+            remaining_runway_cents,
+        )
+        return negotiated

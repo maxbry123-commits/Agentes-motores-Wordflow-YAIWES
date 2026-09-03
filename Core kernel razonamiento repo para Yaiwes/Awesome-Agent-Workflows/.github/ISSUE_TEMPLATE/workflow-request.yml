@@ -1,0 +1,26 @@
+name: Workflow request
+description: Request a new agent workflow card
+title: "Workflow request: "
+labels: ["workflow request"]
+body:
+  - type: textarea
+    id: situation
+    attributes:
+      label: Situation
+      description: When would someone use this workflow?
+    validations:
+      required: true
+  - type: textarea
+    id: desired
+    attributes:
+      label: Desired outcome
+      description: What should the workflow help produce or prevent?
+    validations:
+      required: true
+  - type: textarea
+    id: tools
+    attributes:
+      label: Tools involved
+      description: Claude Code, Codex, Cursor, Aider, OpenCode, local agents, etc.
+    validations:
+      required: false

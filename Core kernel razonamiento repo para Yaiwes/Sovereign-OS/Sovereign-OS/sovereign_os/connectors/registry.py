@@ -1,0 +1,130 @@
+"""
+Connector registry — the tools each delivery category needs to do top-tier work,
+and whether they're configured. A category (e.g. research) declares connectors
+(web_search, web_fetch); this registry says what each connector is, how it's
+provided (MCP server / built-in / HTTP), and whether the environment has it.
+
+How tools reach workers: MCP-kind connectors are fulfilled through the existing
+self-hiring path — when an MCPToolGraph exposes tools for a skill, the registry
+bids an `mcp-{skill}` worker (see WorkerRegistry / mcp/). This registry is the
+catalog + readiness layer on top of that.
+"""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+
+from sovereign_os.agents.categories import CATEGORIES, TaskCategory, get_category
+
+
+@dataclass(frozen=True)
+class ConnectorSpec:
+    name: str
+    kind: str                     # "mcp" | "builtin" | "http"
+    description: str
+    env_keys: tuple[str, ...] = field(default_factory=tuple)  # env needed to be "available"
+    mcp_server: str = ""          # MCP server hint for self-hiring
+
+
+CONNECTORS: dict[str, ConnectorSpec] = {
+    "web_search": ConnectorSpec("web_search", "mcp", "Search the web for current info.", mcp_server="search"),
+    "web_fetch": ConnectorSpec("web_fetch", "builtin", "Fetch and read a URL.", ()),
+    "send_email": ConnectorSpec("send_email", "builtin", "Send email via SMTP.",
+                                ("SOVEREIGN_SMTP_HOST", "SOVEREIGN_SMTP_USER")),
+    "git": ConnectorSpec("git", "mcp", "Clone/read a git repo.", mcp_server="git"),
+    "file_read": ConnectorSpec("file_read", "builtin", "Read provided files.", ()),
+    "code_workspace": ConnectorSpec("code_workspace", "builtin", "Read a code checkout (list/read files) + guarded test runner.", ()),
+    "submit_pr": ConnectorSpec("submit_pr", "builtin", "Open a PR with the fix (git branch/commit/push + gh).", ()),
+    "code_search": ConnectorSpec("code_search", "mcp", "Search a codebase.", mcp_server="code"),
+    "sql": ConnectorSpec("sql", "mcp", "Query a SQL database.", ("DATABASE_URL",), mcp_server="sql"),
+    "spreadsheet": ConnectorSpec("spreadsheet", "builtin", "Parse CSV/XLSX data.", ()),
+    "figma": ConnectorSpec("figma", "builtin", "Read a Figma design file (structure/components) via REST.", ("FIGMA_TOKEN",)),
+    "image_gen": ConnectorSpec("image_gen", "http", "Generate images from a prompt.", ("IMAGE_GEN_API_KEY",)),
+    "workflow": ConnectorSpec("workflow", "mcp", "Trigger automation workflows.", mcp_server="workflow"),
+    "webhook": ConnectorSpec("webhook", "builtin", "POST to a webhook URL.", ("SOVEREIGN_WEBHOOK_URL",)),
+}
+
+
+def get_connector(name: str) -> ConnectorSpec | None:
+    return CONNECTORS.get((name or "").strip().lower())
+
+
+def dispatch(name: str, **kwargs):
+    """
+    Invoke a built-in connector that has a real handler (e.g. send_email).
+    Returns the handler result, or {"error": ...} when the connector has no
+    built-in handler (mcp/http connectors are reached via their own paths).
+    """
+    key = (name or "").strip().lower()
+    if key == "send_email":
+        from sovereign_os.connectors.email_connector import send_email
+        return send_email(kwargs.get("to", ""), kwargs.get("subject", ""), kwargs.get("body", ""),
+                          live=kwargs.get("live"))
+    if key == "web_fetch":
+        from sovereign_os.connectors.web import web_fetch
+        return web_fetch(kwargs.get("url", ""), opener=kwargs.get("opener"),
+                         max_bytes=kwargs.get("max_bytes", 200_000), timeout=kwargs.get("timeout", 15.0))
+    if key == "figma":
+        from sovereign_os.connectors.figma import figma_get_file
+        return figma_get_file(kwargs.get("ref", "") or kwargs.get("url", ""),
+                              token=kwargs.get("token"), opener=kwargs.get("opener"))
+    if key == "image_gen":
+        from sovereign_os.connectors.image_gen import generate_image
+        return generate_image(kwargs.get("prompt", ""), size=kwargs.get("size", "1024x1024"),
+                              generator=kwargs.get("generator"))
+    if key == "submit_pr":
+        from sovereign_os.connectors.git_pr import submit_pr
+        return submit_pr(kwargs.get("root", "."), branch=kwargs.get("branch", ""),
+                         title=kwargs.get("title", ""), body=kwargs.get("body", ""),
+                         base=kwargs.get("base", "main"), runner=kwargs.get("runner"))
+    if key in ("code_workspace", "list_files", "read_file", "write_file", "run_tests"):
+        from sovereign_os.connectors import code_workspace as cw
+        action = kwargs.get("action", key if key != "code_workspace" else "list_files")
+        root = kwargs.get("root", ".")
+        if action == "read_file":
+            return cw.read_file(root, kwargs.get("relpath", ""))
+        if action == "write_file":
+            return cw.write_file(root, kwargs.get("relpath", ""), kwargs.get("content", ""))
+        if action == "run_tests":
+            return cw.run_tests(root, kwargs.get("cmd"))
+        return cw.list_files(root, kwargs.get("glob", "**/*"))
+    return {"error": f"no built-in handler for connector '{name}'"}
+
+
+def is_available(spec: ConnectorSpec) -> bool:
+    """A connector is available when all its required env keys are set (built-ins with no keys are always available)."""
+    return all(os.getenv(k) for k in spec.env_keys)
+
+
+def connectors_for_category(category: TaskCategory | str) -> list[ConnectorSpec]:
+    cat = category if isinstance(category, TaskCategory) else get_category(category)
+    return [CONNECTORS[n] for n in cat.connectors if n in CONNECTORS]
+
+
+def readiness_for_category(category: TaskCategory | str) -> dict[str, bool]:
+    """Map each of a category's connectors to whether it's configured/available."""
+    return {spec.name: is_available(spec) for spec in connectors_for_category(category)}
+
+
+def required_mcp_servers() -> set[str]:
+    """MCP servers referenced by any category's connectors — what to stand up for full coverage."""
+    needed: set[str] = set()
+    for cat in CATEGORIES:
+        for spec in connectors_for_category(cat):
+            if spec.kind == "mcp" and spec.mcp_server:
+                needed.add(spec.mcp_server)
+    return needed
+
+
+def coverage_report() -> dict[str, dict]:
+    """Per-category connector readiness, for ops/dashboards."""
+    out: dict[str, dict] = {}
+    for cat in CATEGORIES:
+        specs = connectors_for_category(cat)
+        out[cat.key] = {
+            "connectors": [s.name for s in specs],
+            "available": [s.name for s in specs if is_available(s)],
+            "missing": [s.name for s in specs if not is_available(s)],
+        }
+    return out
