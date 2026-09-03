@@ -1,0 +1,852 @@
+'use client'
+
+import { useEffect, useCallback, useState, useRef, useMemo } from 'react'
+import dynamic from 'next/dynamic'
+import { useAppStore } from '@/stores/use-app-store'
+import { selectActiveSessionId } from '@/stores/slices/session-slice'
+import { useWs } from '@/hooks/use-ws'
+import { useChatStore } from '@/stores/use-chat-store'
+import { fetchMessages, fetchMessagesPaginated, clearMessages, undoClearMessages, deleteChat, devServer, checkBrowser, stopBrowser } from '@/lib/chat/chats'
+import { toast } from 'sonner'
+import { errorMessage } from '@/lib/shared-utils'
+import { uploadImage } from '@/lib/upload'
+import { deleteAgent } from '@/lib/agents'
+import { useMediaQuery } from '@/hooks/use-media-query'
+import { ChatHeader } from './chat-header'
+import { DevServerBar } from './dev-server-bar'
+import { MessageList } from './message-list'
+import { VoiceOverlay } from './voice-overlay'
+import { useVoiceConversation } from '@/hooks/use-voice-conversation'
+import { ChatInput } from '@/components/input/chat-input'
+
+// Lazy-load conditional panels — only bundled when actually rendered
+const SessionDebugPanel = dynamic(() => import('./session-debug-panel').then((m) => m.SessionDebugPanel), { ssr: false })
+const ChatPreviewPanel = dynamic(() => import('./chat-preview-panel').then((m) => m.ChatPreviewPanel), { ssr: false })
+const InspectorPanel = dynamic(() => import('@/components/agents/inspector-panel').then((m) => m.InspectorPanel), { ssr: false })
+const HeartbeatHistoryPanel = dynamic(() => import('./heartbeat-history-panel').then((m) => m.HeartbeatHistoryPanel), { ssr: false })
+import { Dropdown, DropdownItem } from '@/components/shared/dropdown'
+import { ConfirmDialog } from '@/components/shared/confirm-dialog'
+import { speak } from '@/lib/tts'
+import { api } from '@/lib/app/api-client'
+import { messagesDiffer } from '@/lib/chat/chat-streaming-state'
+import { createAssistantRenderId } from '@/lib/chat/assistant-render-id'
+import { getSessionLastMessage } from '@/lib/chat/session-summary'
+import { buildNewAgentSessionPayload, summarizeFirstMessageAsTitle } from '@/lib/chat/new-session'
+import { getEnabledCapabilityIds, getEnabledToolIds } from '@/lib/capability-selection'
+
+const DIRECT_PROMPT_SUGGESTIONS = [
+  { text: 'What can you help me with?', icon: 'book', gradient: 'from-[#6366F1]/10 to-[#818CF8]/5' },
+  { text: 'Help me choose the right agent for this', icon: 'bot', gradient: 'from-[#34D399]/10 to-[#6EE7B7]/5' },
+  { text: 'Help me set up a new connector', icon: 'link', gradient: 'from-[#EC4899]/10 to-[#F472B6]/5' },
+  { text: 'Summarize what needs attention in this workspace', icon: 'check', gradient: 'from-[#F59E0B]/10 to-[#FBBF24]/5' },
+]
+
+const AGENT_PROMPT_SUGGESTIONS = [
+  { text: 'Give me a quick overview of what you can help with', icon: 'book', gradient: 'from-[#6366F1]/10 to-[#818CF8]/5' },
+  { text: 'Review what needs attention right now', icon: 'check', gradient: 'from-[#F59E0B]/10 to-[#FBBF24]/5' },
+  { text: 'Summarize our recent context before we continue', icon: 'link', gradient: 'from-[#EC4899]/10 to-[#F472B6]/5' },
+  { text: 'Help me map the next best step', icon: 'bot', gradient: 'from-[#34D399]/10 to-[#6EE7B7]/5' },
+]
+
+export function ChatArea() {
+  const session = useAppStore((s) => {
+    const id = selectActiveSessionId(s)
+    return id ? s.sessions[id] : null
+  })
+  const sessionId = useAppStore(selectActiveSessionId)
+  const currentUser = useAppStore((s) => s.currentUser)
+  const setCurrentAgent = useAppStore((s) => s.setCurrentAgent)
+  const removeSessionFromStore = useAppStore((s) => s.removeSession)
+  const refreshSession = useAppStore((s) => s.refreshSession)
+  const updateSessionInStore = useAppStore((s) => s.updateSessionInStore)
+  const setActiveSessionIdOverride = useAppStore((s) => s.setActiveSessionIdOverride)
+  const appSettings = useAppStore((s) => s.appSettings)
+  const messages = useChatStore((s) => s.messages)
+  const messageStartIndex = useChatStore((s) => s.messageStartIndex)
+  const setMessages = useChatStore((s) => s.setMessages)
+  const streaming = useChatStore((s) => s.streaming)
+  const streamingSessionId = useChatStore((s) => s.streamingSessionId)
+  const sendMessage = useChatStore((s) => s.sendMessage)
+  const loadQueuedMessages = useChatStore((s) => s.loadQueuedMessages)
+  const stopStreaming = useChatStore((s) => s.stopStreaming)
+  const devServerStatus = useChatStore((s) => s.devServer)
+  const setDevServer = useChatStore((s) => s.setDevServer)
+  const debugOpen = useChatStore((s) => s.debugOpen)
+  const setDebugOpen = useChatStore((s) => s.setDebugOpen)
+  const ttsEnabled = useChatStore((s) => s.ttsEnabled)
+  const previewContent = useChatStore((s) => s.previewContent)
+  const setPreviewContent = useChatStore((s) => s.setPreviewContent)
+  const isDesktop = useMediaQuery('(min-width: 768px)')
+
+  const markSessionLocallyIdle = useCallback((targetSessionId: string) => {
+    const appState = useAppStore.getState()
+    const existing = appState.sessions[targetSessionId]
+    if (!existing) return
+    appState.updateSessionInStore({
+      ...existing,
+      active: false,
+      currentRunId: null,
+    })
+  }, [])
+
+  const startServerStreamingPlaceholder = useCallback((targetSessionId: string, phase: 'queued' | 'thinking' | 'connecting' = 'thinking') => {
+    useChatStore.setState((state) => {
+      const sameServerStream = state.streaming
+        && state.streamSource === 'server'
+        && state.streamingSessionId === targetSessionId
+
+      return {
+        streaming: true,
+        streamingSessionId: targetSessionId,
+        streamSource: 'server',
+        streamPhase: sameServerStream ? state.streamPhase : phase,
+        streamText: '',
+        displayText: '',
+        assistantRenderId: sameServerStream && state.assistantRenderId ? state.assistantRenderId : createAssistantRenderId(),
+        thinkingStartTime: sameServerStream && state.thinkingStartTime > 0 ? state.thinkingStartTime : Date.now(),
+      }
+    })
+  }, [])
+
+  const currentAgent = useAppStore((s) => {
+    const agentId = session?.agentId
+    return agentId ? s.agents[agentId] ?? null : null
+  })
+  const loadAgents = useAppStore((s) => s.loadAgents)
+  const setEditingAgentId = useAppStore((s) => s.setEditingAgentId)
+  const setAgentSheetOpen = useAppStore((s) => s.setAgentSheetOpen)
+  const setAgentPrefill = useAppStore((s) => s.setAgentPrefill)
+  const inspectorOpen = useAppStore((s) => s.inspectorOpen)
+  const sidebarOpen = useAppStore((s) => s.sidebarOpen)
+  const setSidebarOpen = useAppStore((s) => s.setSidebarOpen)
+  const queuedCount = session?.queuedCount ?? 0
+  const promptSuggestions = useMemo(
+    () => (currentAgent ? AGENT_PROMPT_SUGGESTIONS : DIRECT_PROMPT_SUGGESTIONS),
+    [currentAgent],
+  )
+
+  const voice = useVoiceConversation()
+  const handleVoiceToggle = useCallback(() => {
+    if (voice.active) voice.stop()
+    else voice.start()
+  }, [voice])
+
+  const [menuOpen, setMenuOpen] = useState(false)
+  const [confirmDelete, setConfirmDelete] = useState(false)
+  const [confirmClear, setConfirmClear] = useState(false)
+  const [confirmDeleteAgent, setConfirmDeleteAgent] = useState(false)
+  const [browserActive, setBrowserActive] = useState(false)
+  const heartbeatHistoryOpen = useAppStore((s) => s.heartbeatHistoryOpen)
+  const setHeartbeatHistoryOpen = useAppStore((s) => s.setHeartbeatHistoryOpen)
+  const [messagesLoading, setMessagesLoading] = useState(true)
+  const [connectorFilter, setConnectorFilter] = useState<string | null>(null)
+  const [extensionChatActions, setExtensionChatActions] = useState<Array<{ id: string; label: string; action: string; value: string; tooltip?: string }>>([])
+  const sessionHasBrowserExtension = getEnabledToolIds(session).includes('browser')
+
+  const refreshExtensionChatActions = useCallback(() => {
+    api<Array<{ id: string; label: string; action: string; value: string; tooltip?: string }>>('GET', '/extensions/ui?type=chat_actions').then((actions) => {
+      if (Array.isArray(actions)) setExtensionChatActions(actions)
+    }).catch(() => {})
+  }, [])
+
+  useEffect(() => {
+    void refreshExtensionChatActions()
+  }, [refreshExtensionChatActions])
+
+  useWs('extensions', refreshExtensionChatActions)
+
+  // Collect unique connector sources from messages for filter UI
+  const { connectorSources, hasDirectMessages } = useMemo(() => {
+    const sources = new Map<string, { platform: string; connectorName: string }>()
+    let hasDirect = false
+    for (const msg of messages) {
+      if (msg.source?.connectorId && !sources.has(msg.source.connectorId)) {
+        sources.set(msg.source.connectorId, {
+          platform: msg.source.platform,
+          connectorName: msg.source.connectorName,
+        })
+      } else if (!msg.source?.connectorId && msg.role === 'user') {
+        hasDirect = true
+      }
+    }
+    return { connectorSources: sources, hasDirectMessages: hasDirect }
+  }, [messages])
+  // Show source filter when there are genuinely multiple sources (2+ connectors, or connector + direct)
+  const hasMultipleSources = connectorSources.size > 1 || (connectorSources.size > 0 && hasDirectMessages)
+  const [isDragging, setIsDragging] = useState(false)
+  const dragCounter = useRef(0)
+  const freshSessionIdRef = useRef<string | null>(null)
+  const setPendingImage = useChatStore((s) => s.setPendingImage)
+
+  useEffect(() => {
+    if (!sessionId) return
+    let cancelled = false
+    const requestedSessionId = sessionId
+    const chatState = useChatStore.getState()
+    const preserveLocalStream = chatState.streaming && chatState.streamingSessionId === requestedSessionId
+    if (freshSessionIdRef.current === requestedSessionId) {
+      freshSessionIdRef.current = null
+      setMessages([], { startIndex: 0, totalMessages: 0 })
+      useChatStore.setState({ hasMoreMessages: false })
+      setMessagesLoading(false)
+      return () => { cancelled = true }
+    }
+    // Clear stale messages immediately so the skeleton loader shows instead of
+    // the previous chat's messages flashing briefly during the fetch.
+    if (!preserveLocalStream) setMessages([], { startIndex: 0, totalMessages: 0 })
+    setMessagesLoading(true)
+    if (!preserveLocalStream) {
+      useChatStore.setState({ streaming: false, streamingSessionId: null, streamSource: null, streamText: '', assistantRenderId: null, toolEvents: [] })
+    }
+    fetchMessagesPaginated(requestedSessionId, 100).then((data) => {
+      if (cancelled || selectActiveSessionId(useAppStore.getState()) !== requestedSessionId) return
+      setMessages(data.messages, { startIndex: data.startIndex, totalMessages: data.total })
+      useChatStore.setState({ hasMoreMessages: data.hasMore })
+    }).catch((err) => {
+      if (cancelled || selectActiveSessionId(useAppStore.getState()) !== requestedSessionId) return
+      console.error('Failed to load messages:', err)
+      const fallbackSession = useAppStore.getState().sessions[requestedSessionId]
+      const fallbackLastMessage = fallbackSession ? getSessionLastMessage(fallbackSession) : null
+      setMessages(
+        fallbackSession?.messages?.length
+          ? fallbackSession.messages
+          : (fallbackLastMessage ? [fallbackLastMessage] : []),
+        {
+          startIndex: 0,
+          totalMessages: fallbackSession?.messages?.length
+            ? fallbackSession.messages.length
+            : (fallbackLastMessage ? 1 : 0),
+        },
+      )
+    }).finally(() => {
+      if (cancelled || selectActiveSessionId(useAppStore.getState()) !== requestedSessionId) return
+      setMessagesLoading(false)
+    })
+
+    void loadQueuedMessages(requestedSessionId).catch((err) => {
+      if (cancelled || selectActiveSessionId(useAppStore.getState()) !== requestedSessionId) return
+      console.error('Failed to load queued messages:', err)
+    })
+
+    const sessionAtLoad = useAppStore.getState().sessions[requestedSessionId]
+    if (sessionAtLoad?.active) startServerStreamingPlaceholder(requestedSessionId)
+
+    return () => {
+      cancelled = true
+    }
+  }, [loadQueuedMessages, refreshSession, sessionId, setDevServer, setMessages, startServerStreamingPlaceholder])
+
+  useEffect(() => {
+    if (!sessionId || messagesLoading) return
+    let cancelled = false
+    const requestedSessionId = sessionId
+    const timer = window.setTimeout(() => {
+      void refreshSession(requestedSessionId).then(() => {
+        if (cancelled || selectActiveSessionId(useAppStore.getState()) !== requestedSessionId) return
+        const refreshed = useAppStore.getState().sessions[requestedSessionId]
+        if (refreshed?.active) startServerStreamingPlaceholder(requestedSessionId)
+      }).catch((err) => console.error('Failed to refresh session:', err))
+
+      void devServer(requestedSessionId, 'status').then((r) => {
+        if (cancelled || selectActiveSessionId(useAppStore.getState()) !== requestedSessionId) return
+        setDevServer(r.running ? r : null)
+      }).catch(() => {
+        if (cancelled || selectActiveSessionId(useAppStore.getState()) !== requestedSessionId) return
+        setDevServer(null)
+      })
+    }, 200)
+
+    return () => {
+      cancelled = true
+      window.clearTimeout(timer)
+    }
+  }, [messagesLoading, refreshSession, sessionId, setDevServer, startServerStreamingPlaceholder])
+
+  useEffect(() => {
+    if (!sessionId || messagesLoading) return
+    let cancelled = false
+    if (!sessionHasBrowserExtension) {
+      setBrowserActive(false)
+      return
+    }
+    checkBrowser(sessionId).then((r) => {
+      if (cancelled || selectActiveSessionId(useAppStore.getState()) !== sessionId) return
+      setBrowserActive(r.active)
+    }).catch((err) => {
+      if (cancelled || selectActiveSessionId(useAppStore.getState()) !== sessionId) return
+      console.error('Browser check failed:', err)
+      setBrowserActive(false)
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [messagesLoading, sessionHasBrowserExtension, sessionId])
+
+  // Auto-poll messages for sessions that are actively running on the server
+  const isServerActive = session?.active === true
+  const isOngoingMonitored = appSettings.loopMode === 'ongoing' && getEnabledCapabilityIds(session).length > 0
+  const shouldPollMessages = !!sessionId && (isServerActive || isOngoingMonitored)
+  const messagesRef = useRef(messages)
+  messagesRef.current = messages
+  const messageStartIndexRef = useRef(messageStartIndex)
+  messageStartIndexRef.current = messageStartIndex
+  const isServerActiveRef = useRef(isServerActive)
+  isServerActiveRef.current = isServerActive
+  const ttsEnabledRef = useRef(ttsEnabled)
+  ttsEnabledRef.current = ttsEnabled
+
+  const refreshMessages = useCallback(async () => {
+    if (!sessionId) return
+    // Skip message refresh while we're locally streaming this session —
+    // the SSE stream already drives the inline live transcript row.
+    // Fetching messages here would replace the array with new objects on every
+    // WS notification, causing the full MessageList to re-render and flash.
+    const chatState = useChatStore.getState()
+    if (chatState.streaming && chatState.streamingSessionId === sessionId && chatState.streamSource === 'local') return
+    try {
+      const msgs = await fetchMessages(sessionId)
+      const currentChatState = useChatStore.getState()
+      if (currentChatState.streaming && currentChatState.streamingSessionId === sessionId && currentChatState.streamSource === 'local') return
+      const previous = messagesRef.current
+      if (messagesDiffer(msgs, previous)) {
+        const previousEndIndex = messageStartIndexRef.current + previous.length
+        const newMsgs = msgs.length > previousEndIndex ? msgs.slice(previousEndIndex) : []
+        setMessages(msgs, { startIndex: 0, totalMessages: msgs.length })
+        if (ttsEnabledRef.current && typeof document !== 'undefined' && document.visibilityState === 'visible') {
+          const latestAssistant = [...newMsgs].reverse().find((m) => {
+            if (m.role !== 'assistant') return false
+            const isHeartbeat = m.kind === 'heartbeat' || /^\s*HEARTBEAT_OK\b/i.test(m.text || '')
+            return !isHeartbeat && !!m.text?.trim()
+          })
+          if (latestAssistant?.text) {
+            void speak(latestAssistant.text, currentAgent?.elevenLabsVoiceId)
+          }
+        }
+      }
+      if (isServerActiveRef.current) await refreshSession(sessionId)
+    } catch (err) { console.error('Failed to refresh messages:', err) }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionId])
+
+  // Targeted message fetch that bypasses the streaming guard — used by
+  // refreshQueue to ensure persisted messages appear before sending queue
+  // items are cleaned up by timeout.
+  const syncMessagesForQueue = useCallback(async () => {
+    if (!sessionId) return
+    try {
+      const msgs = await fetchMessages(sessionId)
+      if (messagesDiffer(msgs, messagesRef.current)) {
+        setMessages(msgs, { startIndex: 0, totalMessages: msgs.length })
+      }
+    } catch (err) { console.error('Failed to sync messages for queue:', err) }
+  }, [sessionId, setMessages])
+
+  const refreshQueue = useCallback(async () => {
+    if (!sessionId) return
+    try {
+      await loadQueuedMessages(sessionId)
+      // If there are "sending" queue items, fetch messages so persisted
+      // versions appear before the queue item gets cleaned up.
+      const chatState = useChatStore.getState()
+      const hasSendingItems = chatState.queuedMessages.some(
+        (item) => item.sessionId === sessionId && item.sending,
+      )
+      if (hasSendingItems) void syncMessagesForQueue()
+      // Bridge the gap between "queue item disappears" and "isServerActive propagates".
+      // If the server picked up a queued run, immediately show the thinking indicator
+      // so users don't see a blank gap waiting for loadSessions to propagate.
+      const refreshedSession = useAppStore.getState().sessions[sessionId]
+      if (
+        refreshedSession?.currentRunId
+        && !chatState.streaming
+        && chatState.streamingSessionId !== sessionId
+      ) {
+        startServerStreamingPlaceholder(sessionId)
+      }
+    } catch (err) {
+      console.error('Failed to refresh queue:', err)
+    }
+  }, [loadQueuedMessages, syncMessagesForQueue, sessionId, startServerStreamingPlaceholder])
+
+  // Subscribe to WS messages for this session — always subscribe when session exists,
+  // only enable fallback polling when actively needed
+  useWs(
+    sessionId ? `messages:${sessionId}` : '',
+    refreshMessages,
+    shouldPollMessages ? 10_000 : undefined,
+  )
+  useWs(
+    sessionId ? 'runs' : '',
+    refreshQueue,
+    sessionId && (isServerActive || queuedCount > 0) ? 2_500 : undefined,
+  )
+
+  // Listen for stream-end signal from the server — clears streaming state
+  // when a server-only run finishes without a local SSE stream driving the UI.
+  const handleStreamEnd = useCallback(() => {
+    if (!sessionId) return
+    const state = useChatStore.getState()
+    if (state.streamSource === 'server' && state.streamingSessionId === sessionId) {
+      markSessionLocallyIdle(sessionId)
+      useChatStore.setState({ streaming: false, streamingSessionId: null, streamSource: null, streamText: '', displayText: '', assistantRenderId: null, streamPhase: 'thinking', streamToolName: '', thinkingText: '', thinkingStartTime: 0 })
+      void refreshMessages()
+      void refreshSession(sessionId)
+    }
+  }, [markSessionLocallyIdle, sessionId, refreshMessages, refreshSession])
+  useWs(sessionId ? `stream-end:${sessionId}` : '', handleStreamEnd)
+
+  // Keep the local typing indicator aligned with the server's active state
+  useEffect(() => {
+    if (!sessionId) return
+    const state = useChatStore.getState()
+    if (isServerActive) {
+      if (!state.streaming && !state.streamText) {
+        startServerStreamingPlaceholder(sessionId)
+      }
+      return
+    }
+    if (
+      !isServerActive
+      && state.streaming
+      && (state.streamingSessionId === sessionId || state.streamingSessionId == null)
+    ) {
+      // Server finished — clear all streaming state and fetch final messages
+      fetchMessages(sessionId).then((msgs) => setMessages(msgs, { startIndex: 0, totalMessages: msgs.length })).catch(() => {})
+      markSessionLocallyIdle(sessionId)
+      useChatStore.setState({ streaming: false, streamingSessionId: null, streamSource: null, streamText: '', displayText: '', assistantRenderId: null, streamPhase: 'thinking', streamToolName: '', thinkingText: '', thinkingStartTime: 0 })
+    }
+  }, [isServerActive, markSessionLocallyIdle, sessionId, setMessages, startServerStreamingPlaceholder])
+
+  // Poll browser status while session has browser tools
+  const hasBrowserTool = getEnabledToolIds(session).includes('browser')
+  const checkBrowserStatus = useCallback(() => {
+    if (!sessionId || !hasBrowserTool) return
+    checkBrowser(sessionId).then((r) => setBrowserActive(r.active)).catch(() => {})
+  }, [sessionId, hasBrowserTool])
+
+  useWs(
+    hasBrowserTool && sessionId ? `browser:${sessionId}` : '',
+    checkBrowserStatus,
+    hasBrowserTool ? 30_000 : undefined,
+  )
+
+  const handleStopBrowser = useCallback(async () => {
+    if (!sessionId) return
+    await stopBrowser(sessionId)
+    setBrowserActive(false)
+  }, [sessionId])
+
+  const handleStopDevServer = useCallback(async () => {
+    if (!sessionId) return
+    await devServer(sessionId, 'stop')
+    setDevServer(null)
+  }, [sessionId, setDevServer])
+
+  const handleClear = useCallback(async (mode: 'clear' | 'new-session' = 'clear') => {
+    setConfirmClear(false)
+    if (!sessionId) return
+    const targetSessionId = sessionId
+    let result
+    try {
+      result = await clearMessages(targetSessionId)
+    } catch (err) {
+      toast.error(`Clear failed: ${errorMessage(err)}`)
+      return
+    }
+    if (selectActiveSessionId(useAppStore.getState()) === targetSessionId) {
+      setMessages([], { startIndex: 0, totalMessages: 0 })
+    }
+    await refreshSession(targetSessionId)
+    const { undoToken, cleared } = result
+    if (!undoToken) return
+    const clearedLabel = mode === 'new-session'
+      ? 'Started a fresh chat session.'
+      : cleared === 1
+        ? '1 message cleared'
+        : `${cleared.toLocaleString()} messages cleared`
+    toast(clearedLabel, {
+      duration: 10_000,
+      action: {
+        label: 'Undo',
+        onClick: async () => {
+          try {
+            await undoClearMessages(targetSessionId, undoToken)
+            const restored = await fetchMessages(targetSessionId)
+            if (selectActiveSessionId(useAppStore.getState()) === targetSessionId) {
+              setMessages(restored, { startIndex: 0, totalMessages: restored.length })
+            }
+            await refreshSession(targetSessionId)
+            toast.success('Chat restored.')
+          } catch (err) {
+            toast.error(`Undo failed: ${errorMessage(err)}`)
+          }
+        },
+      },
+    })
+  }, [refreshSession, sessionId, setMessages])
+
+  const handleCompactComplete = useCallback(async () => {
+    if (!sessionId) return
+    const targetSessionId = sessionId
+    try {
+      const refreshed = await fetchMessages(targetSessionId)
+      if (selectActiveSessionId(useAppStore.getState()) === targetSessionId) {
+        setMessages(refreshed, { startIndex: 0, totalMessages: refreshed.length })
+      }
+    } catch {
+      // silent — next poll will catch up
+    }
+  }, [sessionId, setMessages])
+
+  const handleClearRequest = useCallback(() => {
+    setConfirmClear(true)
+  }, [])
+
+  const handleStartNewSession = useCallback(async () => {
+    if (!session) return
+    try {
+      const nextSession = await api<typeof session>('POST', '/chats', {
+        ...buildNewAgentSessionPayload(session),
+        name: currentAgent?.name || session.name,
+      })
+      freshSessionIdRef.current = nextSession.id
+      updateSessionInStore(nextSession)
+      setActiveSessionIdOverride(nextSession.id)
+      toast.success('Started a new chat session.')
+    } catch (err) {
+      toast.error(`Could not start a new chat session: ${errorMessage(err)}`)
+    }
+  }, [currentAgent?.name, session, setActiveSessionIdOverride, updateSessionInStore])
+
+  const handleSend = useCallback(async (text: string) => {
+    if (!sessionId) return
+    if (session && messages.length === 0) {
+      const nextTitle = summarizeFirstMessageAsTitle(text, currentAgent?.name || session.name)
+      if (nextTitle && nextTitle !== session.name) {
+        updateSessionInStore({ ...session, name: nextTitle })
+        void api('PUT', `/chats/${sessionId}`, { name: nextTitle }).catch(() => {})
+      }
+    }
+    await sendMessage(text, { sessionId })
+  }, [currentAgent?.name, messages.length, sendMessage, session, sessionId, updateSessionInStore])
+
+  const handleDelete = useCallback(async () => {
+    setConfirmDelete(false)
+    if (!sessionId) return
+    await deleteChat(sessionId)
+    removeSessionFromStore(sessionId)
+    void setCurrentAgent(null)
+  }, [removeSessionFromStore, sessionId, setCurrentAgent])
+
+  const handlePrompt = useCallback((text: string) => {
+    void handleSend(text)
+  }, [handleSend])
+
+  const handleDragOver = useCallback((e: React.DragEvent) => {
+    e.preventDefault()
+    e.stopPropagation()
+  }, [])
+
+  const handleDragEnter = useCallback((e: React.DragEvent) => {
+    e.preventDefault()
+    e.stopPropagation()
+    dragCounter.current++
+    if (e.dataTransfer.types.includes('Files')) setIsDragging(true)
+  }, [])
+
+  const handleDragLeave = useCallback((e: React.DragEvent) => {
+    e.preventDefault()
+    e.stopPropagation()
+    dragCounter.current--
+    if (dragCounter.current === 0) setIsDragging(false)
+  }, [])
+
+  const handleDrop = useCallback(async (e: React.DragEvent) => {
+    e.preventDefault()
+    e.stopPropagation()
+    dragCounter.current = 0
+    setIsDragging(false)
+    const file = e.dataTransfer.files?.[0]
+    if (!file) return
+    try {
+      const result = await uploadImage(file)
+      setPendingImage({ file, path: result.path, url: result.url })
+    } catch {
+      // ignore
+    }
+  }, [setPendingImage])
+
+  const streamingForThisSession = streaming && (!!session && (!streamingSessionId || streamingSessionId === session.id))
+
+  if (!session) return null
+
+  const isEmpty = !messages.length && !streamingForThisSession && !messagesLoading
+
+  return (
+    <div className="flex-1 flex h-full min-h-0 min-w-0">
+    <div
+      data-testid="chat-area"
+      className="flex-1 flex flex-col h-full min-h-0 min-w-0 relative"
+      onDragOver={handleDragOver}
+      onDragEnter={handleDragEnter}
+      onDragLeave={handleDragLeave}
+      onDrop={handleDrop}
+    >
+      {isDesktop && (
+        <ChatHeader
+          session={session}
+          streaming={streamingForThisSession}
+          onStop={stopStreaming}
+          onMenuToggle={() => setMenuOpen(!menuOpen)}
+          onBack={sidebarOpen ? () => setSidebarOpen(false) : undefined}
+          browserActive={browserActive}
+          onStopBrowser={handleStopBrowser}
+          voiceActive={voice.active}
+          voiceSupported={voice.supported}
+          onVoiceToggle={handleVoiceToggle}
+          connectorSources={connectorSources}
+          connectorFilter={connectorFilter}
+          onConnectorFilterChange={setConnectorFilter}
+          hasMultipleSources={hasMultipleSources}
+          messageCount={messages.length}
+          onCompactComplete={handleCompactComplete}
+          onClearRequest={handleClearRequest}
+          onStartNewSession={handleStartNewSession}
+        />
+      )}
+      {!isDesktop && (
+        <ChatHeader
+          session={session}
+          streaming={streamingForThisSession}
+          onStop={stopStreaming}
+          onMenuToggle={() => setMenuOpen(!menuOpen)}
+          mobile
+          browserActive={browserActive}
+          onStopBrowser={handleStopBrowser}
+          voiceActive={voice.active}
+          voiceSupported={voice.supported}
+          onVoiceToggle={handleVoiceToggle}
+          connectorSources={connectorSources}
+          connectorFilter={connectorFilter}
+          onConnectorFilterChange={setConnectorFilter}
+          hasMultipleSources={hasMultipleSources}
+          messageCount={messages.length}
+          onCompactComplete={handleCompactComplete}
+          onClearRequest={handleClearRequest}
+          onStartNewSession={handleStartNewSession}
+        />
+      )}
+      <DevServerBar status={devServerStatus} onStop={handleStopDevServer} />
+
+      {messagesLoading && !messages.length ? (
+        <div className="flex-1 flex flex-col gap-5 px-4 md:px-12 lg:px-16 py-8" style={{ animation: 'fade-in 0.2s ease' }}>
+          {/* Skeleton message bubbles */}
+          <div className="flex gap-3 max-w-[70%]">
+            <div className="w-8 h-8 rounded-full bg-white/[0.06] animate-pulse shrink-0" />
+            <div className="flex-1 space-y-2">
+              <div className="h-3 w-24 rounded bg-white/[0.06] animate-pulse" />
+              <div className="h-16 rounded-[12px] bg-white/[0.04] animate-pulse" />
+            </div>
+          </div>
+          <div className="flex gap-3 max-w-[60%] self-end flex-row-reverse">
+            <div className="w-8 h-8 rounded-full bg-white/[0.06] animate-pulse shrink-0" />
+            <div className="flex-1 space-y-2">
+              <div className="h-3 w-16 rounded bg-white/[0.06] animate-pulse ml-auto" />
+              <div className="h-10 rounded-[12px] bg-white/[0.04] animate-pulse" />
+            </div>
+          </div>
+          <div className="flex gap-3 max-w-[65%]">
+            <div className="w-8 h-8 rounded-full bg-white/[0.06] animate-pulse shrink-0" />
+            <div className="flex-1 space-y-2">
+              <div className="h-3 w-20 rounded bg-white/[0.06] animate-pulse" />
+              <div className="h-24 rounded-[12px] bg-white/[0.04] animate-pulse" />
+            </div>
+          </div>
+        </div>
+      ) : isEmpty ? (
+        <div className="flex-1 flex flex-col items-center justify-center px-6 pb-[120px] md:pb-4 relative">
+          {/* Atmospheric background glow */}
+          <div className="absolute inset-0 pointer-events-none overflow-hidden">
+            <div className="absolute top-[20%] left-[50%] -translate-x-1/2 w-[500px] h-[300px]"
+              style={{
+                background: 'radial-gradient(ellipse at center, rgba(99,102,241,0.05) 0%, transparent 70%)',
+                animation: 'glow-pulse 6s ease-in-out infinite',
+              }} />
+          </div>
+
+          <div className="relative max-w-[560px] w-full text-center mb-10"
+            style={{ animation: 'fade-in 0.5s cubic-bezier(0.16, 1, 0.3, 1)' }}>
+            {/* Sparkle */}
+            <div className="flex justify-center mb-5">
+              <div className="relative">
+                <svg width="32" height="32" viewBox="0 0 48 48" fill="none" className="text-accent-bright"
+                  style={{ animation: 'sparkle-spin 8s linear infinite' }}>
+                  <path d="M24 4L27.5 18.5L42 24L27.5 29.5L24 44L20.5 29.5L6 24L20.5 18.5L24 4Z"
+                    fill="currentColor" opacity="0.8" />
+                </svg>
+                <div className="absolute inset-0 blur-lg bg-accent-bright/20" />
+              </div>
+            </div>
+
+            <h1 className="font-display text-[28px] md:text-[36px] font-800 leading-[1.1] tracking-[-0.04em] mb-3">
+              Hi{currentUser ? ', ' : ' '}<span className="text-accent-bright">{currentUser || 'there'}</span>
+              <br />
+              <span className="text-text-2">
+                {currentAgent ? `Start with ${currentAgent.name}` : 'Start the conversation'}
+              </span>
+            </h1>
+            <p className="text-[13px] text-text-3 mt-2">
+              {currentAgent
+                ? `Ask ${currentAgent.name} anything, hand over work, or start with one of these openers.`
+                : 'Pick a prompt or type your own below.'}
+            </p>
+          </div>
+
+          <div className="relative grid grid-cols-2 md:grid-cols-4 gap-3 max-w-[640px] w-full mb-6">
+            {promptSuggestions.map((prompt, i) => (
+              <button
+                key={prompt.text}
+                onClick={() => handlePrompt(prompt.text)}
+                className={`suggestion-card p-4 rounded-[14px] border border-white/[0.04] bg-gradient-to-br ${prompt.gradient}
+                  text-left cursor-pointer flex flex-col gap-3 min-h-[110px] active:scale-[0.97]`}
+                style={{ fontFamily: 'inherit', animation: `fade-in 0.4s cubic-bezier(0.16, 1, 0.3, 1) ${i * 0.07 + 0.15}s both` }}
+              >
+                <PromptIcon type={prompt.icon} />
+                <span className="text-[12px] text-text-2/80 leading-snug flex-1">{prompt.text}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+      ) : (
+        <MessageList messages={messages} streaming={streamingForThisSession} connectorFilter={connectorFilter} loading={messagesLoading} />
+      )}
+
+      {voice.active && (
+        <VoiceOverlay
+          state={voice.state}
+          interimText={voice.interimText}
+          transcript={voice.transcript}
+          onStop={voice.stop}
+        />
+      )}
+
+      <SessionDebugPanel
+        messages={messages}
+        open={debugOpen}
+        onClose={() => setDebugOpen(false)}
+      />
+
+        <ChatInput
+          streaming={streamingForThisSession}
+          busy={streamingForThisSession || session.active === true}
+          onSend={handleSend}
+          onStop={stopStreaming}
+          extensionChatActions={extensionChatActions}
+        />
+
+      <Dropdown open={menuOpen} onClose={() => setMenuOpen(false)}>
+        <DropdownItem onClick={() => {
+          setMenuOpen(false)
+          setDebugOpen(!debugOpen)
+        }}>
+          {debugOpen ? 'Hide Debug Panel' : 'Show Debug Panel'}
+        </DropdownItem>
+        <DropdownItem onClick={() => { setMenuOpen(false); setConfirmClear(true) }}>
+          Clear History
+        </DropdownItem>
+        <DropdownItem danger onClick={() => { setMenuOpen(false); setConfirmDelete(true) }}>
+          Delete Chat
+        </DropdownItem>
+      </Dropdown>
+
+      <ConfirmDialog
+        open={confirmClear}
+        title="Clear chat"
+        message="Clear every message in this chat. Long-term memory, skills, and facts are preserved. You'll have 10 seconds to undo."
+        confirmLabel="Clear"
+        danger
+        onConfirm={() => { void handleClear('clear') }}
+        onCancel={() => setConfirmClear(false)}
+      />
+      <ConfirmDialog
+        open={confirmDelete}
+        title="Delete Chat"
+        message={`Delete "${session.name}"? This cannot be undone.`}
+        confirmLabel="Delete"
+        danger
+        onConfirm={handleDelete}
+        onCancel={() => setConfirmDelete(false)}
+      />
+      {session.agentId && currentAgent && (
+        <ConfirmDialog
+          open={confirmDeleteAgent}
+          title="Delete Agent"
+          message={`Delete agent "${currentAgent.name}"? This cannot be undone.`}
+          confirmLabel="Delete"
+          danger
+          onConfirm={async () => {
+            setConfirmDeleteAgent(false)
+            await deleteAgent(session.agentId!)
+            await loadAgents()
+          }}
+          onCancel={() => setConfirmDeleteAgent(false)}
+        />
+      )}
+
+      {isDragging && (
+        <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm pointer-events-none">
+          <div className="px-8 py-6 rounded-[20px] border-2 border-dashed border-accent-bright/50 bg-surface/80 text-center">
+            <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" className="text-accent-bright mx-auto mb-3">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+              <polyline points="17 8 12 3 7 8" />
+              <line x1="12" y1="3" x2="12" y2="15" />
+            </svg>
+            <p className="text-[15px] font-600 text-text">Drop file to attach</p>
+          </div>
+        </div>
+      )}
+    </div>
+    {isDesktop && previewContent && (
+      <ChatPreviewPanel content={previewContent} onClose={() => setPreviewContent(null)} />
+    )}
+    {isDesktop && inspectorOpen && currentAgent && (
+      <InspectorPanel
+        agent={currentAgent}
+        session={session}
+        onEditAgent={() => { setEditingAgentId(session.agentId!); setAgentSheetOpen(true) }}
+        onDuplicateAgent={() => {
+          setAgentPrefill(currentAgent)
+          setEditingAgentId(null)
+          setAgentSheetOpen(true)
+        }}
+        onClearHistory={() => setConfirmClear(true)}
+        onDeleteAgent={() => setConfirmDeleteAgent(true)}
+        onDeleteChat={() => setConfirmDelete(true)}
+      />
+    )}
+    {isDesktop && heartbeatHistoryOpen && currentAgent?.heartbeatEnabled && (
+      <HeartbeatHistoryPanel
+        messages={messages}
+        agentHeartbeatGoal={currentAgent.heartbeatGoal ?? undefined}
+        onClose={() => setHeartbeatHistoryOpen(false)}
+      />
+    )}
+    </div>
+  )
+}
+
+function PromptIcon({ type }: { type: string }) {
+  const cls = "w-5 h-5"
+  switch (type) {
+    case 'book':
+      return <svg className={cls} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" style={{ color: 'var(--color-accent-bright)' }}><rect x="3" y="3" width="7" height="7" rx="1" /><rect x="14" y="3" width="7" height="7" rx="1" /><rect x="3" y="14" width="7" height="7" rx="1" /><rect x="14" y="14" width="7" height="7" rx="1" /></svg>
+    case 'link':
+      return <svg className={cls} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" style={{ color: '#F472B6' }}><path d="M15 7h3a5 5 0 0 1 5 5 5 5 0 0 1-5 5h-3m-6 0H6a5 5 0 0 1-5-5 5 5 0 0 1 5-5h3" /><line x1="8" y1="12" x2="16" y2="12" /></svg>
+    case 'bot':
+      return <svg className={cls} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" style={{ color: '#34D399' }}><path d="M12 2a2 2 0 0 1 2 2c0 .74-.4 1.39-1 1.73V7h1a7 7 0 0 1 7 7v3a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-3a7 7 0 0 1 7-7h1V5.73c-.6-.34-1-.99-1-1.73a2 2 0 0 1 2-2z" /><circle cx="9" cy="13" r="1.25" fill="currentColor" /><circle cx="15" cy="13" r="1.25" fill="currentColor" /><path d="M10 17h4" /></svg>
+    case 'check':
+      return <svg className={cls} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" style={{ color: '#FBBF24' }}><circle cx="12" cy="12" r="10" /><polyline points="12 6 12 12 16 14" /></svg>
+    default:
+      return null
+  }
+}

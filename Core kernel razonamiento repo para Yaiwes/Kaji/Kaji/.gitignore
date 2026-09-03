@@ -1,0 +1,85 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.venv
+.venv/
+venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+.serena/
+*.swp
+*.swo
+*~
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Type checking
+.mypy_cache/
+
+# Artifacts
+test-artifacts/
+.kaji-artifacts/
+*.log
+
+# kaji local mode — per-machine counter（commit すると pc1 の counter を
+# pc2 が pull した際に番号空間が汚染される）。LocalProvider が書き込む。
+.kaji/counters/
+
+# kaji local mode — per-machine config overlay（machine_id / active provider）。
+# `kaji local init` で生成され、commit してはいけない。
+.kaji/config.local.toml
+
+# kaji local mode — provider cache（`kaji sync` 等が書き込む runtime cache）。
+# マシンローカルの一時データなので commit しない。
+.kaji/cache/
+
+# Working scratch space (smoke test logs, ad-hoc experiment artifacts).
+# 作業ローカルの一時ファイルをここに置く。コミット禁止。
+tmp/
+
+# kaji local config backups (smoke test 等でバックアップする時の安全網)
+.kaji/config.local.toml.bak-*
+
+# Environment
+.env
+.env.local
+secrets/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local tools — CLI markers / standalone binaries dropped at repo root
+.codex
+actionlint
+
+# Claude Code — runtime lock files (session-specific, should not be committed)
+.claude/*.lock

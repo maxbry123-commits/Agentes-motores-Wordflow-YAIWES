@@ -1,0 +1,73 @@
+{
+  "agents": [
+    {
+      "agent_id": "0",
+      "name": "DataPreprocessingAgent",
+      "system_prompt": "You are DataPreprocessingAgent. Your goal is to clean and prepare the given dataset for machine learning. Your responsibilities include handling missing values, encoding categorical variables, and normalizing numerical features. Ensure the dataset is in a format suitable for model training. You can use the following tools:\n- code_interpreter: Use it with <execute>```python <Your Code> ```<\\execute>. and you will got the stdout or error message\n WARNING: Thses enironment is not a jupyter notebook. Please use print(df.head()) instead of df.head(), other jupyer outputs  also need print out\n- If If dataset is prepared successfully, output `<STATE_TRANS>: 2`.\n- If no conditions are met, output `<STATE_TRANS>: None`.\n DO NOT WRITE THIS IN THE CODE SNIPPET!",
+      "tools": [
+        "code_interpreter"
+      ]
+    },
+    {
+      "agent_id": "1",
+      "name": "ReportingAgent",
+      "system_prompt": "You are ReportingAgent. Your goal is to compile the evaluation metrics and generate a comprehensive report for the user. Ensure the report is clear, concise, and includes all relevant metrics and insights.\n- If no conditions are met, output `<STATE_TRANS>: None`.\n DO NOT WRITE THIS IN THE CODE SNIPPET!",
+      "tools": []
+    },
+    {
+      "agent_id": "2",
+      "name": "ModelLifecycleAgent",
+      "system_prompt": "You are ModelLifecycleAgent. Your goal is to manage the entire lifecycle of a machine learning model, from selection to training and evaluation.\n\n1. **Model Selection**: Select the most appropriate machine learning model based on the characteristics of the prepared dataset. Consider factors like the type of problem (classification, regression), dataset size, and feature types. Output the selected model type.\n- If the model is selected successfully, output `<STATE_TRANS>: 3`.\n- If no conditions are met, output `<STATE_TRANS>: None`.\n\n2. **Model Training**: Train the selected machine learning model using the prepared dataset. Ensure to split the dataset into training and validation sets, and optimize the model's hyperparameters if necessary. Output the trained model.\n- You can use the following tools:\n  - code_interpreter: Use it with <execute>```python <Your Code> ```<\\execute>. and you will get the stdout or error message.\n  - WARNING: This environment is not a Jupyter notebook. Please use print(df.head()) instead of df.head(), and other Jupyter outputs also need print out.\n- If the model is trained successfully, output `<STATE_TRANS>: 4`.\n- If no conditions are met, output `<STATE_TRANS>: None`.\n\n3. **Model Evaluation**: Evaluate the trained model on the test dataset. Compute the required metrics such as F-1 score, RMSE, and any other relevant metrics. Output the evaluation results.\n- You can use the following tools:\n  - code_interpreter: Use it with <execute>```python <Your Code> ```<\\execute>. and you will get the stdout or error message.\n  - WARNING: This environment is not a Jupyter notebook. Please use print(df.head()) instead of df.head(), and other Jupyter outputs also need print out.\n- If the model is evaluated successfully, output `<STATE_TRANS>: 5`.\n- If no conditions are met, output `<STATE_TRANS>: None`.\n\nDO NOT WRITE THIS IN THE CODE SNIPPET!",
+      "tools": [
+        "code_interpreter"
+      ]
+    }
+  ],
+  "states": {
+    "states": [
+      {
+        "state_id": "1",
+        "agent_id": "0",
+        "instruction": "Clean and prepare the given dataset for machine learning.",
+        "is_initial": true,
+        "is_final": false,
+        "listener": [
+          "2",
+          "2"
+        ]
+      },
+      {
+        "state_id": "2",
+        "agent_id": "1",
+        "instruction": "Compile the evaluation metrics and generate a comprehensive report for the user. use <|submit|>: Your answer to subit the answer to user",
+        "is_initial": false,
+        "is_final": true,
+        "listener": []
+      },
+      {
+        "state_id": "3",
+        "agent_id": "2",
+        "instruction": "\"Select the most appropriate machine learning model based on the prepared dataset, train the selected model using the prepared dataset, and then evaluate the trained model on the test dataset. Ensure to split the dataset into training and validation sets, optimize the model's hyperparameters if necessary, and compute the required metrics.\"",
+        "is_initial": false,
+        "is_final": false,
+        "listener": [
+          "2",
+          "2",
+          "1"
+        ]
+      }
+    ],
+    "transitions": [
+      {
+        "from_state": "1",
+        "to_state": "3",
+        "condition": "If dataset is prepared successfully"
+      },
+      {
+        "from_state": "3",
+        "to_state": "2",
+        "condition": "If model is evaluated successfully"
+      }
+    ]
+  }
+}

@@ -1,0 +1,841 @@
+{
+  "version": 1,
+  "generatedAt": "2026-05-05T14:53:22.998Z",
+  "totalIssues": 352,
+  "uniqueIssues": 119,
+  "issues": [
+    {
+      "filePath": "bin/worker-cmd.js",
+      "ruleId": "@typescript-eslint/no-require-imports",
+      "severity": 2,
+      "message": "A `require()` style import is forbidden.",
+      "count": 2
+    },
+    {
+      "filePath": "src/app/api/claude-skills/route.ts",
+      "ruleId": "@typescript-eslint/no-unused-vars",
+      "severity": 1,
+      "message": "'_req' is defined but never used.",
+      "count": 1
+    },
+    {
+      "filePath": "src/app/api/external-agents/route.test.ts",
+      "ruleId": "@typescript-eslint/no-explicit-any",
+      "severity": 2,
+      "message": "Unexpected any. Specify a different type.",
+      "count": 1
+    },
+    {
+      "filePath": "src/app/api/mcp-servers/[id]/test/route.ts",
+      "ruleId": "@typescript-eslint/no-explicit-any",
+      "severity": 2,
+      "message": "Unexpected any. Specify a different type.",
+      "count": 1
+    },
+    {
+      "filePath": "src/app/api/mcp-servers/route.ts",
+      "ruleId": "@typescript-eslint/no-unused-vars",
+      "severity": 1,
+      "message": "'_req' is defined but never used.",
+      "count": 1
+    },
+    {
+      "filePath": "src/app/api/providers/configs/route.ts",
+      "ruleId": "@typescript-eslint/no-unused-vars",
+      "severity": 1,
+      "message": "'_req' is defined but never used.",
+      "count": 1
+    },
+    {
+      "filePath": "src/app/api/providers/route.ts",
+      "ruleId": "@typescript-eslint/no-unused-vars",
+      "severity": 1,
+      "message": "'_req' is defined but never used.",
+      "count": 1
+    },
+    {
+      "filePath": "src/app/api/secrets/route.ts",
+      "ruleId": "@typescript-eslint/no-unused-vars",
+      "severity": 1,
+      "message": "'_req' is defined but never used.",
+      "count": 1
+    },
+    {
+      "filePath": "src/app/api/secrets/route.ts",
+      "ruleId": "@typescript-eslint/no-unused-vars",
+      "severity": 1,
+      "message": "'encryptedValue' is assigned a value but never used.",
+      "count": 1
+    },
+    {
+      "filePath": "src/app/api/secrets/route.ts",
+      "ruleId": "@typescript-eslint/no-explicit-any",
+      "severity": 2,
+      "message": "Unexpected any. Specify a different type.",
+      "count": 1
+    },
+    {
+      "filePath": "src/app/api/setup/openclaw-device/route.ts",
+      "ruleId": "@typescript-eslint/no-unused-vars",
+      "severity": 1,
+      "message": "'_req' is defined but never used.",
+      "count": 1
+    },
+    {
+      "filePath": "src/app/api/version/route.ts",
+      "ruleId": "@typescript-eslint/no-unused-vars",
+      "severity": 1,
+      "message": "'_req' is defined but never used.",
+      "count": 1
+    },
+    {
+      "filePath": "src/app/api/webhooks/route.test.ts",
+      "ruleId": "@typescript-eslint/no-explicit-any",
+      "severity": 2,
+      "message": "Unexpected any. Specify a different type.",
+      "count": 3
+    },
+    {
+      "filePath": "src/app/api/webhooks/route.ts",
+      "ruleId": "@typescript-eslint/no-unused-vars",
+      "severity": 1,
+      "message": "'_req' is defined but never used.",
+      "count": 1
+    },
+    {
+      "filePath": "src/app/protocols/page.tsx",
+      "ruleId": "@typescript-eslint/no-unused-vars",
+      "severity": 1,
+      "message": "'AgentList' is defined but never used.",
+      "count": 1
+    },
+    {
+      "filePath": "src/app/protocols/page.tsx",
+      "ruleId": "@typescript-eslint/no-unused-vars",
+      "severity": 1,
+      "message": "'ProtocolRunDetail' is defined but never used.",
+      "count": 1
+    },
+    {
+      "filePath": "src/app/usage/page.tsx",
+      "ruleId": "@typescript-eslint/no-unused-vars",
+      "severity": 1,
+      "message": "'_id' is defined but never used.",
+      "count": 1
+    },
+    {
+      "filePath": "src/cli/index.test.js",
+      "ruleId": "@typescript-eslint/no-unused-vars",
+      "severity": 1,
+      "message": "'init' is defined but never used.",
+      "count": 1
+    },
+    {
+      "filePath": "src/cli/index.test.js",
+      "ruleId": "@typescript-eslint/no-require-imports",
+      "severity": 2,
+      "message": "A `require()` style import is forbidden.",
+      "count": 6
+    },
+    {
+      "filePath": "src/components/chat/chat-card.tsx",
+      "ruleId": "@typescript-eslint/no-unused-vars",
+      "severity": 1,
+      "message": "'router' is assigned a value but never used.",
+      "count": 1
+    },
+    {
+      "filePath": "src/components/chat/chat-preview-panel.tsx",
+      "ruleId": "@next/next/no-img-element",
+      "severity": 1,
+      "message": "Using `<img>` could result in slower LCP and higher bandwidth. Consider using `<Image />` from `next/image` or a custom image loader to automatically optimize images. This may incur additional usage or cost from your provider. See: https://nextjs.org/docs/messages/no-img-element",
+      "count": 1
+    },
+    {
+      "filePath": "src/components/chat/code-block.tsx",
+      "ruleId": "@typescript-eslint/no-explicit-any",
+      "severity": 2,
+      "message": "Unexpected any. Specify a different type.",
+      "count": 1
+    },
+    {
+      "filePath": "src/components/chat/swarm-panel.tsx",
+      "ruleId": "@typescript-eslint/no-unused-vars",
+      "severity": 1,
+      "message": "'count' is assigned a value but never used.",
+      "count": 1
+    },
+    {
+      "filePath": "src/components/chat/swarm-panel.tsx",
+      "ruleId": "@typescript-eslint/no-explicit-any",
+      "severity": 2,
+      "message": "Unexpected any. Specify a different type.",
+      "count": 3
+    },
+    {
+      "filePath": "src/components/memory/memory-detail.tsx",
+      "ruleId": "@next/next/no-img-element",
+      "severity": 1,
+      "message": "Using `<img>` could result in slower LCP and higher bandwidth. Consider using `<Image />` from `next/image` or a custom image loader to automatically optimize images. This may incur additional usage or cost from your provider. See: https://nextjs.org/docs/messages/no-img-element",
+      "count": 1
+    },
+    {
+      "filePath": "src/components/org-chart/use-org-chart-drag.ts",
+      "ruleId": "@typescript-eslint/no-unused-vars",
+      "severity": 1,
+      "message": "'_evt' is defined but never used.",
+      "count": 1
+    },
+    {
+      "filePath": "src/components/org-chart/use-org-chart-pan-zoom.ts",
+      "ruleId": "@typescript-eslint/no-unused-vars",
+      "severity": 1,
+      "message": "'_err' is defined but never used.",
+      "count": 1
+    },
+    {
+      "filePath": "src/components/projects/project-detail.tsx",
+      "ruleId": "@typescript-eslint/no-unused-vars",
+      "severity": 1,
+      "message": "'api' is defined but never used.",
+      "count": 1
+    },
+    {
+      "filePath": "src/components/projects/project-detail.tsx",
+      "ruleId": "@typescript-eslint/no-unused-vars",
+      "severity": 1,
+      "message": "'useState' is defined but never used.",
+      "count": 1
+    },
+    {
+      "filePath": "src/components/projects/tabs/overview-tab.tsx",
+      "ruleId": "@typescript-eslint/no-unused-vars",
+      "severity": 1,
+      "message": "'relativeDate' is defined but never used.",
+      "count": 1
+    },
+    {
+      "filePath": "src/components/protocols/structured-session-launcher.tsx",
+      "ruleId": "@typescript-eslint/no-unused-vars",
+      "severity": 1,
+      "message": "'AgentList' is defined but never used.",
+      "count": 1
+    },
+    {
+      "filePath": "src/components/protocols/structured-session-launcher.tsx",
+      "ruleId": "@typescript-eslint/no-unused-vars",
+      "severity": 1,
+      "message": "'Chatroom' is defined but never used.",
+      "count": 1
+    },
+    {
+      "filePath": "src/components/protocols/structured-session-launcher.tsx",
+      "ruleId": "@typescript-eslint/no-unused-vars",
+      "severity": 1,
+      "message": "'ProtocolTemplate' is defined but never used.",
+      "count": 1
+    },
+    {
+      "filePath": "src/components/protocols/structured-session-launcher.tsx",
+      "ruleId": "@typescript-eslint/no-unused-vars",
+      "severity": 1,
+      "message": "'TaskList' is defined but never used.",
+      "count": 1
+    },
+    {
+      "filePath": "src/components/protocols/structured-session-launcher.tsx",
+      "ruleId": "react-hooks/exhaustive-deps",
+      "severity": 1,
+      "message": "The 'agents' logical expression could make the dependencies of useMemo Hook (at line 129) change on every render. To fix this, wrap the initialization of 'agents' in its own useMemo() Hook.",
+      "count": 1
+    },
+    {
+      "filePath": "src/components/protocols/structured-session-launcher.tsx",
+      "ruleId": "react-hooks/exhaustive-deps",
+      "severity": 1,
+      "message": "The 'agents' logical expression could make the dependencies of useMemo Hook (at line 145) change on every render. To fix this, wrap the initialization of 'agents' in its own useMemo() Hook.",
+      "count": 1
+    },
+    {
+      "filePath": "src/components/protocols/structured-session-launcher.tsx",
+      "ruleId": "react-hooks/exhaustive-deps",
+      "severity": 1,
+      "message": "The 'templates' logical expression could make the dependencies of useMemo Hook (at line 133) change on every render. To fix this, wrap the initialization of 'templates' in its own useMemo() Hook.",
+      "count": 1
+    },
+    {
+      "filePath": "src/components/shared/attachment-chip.tsx",
+      "ruleId": "@next/next/no-img-element",
+      "severity": 1,
+      "message": "Using `<img>` could result in slower LCP and higher bandwidth. Consider using `<Image />` from `next/image` or a custom image loader to automatically optimize images. This may incur additional usage or cost from your provider. See: https://nextjs.org/docs/messages/no-img-element",
+      "count": 2
+    },
+    {
+      "filePath": "src/components/shared/file-preview.tsx",
+      "ruleId": "@next/next/no-img-element",
+      "severity": 1,
+      "message": "Using `<img>` could result in slower LCP and higher bandwidth. Consider using `<Image />` from `next/image` or a custom image loader to automatically optimize images. This may incur additional usage or cost from your provider. See: https://nextjs.org/docs/messages/no-img-element",
+      "count": 1
+    },
+    {
+      "filePath": "src/components/tasks/task-card.tsx",
+      "ruleId": "@next/next/no-img-element",
+      "severity": 1,
+      "message": "Using `<img>` could result in slower LCP and higher bandwidth. Consider using `<Image />` from `next/image` or a custom image loader to automatically optimize images. This may incur additional usage or cost from your provider. See: https://nextjs.org/docs/messages/no-img-element",
+      "count": 1
+    },
+    {
+      "filePath": "src/components/tasks/task-list.tsx",
+      "ruleId": "@typescript-eslint/no-unused-vars",
+      "severity": 1,
+      "message": "'inSidebar' is defined but never used.",
+      "count": 1
+    },
+    {
+      "filePath": "src/components/tasks/task-sheet.tsx",
+      "ruleId": "@next/next/no-img-element",
+      "severity": 1,
+      "message": "Using `<img>` could result in slower LCP and higher bandwidth. Consider using `<Image />` from `next/image` or a custom image loader to automatically optimize images. This may incur additional usage or cost from your provider. See: https://nextjs.org/docs/messages/no-img-element",
+      "count": 1
+    },
+    {
+      "filePath": "src/hooks/use-speech-recognition.ts",
+      "ruleId": "@typescript-eslint/no-explicit-any",
+      "severity": 2,
+      "message": "Unexpected any. Specify a different type.",
+      "count": 4
+    },
+    {
+      "filePath": "src/lib/observability/local-observability.test.ts",
+      "ruleId": "@typescript-eslint/no-explicit-any",
+      "severity": 2,
+      "message": "Unexpected any. Specify a different type.",
+      "count": 2
+    },
+    {
+      "filePath": "src/lib/providers/index.ts",
+      "ruleId": "@typescript-eslint/no-unused-vars",
+      "severity": 1,
+      "message": "'ProviderType' is defined but never used.",
+      "count": 1
+    },
+    {
+      "filePath": "src/lib/runtime/runtime-env.test.ts",
+      "ruleId": "@typescript-eslint/no-explicit-any",
+      "severity": 2,
+      "message": "Unexpected any. Specify a different type.",
+      "count": 6
+    },
+    {
+      "filePath": "src/lib/server/agents/subagent-runtime.test.ts",
+      "ruleId": "@typescript-eslint/no-explicit-any",
+      "severity": 2,
+      "message": "Unexpected any. Specify a different type.",
+      "count": 4
+    },
+    {
+      "filePath": "src/lib/server/agents/subagent-swarm.test.ts",
+      "ruleId": "@typescript-eslint/no-unused-vars",
+      "severity": 1,
+      "message": "'members' is assigned a value but never used.",
+      "count": 1
+    },
+    {
+      "filePath": "src/lib/server/agents/subagent-swarm.test.ts",
+      "ruleId": "@typescript-eslint/no-unused-vars",
+      "severity": 1,
+      "message": "'swarm' is assigned a value but never used.",
+      "count": 1
+    },
+    {
+      "filePath": "src/lib/server/agents/subagent-swarm.test.ts",
+      "ruleId": "@typescript-eslint/no-explicit-any",
+      "severity": 2,
+      "message": "Unexpected any. Specify a different type.",
+      "count": 22
+    },
+    {
+      "filePath": "src/lib/server/chat-execution/chat-streaming-utils.ts",
+      "ruleId": "@typescript-eslint/no-unused-vars",
+      "severity": 1,
+      "message": "'_params' is defined but never used.",
+      "count": 1
+    },
+    {
+      "filePath": "src/lib/server/chat-execution/prompt-builder.ts",
+      "ruleId": "@typescript-eslint/no-unused-vars",
+      "severity": 1,
+      "message": "'getEnabledDisplayTool' is defined but never used.",
+      "count": 1
+    },
+    {
+      "filePath": "src/lib/server/chat-execution/stream-continuation.ts",
+      "ruleId": "@typescript-eslint/no-unused-vars",
+      "severity": 1,
+      "message": "'_params' is defined but never used.",
+      "count": 2
+    },
+    {
+      "filePath": "src/lib/server/connectors/discord.ts",
+      "ruleId": "@typescript-eslint/no-unused-vars",
+      "severity": 1,
+      "message": "'Connector' is defined but never used.",
+      "count": 1
+    },
+    {
+      "filePath": "src/lib/server/connectors/discord.ts",
+      "ruleId": "@typescript-eslint/no-explicit-any",
+      "severity": 2,
+      "message": "Unexpected any. Specify a different type.",
+      "count": 14
+    },
+    {
+      "filePath": "src/lib/server/connectors/manager-roundtrip.test.ts",
+      "ruleId": "@typescript-eslint/no-explicit-any",
+      "severity": 2,
+      "message": "Unexpected any. Specify a different type.",
+      "count": 2
+    },
+    {
+      "filePath": "src/lib/server/connectors/manager.test.ts",
+      "ruleId": "@typescript-eslint/no-explicit-any",
+      "severity": 2,
+      "message": "Unexpected any. Specify a different type.",
+      "count": 30
+    },
+    {
+      "filePath": "src/lib/server/connectors/matrix.ts",
+      "ruleId": "@typescript-eslint/no-explicit-any",
+      "severity": 2,
+      "message": "Unexpected any. Specify a different type.",
+      "count": 1
+    },
+    {
+      "filePath": "src/lib/server/connectors/openclaw.test.ts",
+      "ruleId": "@typescript-eslint/no-explicit-any",
+      "severity": 2,
+      "message": "Unexpected any. Specify a different type.",
+      "count": 16
+    },
+    {
+      "filePath": "src/lib/server/connectors/outbox.test.ts",
+      "ruleId": "@typescript-eslint/no-explicit-any",
+      "severity": 2,
+      "message": "Unexpected any. Specify a different type.",
+      "count": 3
+    },
+    {
+      "filePath": "src/lib/server/connectors/signal.ts",
+      "ruleId": "@typescript-eslint/no-explicit-any",
+      "severity": 2,
+      "message": "Unexpected any. Specify a different type.",
+      "count": 1
+    },
+    {
+      "filePath": "src/lib/server/connectors/slack.ts",
+      "ruleId": "@typescript-eslint/no-unused-vars",
+      "severity": 1,
+      "message": "'Connector' is defined but never used.",
+      "count": 1
+    },
+    {
+      "filePath": "src/lib/server/connectors/slack.ts",
+      "ruleId": "@typescript-eslint/no-unused-vars",
+      "severity": 1,
+      "message": "'isImageMime' is defined but never used.",
+      "count": 1
+    },
+    {
+      "filePath": "src/lib/server/connectors/slack.ts",
+      "ruleId": "@typescript-eslint/no-unused-vars",
+      "severity": 1,
+      "message": "'mimeFromPath' is defined but never used.",
+      "count": 1
+    },
+    {
+      "filePath": "src/lib/server/connectors/slack.ts",
+      "ruleId": "@typescript-eslint/no-explicit-any",
+      "severity": 2,
+      "message": "Unexpected any. Specify a different type.",
+      "count": 16
+    },
+    {
+      "filePath": "src/lib/server/connectors/teams.ts",
+      "ruleId": "@typescript-eslint/no-explicit-any",
+      "severity": 2,
+      "message": "Unexpected any. Specify a different type.",
+      "count": 6
+    },
+    {
+      "filePath": "src/lib/server/connectors/telegram.ts",
+      "ruleId": "@typescript-eslint/no-unused-vars",
+      "severity": 1,
+      "message": "'Connector' is defined but never used.",
+      "count": 1
+    },
+    {
+      "filePath": "src/lib/server/connectors/telegram.ts",
+      "ruleId": "@typescript-eslint/no-explicit-any",
+      "severity": 2,
+      "message": "Unexpected any. Specify a different type.",
+      "count": 12
+    },
+    {
+      "filePath": "src/lib/server/connectors/whatsapp.ts",
+      "ruleId": "@typescript-eslint/no-explicit-any",
+      "severity": 2,
+      "message": "Unexpected any. Specify a different type.",
+      "count": 9
+    },
+    {
+      "filePath": "src/lib/server/langgraph-checkpoint.test.ts",
+      "ruleId": "@typescript-eslint/no-explicit-any",
+      "severity": 2,
+      "message": "Unexpected any. Specify a different type.",
+      "count": 4
+    },
+    {
+      "filePath": "src/lib/server/mcp-client.test.ts",
+      "ruleId": "@typescript-eslint/no-unused-vars",
+      "severity": 1,
+      "message": "'args' is defined but never used.",
+      "count": 1
+    },
+    {
+      "filePath": "src/lib/server/mcp-client.test.ts",
+      "ruleId": "@typescript-eslint/no-unused-vars",
+      "severity": 1,
+      "message": "'result' is assigned a value but never used.",
+      "count": 1
+    },
+    {
+      "filePath": "src/lib/server/mcp-client.test.ts",
+      "ruleId": "@typescript-eslint/no-unused-vars",
+      "severity": 1,
+      "message": "'z' is defined but never used.",
+      "count": 1
+    },
+    {
+      "filePath": "src/lib/server/mcp-client.test.ts",
+      "ruleId": "@typescript-eslint/no-explicit-any",
+      "severity": 2,
+      "message": "Unexpected any. Specify a different type.",
+      "count": 6
+    },
+    {
+      "filePath": "src/lib/server/mcp-client.ts",
+      "ruleId": "@typescript-eslint/no-explicit-any",
+      "severity": 2,
+      "message": "Unexpected any. Specify a different type.",
+      "count": 14
+    },
+    {
+      "filePath": "src/lib/server/memory/memory-db.ts",
+      "ruleId": "@typescript-eslint/no-explicit-any",
+      "severity": 2,
+      "message": "Unexpected any. Specify a different type.",
+      "count": 12
+    },
+    {
+      "filePath": "src/lib/server/protocols/protocol-foreach.ts",
+      "ruleId": "@typescript-eslint/no-require-imports",
+      "severity": 2,
+      "message": "A `require()` style import is forbidden.",
+      "count": 1
+    },
+    {
+      "filePath": "src/lib/server/protocols/protocol-step-helpers.ts",
+      "ruleId": "@typescript-eslint/no-unused-vars",
+      "severity": 1,
+      "message": "'genId' is defined but never used.",
+      "count": 1
+    },
+    {
+      "filePath": "src/lib/server/protocols/protocol-step-helpers.ts",
+      "ruleId": "@typescript-eslint/no-unused-vars",
+      "severity": 1,
+      "message": "'ProtocolRunStatus' is defined but never used.",
+      "count": 1
+    },
+    {
+      "filePath": "src/lib/server/protocols/protocol-step-helpers.ts",
+      "ruleId": "@typescript-eslint/no-require-imports",
+      "severity": 2,
+      "message": "A `require()` style import is forbidden.",
+      "count": 3
+    },
+    {
+      "filePath": "src/lib/server/protocols/protocol-step-processors.ts",
+      "ruleId": "@typescript-eslint/no-require-imports",
+      "severity": 2,
+      "message": "A `require()` style import is forbidden.",
+      "count": 1
+    },
+    {
+      "filePath": "src/lib/server/protocols/protocol-subflow.ts",
+      "ruleId": "@typescript-eslint/no-unused-vars",
+      "severity": 1,
+      "message": "'cleanText' is defined but never used.",
+      "count": 1
+    },
+    {
+      "filePath": "src/lib/server/protocols/protocol-subflow.ts",
+      "ruleId": "@typescript-eslint/no-require-imports",
+      "severity": 2,
+      "message": "A `require()` style import is forbidden.",
+      "count": 4
+    },
+    {
+      "filePath": "src/lib/server/protocols/protocol-swarm.ts",
+      "ruleId": "@typescript-eslint/no-require-imports",
+      "severity": 2,
+      "message": "A `require()` style import is forbidden.",
+      "count": 2
+    },
+    {
+      "filePath": "src/lib/server/runtime/daemon-state-connectors.test.ts",
+      "ruleId": "@typescript-eslint/no-explicit-any",
+      "severity": 2,
+      "message": "Unexpected any. Specify a different type.",
+      "count": 2
+    },
+    {
+      "filePath": "src/lib/server/runtime/heartbeat-service.ts",
+      "ruleId": "@typescript-eslint/no-explicit-any",
+      "severity": 2,
+      "message": "Unexpected any. Specify a different type.",
+      "count": 5
+    },
+    {
+      "filePath": "src/lib/server/runtime/queue-followups.test.ts",
+      "ruleId": "@typescript-eslint/no-explicit-any",
+      "severity": 2,
+      "message": "Unexpected any. Specify a different type.",
+      "count": 9
+    },
+    {
+      "filePath": "src/lib/server/runtime/queue.test.ts",
+      "ruleId": "@typescript-eslint/no-explicit-any",
+      "severity": 2,
+      "message": "Unexpected any. Specify a different type.",
+      "count": 3
+    },
+    {
+      "filePath": "src/lib/server/runtime/wake-dispatcher.ts",
+      "ruleId": "@typescript-eslint/no-unused-vars",
+      "severity": 1,
+      "message": "'wakeModeToSource' is defined but never used.",
+      "count": 1
+    },
+    {
+      "filePath": "src/lib/server/runtime/wake-mode.test.ts",
+      "ruleId": "@typescript-eslint/no-unused-vars",
+      "severity": 1,
+      "message": "'WakeModeRequest' is defined but never used.",
+      "count": 1
+    },
+    {
+      "filePath": "src/lib/server/session-tools/connector.test.ts",
+      "ruleId": "@typescript-eslint/no-explicit-any",
+      "severity": 2,
+      "message": "Unexpected any. Specify a different type.",
+      "count": 2
+    },
+    {
+      "filePath": "src/lib/server/session-tools/context.ts",
+      "ruleId": "@typescript-eslint/no-explicit-any",
+      "severity": 2,
+      "message": "Unexpected any. Specify a different type.",
+      "count": 1
+    },
+    {
+      "filePath": "src/lib/server/session-tools/context.ts",
+      "ruleId": "@typescript-eslint/no-require-imports",
+      "severity": 2,
+      "message": "A `require()` style import is forbidden.",
+      "count": 4
+    },
+    {
+      "filePath": "src/lib/server/session-tools/crud.ts",
+      "ruleId": "@typescript-eslint/no-unused-vars",
+      "severity": 1,
+      "message": "'encryptedValue' is assigned a value but never used.",
+      "count": 2
+    },
+    {
+      "filePath": "src/lib/server/session-tools/crud.ts",
+      "ruleId": "@typescript-eslint/no-explicit-any",
+      "severity": 2,
+      "message": "Unexpected any. Specify a different type.",
+      "count": 14
+    },
+    {
+      "filePath": "src/lib/server/session-tools/edit_file.ts",
+      "ruleId": "@typescript-eslint/no-explicit-any",
+      "severity": 2,
+      "message": "Unexpected any. Specify a different type.",
+      "count": 2
+    },
+    {
+      "filePath": "src/lib/server/session-tools/index.ts",
+      "ruleId": "@typescript-eslint/no-explicit-any",
+      "severity": 2,
+      "message": "Unexpected any. Specify a different type.",
+      "count": 1
+    },
+    {
+      "filePath": "src/lib/server/session-tools/manage-schedules.test.ts",
+      "ruleId": "@typescript-eslint/no-explicit-any",
+      "severity": 2,
+      "message": "Unexpected any. Specify a different type.",
+      "count": 1
+    },
+    {
+      "filePath": "src/lib/server/session-tools/openclaw-nodes.ts",
+      "ruleId": "@typescript-eslint/no-explicit-any",
+      "severity": 2,
+      "message": "Unexpected any. Specify a different type.",
+      "count": 1
+    },
+    {
+      "filePath": "src/lib/server/session-tools/openclaw-workspace.ts",
+      "ruleId": "@typescript-eslint/no-unused-vars",
+      "severity": 1,
+      "message": "'truncate' is defined but never used.",
+      "count": 1
+    },
+    {
+      "filePath": "src/lib/server/session-tools/openclaw-workspace.ts",
+      "ruleId": "@typescript-eslint/no-explicit-any",
+      "severity": 2,
+      "message": "Unexpected any. Specify a different type.",
+      "count": 1
+    },
+    {
+      "filePath": "src/lib/server/session-tools/platform-tool.ts",
+      "ruleId": "@typescript-eslint/no-unused-vars",
+      "severity": 1,
+      "message": "'_ctx' is defined but never used.",
+      "count": 8
+    },
+    {
+      "filePath": "src/lib/server/session-tools/platform-tool.ts",
+      "ruleId": "@typescript-eslint/no-unused-vars",
+      "severity": 1,
+      "message": "'_params' is defined but never used.",
+      "count": 3
+    },
+    {
+      "filePath": "src/lib/server/session-tools/platform.ts",
+      "ruleId": "@typescript-eslint/no-explicit-any",
+      "severity": 2,
+      "message": "Unexpected any. Specify a different type.",
+      "count": 1
+    },
+    {
+      "filePath": "src/lib/server/session-tools/schedule.ts",
+      "ruleId": "@typescript-eslint/no-explicit-any",
+      "severity": 2,
+      "message": "Unexpected any. Specify a different type.",
+      "count": 2
+    },
+    {
+      "filePath": "src/lib/server/session-tools/session-info.ts",
+      "ruleId": "@typescript-eslint/no-unused-vars",
+      "severity": 1,
+      "message": "'message' is assigned a value but never used.",
+      "count": 1
+    },
+    {
+      "filePath": "src/lib/server/session-tools/session-info.ts",
+      "ruleId": "@typescript-eslint/no-explicit-any",
+      "severity": 2,
+      "message": "Unexpected any. Specify a different type.",
+      "count": 2
+    },
+    {
+      "filePath": "src/lib/server/session-tools/team-context.ts",
+      "ruleId": "@typescript-eslint/no-unused-vars",
+      "severity": 1,
+      "message": "'activeSession' is assigned a value but never used.",
+      "count": 1
+    },
+    {
+      "filePath": "src/lib/server/skills/skill-prompt-budget.test.ts",
+      "ruleId": "@typescript-eslint/no-unused-vars",
+      "severity": 1,
+      "message": "'MAX_SKILLS_PROMPT_CHARS' is defined but never used.",
+      "count": 1
+    },
+    {
+      "filePath": "src/lib/server/storage-mcp.test.ts",
+      "ruleId": "@typescript-eslint/no-explicit-any",
+      "severity": 2,
+      "message": "Unexpected any. Specify a different type.",
+      "count": 4
+    },
+    {
+      "filePath": "src/lib/server/wallets/wallet-repository.ts",
+      "ruleId": "@typescript-eslint/no-unused-vars",
+      "severity": 1,
+      "message": "'saveWalletsStore' is defined but never used.",
+      "count": 1
+    },
+    {
+      "filePath": "src/lib/server/wallets/wallet-service.ts",
+      "ruleId": "@typescript-eslint/no-unused-vars",
+      "severity": 1,
+      "message": "'_' is assigned a value but never used.",
+      "count": 1
+    },
+    {
+      "filePath": "src/lib/server/working-state/normalization.ts",
+      "ruleId": "@typescript-eslint/no-unused-vars",
+      "severity": 1,
+      "message": "'WorkingPlanStepPatch' is defined but never used.",
+      "count": 1
+    },
+    {
+      "filePath": "src/lib/server/ws-hub.ts",
+      "ruleId": "@typescript-eslint/no-explicit-any",
+      "severity": 2,
+      "message": "Unexpected any. Specify a different type.",
+      "count": 2
+    },
+    {
+      "filePath": "src/proxy.test.ts",
+      "ruleId": "@typescript-eslint/no-explicit-any",
+      "severity": 2,
+      "message": "Unexpected any. Specify a different type.",
+      "count": 3
+    },
+    {
+      "filePath": "src/stores/slices/auth-slice.ts",
+      "ruleId": "@typescript-eslint/no-unused-vars",
+      "severity": 1,
+      "message": "'get' is defined but never used.",
+      "count": 1
+    },
+    {
+      "filePath": "src/stores/slices/ui-slice.ts",
+      "ruleId": "@typescript-eslint/no-unused-vars",
+      "severity": 1,
+      "message": "'get' is defined but never used.",
+      "count": 1
+    },
+    {
+      "filePath": "src/views/settings/section-providers.tsx",
+      "ruleId": "@typescript-eslint/no-explicit-any",
+      "severity": 2,
+      "message": "Unexpected any. Specify a different type.",
+      "count": 1
+    },
+    {
+      "filePath": "src/views/settings/section-secrets.tsx",
+      "ruleId": "@typescript-eslint/no-unused-vars",
+      "severity": 1,
+      "message": "'appSettings' is defined but never used.",
+      "count": 1
+    }
+  ]
+}

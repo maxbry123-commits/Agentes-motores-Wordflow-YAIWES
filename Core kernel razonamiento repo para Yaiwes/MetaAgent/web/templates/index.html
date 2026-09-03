@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>MetaAgent Demo</title>
+    <link rel="stylesheet" href="/static/css/styles.css">
+    <script src="https://d3js.org/d3.v6.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/gh/VincentGarreau/particles.js/particles.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.11.3/gsap.min.js"></script>
+    <style>
+        /* Add scrollbar styles */
+        #run-log, #test-cases {
+            max-height: 300px;
+            overflow-y: scroll;
+            background-color: #f0f0f0;
+            padding: 10px;
+            border: 1px solid #ccc;
+        }
+    </style>
+</head>
+<body>
+    <div id="particles-js"></div>
+
+    <h1 style="color: #00cccc;">MetaAgent Demo</h1>
+
+    <div class="container">
+        <!-- Construction Stage -->
+        <section>
+            <h2>Construction Stage</h2>
+            <form id="design-form">
+                <label for="task_description">Task Description:</label>
+                <textarea id="task_description" name="task_description" rows="3" placeholder="Enter task description..."></textarea>
+                <button type="submit">Design Multi-Agent System</button>
+                <span id="design-spinner" class="loading-spinner"></span>
+            </form>
+            <div id="design-response"></div>
+        </section>
+
+        <!-- Generate Test Cases Stage -->
+        <section>
+            <h2>Generate Test Cases</h2>
+            <button id="generate-cases-button">Generate Test Cases</button>
+            <span class="loading-spinner" id="cases-spinner"></span>
+            <div id="cases-response"></div>
+            <h3>Test Cases</h3>
+            <pre id="test-cases"></pre>
+        </section>
+
+        <!-- Evolution Stage -->
+        <section>
+            <h2>Evolution Stage</h2>
+            <button id="evolve-button">Start Evolution</button>
+            <span class="loading-spinner" id="evolve-spinner"></span>
+            <div id="evolve-response"></div>
+        </section>
+
+        <!-- FSM Visualization -->
+        <section>
+            <h2>Multi-Agent System Visualization</h2>
+            <div id="fsm-graph" style="width: 100%; height: 500px;"></div>
+        </section>
+
+        <!-- Deployment Stage -->
+        <section>
+            <h2>Deployment Stage</h2>
+            <form id="deploy-form">
+                <label for="case_input">Enter Case</label><br>
+                <textarea id="case_input" name="case_input" rows="4" cols="50" required></textarea><br><br>
+                <button type="submit">Run Test</button>
+                <span class="loading-spinner" id="deploy-spinner"></span>
+            </form>
+            <div id="deploy-response"></div>
+        </section>
+
+        <!-- Running Log -->
+        <section>
+            <h2 id="run-log-header" style="cursor: pointer;">Running Log &#9656;</h2>
+            <div id="run-log-container" style="display: none;">
+                <pre id="run-log"></pre>
+            </div>
+        </section>
+    </div>
+
+    <script src="/static/js/interactive_graph.js"></script>
+    <script src="/static/js/particles_init.js"></script>
+
+    <script>
+        // Toggle running log display
+        document.getElementById('run-log-header').addEventListener('click', function() {
+            const container = document.getElementById('run-log-container');
+            const header = document.getElementById('run-log-header');
+            if (container.style.display === 'none') {
+                container.style.display = 'block';
+                header.innerHTML = 'Running Log &#9662;'; // Arrow pointing down
+                updateLog(); // Load the log when expanded
+                // Start fetching the log every 5 seconds
+                logInterval = setInterval(updateLog, 5000);
+            } else {
+                container.style.display = 'none';
+                header.innerHTML = 'Running Log &#9656;'; // Arrow pointing right
+                // Stop fetching the log when collapsed
+                clearInterval(logInterval);
+            }
+        });
+
+        let logInterval; // Variable to store the interval ID
+
+        // Function to fetch and update the log
+        function updateLog() {
+            fetch('/get_log')
+                .then(response => response.json())
+                .then(data => {
+                    if (data.log) {
+                        document.getElementById('run-log').textContent = data.log;
+                        // Auto-scroll to the bottom
+                        const logElement = document.getElementById('run-log');
+                        logElement.scrollTop = logElement.scrollHeight;
+                    } else {
+                        document.getElementById('run-log').textContent = 'No logs available.';
+                    }
+                })
+                .catch(error => {
+                    console.error('Error fetching log:', error);
+                });
+        }
+
+        // Optionally, you can fetch the log immediately after the page loads if the log is visible
+        document.addEventListener('DOMContentLoaded', function() {
+            const container = document.getElementById('run-log-container');
+            if (container.style.display !== 'none') {
+                updateLog();
+                logInterval = setInterval(updateLog, 5000);
+            }
+        });
+
+        // Start real-time log update when the "Start Evolution" button is clicked
+        $('#evolve-button').click(function() {
+            // Clear previous log
+            $('#run-log').text('');
+            // Send evolution request
+            $.post('/evolve', function(response) {
+                if (response.status === 'success') {
+                    alert(response.message);
+                } else {
+                    alert('Evolution failed to start: ' + response.message);
+                }
+            });
+        });
+
+        // Handle the design form submission
+        $('#design-form').submit(function(event) {
+            event.preventDefault();
+            $('#design-spinner').show();
+            $.post('/design', $(this).serialize(), function(data) {
+                $('#design-spinner').hide();
+                if (data.status === 'success') {
+                    $('#design-response').text(data.message + ' Token Cost: ' + data.token_cost);
+                } else {
+                    $('#design-response').text('Error: ' + data.message);
+                }
+            });
+        });
+
+        // Handle the deploy form submission
+        $('#deploy-form').submit(function(event) {
+            event.preventDefault();
+            $('#deploy-spinner').show();
+            $.post('/deploy', $(this).serialize(), function(data) {
+                $('#deploy-spinner').hide();
+                if (data.status === 'success') {
+                    $('#deploy-response').text(data.message);
+                } else {
+                    $('#deploy-response').text('Error: ' + data.message);
+                }
+            });
+        });
+
+        // Handle the generate test cases button
+        $('#generate-cases-button').click(function() {
+            $('#cases-spinner').show();
+            $.get('/generate_cases', function(data) {
+                $('#cases-spinner').hide();
+                if (data.status === 'success') {
+                    $('#test-cases').text(data.cases.join('\n'));
+                    $('#cases-response').text('Test cases generated successfully.');
+                } else {
+                    $('#cases-response').text('Error: ' + data.message);
+                }
+            });
+        });
+    </script>
+
+    <button id="theme-toggle">Toggle Dark Mode</button>
+
+    <div id="loading-screen" style="display: none;">
+        <div class="spinner"></div>
+        <p>Loading...</p>
+    </div>
+</body>
+</html>

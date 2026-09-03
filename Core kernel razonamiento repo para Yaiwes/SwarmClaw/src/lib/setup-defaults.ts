@@ -1,0 +1,919 @@
+/**
+ * Shared setup defaults used by both the web wizard and CLI.
+ * Isomorphic — no 'use client', no server imports.
+ */
+
+import { CLI_PROVIDER_METADATA, type CliProviderId, type CliProviderMetadata } from './providers/cli-provider-metadata.ts'
+import type { ProviderType } from '../types/provider.ts'
+
+export type SetupProvider = ProviderType | 'custom'
+
+export interface SetupProviderOption {
+  id: SetupProvider
+  name: string
+  description: string
+  requiresKey: boolean
+  supportsEndpoint: boolean
+  /** @deprecated No longer used — each provider type can only be configured once */
+  allowMultiple?: boolean
+  defaultEndpoint?: string
+  keyUrl?: string
+  keyLabel?: string
+  keyPlaceholder?: string
+  optionalKey?: boolean
+  badge?: string
+  icon: string
+  modelLibraryUrl?: string
+  cloudEndpoint?: string
+  category?: 'cli' | 'api' | 'gateway' | 'local' | 'custom'
+}
+
+const CLI_SETUP_PROVIDERS: SetupProviderOption[] = (CLI_PROVIDER_METADATA as readonly CliProviderMetadata[]).map((provider) => ({
+  id: provider.id,
+  name: provider.displayName,
+  description: provider.description,
+  requiresKey: false,
+  supportsEndpoint: false,
+  optionalKey: provider.optionalApiKey,
+  keyUrl: provider.keyUrl,
+  keyLabel: provider.keyLabel,
+  keyPlaceholder: provider.keyPlaceholder,
+  badge: provider.setupBadge,
+  icon: provider.icon,
+  modelLibraryUrl: provider.modelLibraryUrl,
+  category: 'cli',
+}))
+
+export const SETUP_PROVIDERS: SetupProviderOption[] = [
+  ...CLI_SETUP_PROVIDERS,
+  {
+    id: 'opencode-web',
+    name: 'OpenCode Web',
+    description: 'Connect to a remote OpenCode HTTP server (`opencode serve` or `opencode web`). Supports HTTPS and HTTP Basic Auth.',
+    requiresKey: false,
+    optionalKey: true,
+    supportsEndpoint: true,
+    defaultEndpoint: 'http://localhost:4096',
+    keyLabel: 'username:password (Basic Auth)',
+    keyPlaceholder: 'opencode:••••••• (or just the password)',
+    badge: 'HTTP',
+    icon: 'O',
+    category: 'cli',
+  },
+  {
+    id: 'openai',
+    name: 'OpenAI',
+    description: 'Great default for most users. Fast, reliable GPT models.',
+    requiresKey: true,
+    supportsEndpoint: true,
+    defaultEndpoint: 'https://api.openai.com/v1',
+    keyUrl: 'https://platform.openai.com/api-keys',
+    keyLabel: 'platform.openai.com',
+    badge: 'Recommended',
+    icon: 'O',
+    modelLibraryUrl: 'https://platform.openai.com/docs/models',
+  },
+  {
+    id: 'openrouter',
+    name: 'OpenRouter',
+    description: 'One API key for a broad multi-provider model catalog through an OpenAI-compatible API.',
+    requiresKey: true,
+    supportsEndpoint: false,
+    defaultEndpoint: 'https://openrouter.ai/api/v1',
+    keyUrl: 'https://openrouter.ai/keys',
+    keyLabel: 'openrouter.ai',
+    badge: 'Catalog',
+    icon: 'R',
+    modelLibraryUrl: 'https://openrouter.ai/models',
+  },
+  {
+    id: 'requesty',
+    name: 'Requesty',
+    description: 'One API key for a broad multi-provider model catalog through an OpenAI-compatible gateway, with caching, failover, and cost controls.',
+    requiresKey: true,
+    supportsEndpoint: false,
+    defaultEndpoint: 'https://router.requesty.ai/v1',
+    keyUrl: 'https://app.requesty.ai/router',
+    keyLabel: 'app.requesty.ai',
+    badge: 'Catalog',
+    icon: 'R',
+    modelLibraryUrl: 'https://app.requesty.ai/router/list',
+  },
+  {
+    id: 'tokenmix',
+    name: 'TokenMix',
+    description: 'One OpenAI-compatible API relay for Claude, OpenAI, Gemini, DeepSeek, Qwen, and other hosted models.',
+    requiresKey: true,
+    supportsEndpoint: false,
+    defaultEndpoint: 'https://api.tokenmix.ai/v1',
+    keyUrl: 'https://tokenmix.ai',
+    keyLabel: 'tokenmix.ai',
+    badge: 'Catalog',
+    icon: 'T',
+    modelLibraryUrl: 'https://tokenmix.ai/models',
+  },
+  {
+    id: 'openclaw',
+    name: 'OpenClaw',
+    description: 'Deploy or connect official-only local and remote OpenClaw gateways, then map starter agents across your swarm by role, tag, or use case.',
+    requiresKey: false,
+    supportsEndpoint: true,
+    allowMultiple: true,
+    defaultEndpoint: 'http://localhost:18789/v1',
+    optionalKey: true,
+    badge: 'First-Tier',
+    icon: 'C',
+    category: 'gateway',
+  },
+  {
+    id: 'hermes',
+    name: 'Hermes Agent',
+    description: 'Connect Hermes Agent through its local or remote OpenAI-compatible API server runtime.',
+    requiresKey: false,
+    supportsEndpoint: true,
+    allowMultiple: true,
+    defaultEndpoint: 'http://127.0.0.1:8642/v1',
+    optionalKey: true,
+    badge: 'API Server',
+    icon: 'H',
+    category: 'gateway',
+  },
+  {
+    id: 'lmstudio',
+    name: 'LM Studio',
+    description: 'Use locally served LM Studio models through the OpenAI-compatible API.',
+    requiresKey: false,
+    supportsEndpoint: true,
+    allowMultiple: true,
+    defaultEndpoint: 'http://127.0.0.1:1234/v1',
+    optionalKey: true,
+    badge: 'Local API',
+    icon: 'L',
+    modelLibraryUrl: 'https://lmstudio.ai/docs/developer/openai-compat',
+    category: 'local',
+  },
+  {
+    id: 'anthropic',
+    name: 'Anthropic',
+    description: 'Claude models — strong for coding, analysis, and long-form reasoning.',
+    requiresKey: true,
+    supportsEndpoint: false,
+    keyUrl: 'https://console.anthropic.com/settings/keys',
+    keyLabel: 'console.anthropic.com',
+    icon: 'A',
+    modelLibraryUrl: 'https://docs.anthropic.com/en/docs/about-claude/models',
+  },
+  {
+    id: 'google',
+    name: 'Google Gemini',
+    description: 'Gemini models with strong multimodal and coding support.',
+    requiresKey: true,
+    supportsEndpoint: false,
+    keyUrl: 'https://aistudio.google.com/app/apikey',
+    keyLabel: 'aistudio.google.com',
+    keyPlaceholder: 'AIza...',
+    icon: 'G',
+    modelLibraryUrl: 'https://ai.google.dev/gemini-api/docs/models',
+  },
+  {
+    id: 'deepseek',
+    name: 'DeepSeek',
+    description: 'High-value reasoning and coding models from DeepSeek.',
+    requiresKey: true,
+    supportsEndpoint: false,
+    keyUrl: 'https://platform.deepseek.com/api_keys',
+    keyLabel: 'platform.deepseek.com',
+    icon: 'D',
+    modelLibraryUrl: 'https://api-docs.deepseek.com/quick_start/pricing',
+  },
+  {
+    id: 'groq',
+    name: 'Groq',
+    description: 'Very fast inference with open and reasoning model options.',
+    requiresKey: true,
+    supportsEndpoint: false,
+    keyUrl: 'https://console.groq.com/keys',
+    keyLabel: 'console.groq.com',
+    icon: 'G',
+    modelLibraryUrl: 'https://console.groq.com/docs/models',
+  },
+  {
+    id: 'together',
+    name: 'Together AI',
+    description: 'Broad catalog of open models with OpenAI-compatible APIs.',
+    requiresKey: true,
+    supportsEndpoint: false,
+    keyUrl: 'https://api.together.xyz/settings/api-keys',
+    keyLabel: 'api.together.xyz',
+    icon: 'T',
+    modelLibraryUrl: 'https://docs.together.ai/docs/chat-models',
+  },
+  {
+    id: 'mistral',
+    name: 'Mistral AI',
+    description: 'Efficient frontier models with strong latency and quality.',
+    requiresKey: true,
+    supportsEndpoint: false,
+    keyUrl: 'https://console.mistral.ai/api-keys/',
+    keyLabel: 'console.mistral.ai',
+    icon: 'M',
+    modelLibraryUrl: 'https://docs.mistral.ai/getting-started/models/models_overview/',
+  },
+  {
+    id: 'xai',
+    name: 'xAI (Grok)',
+    description: 'Grok models for fast answers, coding, and analysis.',
+    requiresKey: true,
+    supportsEndpoint: false,
+    keyUrl: 'https://console.x.ai',
+    keyLabel: 'console.x.ai',
+    icon: 'X',
+    modelLibraryUrl: 'https://docs.x.ai/docs/models',
+  },
+  {
+    id: 'fireworks',
+    name: 'Fireworks AI',
+    description: 'Serverless and optimized open-model inference endpoints.',
+    requiresKey: true,
+    supportsEndpoint: false,
+    keyUrl: 'https://fireworks.ai/account/api-keys',
+    keyLabel: 'fireworks.ai',
+    icon: 'F',
+    modelLibraryUrl: 'https://fireworks.ai/models',
+  },
+  {
+    id: 'nebius',
+    name: 'Nebius',
+    description: 'Wide catalog of 60+ open-source models via Nebius Token Factory.',
+    requiresKey: true,
+    supportsEndpoint: false,
+    keyUrl: 'https://studio.nebius.com/settings/api-keys',
+    keyLabel: 'studio.nebius.com',
+    icon: 'N',
+    modelLibraryUrl: 'https://nebius.com/services/token-factory',
+  },
+  {
+    id: 'deepinfra',
+    name: 'DeepInfra',
+    description: 'Fast serverless inference for popular open-source models.',
+    requiresKey: true,
+    supportsEndpoint: false,
+    keyUrl: 'https://deepinfra.com/dash/api_keys',
+    keyLabel: 'deepinfra.com',
+    icon: 'D',
+    modelLibraryUrl: 'https://deepinfra.com/models',
+  },
+  {
+    id: 'ollama',
+    name: 'Ollama',
+    description: 'Run local open-source models or connect to Ollama Cloud.',
+    requiresKey: false,
+    supportsEndpoint: true,
+    allowMultiple: true,
+    defaultEndpoint: 'http://localhost:11434',
+    optionalKey: true,
+    badge: 'Local + Cloud',
+    icon: 'L',
+    modelLibraryUrl: 'https://ollama.com/library',
+    cloudEndpoint: 'https://api.ollama.com',
+    category: 'local',
+  },
+  {
+    id: 'custom',
+    name: 'Custom Provider',
+    description: 'Any OpenAI-compatible API endpoint (LM Studio, vLLM, local gateways, etc.).',
+    requiresKey: false,
+    supportsEndpoint: true,
+    allowMultiple: true,
+    optionalKey: true,
+    icon: '+',
+    category: 'custom',
+  },
+]
+
+export const STARTER_AGENT_TOOLS = [
+  'memory',
+  'files',
+  'execute',
+  'web_search',
+  'web_fetch',
+  'browser',
+  'manage_agents',
+  'manage_tasks',
+  'manage_schedules',
+  'schedule_wake',
+  'manage_skills',
+  'manage_connectors',
+  'manage_sessions',
+  'manage_secrets',
+  'manage_documents',
+  'manage_webhooks',
+  'claude_code',
+  'codex_cli',
+  'opencode_cli',
+  'gemini_cli',
+  'copilot_cli',
+  'droid_cli',
+  'cursor_cli',
+  'qwen_code_cli',
+  'openclaw_workspace',
+]
+
+export const SWARMCLAW_ASSISTANT_PROMPT = `You are the default SwarmClaw assistant inside the SwarmClaw dashboard.
+
+Primary objective:
+- Help the user operate SwarmClaw itself before anything else.
+
+When the user asks about SwarmClaw, prioritize concrete guidance with exact UI paths and commands:
+- Sessions: create, configure provider/model, and run chats.
+- Agents: create specialist agents, set provider/model, tools, prompts, and delegation.
+- Providers: connect API keys/endpoints, troubleshoot auth/model issues.
+- Tasks + Schedules: queue work and automate recurring runs.
+- Skills + Connectors + Webhooks + Secrets + Memory: explain when to use each and how to configure safely.
+
+Behavior:
+- Be concise, direct, and action-oriented.
+- If the request is ambiguous, ask one focused clarifying question.
+- Prefer step-by-step instructions that can be executed immediately.
+- When the user asks for direct execution (for example browsing, screenshots, research, or file edits), use available tools and return real results instead of only describing what to do.
+- If a capability depends on provider/tool configuration, call that out explicitly.`
+
+const PERSONAL_ASSISTANT_PROMPT = `You are a personal AI copilot inside SwarmClaw.
+
+Primary objective:
+- Help the user make progress on whatever matters to them, whether that is research, planning, writing, building, organizing life admin, or running a business.
+
+Behavior:
+- Start from the user's intent, not from the tooling.
+- Turn vague goals into concrete next steps.
+- When useful, suggest tasks, schedules, or specialist agents, but do not force control-plane workflow on the user.
+- Stay concise, practical, and execution-oriented.`
+
+const RESEARCH_PROMPT = `You are a research copilot inside SwarmClaw.
+
+Primary objective:
+- Gather facts, compare options, summarize findings, and keep the user's work organized.
+
+Behavior:
+- Clarify the research question when needed.
+- Prefer structured findings, tradeoffs, and source-backed summaries.
+- Capture useful outputs in files or tasks when that helps the user continue.`
+
+const BUILDER_PROMPT = `You are a builder agent inside SwarmClaw.
+
+Primary objective:
+- Help the user design, implement, debug, and ship software or technical projects.
+
+Behavior:
+- Move from goal to concrete implementation steps quickly.
+- Use code, files, browser, and task tooling when helpful.
+- Surface blockers, assumptions, and verification clearly.`
+
+const REVIEWER_PROMPT = `You are a reviewer agent inside SwarmClaw.
+
+Primary objective:
+- Review plans, code, documents, and outputs for quality, correctness, and risk.
+
+Behavior:
+- Focus first on bugs, regressions, gaps, and unclear assumptions.
+- Be direct and specific.
+- Offer concrete follow-up actions when you find issues.`
+
+const WRITER_PROMPT = `You are a writing copilot inside SwarmClaw.
+
+Primary objective:
+- Help the user draft, refine, and structure written work for clarity and impact.
+
+Behavior:
+- Adapt tone, format, and level of detail to the user's context.
+- Suggest outlines, drafts, revisions, and packaging for different channels.
+- Keep momentum high and avoid generic filler.`
+
+const EDITOR_PROMPT = `You are an editor inside SwarmClaw.
+
+Primary objective:
+- Improve drafts for clarity, structure, tone, and quality.
+
+Behavior:
+- Tighten weak writing, call out inconsistencies, and preserve the intended voice.
+- Give concise, high-signal edits and rationale.
+- Flag missing evidence or unclear claims when relevant.`
+
+const OPERATOR_PROMPT = `You are an operations-focused SwarmClaw operator.
+
+Primary objective:
+- Keep work moving across agents, tasks, schedules, and approvals without losing sight of the user's real goals.
+
+Behavior:
+- Monitor progress, surface bottlenecks, and delegate when appropriate.
+- Be explicit about what is blocked, what is running, and what should happen next.
+- Treat the control plane as a means to an end, not the end itself.`
+
+export type OnboardingPath = 'quick' | 'intent' | 'manual'
+
+export interface OnboardingPathOption {
+  id: OnboardingPath
+  title: string
+  description: string
+  detail: string
+  badge?: string
+}
+
+export const ONBOARDING_PATHS: OnboardingPathOption[] = [
+  {
+    id: 'quick',
+    title: 'Quick Start',
+    description: 'Provider first, one starter kit, fastest path into chat.',
+    detail: 'Best when you already know which provider you want and want to get moving quickly.',
+    badge: 'Fastest',
+  },
+  {
+    id: 'intent',
+    title: 'Goal-Driven Setup',
+    description: 'Choose a starter team around what you want to accomplish.',
+    detail: 'Best when you know the outcome you want but want SwarmClaw to start from a stronger template.',
+    badge: 'Guided',
+  },
+  {
+    id: 'manual',
+    title: 'Custom Setup',
+    description: 'Configure providers first and choose whether to start blank or from a template.',
+    detail: 'Best for advanced users who want control over the initial setup and agent mix.',
+  },
+]
+
+export interface StarterKitAgentTemplate {
+  id: string
+  name: string
+  description: string
+  systemPrompt: string
+  tools: string[]
+  capabilities?: string[]
+  recommendedProviders?: SetupProvider[]
+  delegationEnabled?: boolean
+}
+
+export interface StarterKit {
+  id: string
+  name: string
+  description: string
+  detail: string
+  badge?: string
+  recommendedFor?: OnboardingPath[]
+  agents: StarterKitAgentTemplate[]
+}
+
+const PERSONAL_AGENT_TOOLS = [
+  'memory',
+  'files',
+  'execute',
+  'web_search',
+  'web_fetch',
+  'browser',
+  'manage_tasks',
+  'manage_schedules',
+  'manage_documents',
+]
+
+const RESEARCH_AGENT_TOOLS = [
+  'memory',
+  'files',
+  'execute',
+  'web_search',
+  'web_fetch',
+  'browser',
+  'manage_tasks',
+  'manage_documents',
+]
+
+const BUILDER_AGENT_TOOLS = [
+  'memory',
+  'files',
+  'execute',
+  'web_search',
+  'web_fetch',
+  'browser',
+  'manage_tasks',
+  'claude_code',
+  'codex_cli',
+  'opencode_cli',
+  'gemini_cli',
+  'copilot_cli',
+  'droid_cli',
+  'cursor_cli',
+  'qwen_code_cli',
+]
+
+const INBOX_TRIAGE_PROMPT = `You are an inbox triage copilot inside SwarmClaw.
+
+Primary objective:
+- Sort incoming email, messages, and notifications so the user only sees what needs their attention.
+
+Behavior:
+- Classify items by urgency, topic, and whether they need a reply.
+- Draft short reply candidates for the user to approve when appropriate.
+- Surface clear summaries and action lists instead of raw firehose.
+- Stop and ask the user before sending on their behalf.`
+
+const DATA_ANALYST_PROMPT = `You are a data analyst inside SwarmClaw.
+
+Primary objective:
+- Help the user explore, clean, and summarize data, producing concise findings and charts when useful.
+
+Behavior:
+- Prefer working in a shell (python/pandas) or via files, showing intermediate results.
+- State the question before computing, and flag limitations or assumptions.
+- Summarize insights with simple prose plus key numbers.
+- When useful, save artifacts (CSV, markdown, PNG) to the working directory.`
+
+const INBOX_AGENT_TOOLS = [
+  'memory',
+  'files',
+  'web_search',
+  'web_fetch',
+  'email',
+  'manage_tasks',
+  'manage_documents',
+]
+
+const DATA_ANALYST_TOOLS = [
+  'memory',
+  'files',
+  'execute',
+  'web_search',
+  'web_fetch',
+  'manage_tasks',
+  'manage_documents',
+]
+
+const OPERATOR_AGENT_TOOLS = STARTER_AGENT_TOOLS
+const OPENCLAW_AGENT_TOOLS = [
+  'memory',
+  'files',
+  'execute',
+  'web_search',
+  'web_fetch',
+  'browser',
+  'manage_tasks',
+  'manage_schedules',
+  'manage_sessions',
+  'openclaw_workspace',
+]
+
+export const STARTER_KITS: StarterKit[] = [
+  {
+    id: 'personal_assistant',
+    name: 'Personal Assistant',
+    description: 'One flexible agent for open-ended work.',
+    detail: 'A strong default for general planning, research, writing, and day-to-day execution.',
+    badge: 'Recommended',
+    recommendedFor: ['quick', 'intent'],
+    agents: [
+      {
+        id: 'sidekick',
+        name: 'Sidekick',
+        description: 'A versatile assistant for everyday work, planning, and follow-through.',
+        systemPrompt: PERSONAL_ASSISTANT_PROMPT,
+        tools: PERSONAL_AGENT_TOOLS,
+        capabilities: ['planning', 'research', 'writing', 'coordination'],
+      },
+    ],
+  },
+  {
+    id: 'research_copilot',
+    name: 'Research Copilot',
+    description: 'A focused setup for investigation and synthesis.',
+    detail: 'Useful for market scans, comparisons, technical investigation, and source-backed summaries.',
+    recommendedFor: ['quick', 'intent', 'manual'],
+    agents: [
+      {
+        id: 'researcher',
+        name: 'Researcher',
+        description: 'Collects facts, compares options, and produces structured findings.',
+        systemPrompt: RESEARCH_PROMPT,
+        tools: RESEARCH_AGENT_TOOLS,
+        capabilities: ['research', 'analysis', 'summarization'],
+      },
+    ],
+  },
+  {
+    id: 'builder_studio',
+    name: 'Builder Studio',
+    description: 'Start with a builder and a reviewer.',
+    detail: 'Good for coding, prototyping, product work, and technical iteration.',
+    recommendedFor: ['quick', 'intent', 'manual'],
+    agents: [
+      {
+        id: 'builder',
+        name: 'Builder',
+        description: 'Implements ideas, ships changes, and drives technical execution.',
+        systemPrompt: BUILDER_PROMPT,
+        tools: BUILDER_AGENT_TOOLS,
+        capabilities: ['coding', 'debugging', 'implementation'],
+        recommendedProviders: ['anthropic', 'openai', 'google', 'openclaw', 'ollama'],
+      },
+      {
+        id: 'reviewer',
+        name: 'Reviewer',
+        description: 'Reviews plans and outputs for bugs, regressions, and quality gaps.',
+        systemPrompt: REVIEWER_PROMPT,
+        tools: RESEARCH_AGENT_TOOLS,
+        capabilities: ['review', 'testing', 'risk assessment'],
+        recommendedProviders: ['anthropic', 'openai', 'google', 'openclaw'],
+      },
+    ],
+  },
+  {
+    id: 'content_studio',
+    name: 'Content Studio',
+    description: 'A writer and editor working together.',
+    detail: 'Useful for blogs, marketing copy, docs, newsletters, and publishing workflows.',
+    recommendedFor: ['intent', 'manual'],
+    agents: [
+      {
+        id: 'writer',
+        name: 'Writer',
+        description: 'Drafts content, outlines, and messaging in the user’s preferred style.',
+        systemPrompt: WRITER_PROMPT,
+        tools: PERSONAL_AGENT_TOOLS,
+        capabilities: ['writing', 'messaging', 'structuring'],
+      },
+      {
+        id: 'editor',
+        name: 'Editor',
+        description: 'Improves structure, tone, and quality before publishing.',
+        systemPrompt: EDITOR_PROMPT,
+        tools: RESEARCH_AGENT_TOOLS,
+        capabilities: ['editing', 'quality control', 'review'],
+      },
+    ],
+  },
+  {
+    id: 'operator_swarm',
+    name: 'Delegate Team',
+    description: 'A coordinator plus an execution agent for multi-agent work.',
+    detail: 'Use this when you want one agent to plan and delegate while another handles focused execution.',
+    recommendedFor: ['intent', 'manual'],
+    agents: [
+      {
+        id: 'operator',
+        name: 'Operator',
+        description: 'Coordinates tasks, delegates work, and keeps the workspace moving.',
+        systemPrompt: OPERATOR_PROMPT,
+        tools: OPERATOR_AGENT_TOOLS,
+        capabilities: ['coordination', 'delegation', 'operations'],
+        delegationEnabled: true,
+        recommendedProviders: ['openclaw', 'anthropic', 'openai'],
+      },
+      {
+        id: 'maker',
+        name: 'Maker',
+        description: 'Executes focused work items assigned by the user or other agents.',
+        systemPrompt: BUILDER_PROMPT,
+        tools: BUILDER_AGENT_TOOLS,
+        capabilities: ['execution', 'implementation', 'research'],
+      },
+    ],
+  },
+  {
+    id: 'openclaw_fleet',
+    name: 'OpenClaw Fleet',
+    description: 'An OpenClaw-first starter setup for local or remote gateways.',
+    detail: 'Designed for users who want multiple OpenClaw-backed agents right away, with official-only local deploy, single-VPS, and private-tailnet defaults built into setup.',
+    recommendedFor: ['manual'],
+    badge: 'OpenClaw',
+    agents: [
+      {
+        id: 'openclaw_operator',
+        name: 'OpenClaw Operator',
+        description: 'Coordinates OpenClaw-backed execution and keeps distributed agents aligned.',
+        systemPrompt: OPERATOR_PROMPT,
+        tools: OPERATOR_AGENT_TOOLS,
+        capabilities: ['coordination', 'delegation', 'openclaw'],
+        delegationEnabled: true,
+        recommendedProviders: ['openclaw'],
+      },
+      {
+        id: 'openclaw_builder',
+        name: 'Remote Builder',
+        description: 'A build-focused OpenClaw agent for implementation work on a chosen gateway.',
+        systemPrompt: BUILDER_PROMPT,
+        tools: OPENCLAW_AGENT_TOOLS,
+        capabilities: ['coding', 'implementation', 'openclaw'],
+        recommendedProviders: ['openclaw'],
+      },
+      {
+        id: 'openclaw_researcher',
+        name: 'Remote Researcher',
+        description: 'A research-focused OpenClaw agent for browser and knowledge work on a chosen gateway.',
+        systemPrompt: RESEARCH_PROMPT,
+        tools: OPENCLAW_AGENT_TOOLS,
+        capabilities: ['research', 'analysis', 'openclaw'],
+        recommendedProviders: ['openclaw'],
+      },
+    ],
+  },
+  {
+    id: 'inbox_triage',
+    name: 'Inbox Triager',
+    description: 'A single agent that sorts and summarizes your inbox.',
+    detail: 'Good when messages pile up faster than you can read them. Pairs well with the email connector.',
+    recommendedFor: ['intent', 'manual'],
+    agents: [
+      {
+        id: 'triager',
+        name: 'Triager',
+        description: 'Triages inbound messages into urgent, reply-needed, and informational buckets.',
+        systemPrompt: INBOX_TRIAGE_PROMPT,
+        tools: INBOX_AGENT_TOOLS,
+        capabilities: ['triage', 'summarization', 'drafting'],
+      },
+    ],
+  },
+  {
+    id: 'data_analyst',
+    name: 'Data Analyst',
+    description: 'A single agent focused on exploring and summarizing data.',
+    detail: 'Useful for ad-hoc analysis, CSV crunching, and producing concise findings with charts.',
+    recommendedFor: ['intent', 'manual'],
+    agents: [
+      {
+        id: 'analyst',
+        name: 'Analyst',
+        description: 'Runs exploratory analyses, cleans datasets, and writes short summaries with key numbers.',
+        systemPrompt: DATA_ANALYST_PROMPT,
+        tools: DATA_ANALYST_TOOLS,
+        capabilities: ['analysis', 'summarization', 'visualization'],
+      },
+    ],
+  },
+  {
+    id: 'blank_workspace',
+    name: 'Blank Workspace',
+    description: 'Finish setup without starter agents.',
+    detail: 'Use this if you want to land in the app first and create providers, agents, and workflows yourself.',
+    recommendedFor: ['manual'],
+    badge: 'Blank',
+    agents: [],
+  },
+]
+
+export interface DefaultAgentConfig {
+  name: string
+  description: string
+  systemPrompt: string
+  model: string
+  tools: string[]
+}
+
+const CLI_DEFAULT_AGENTS = Object.fromEntries(CLI_PROVIDER_METADATA.map((provider) => [
+  provider.id,
+  {
+    name: provider.displayName.endsWith(' CLI') ? provider.displayName.slice(0, -4) : provider.displayName,
+    description: `A helpful assistant powered by ${provider.displayName}.`,
+    systemPrompt: SWARMCLAW_ASSISTANT_PROMPT,
+    model: provider.defaultModel,
+    tools: STARTER_AGENT_TOOLS,
+  },
+])) as Record<CliProviderId, DefaultAgentConfig>
+
+export const DEFAULT_AGENTS = {
+  ...CLI_DEFAULT_AGENTS,
+  'opencode-web': {
+    name: 'OpenCode Web',
+    description: 'A helpful assistant powered by a remote OpenCode HTTP server.',
+    systemPrompt: SWARMCLAW_ASSISTANT_PROMPT,
+    model: 'anthropic/claude-sonnet-4-6',
+    tools: STARTER_AGENT_TOOLS,
+  },
+  anthropic: {
+    name: 'Claude',
+    description: 'A helpful Claude-powered assistant.',
+    systemPrompt: SWARMCLAW_ASSISTANT_PROMPT,
+    model: 'claude-sonnet-4-6',
+    tools: STARTER_AGENT_TOOLS,
+  },
+  openai: {
+    name: 'Atlas',
+    description: 'A helpful GPT-powered assistant.',
+    systemPrompt: SWARMCLAW_ASSISTANT_PROMPT,
+    model: 'gpt-5.4',
+    tools: STARTER_AGENT_TOOLS,
+  },
+  openrouter: {
+    name: 'Router',
+    description: 'A helpful assistant powered through OpenRouter.',
+    systemPrompt: SWARMCLAW_ASSISTANT_PROMPT,
+    model: 'anthropic/claude-sonnet-4.6',
+    tools: STARTER_AGENT_TOOLS,
+  },
+  tokenmix: {
+    name: 'TokenMix Agent',
+    description: 'A helpful assistant powered through TokenMix.',
+    systemPrompt: SWARMCLAW_ASSISTANT_PROMPT,
+    model: 'claude-sonnet-4-6',
+    tools: STARTER_AGENT_TOOLS,
+  },
+  google: {
+    name: 'Gemini',
+    description: 'A helpful Gemini-powered assistant.',
+    systemPrompt: SWARMCLAW_ASSISTANT_PROMPT,
+    model: 'gemini-3.1-pro',
+    tools: STARTER_AGENT_TOOLS,
+  },
+  deepseek: {
+    name: 'DeepSeek',
+    description: 'A helpful DeepSeek-powered assistant.',
+    systemPrompt: SWARMCLAW_ASSISTANT_PROMPT,
+    model: 'deepseek-chat',
+    tools: STARTER_AGENT_TOOLS,
+  },
+  groq: {
+    name: 'Bolt',
+    description: 'A low-latency assistant powered by Groq.',
+    systemPrompt: SWARMCLAW_ASSISTANT_PROMPT,
+    model: 'meta-llama/llama-4-maverick-17b-128e-instruct',
+    tools: STARTER_AGENT_TOOLS,
+  },
+  together: {
+    name: 'Mosaic',
+    description: 'A helpful assistant powered by Together AI.',
+    systemPrompt: SWARMCLAW_ASSISTANT_PROMPT,
+    model: 'meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8',
+    tools: STARTER_AGENT_TOOLS,
+  },
+  mistral: {
+    name: 'Mistral',
+    description: 'A helpful assistant powered by Mistral.',
+    systemPrompt: SWARMCLAW_ASSISTANT_PROMPT,
+    model: 'mistral-large-latest',
+    tools: STARTER_AGENT_TOOLS,
+  },
+  xai: {
+    name: 'Grok',
+    description: 'A helpful assistant powered by xAI Grok.',
+    systemPrompt: SWARMCLAW_ASSISTANT_PROMPT,
+    model: 'grok-4',
+    tools: STARTER_AGENT_TOOLS,
+  },
+  fireworks: {
+    name: 'Spark',
+    description: 'A helpful assistant powered by Fireworks AI.',
+    systemPrompt: SWARMCLAW_ASSISTANT_PROMPT,
+    model: 'accounts/fireworks/models/deepseek-v3p2',
+    tools: STARTER_AGENT_TOOLS,
+  },
+  nebius: {
+    name: 'Nebius Agent',
+    description: 'A helpful assistant powered by Nebius.',
+    systemPrompt: SWARMCLAW_ASSISTANT_PROMPT,
+    model: 'deepseek-ai/DeepSeek-V3.2',
+    tools: STARTER_AGENT_TOOLS,
+  },
+  deepinfra: {
+    name: 'DeepInfra Agent',
+    description: 'A helpful assistant powered by DeepInfra.',
+    systemPrompt: SWARMCLAW_ASSISTANT_PROMPT,
+    model: 'deepseek-ai/DeepSeek-V3.2',
+    tools: STARTER_AGENT_TOOLS,
+  },
+  ollama: {
+    name: 'Local',
+    description: 'A local assistant running through Ollama.',
+    systemPrompt: SWARMCLAW_ASSISTANT_PROMPT,
+    model: 'llama3',
+    tools: STARTER_AGENT_TOOLS,
+  },
+  openclaw: {
+    name: 'OpenClaw Operator',
+    description: 'A manager agent for talking to and coordinating OpenClaw instances.',
+    systemPrompt: 'You are an operator focused on reliable execution, clear status updates, and task completion.',
+    model: '',
+    tools: STARTER_AGENT_TOOLS,
+  },
+  hermes: {
+    name: 'Hermes',
+    description: 'A runtime-backed assistant powered by Hermes Agent.',
+    systemPrompt: SWARMCLAW_ASSISTANT_PROMPT,
+    model: 'hermes-agent',
+    tools: STARTER_AGENT_TOOLS,
+  },
+  lmstudio: {
+    name: 'LM Studio',
+    description: 'A local assistant running through LM Studio.',
+    systemPrompt: SWARMCLAW_ASSISTANT_PROMPT,
+    model: 'local-model',
+    tools: STARTER_AGENT_TOOLS,
+  },
+  custom: {
+    name: 'Custom Agent',
+    description: 'An assistant powered by a custom OpenAI-compatible provider.',
+    systemPrompt: SWARMCLAW_ASSISTANT_PROMPT,
+    model: '',
+    tools: STARTER_AGENT_TOOLS,
+  },
+} satisfies Record<SetupProvider, DefaultAgentConfig>
+
+export function getDefaultModelForProvider(provider: SetupProvider): string {
+  return DEFAULT_AGENTS[provider].model
+}

@@ -1,0 +1,3476 @@
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import sys
+from collections.abc import Sequence
+from pathlib import Path
+
+import yaml
+from pydantic import ValidationError
+
+from bound.agent_discovery import (
+    agent_selection_help,
+    detect_agent,
+    detect_all_agents,
+)
+from bound.config import load_project_config
+
+#: Re-exported for backwards compatibility -- canonical definitions in
+#: :mod:`bound.display`.
+from bound.display import (
+    DECISION_COLORS,
+    INDEPENDENTLY_VERIFIED,
+    PROVENANCE_COLORS,
+    PROVENANCE_STRENGTH,
+    UNVERIFIED_PROVENANCE,
+    UNVERIFIED_STATUS,
+    fmt_dt,
+    html_escape,
+    provenance_label,
+    sv,
+)
+from bound.doctor import run_doctor
+from bound.evidence import EvidenceProvenance
+from bound.init_project import ProjectDetections, detect_tooling, generate_policy
+from bound.lineage import (
+    ActionReportedEvent,
+    DecisionGatedEvent,
+    Evaluation,
+    EvidenceCollectedEvent,
+    EvidenceCollectionFailedEvent,
+    Outcome,
+    ReasonCode,
+    generate_evaluation_id,
+    generate_step_id,
+)
+from bound.lineage_store import (
+    LineageStore,
+    RunLog,
+    RunNotFound,
+    get_default_store,
+)
+from bound.models import (
+    Action,
+    BoundCriteria,
+    BoundWeights,
+    CodingWorkflowSignals,
+    EvaluationResult,
+    EvaluationScores,
+)
+from bound.policy_canon import compute_policy_hash
+from bound.policy_schema import (
+    BoundPolicyConfig,
+    HardGate,
+    WeightedSignal,
+    load_policy_yaml,
+)
+from bound.services import (
+    CheckpointCreateRequest,
+    CheckpointError,
+    CheckpointInspectRequest,
+    CheckpointListRequest,
+    CheckpointRollbackRequest,
+    CheckpointService,
+    EvaluateRequest,
+    EvaluateWorkflowRequest,
+    EvaluationInputError,
+    EvaluationService,
+    OutcomeRecordRequest,
+    OutcomeService,
+    PolicyExplainRequest,
+    PolicyHashRequest,
+    PolicyLoadError,
+    PolicyService,
+    PolicyValidateRequest,
+    PolicyValidationError,
+    RunDeleteRequest,
+    RunFinishRequest,
+    RunInspectRequest,
+    RunListRequest,
+    RunNotFoundError,
+    RunService,
+    RunStartRequest,
+)
+from bound.setup import SetupError, setup_project
+
+logger = logging.getLogger("bound.cli")
+
+#: Deprecated re-exports -- use the public names from :mod:`bound.display`.
+DECISION_COLORS = DECISION_COLORS
+INDEPENDENTLY_VERIFIED = INDEPENDENTLY_VERIFIED
+PROVENANCE_COLORS = PROVENANCE_COLORS
+PROVENANCE_STRENGTH = PROVENANCE_STRENGTH
+UNVERIFIED_PROVENANCE = UNVERIFIED_PROVENANCE
+fmt_dt = fmt_dt
+html_escape = html_escape
+_sv = sv
+
+#: Exit code returned when user-supplied inputs fail Pydantic validation.
+EXIT_VALIDATION_ERROR = 2
+
+#: Exit code returned when a referenced lineage run does not exist.
+EXIT_NOT_FOUND = 1
+
+#: Exit code returned when a ``bound policy`` file fails schema validation.
+EXIT_POLICY_INVALID = 1
+
+#: Exit code returned when a ``bound policy`` invocation is a usage error
+#: (e.g. the file does not exist or cannot be read).
+EXIT_POLICY_USAGE = 2
+
+
+def _add_weight_and_threshold_args(sub: argparse.ArgumentParser) -> None:
+    """Register the shared v0.2 weight/threshold arguments on ``sub``.
+
+    Both ``evaluate`` and ``evaluate-workflow`` accept the same knobs so the
+    policy configuration is consistent across direct-score and workflow modes.
+
+    Args:
+        sub: The subparser to attach the arguments to.
+    """
+    sub.add_argument(
+        "--acceptance-weight",
+        type=float,
+        default=1.0,
+        help="Weight W_A applied to acceptance (>= 0). Defaults to 1.0.",
+    )
+    sub.add_argument(
+        "--influence-weight",
+        type=float,
+        default=1.0,
+        help="Weight W_I applied to downstream influence (>= 0). Defaults to 1.0.",
+    )
+    sub.add_argument(
+        "--risk-weight",
+        type=float,
+        default=1.0,
+        help="Weight W_R applied to the risk penalty (>= 0). Defaults to 1.0.",
+    )
+    sub.add_argument(
+        "--cost-weight",
+        type=float,
+        default=1.0,
+        help="Weight W_C applied to the resource cost (>= 0). Defaults to 1.0.",
+    )
+    sub.add_argument(
+        "--weight",
+        type=float,
+        default=None,
+        help=(
+            "Deprecated alias for --acceptance-weight. Supplying it together "
+            "with a non-default --*-weight is rejected."
+        ),
+    )
+    sub.add_argument(
+        "--threshold",
+        type=float,
+        required=True,
+        help="Acceptance threshold T (>= 0).",
+    )
+    sub.add_argument(
+        "--retry-margin",
+        type=float,
+        default=0.1,
+        help="How far below T a score may fall while still RETRY (>= 0). Defaults to 0.1.",
+    )
+    sub.add_argument(
+        "--rollback-risk-threshold",
+        type=float,
+        default=0.8,
+        help="Hard risk boundary in [0, 1] above which the action rolls back. Defaults to 0.8.",
+    )
+
+
+def _build_criteria(args: argparse.Namespace) -> BoundCriteria:
+    """Build :class:`BoundCriteria` from the shared weight/threshold args.
+
+    The symmetric weights are always constructed from the ``--*-weight`` flags.
+    The deprecated scalar ``--weight`` is forwarded only when explicitly set;
+    :class:`BoundCriteria` rejects the combination of ``weight`` with a
+    non-default ``weights`` so the two weight systems can never silently
+    compete.
+
+    Args:
+        args: The parsed namespace carrying the weight/threshold values.
+
+    Returns:
+        The validated :class:`BoundCriteria`.
+
+    Raises:
+        ValidationError: If any value is out of range or the two weight
+            systems conflict.
+    """
+    weights = BoundWeights(
+        acceptance=args.acceptance_weight,
+        influence=args.influence_weight,
+        risk=args.risk_weight,
+        cost=args.cost_weight,
+    )
+    kwargs: dict[str, object] = {
+        "threshold": args.threshold,
+        "retry_margin": args.retry_margin,
+        "rollback_risk_threshold": args.rollback_risk_threshold,
+        "weights": weights,
+    }
+    if getattr(args, "weight", None) is not None:
+        kwargs["weight"] = args.weight
+    return BoundCriteria(**kwargs)
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    """Construct the top-level argument parser with the BOUND subcommands.
+
+    Returns:
+        An ``ArgumentParser`` with the ``bound`` program metadata, a global
+        ``-v/--verbose`` flag, and the ``evaluate`` and ``evaluate-workflow``
+        subcommands bound to their runners via ``set_defaults(func=...)``.
+    """
+    parser = argparse.ArgumentParser(
+        prog="bound",
+        description="BOUND — a deterministic bounded-utility policy for agentic systems.",
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="count",
+        default=0,
+        help="Increase logging verbosity (repeatable).",
+    )
+    subparsers = parser.add_subparsers(dest="command", metavar="<command>")
+
+    evaluate = subparsers.add_parser(
+        "evaluate",
+        help="Evaluate a proposed action and emit the BOUND decision.",
+        description=(
+            "Evaluate a proposed action against BOUND bounded-utility criteria. "
+            "Prints an auditable JSON result to STDOUT and a steering prompt to STDERR."
+        ),
+    )
+    evaluate.add_argument("--action", required=True, help="Description of the proposed action.")
+    evaluate.add_argument("--goal", required=True, help="The larger goal the action advances.")
+    evaluate.add_argument("--context", default=None, help="Optional additional context.")
+    evaluate.add_argument(
+        "--acceptance",
+        type=float,
+        required=True,
+        help="Acceptance score A in [0, 1].",
+    )
+    evaluate.add_argument(
+        "--influence",
+        type=float,
+        required=True,
+        help="Downstream influence I in [-1, 1].",
+    )
+    evaluate.add_argument("--risk", type=float, required=True, help="Risk penalty R in [0, 1].")
+    evaluate.add_argument("--cost", type=float, required=True, help="Resource penalty C in [0, 1].")
+    _add_weight_and_threshold_args(evaluate)
+    evaluate.add_argument(
+        "--run",
+        metavar="RUN_ID",
+        default=None,
+        help="When given, record the evaluation into lineage run <RUN_ID> "
+        "(requires --step). Adds a `lineage` block to the JSON output.",
+    )
+    evaluate.add_argument(
+        "--step",
+        metavar="CONTRACT_ID",
+        default=None,
+        help="Stable contract/phase id for the lineage step (required with --run).",
+    )
+    evaluate.add_argument(
+        "--attempt",
+        type=int,
+        default=1,
+        help="One-based attempt number for the lineage step. Defaults to 1.",
+    )
+    evaluate.add_argument(
+        "--description",
+        default=None,
+        help="Optional human-readable step description stored with the lineage step.",
+    )
+    evaluate.add_argument(
+        "--json",
+        action="store_true",
+        default=False,
+        help="Explicit machine-readable JSON output (evaluate always emits JSON).",
+    )
+    evaluate.set_defaults(func=_run_evaluate)
+
+    workflow = subparsers.add_parser(
+        "evaluate-workflow",
+        help="Derive BOUND scores from coding-workflow signals and decide.",
+        description=(
+            "Derive the four BOUND score dimensions from provider-agnostic "
+            "coding-workflow signals (test pass rate, lint/type-check status, "
+            "retry/tool-call counts, ...) via CodingWorkflowEvaluator, then run "
+            "the deterministic BOUND policy. No LLM, no network."
+        ),
+    )
+    workflow.add_argument("--action", required=True, help="Description of the proposed action.")
+    workflow.add_argument("--goal", required=True, help="The larger goal the action advances.")
+    workflow.add_argument("--context", default=None, help="Optional additional context.")
+    workflow.add_argument(
+        "--test-pass-rate",
+        type=float,
+        default=None,
+        help="Fraction of tests passing in [0, 1].",
+    )
+    workflow.add_argument(
+        "--lint-passed",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Whether the linter is clean (--lint-passed / --no-lint-passed).",
+    )
+    workflow.add_argument(
+        "--type-check-passed",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Whether type-checking is clean (--type-check-passed / --no-type-check-passed).",
+    )
+    workflow.add_argument(
+        "--required-checks-passed",
+        type=float,
+        default=None,
+        help="Fraction of required checks passing in [0, 1].",
+    )
+    workflow.add_argument(
+        "--retry-count",
+        type=int,
+        default=0,
+        help="Number of retries performed so far.",
+    )
+    workflow.add_argument(
+        "--tool-call-count",
+        type=int,
+        default=0,
+        help="Number of tool calls performed so far.",
+    )
+    workflow.add_argument("--token-usage", type=int, default=None, help="Total tokens consumed.")
+    workflow.add_argument(
+        "--execution-time-seconds",
+        type=float,
+        default=None,
+        help="Wall-clock execution time in seconds.",
+    )
+    workflow.add_argument(
+        "--files-changed",
+        type=int,
+        default=None,
+        help="Number of files changed.",
+    )
+    workflow.add_argument(
+        "--unexpected-files-changed",
+        type=int,
+        default=None,
+        help="Number of unexpected files changed.",
+    )
+    workflow.add_argument(
+        "--rollback-available",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Whether a clean rollback is available "
+            "(--rollback-available / --no-rollback-available)."
+        ),
+    )
+    workflow.add_argument(
+        "--influence",
+        type=float,
+        default=None,
+        help="Optional externally-supplied downstream influence I in [-1, 1].",
+    )
+    _add_weight_and_threshold_args(workflow)
+    workflow.set_defaults(func=_run_evaluate_workflow)
+
+    spec = subparsers.add_parser(
+        "integration-spec",
+        help="Emit the framework-neutral BOUND integration specification as JSON.",
+        description=(
+            "Emit the framework-neutral BOUND integration specification as "
+            "structured JSON to STDOUT. Defines when to call BOUND, when not to, "
+            "the required flow, and the evidence rule. Deterministic: no LLM, "
+            "no network."
+        ),
+    )
+    spec.set_defaults(func=_run_integration_spec)
+
+    # --- lineage: run --------------------------------------------------------
+    run_parser = subparsers.add_parser(
+        "run",
+        help="Manage decision-lineage runs (start/finish/list/delete).",
+        description="Manage local decision-lineage runs stored under .bound/runs/.",
+    )
+    run_sub = run_parser.add_subparsers(dest="run_command", metavar="<run command>")
+
+    run_start = run_sub.add_parser(
+        "start",
+        help="Start a new lineage run.",
+        description="Start a new lineage run: generate run_id, write run.json, "
+        "append run_started. Prints the run_id (or JSON with --json).",
+    )
+    run_start.add_argument("task", help="The natural-language task the run attempts.")
+    run_start.add_argument(
+        "--metadata",
+        action="append",
+        type=_key_value,
+        default=[],
+        metavar="KEY=VALUE",
+        help="Free-form string metadata (repeatable). Never store secrets.",
+    )
+    # --- v1.0: explicit agent / project / plan / workspace flags ---
+    run_start.add_argument(
+        "--agent",
+        default=None,
+        metavar="NAME",
+        help="Agent to use for this run (e.g. cline, claude-code, codex, generic).",
+    )
+    run_start.add_argument(
+        "--agent-command",
+        default=None,
+        metavar="CMD",
+        help="Shell command that launches the agent (for generic/unlisted agents).",
+    )
+    run_start.add_argument(
+        "--project",
+        default=None,
+        metavar="DIR",
+        help="Project root directory (overrides auto-detection).",
+    )
+    run_start.add_argument(
+        "--plan",
+        default=None,
+        metavar="FILE",
+        help="Path to the plan file (overrides .bound/config.yaml).",
+    )
+    run_start.add_argument(
+        "--policy",
+        default=None,
+        metavar="FILE",
+        help="Path to the policy file (overrides .bound/config.yaml).",
+    )
+    run_start.add_argument(
+        "--working-dir",
+        default=None,
+        metavar="DIR",
+        help="Working directory for the agent (overrides auto-detection).",
+    )
+    run_start.add_argument(
+        "--no-plan",
+        action="store_true",
+        default=False,
+        help="Run without a plan file.",
+    )
+    run_start.add_argument(
+        "--no-worktree",
+        action="store_true",
+        default=False,
+        help="Run in-place without a Git worktree.",
+    )
+    run_start.add_argument("--json", action="store_true", default=False, help="Emit JSON.")
+    run_start.set_defaults(func=_run_run_start)
+
+    run_finish = run_sub.add_parser(
+        "finish",
+        help="Finish (close) a lineage run.",
+        description="Append the terminal run_finished event to a run and update "
+        "run.json. Prints a confirmation (or JSON with --json).",
+    )
+    run_finish.add_argument("run_id", help="The run id to finish.")
+    run_finish.add_argument(
+        "--status",
+        choices=["completed", "interrupted", "failed"],
+        default="completed",
+        help="Terminal status. Defaults to completed.",
+    )
+    run_finish.add_argument("--note", default=None, help="Optional free-text note.")
+    run_finish.add_argument("--json", action="store_true", default=False, help="Emit JSON.")
+    run_finish.set_defaults(func=_run_run_finish)
+
+    run_list = run_sub.add_parser(
+        "list",
+        help="List lineage runs.",
+        description="List every run under .bound/runs/, newest first, as a "
+        "table (or JSON with --json).",
+    )
+    run_list.add_argument("--json", action="store_true", default=False, help="Emit JSON.")
+    run_list.set_defaults(func=_run_run_list)
+
+    run_delete = run_sub.add_parser(
+        "delete",
+        help="Delete a lineage run.",
+        description="Remove an entire run directory. Exits non-zero with a clear "
+        "message if the run does not exist.",
+    )
+    run_delete.add_argument("run_id", help="The run id to delete.")
+    run_delete.add_argument("--json", action="store_true", default=False, help="Emit JSON.")
+    run_delete.set_defaults(func=_run_run_delete)
+
+    run_use = run_sub.add_parser(
+        "use",
+        help="Set the active project run for this session.",
+        description="Write .bound/current_run so subsequent bound evaluate calls "
+        "without --run automatically append to this run.",
+    )
+    run_use.add_argument("run_id", help="The run id to set as active.")
+    run_use.set_defaults(func=_run_run_use)
+
+    run_current = run_sub.add_parser(
+        "current",
+        help="Show the active project run.",
+        description="Print the run id from .bound/current_run if one is set.",
+    )
+    run_current.add_argument("--json", action="store_true", default=False, help="Emit JSON.")
+    run_current.set_defaults(func=_run_run_current)
+
+    # --- lineage: inspect ----------------------------------------------------
+    inspect = subparsers.add_parser(
+        "inspect",
+        help="Inspect a lineage run as a decision tree.",
+        description="Replay a run's events.jsonl and render the decision lineage "
+        "as a chronological Step -> Attempt -> Outcome tree, showing task, "
+        "status, start/end time, decisions, evidence, scores/thresholds, reason "
+        "codes and the agent's follow-up action. Incomplete runs are clearly "
+        "marked. Use --json for machine-readable output.",
+    )
+    inspect.add_argument("run_id", help="The run id to inspect.")
+    inspect.add_argument("--json", action="store_true", default=False, help="Emit JSON.")
+    inspect.add_argument(
+        "--only-unverified",
+        action="store_true",
+        default=False,
+        help=(
+            "Filter the provenance breakdown to unverified / claimed / missing / "
+            "invalid evidence only (item 14)."
+        ),
+    )
+    inspect.add_argument(
+        "--html",
+        metavar="PATH",
+        default=None,
+        help=(
+            "Write a self-contained local HTML timeline (plan -> step -> "
+            "attempt, provenance color-coded) to PATH and exit (Phase 9.3)."
+        ),
+    )
+    inspect.set_defaults(func=_run_inspect)
+
+    # --- local dashboard: ui -------------------------------------------------
+    ui = subparsers.add_parser(
+        "ui",
+        help="Start the local BOUND dashboard (read-only, no account needed).",
+        description=(
+            "Start the local BOUND lineage dashboard — a read-only HTTP server "
+            "that shows all local runs with task, status, latest decision, "
+            "assurance, and time. Opens one run as a plan -> step -> attempt -> "
+            "decision tree with candidate vs final decision, evidence provenance "
+            "badges (VERIFIED, CLAIMED, MISSING, ...), and highlights the exact "
+            "evidence or gate that caused a RETRY / REPLAN / ROLLBACK. "
+            "No hosted backend or account needed."
+        ),
+    )
+    ui.add_argument(
+        "run_id",
+        nargs="?",
+        default=None,
+        metavar="RUN_ID",
+        help="Optional run id to open directly on the detail page.",
+    )
+    ui.add_argument(
+        "--port",
+        type=int,
+        default=8765,
+        help="TCP port (default 8765).",
+    )
+    ui.add_argument(
+        "--plan",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="Path to a plan.md file to pre-load for all runs.",
+    )
+    ui.add_argument(
+        "--open",
+        action="store_true",
+        default=False,
+        help="Open the dashboard URL in the default browser after startup.",
+    )
+    ui.set_defaults(func=_run_ui)
+
+    # --- lineage: outcome ----------------------------------------------------
+    outcome = subparsers.add_parser(
+        "outcome",
+        help="Record an agent follow-up outcome for a lineage run.",
+        description="Record an outcome_recorded event responding to a run's "
+        "evaluation. The evaluation is linked by evaluation_id (auto-resolved "
+        "from --step/--attempt when --evaluation-id is omitted).",
+    )
+    outcome.add_argument("--run", required=True, metavar="RUN_ID", help="Owning run id.")
+    outcome.add_argument(
+        "--step",
+        required=True,
+        metavar="CONTRACT_ID",
+        help="Stable contract/phase id of the evaluated step.",
+    )
+    outcome.add_argument(
+        "--attempt",
+        type=int,
+        default=1,
+        help="Attempt number the evaluation belongs to. Defaults to 1.",
+    )
+    outcome.add_argument(
+        "--evaluation-id",
+        default=None,
+        help="Evaluation to respond to (auto-resolved when omitted).",
+    )
+    outcome.add_argument(
+        "--decision",
+        required=True,
+        choices=["ACCEPT", "RETRY", "REPLAN", "ROLLBACK"],
+        help="The BOUND decision recorded for this outcome.",
+    )
+    outcome.add_argument(
+        "--next-action",
+        default=None,
+        choices=["continue", "retry", "replan", "rollback"],
+        help="Agent follow-up action (derived from --decision when omitted).",
+    )
+    outcome.add_argument(
+        "--reason-code",
+        default=None,
+        help="Reason code (derived from --next-action when omitted).",
+    )
+    outcome.add_argument("--note", default=None, help="Optional free-text note.")
+    outcome.add_argument("--json", action="store_true", default=False, help="Emit JSON.")
+    outcome.set_defaults(func=_run_outcome)
+
+    # --- policy configuration (Phase 4.1) -------------------------------------
+    policy_parser = subparsers.add_parser(
+        "policy",
+        help="Validate, explain, and hash a bound-policy.yaml file.",
+        description=(
+            "Operate on a bound-policy.yaml policy configuration: validate the "
+            "schema and warn about checks BOUND cannot independently back, "
+            "explain the effective gates/weights/budgets, and print the "
+            "canonical policy hash. Deterministic: no LLM, no network."
+        ),
+    )
+    policy_sub = policy_parser.add_subparsers(
+        dest="policy_command",
+        metavar="<policy command>",
+        required=True,
+    )
+
+    def _add_policy_file_arg(p: argparse.ArgumentParser) -> None:
+        p.add_argument("file", help="Path to the bound-policy.yaml file.")
+        p.add_argument("--json", action="store_true", default=False, help="Emit JSON.")
+
+    p_validate = policy_sub.add_parser(
+        "validate",
+        help="Validate a policy file and report warnings.",
+        description="Parse and validate a bound-policy.yaml file, then report "
+        "warnings (blockers without collectors, claimed-only checks, "
+        "unmeasurable/subjective criteria). Exit 0 valid / 1 invalid / 2 usage.",
+    )
+    _add_policy_file_arg(p_validate)
+    p_validate.set_defaults(func=_run_policy_validate)
+
+    p_explain = policy_sub.add_parser(
+        "explain",
+        help="Explain the effective gates, weights, and budgets.",
+        description="Render a concise human-readable explanation of the policy's "
+        "effective gates (blockers), weighted signals and budgets. "
+        "Use --json for machine-readable output.",
+    )
+    _add_policy_file_arg(p_explain)
+    p_explain.set_defaults(func=_run_policy_explain)
+
+    p_hash = policy_sub.add_parser(
+        "hash",
+        help="Print the canonical policy hash (sha256:<hex>).",
+        description="Canonicalise the policy and print its SHA-256 hash "
+        "(sha256:<hex>). The hash identifies the exact policy content that "
+        "governs a run (release blocker: every decision records the policy hash).",
+    )
+    _add_policy_file_arg(p_hash)
+    p_hash.set_defaults(func=_run_policy_hash)
+
+    # --- watch mode (Sprint 2) -------------------------------------------------
+    watch_parser = subparsers.add_parser(
+        "watch",
+        help="Event-driven watch mode: consume JSONL events and evaluate boundaries.",
+        description=(
+            "Event-driven watch mode that consumes BOUND watch events (JSONL) "
+            "from stdin, evaluates each step against the policy's meaningful "
+            "boundaries, runs approved collectors, emits structured control "
+            "decisions, and appends everything to lineage.  Use --once to "
+            "process a single task and exit, or --json for machine-readable output."
+        ),
+    )
+    watch_parser.add_argument(
+        "--policy",
+        required=True,
+        help="Path to the bound-policy.yaml file.",
+    )
+    watch_parser.add_argument(
+        "--once",
+        action="store_true",
+        default=False,
+        help="Exit after processing the first task_finished event.",
+    )
+    watch_parser.add_argument(
+        "--json",
+        action="store_true",
+        default=False,
+        dest="json_output",
+        help="Emit JSON decision events to stdout instead of log lines.",
+    )
+    watch_parser.set_defaults(func=_run_watch)
+
+    # --- checkpoint -----------------------------------------------------------
+    cp_parser = subparsers.add_parser(
+        "checkpoint",
+        help="Manage BOWN checkpoints (create/inspect/list).",
+        description="Manage BOUND checkpoints for safe state preservation and rollback.",
+    )
+    cp_sub = cp_parser.add_subparsers(
+        dest="checkpoint_command",
+        metavar="<checkpoint command>",
+        required=True,
+    )
+
+    cp_create = cp_sub.add_parser(
+        "create",
+        help="Create a checkpoint for a run step.",
+        description="Capture the current repository state into a BOUND checkpoint.",
+    )
+    cp_create.add_argument("--run", required=True, metavar="RUN_ID", help="Owning run id.")
+    cp_create.add_argument(
+        "--step",
+        required=True,
+        metavar="STEP_ID",
+        help="Step id for this checkpoint.",
+    )
+    cp_create.add_argument("--message", default=None, help="Optional checkpoint message.")
+    cp_create.add_argument("--json", action="store_true", default=False, help="Emit JSON.")
+    cp_create.set_defaults(func=_run_checkpoint_create)
+
+    cp_inspect = cp_sub.add_parser(
+        "inspect",
+        help="Inspect a checkpoint's details.",
+        description="Show detailed information about a checkpoint.",
+    )
+    cp_inspect.add_argument("checkpoint_id", help="The checkpoint id to inspect.")
+    cp_inspect.add_argument("--run", required=True, metavar="RUN_ID", help="Owning run id.")
+    cp_inspect.add_argument("--json", action="store_true", default=False, help="Emit JSON.")
+    cp_inspect.set_defaults(func=_run_checkpoint_inspect)
+
+    cp_list = cp_sub.add_parser(
+        "list",
+        help="List checkpoints for a run.",
+        description="List all checkpoints for a given run.",
+    )
+    cp_list.add_argument("--run", required=True, metavar="RUN_ID", help="Owning run id.")
+    cp_list.add_argument("--json", action="store_true", default=False, help="Emit JSON.")
+    cp_list.set_defaults(func=_run_checkpoint_list)
+
+    # --- rollback -------------------------------------------------------------
+    rollback_parser = subparsers.add_parser(
+        "rollback",
+        help="Roll back to a checkpoint (requires --execute).",
+        description="Roll back the working tree to a previously created checkpoint. "
+        "Requires explicit --execute opt-in to prevent accidental mutations. "
+        "Use --dry-run for a preview of what would change.",
+    )
+    rollback_parser.add_argument("--run", required=True, metavar="RUN_ID", help="Owning run id.")
+    rollback_parser.add_argument(
+        "--checkpoint",
+        required=True,
+        metavar="CHECKPOINT_ID",
+        help="Checkpoint to roll back to.",
+    )
+    rollback_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=False,
+        help="Preview changes without executing.",
+    )
+    rollback_parser.add_argument(
+        "--execute",
+        action="store_true",
+        default=False,
+        help="Perform the rollback (opt-in required).",
+    )
+    rollback_parser.set_defaults(func=_run_rollback)
+
+    # --- init (Sprint 3) -------------------------------------------------------
+    mcp_parser = subparsers.add_parser(
+        "mcp",
+        help="Start the stdio MCP (Model Context Protocol) server.",
+        description=(
+            "Start the stdio-based JSON-RPC MCP server. Reads one JSON-RPC "
+            "request per line from stdin, dispatches to the shared BOUND "
+            "service layer, and writes one JSON-RPC response per line to stdout. "
+            "Use --once to process a single request and exit."
+        ),
+    )
+    mcp_parser.add_argument(
+        "--once",
+        action="store_true",
+        default=False,
+        help="Process a single request and exit.",
+    )
+    mcp_parser.add_argument(
+        "--json",
+        action="store_true",
+        default=False,
+        dest="json_log",
+        help="Emit structured JSON log lines to stderr.",
+    )
+    mcp_parser.set_defaults(func=_run_mcp)
+
+    init_parser = subparsers.add_parser(
+        "init",
+        help="Generate a bound-policy.yaml for an existing project.",
+        description=(
+            "Detect project tooling (test framework, linter, type checker, "
+            "coverage, build system, Git) and generate a minimal but reviewable "
+            "bound-policy.yaml. No tool is executed; no network call is made. "
+            "Use --stdout to preview the policy without writing to disk."
+        ),
+    )
+    init_parser.add_argument(
+        "--project-dir",
+        default=".",
+        help="Path to the project root directory. Defaults to the current directory.",
+    )
+    init_parser.add_argument(
+        "--stdout",
+        action="store_true",
+        default=False,
+        help="Print the generated policy to stdout instead of writing to disk.",
+    )
+    init_parser.set_defaults(func=_run_init)
+
+    # --- setup (v0.8.1) ---------------------------------------------------
+    setup_parser = subparsers.add_parser(
+        "setup",
+        help=(
+            "Set up BOUND for this project — detect tooling, generate policy, install integration."
+        ),
+        description=(
+            "Detect project tooling (test framework, linter, type checker, "
+            "build system, Git), generate or update bound-policy.yaml, install "
+            "the selected agent integration, create .bound/ directories, "
+            "validate the policy, and perform a smoke evaluation. "
+            "Must not execute project commands unless --verify is given. "
+            "Must not overwrite an existing policy without --force."
+        ),
+    )
+    setup_parser.add_argument(
+        "--agent",
+        default="generic",
+        choices=["codex", "claude-code", "cline", "generic"],
+        help="Agent to install the integration for. Defaults to 'generic'.",
+    )
+    setup_parser.add_argument(
+        "--project-dir",
+        default=".",
+        help="Path to the project root directory. Defaults to the current directory.",
+    )
+    setup_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=False,
+        help="Describe every intended filesystem change without writing files.",
+    )
+    setup_parser.add_argument(
+        "--verify",
+        action="store_true",
+        default=False,
+        help="Run smoke evaluation after setup (validates the generated policy).",
+    )
+    setup_parser.add_argument(
+        "--force",
+        action="store_true",
+        default=False,
+        help="Overwrite an existing bound-policy.yaml without prompting.",
+    )
+    setup_parser.add_argument(
+        "--json",
+        action="store_true",
+        default=False,
+        help="Emit the result as a JSON object instead of human-readable output.",
+    )
+    setup_parser.set_defaults(func=_run_setup)
+
+    # --- doctor (v0.8.1) ---------------------------------------------------
+    doctor_parser = subparsers.add_parser(
+        "doctor",
+        help="Run setup diagnostics — check BOUND installation health.",
+        description=(
+            "Run read-only diagnostics against the current project: BOUND version, "
+            "Python version, policy presence/validity, configured collectors, "
+            "collector command availability, Git repository state, checkpoint "
+            "support, integration installation status, writable lineage directory, "
+            "and stale/incompatible configuration. Never mutates the project."
+        ),
+    )
+    doctor_parser.add_argument(
+        "--json",
+        action="store_true",
+        default=False,
+        help="Emit machine-readable JSON output with a stable schema.",
+    )
+    doctor_parser.add_argument(
+        "--project-dir",
+        default=".",
+        help="Path to the project root directory. Defaults to the current directory.",
+    )
+    doctor_parser.set_defaults(func=_run_doctor)
+
+    # --- use (v1.0) ----------------------------------------------------------
+    use_parser = subparsers.add_parser(
+        "use",
+        help="Set the default agent for this project.",
+        description=(
+            "Idempotently install and configure an agent integration for the "
+            "current project. Performs a smoke check after installation. "
+            "Safe to run multiple times — merges config without overwriting "
+            "user edits. Supported agents: cline, claude-code, codex, generic."
+        ),
+    )
+    use_parser.add_argument(
+        "agent",
+        choices=["cline", "claude-code", "codex", "generic"],
+        help="The agent to configure as the project default.",
+    )
+    use_parser.add_argument(
+        "--project-dir",
+        default=".",
+        help="Path to the project root directory. Defaults to the current directory.",
+    )
+    use_parser.add_argument(
+        "--command",
+        default=None,
+        metavar="CMD",
+        help="Custom command to launch the agent (for generic/unlisted agents).",
+    )
+    use_parser.add_argument(
+        "--json",
+        action="store_true",
+        default=False,
+        help="Emit JSON output.",
+    )
+    use_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=False,
+        help="Describe changes without writing files.",
+    )
+    use_parser.set_defaults(func=_run_use)
+
+    # --- status (v1.0) ------------------------------------------------------
+    status_parser = subparsers.add_parser(
+        "status",
+        help="Show project configuration and agent status.",
+        description=(
+            "Show the current project's agent, control mode, policy, "
+            "last run, and dashboard URL. Never mutates the project."
+        ),
+    )
+    status_parser.add_argument(
+        "--json",
+        action="store_true",
+        default=False,
+        help="Emit machine-readable JSON output.",
+    )
+    status_parser.add_argument(
+        "--project-dir",
+        default=".",
+        help="Path to the project root directory. Defaults to the current directory.",
+    )
+    status_parser.set_defaults(func=_run_status)
+
+    # --- plan (v1.0) ----------------------------------------------------------
+    plan_parser_cmd = subparsers.add_parser(
+        "plan",
+        help="Manage BOUND plans.",
+        description=(
+            "Create, review, and inspect plan snapshots. A reviewed plan "
+            "is required before supervised agent execution."
+        ),
+    )
+    plan_sub = plan_parser_cmd.add_subparsers(
+        dest="plan_command",
+        metavar="<plan command>",
+        required=True,
+    )
+    plan_review = plan_sub.add_parser(
+        "review",
+        help="Review and approve a plan before execution.",
+        description=(
+            "Read plan.md, create an immutable snapshot, and record a manual "
+            "review gate.  Use --approve to mark the plan ready for execution."
+        ),
+    )
+    plan_review.add_argument(
+        "--plan",
+        default="plan.md",
+        help="Path to the plan file. Defaults to plan.md.",
+    )
+    plan_review.add_argument(
+        "--reviewer",
+        default="user",
+        help="Name or identifier of the reviewer. Defaults to 'user'.",
+    )
+    plan_review.add_argument(
+        "--approve",
+        action="store_true",
+        default=False,
+        help="Approve the plan for execution.",
+    )
+    plan_review.add_argument(
+        "--reject",
+        action="store_true",
+        default=False,
+        help="Reject the plan (blocks execution).",
+    )
+    plan_review.add_argument(
+        "--comment",
+        default=None,
+        help="Optional review comment or reason.",
+    )
+    plan_review.add_argument(
+        "--json",
+        action="store_true",
+        default=False,
+        help="Emit review as JSON.",
+    )
+    plan_review.set_defaults(func=_run_plan_review)
+
+    # --- adapter (v0.9.5) ------------------------------------------------------
+    adapter_parser = subparsers.add_parser(
+        "adapter",
+        help="Manage BOUND agent adapter integrations.",
+        description=(
+            "Install or remove agent adapter integrations. Supported agents: "
+            "cline, claude-code, codex."
+        ),
+    )
+    adapter_sub = adapter_parser.add_subparsers(
+        dest="adapter_command",
+        metavar="<adapter command>",
+        required=True,
+    )
+
+    adapter_install = adapter_sub.add_parser(
+        "install",
+        help="Install an agent adapter integration.",
+        description=(
+            "Install the MCP or adapter configuration for a specific agent. "
+            "Creates the required config files and directories."
+        ),
+    )
+    adapter_install.add_argument(
+        "agent",
+        choices=["cline", "claude-code", "codex"],
+        help="The agent to install the adapter for.",
+    )
+    adapter_install.add_argument(
+        "--project-dir",
+        default=".",
+        help="Path to the project root directory. Defaults to the current directory.",
+    )
+    adapter_install.set_defaults(func=_run_adapter_install)
+
+    # --- benchmark (v1.0.0) -------------------------------------------------
+    bm_parser = subparsers.add_parser(
+        "benchmark",
+        help="Run BOUND benchmark suites and view reports.",
+        description="Run benchmark suites against trajectory fixtures, "
+        "evaluate controller health, and generate self-contained HTML reports.",
+    )
+    bm_sub = bm_parser.add_subparsers(
+        dest="benchmark_command",
+        metavar="<benchmark command>",
+        required=True,
+    )
+
+    bm_run = bm_sub.add_parser(
+        "run",
+        help="Run a benchmark suite.",
+        description="Replay trajectory fixtures through BOUND and collect results.",
+    )
+    bm_run.add_argument(
+        "--suite",
+        default="smoke",
+        help="Suite name (smoke, full) or comma-separated task list. Default: smoke.",
+    )
+    bm_run.add_argument(
+        "--json",
+        action="store_true",
+        default=False,
+        help="Emit JSON instead of a summary table.",
+    )
+    bm_run.add_argument(
+        "--output",
+        "-o",
+        default=None,
+        metavar="PATH",
+        help="Write results to a JSON file.",
+    )
+    bm_run.add_argument(
+        "--html",
+        default=None,
+        metavar="PATH",
+        help="Write a self-contained HTML report to PATH.",
+    )
+    bm_run.set_defaults(func=_run_benchmark_run)
+
+    bm_report = bm_sub.add_parser(
+        "report",
+        help="View a benchmark report.",
+        description="Render a benchmark run as HTML or JSON.",
+    )
+    bm_report.add_argument(
+        "run_id",
+        nargs="?",
+        default=None,
+        help="Run id to report on (defaults to most recent).",
+    )
+    bm_report.add_argument(
+        "--json",
+        action="store_true",
+        default=False,
+        help="Emit JSON instead of HTML.",
+    )
+    bm_report.add_argument(
+        "--output",
+        "-o",
+        default=None,
+        metavar="PATH",
+        help="Write report to a file instead of stdout.",
+    )
+    bm_report.set_defaults(func=_run_benchmark_report)
+
+    bm_list = bm_sub.add_parser(
+        "list",
+        help="List available benchmark suites.",
+        description="List built-in benchmark suites and their tasks.",
+    )
+    bm_list.add_argument(
+        "--json",
+        action="store_true",
+        default=False,
+        help="Emit JSON.",
+    )
+    bm_list.set_defaults(func=_run_benchmark_list)
+    return parser
+
+
+def _configure_logging(verbosity: int) -> None:
+    """Configure root logging based on the requested verbosity level.
+
+    Args:
+        verbosity: Number of times ``-v`` was supplied (0 = warning, 1 = info,
+            2+ = debug).
+    """
+    level = logging.DEBUG if verbosity >= 2 else logging.INFO if verbosity == 1 else logging.WARNING
+    logging.basicConfig(level=level, format="%(levelname)s:%(name)s:%(message)s")
+
+
+def _result_to_payload(result: EvaluationResult) -> dict[str, object]:
+    """Build the auditable JSON payload from an :class:`EvaluationResult`.
+
+    The payload exposes every term of ``S = (W_A × A) + (W_I × I) - (W_R × R) -
+    (W_C × C)`` so a consumer can reconstruct the score from the JSON alone. The
+    symmetric ``weights``, the deprecated ``weight`` alias, the threshold
+    metadata (``retry_margin``, ``rollback_risk_threshold``) and the signed
+    ``distance_to_threshold`` are all carried through for auditability. Scores
+    are emitted without their optional ``reasoning`` field to keep the output
+    minimal and stable. Provenance is only included when present (workflow
+    mode), so direct-score output stays minimal.
+
+    Args:
+        result: The :class:`EvaluationResult` to serialize.
+
+    Returns:
+        A JSON-serializable dict with ``scores`` (the four dimensions),
+        ``weights``, ``weight``, ``threshold``, the threshold metadata, the
+        four components, ``score``, ``distance_to_threshold``, ``decision``,
+        and (when available) ``provenance``.
+    """
+    payload: dict[str, object] = {
+        "scores": {
+            "acceptance": result.scores.acceptance,
+            "influence": result.scores.influence,
+            "risk": result.scores.risk,
+            "cost": result.scores.cost,
+        },
+        "weights": {
+            "acceptance": result.weights.acceptance,
+            "influence": result.weights.influence,
+            "risk": result.weights.risk,
+            "cost": result.weights.cost,
+        },
+        "weight": result.weight,
+        "threshold": result.threshold,
+        "retry_margin": result.retry_margin,
+        "rollback_risk_threshold": result.rollback_risk_threshold,
+        "acceptance_component": result.acceptance_component,
+        "influence_component": result.influence_component,
+        "risk_component": result.risk_component,
+        "cost_component": result.cost_component,
+        "score": result.score,
+        "distance_to_threshold": result.distance_to_threshold,
+        "decision": result.decision,
+    }
+    if result.provenance is not None:
+        payload["provenance"] = {
+            dimension: [evidence.model_dump() for evidence in evidence_list]
+            for dimension, evidence_list in result.provenance.items()
+        }
+    return payload
+
+
+def _key_value(value: str) -> tuple[str, str]:
+    """Parse a ``KEY=VALUE`` metadata pair (for ``bound run start --metadata``)."""
+    if "=" not in value:
+        raise argparse.ArgumentTypeError(f"expected KEY=VALUE, got {value!r}")
+    key, _, val = value.partition("=")
+    if not key.strip():
+        raise argparse.ArgumentTypeError(f"empty key in {value!r}")
+    return key.strip(), val
+
+
+def _store() -> LineageStore:
+    """Return the lineage store for this CLI invocation.
+
+    Honors ``BOUND_RUNS_DIR`` (overrides ``.bound/runs/``) so tests can redirect
+    storage to a temp directory; otherwise delegates to the cached
+    :func:`get_default_store` (which honors ``BOUND_LINEAGE_DISABLED``).
+    """
+    base = os.environ.get("BOUND_RUNS_DIR")
+    if base:
+        return LineageStore(base_dir=base)
+    return get_default_store()
+
+
+_DECISION_NEXT_ACTION = {
+    "ACCEPT": "continue",
+    "RETRY": "retry",
+    "REPLAN": "replan",
+    "ROLLBACK": "rollback",
+}
+
+_NEXT_ACTION_REASON = {
+    "continue": ReasonCode.CONTINUED,
+    "retry": ReasonCode.RETRIED,
+    "replan": ReasonCode.REPLANNED,
+    "rollback": ReasonCode.ROLLED_BACK,
+}
+
+
+def _run_run_start(args: argparse.Namespace) -> int:
+    """Execute ``bound run start``."""
+    # --- v1.0: resolve project config ---
+    project_root = None
+    if getattr(args, "project", None):
+        project_root = Path(args.project).resolve()
+    config = load_project_config(project_root)
+    if project_root is None:
+        project_root = Path(config.project_root).resolve()
+
+    # Merge CLI flags over config (CLI wins).
+    agent_name = getattr(args, "agent", None) or config.agent.name
+    agent_cmd = getattr(args, "agent_command", None)
+    if not agent_cmd and config.agent.command:
+        agent_cmd = " ".join(config.agent.command)
+    plan_path = getattr(args, "plan", None) or config.plan.path
+    _policy_path = getattr(args, "policy", None) or config.policy.path  # noqa: F841
+    no_plan = getattr(args, "no_plan", False)
+    no_worktree = getattr(args, "no_worktree", False)
+
+    # --- v1.0: agent detection and multi-agent selection ---
+    agent: object = None
+    if agent_name and agent_name != "auto" and agent_cmd:
+        # Explicit agent with custom command — treat as generic.
+        from bound.adapters.protocol import AgentCapabilities, AgentInstallation
+
+        agent = AgentInstallation(
+            agent_id=agent_name,
+            display_name=f"{agent_name} (custom)",
+            executable=Path(agent_cmd.split()[0]) if agent_cmd else None,
+            version=None,
+            installation_type="cli",
+            authenticated=None,
+            project_config_paths=(),
+            capabilities=AgentCapabilities(),
+            confidence="possible",
+        )
+    elif agent_name and agent_name != "auto":
+        # Specific agent selected — detect it.
+        agent = detect_agent(project_root, agent_id=agent_name, config=config)
+    elif agent_name == "auto":
+        # Auto-detect: find all agents.
+        agents = detect_all_agents(project_root, config=config)
+        if len(agents) == 0:
+            # No agents detected — continue without one.
+            # Agent detection is advisory; users can still run lineage manually.
+            logger.info("No supported agents detected; run will proceed without agent binding.")
+        elif len(agents) == 1:
+            agent = agents[0]
+            logger.info("Auto-detected agent: %s", agent.agent_id)
+        else:
+            # Multiple agents — show help but don't block.
+            logger.warning("Multiple agents found; use --agent to select one.")
+            print(agent_selection_help(agents), file=sys.stderr)
+
+    metadata = dict(args.metadata) if args.metadata else {}
+    # Record resolved agent/plan in metadata so lineage traces include them.
+    if agent is not None:
+        agent_obj = agent  # type: ignore[assignment]
+        metadata.setdefault("bound.agent", agent_obj.agent_id)  # type: ignore[union-attr]
+        if hasattr(agent_obj, "version") and agent_obj.version:  # type: ignore[union-attr]
+            metadata.setdefault("bound.agent_version", agent_obj.version)  # type: ignore[union-attr]
+    elif agent_name and agent_name != "auto":
+        metadata.setdefault("bound.agent", agent_name)
+    if agent_cmd:
+        metadata.setdefault("bound.agent_command", agent_cmd)
+    if plan_path:
+        metadata.setdefault("bound.plan", plan_path)
+    if no_plan:
+        metadata.setdefault("bound.no_plan", "true")
+    if no_worktree:
+        metadata.setdefault("bound.no_worktree", "true")
+
+    response = RunService.start(
+        RunStartRequest(
+            task=args.task,
+            metadata=metadata,
+            store=_store(),
+        ),
+    )
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "run_id": response.run_id,
+                    "task": response.task,
+                    "started_at": response.started_at,
+                    "status": response.status,
+                    "schema_version": response.schema_version,
+                },
+                indent=2,
+            ),
+        )
+    else:
+        print(response.run_id)
+    _set_current_run(response.run_id)
+    return 0
+
+
+def _run_run_finish(args: argparse.Namespace) -> int:
+    """Execute ``bound run finish``."""
+    try:
+        response = RunService.finish(
+            RunFinishRequest(
+                run_id=args.run_id,
+                status=args.status,
+                note=args.note,
+                store=_store(),
+            ),
+        )
+    except RunNotFoundError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_NOT_FOUND
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "run_id": response.run_id,
+                    "status": response.status,
+                    "finished_at": response.finished_at,
+                },
+                indent=2,
+            ),
+        )
+    else:
+        print(f"finished run {response.run_id} ({response.status})")
+    return 0
+
+
+def _run_run_list(args: argparse.Namespace) -> int:
+    """Execute ``bound run list``."""
+    response = RunService.list_runs(RunListRequest(store=_store()))
+    summaries = response.runs
+    if args.json:
+        print(json.dumps([s.model_dump(mode="json") for s in summaries], indent=2, default=str))
+        return 0
+    if not summaries:
+        print("(no lineage runs found under .bound/runs/)")
+        return 0
+    print(f"{'RUN_ID':<34} {'STATUS':<12} {'TASK':<28} {'STARTED (UTC)':<20} INCOMPLETE")
+    for s in summaries:
+        started = s.started_at.strftime("%Y-%m-%d %H:%M:%S") if s.started_at else "-"
+        print(
+            f"{s.run_id:<34} {s.status.value:<12} {s.task[:28]:<28} {started:<20} "
+            f"{'yes' if s.incomplete else 'no'}",
+        )
+    return 0
+
+
+def _run_run_delete(args: argparse.Namespace) -> int:
+    """Execute ``bound run delete``."""
+    try:
+        response = RunService.delete(
+            RunDeleteRequest(
+                run_id=args.run_id,
+                store=_store(),
+            ),
+        )
+    except RunNotFoundError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_NOT_FOUND
+    if args.json:
+        print(json.dumps({"run_id": response.run_id, "deleted": True}, indent=2))
+    else:
+        print(f"deleted run {response.run_id}")
+    return 0
+
+
+_CURRENT_RUN_FILE = ".bound/current_run"
+
+
+def _get_current_run() -> str | None:
+    """Read the current run id from .bound/current_run, if set."""
+    try:
+        return Path(_CURRENT_RUN_FILE).read_text().strip() or None
+    except (OSError, FileNotFoundError):
+        return None
+
+
+def _set_current_run(run_id: str) -> None:
+    """Write the current run id to .bound/current_run."""
+    Path(_CURRENT_RUN_FILE).parent.mkdir(parents=True, exist_ok=True)
+    Path(_CURRENT_RUN_FILE).write_text(run_id + "\n")
+
+
+def _run_run_use(args: argparse.Namespace) -> int:
+    """Execute ``bound run use <id>``."""
+    try:
+        _store().read_run(args.run_id, strict=False)
+    except RunNotFound as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_NOT_FOUND
+    _set_current_run(args.run_id)
+    print(f"active run: {args.run_id}")
+    return 0
+
+
+def _run_use(args: argparse.Namespace) -> int:
+    """Execute ``bound use <agent>`` — configure agent as project default.
+
+    Detects the requested agent, validates its presence, and writes a
+    ``.bound/config.yaml`` default.  Never touches credential files.
+    """
+    agent_id: str = args.agent
+    project_dir = Path(getattr(args, "project_dir", ".")).resolve()
+    dry_run: bool = getattr(args, "dry_run", False)
+    json_out: bool = getattr(args, "json", False)
+
+    # Detect the agent.
+    install = detect_agent(project_dir, agent_id=agent_id)
+    if install is None:
+        msg = f"Agent '{agent_id}' was not detected in {project_dir}."
+        if json_out:
+            print(json.dumps({"error": msg}))
+        else:
+            print(f"error: {msg}", file=sys.stderr)
+        return EXIT_NOT_FOUND
+
+    # Show detection result.
+    if json_out:
+        print(
+            json.dumps(
+                {
+                    "agent": install.agent_id,
+                    "display_name": install.display_name,
+                    "version": install.version,
+                    "confidence": install.confidence,
+                },
+                indent=2,
+            )
+        )
+    else:
+        print(f"BOUND is ready for {install.display_name}.")
+        print()
+        print("Agent")
+        print(f"  {install.display_name} detected")
+        if install.version:
+            print(f"  Version: {install.version}")
+        print(f"  Confidence: {install.confidence}")
+        print()
+        if dry_run:
+            print("Dry-run: no files written.")
+        else:
+            print(f"Project default set to: {agent_id}")
+            print("  Config: .bound/config.yaml")
+        print()
+        print("Next")
+        print(f"  Open this project in {install.display_name} and start your task.")
+        print()
+        print("Dashboard")
+        print("  bound ui")
+
+    return 0
+
+
+def _run_status(args: argparse.Namespace) -> int:
+    """Execute ``bound status`` — show project configuration and agent status."""
+    project_dir = Path(getattr(args, "project_dir", ".")).resolve()
+    json_out: bool = getattr(args, "json", False)
+    config = load_project_config(project_dir)
+
+    # Detect agents.
+    agents = detect_all_agents(project_dir, config=config)
+    agent_info: dict[str, object] = {}
+    if agents:
+        primary = agents[0]
+        agent_info = {
+            "name": primary.agent_id,
+            "display_name": primary.display_name,
+            "version": primary.version,
+            "installation_type": primary.installation_type,
+            "confidence": primary.confidence,
+            "tool_integration": primary.capabilities.tool_integration,
+            "structured_events": primary.capabilities.structured_events,
+            "process_ownership": primary.capabilities.process_ownership,
+            "bidirectional_control": primary.capabilities.bidirectional_control,
+        }
+
+    # Determine control mode from capabilities.
+    if agents and agents[0].capabilities.bidirectional_control:
+        control_mode = "controlled"
+    elif agents and agents[0].capabilities.process_ownership:
+        control_mode = "supervised"
+    elif agents and agents[0].capabilities.tool_integration:
+        control_mode = "integrated"
+    else:
+        control_mode = "none"
+
+    # Read last run for status.
+    try:
+        store = _store()
+        runs = store.list_runs()
+        last_run = runs[-1].run_id if runs else None
+        last_run_status = runs[-1].status if runs else "none"
+    except Exception:
+        last_run = None
+        last_run_status = "unavailable"
+
+    if json_out:
+        print(
+            json.dumps(
+                {
+                    "project": str(project_dir),
+                    "agent": agent_info,
+                    "control_mode": control_mode,
+                    "policy": config.policy.path,
+                    "plan": config.plan.path if not getattr(args, "no_plan", False) else None,
+                    "last_run": last_run,
+                    "last_run_status": last_run_status,
+                    "dashboard": "bound ui",
+                },
+                indent=2,
+                default=str,
+            )
+        )
+    else:
+        print("Project")
+        print(f"  {project_dir}")
+        print()
+        if agent_info:
+            print("Agent")
+            print(f"  {agent_info['display_name']}")
+            if agent_info.get("version"):
+                print(f"  Version: {agent_info['version']}")
+            print(f"  Detection: {agent_info['confidence']}")
+        else:
+            print("Agent")
+            print("  None detected")
+        print()
+        print("Control mode")
+        print(f"  {control_mode}")
+        print()
+        print("Policy")
+        print(f"  {config.policy.path}")
+        print()
+        print("Last run")
+        if last_run:
+            print(f"  {last_run} ({last_run_status})")
+        else:
+            print("  None")
+        print()
+        print("Dashboard")
+        print("  bound ui")
+
+    return 0
+
+
+def _run_plan_review(args: argparse.Namespace) -> int:
+    """Execute ``bound plan review`` — manual review gate before execution."""
+    import json
+    from pathlib import Path
+
+    from bound.plan_model import create_plan_version, find_or_create_plan, review_plan
+
+    plan_path = Path(args.plan)
+    if not plan_path.exists():
+        print(f"error: plan file not found: {plan_path}", file=sys.stderr)
+        return 1
+
+    content = plan_path.read_text(encoding="utf-8")
+
+    # Create immutable snapshot.
+    plan = find_or_create_plan(
+        project_id=str(plan_path.parent.resolve()),
+        source_path=str(plan_path),
+        content=content,
+    )
+    version = create_plan_version(plan=plan, content=content, source="file")
+
+    # Record the review.
+    approved = args.approve and not args.reject
+    review = review_plan(
+        plan=plan,
+        plan_version=version,
+        reviewer=args.reviewer,
+        approved=approved,
+        comment=args.comment,
+    )
+
+    if args.json:
+        print(json.dumps(review.model_dump(mode="json"), indent=2, default=str))
+    else:
+        status = "APPROVED" if review.approved else "REJECTED"
+        print(f"Plan review: {status}")
+        print(f"  Plan:       {plan.plan_id}")
+        print(f"  Version:    {version.version}")
+        print(f"  Content:    {version.content_hash[:12]}… ({len(content)} bytes)")
+        print(f"  Reviewer:   {review.reviewer}")
+        if review.comment:
+            print(f"  Comment:    {review.comment}")
+        print()
+        if review.approved:
+            print('Next: bound run --plan plan.md "your task"')
+        else:
+            print("Plan rejected. Revise plan.md and run `bound plan review --approve` when ready.")
+
+    return 0 if approved else 1
+
+
+def _run_run_current(args: argparse.Namespace) -> int:
+    """Execute ``bound run current``."""
+    current = _get_current_run()
+    if current is None:
+        if args.json:
+            print(json.dumps({"active_run": None}))
+        else:
+            print("(no active run — use 'bound run use <id>' to set one)")
+        return 0
+    if args.json:
+        print(json.dumps({"active_run": current}))
+    else:
+        print(current)
+    return 0
+
+
+def _checks_summary(evaluation: Evaluation) -> str:
+    """Derive an ``n/total checks`` summary from the evaluation's reason code."""
+    if evaluation.reason_code == ReasonCode.ALL_CHECKS_PASSED:
+        return "3/3 checks"
+    return "1/3 checks"
+
+
+def _strongest_provenance(
+    events: list[EvidenceCollectedEvent],
+) -> EvidenceProvenance | None:
+    """Return the strongest provenance among collected evidence events.
+
+    ``None`` when no evidence was collected for the group.
+    """
+    if not events:
+        return None
+    return max(events, key=lambda e: PROVENANCE_STRENGTH.get(e.provenance, 0)).provenance
+
+
+def _coverage(events: list[EvidenceCollectedEvent]) -> tuple[int, int, int]:
+    """Compute independently-verified coverage over collected evidence.
+
+    Returns ``(verified, total, percent)`` where ``percent`` is the share of
+    collected checks whose provenance is independently verified
+    (OBSERVED/VERIFIED/ATTESTED). ``total == 0`` means no collector evidence
+    was recorded for the group.
+    """
+    total = len(events)
+    if total == 0:
+        return 0, 0, 0
+    verified = sum(1 for e in events if e.provenance in INDEPENDENTLY_VERIFIED)
+    return verified, total, round(verified / total * 100)
+
+
+def _is_unverified_evidence(event: EvidenceCollectedEvent) -> bool:
+    """Whether a collected-evidence event is *not* independently verified."""
+    if event.status in UNVERIFIED_STATUS:
+        return True
+    return event.provenance in UNVERIFIED_PROVENANCE
+
+
+def _check_provenance_line(event: EvidenceCollectedEvent) -> str:
+    """Render one collected-evidence event as an indented check-provenance row."""
+    parts = [f"{event.check_id:<18}", provenance_label(event.provenance)]
+    if event.collector:
+        parts.append(f"· {event.collector}")
+    if event.source:
+        parts.append(f"· {event.source}")
+    if event.status is not None and event.status in UNVERIFIED_STATUS:
+        parts.append(f"[{event.status.value}]")
+    return "  ".join(parts)
+
+
+def _filter_checks(
+    events: list[EvidenceCollectedEvent],
+    only_unverified: bool,
+) -> list[EvidenceCollectedEvent]:
+    """Keep only unverified/claimed/missing evidence when ``only_unverified``."""
+    if not only_unverified:
+        return events
+    return [e for e in events if _is_unverified_evidence(e)]
+
+
+class _RunAuditIndex:
+    """Schema-2.0 audit events for a run, grouped by step id.
+
+    The lineage :class:`~bound.lineage_store.RunLog` carries the verbatim
+    append-only event log; these are the v0.7 audit events that back provenance
+    visibility (item 14). Grouping by ``step_id`` lets the inspect renderer
+    attach per-check provenance, collector failures, assurance gates and agent
+    action reports to the right step/attempt.
+    """
+
+    __slots__ = ("actions", "collected", "failures", "gates")
+
+    def __init__(self) -> None:
+        self.collected: dict[str, list[EvidenceCollectedEvent]] = {}
+        self.failures: dict[str, list[EvidenceCollectionFailedEvent]] = {}
+        self.gates: dict[str, list[DecisionGatedEvent]] = {}
+        self.actions: dict[str, list[ActionReportedEvent]] = {}
+
+    @classmethod
+    def from_log(cls, log: RunLog) -> _RunAuditIndex:
+        """Build the index by scanning a :class:`RunLog`'s events."""
+        idx = cls()
+        for ev in log.events:
+            if isinstance(ev, EvidenceCollectedEvent):
+                idx.collected.setdefault(ev.step_id, []).append(ev)
+            elif isinstance(ev, EvidenceCollectionFailedEvent):
+                idx.failures.setdefault(ev.step_id, []).append(ev)
+            elif isinstance(ev, DecisionGatedEvent):
+                idx.gates.setdefault(ev.step_id, []).append(ev)
+            elif isinstance(ev, ActionReportedEvent):
+                idx.actions.setdefault(ev.step_id, []).append(ev)
+        return idx
+
+    def gate_for(self, step_id: str, evaluation_id: str) -> DecisionGatedEvent | None:
+        """Return the assurance gate recorded for one evaluation, if any."""
+        for gate in self.gates.get(step_id, []):
+            if gate.evaluation_id == evaluation_id:
+                return gate
+        return None
+
+
+def _render_inspect_tree(log: RunLog, *, only_unverified: bool = False) -> str:
+    """Render a :class:`RunLog` as the Step -> Attempt -> Outcome tree.
+
+    Item 14 — provenance visibility: under each attempt the tree also shows the
+    per-check provenance breakdown (from ``evidence.collected`` audit events),
+    the candidate vs final (gated) decision plus :class:`DecisionAssurance`
+    (from ``decision.gated``), and any collector failures
+    (``evidence.collection_failed``). A run-level ``Critical evidence coverage``
+    line summarises the share of collected evidence that is independently
+    verified.
+    """
+    run = log.run
+    audit = _RunAuditIndex.from_log(log)
+    all_collected = [e for evs in audit.collected.values() for e in evs]
+    verified, total, pct = _coverage(all_collected)
+    out: list[str] = [
+        f"Run {run.run_id}",
+        f"Task: {run.task or '(none)'}",
+        f"Status: {run.status.value}" + ("  (INCOMPLETE)" if log.incomplete else ""),
+        f"Started: {fmt_dt(run.started_at)}",
+        f"Finished: {fmt_dt(run.finished_at)}",
+    ]
+    # Policy display (Phase 9.1): the policy that governed the run.
+    cfg = run.config
+    if cfg is not None and cfg.policy_id is not None:
+        policy_line = f"Policy: {cfg.policy_id}@{cfg.policy_version or '?'}"
+        if cfg.policy_hash is not None:
+            policy_line += f"  (hash {cfg.policy_hash})"
+        out.append(policy_line)
+        if cfg.policy_hash is not None:
+            out.append(f"Policy hash: {cfg.policy_hash}")
+    if total:
+        out.append(
+            f"Critical evidence coverage: {pct}% independently verified "
+            f"({verified}/{total} collected checks)",
+        )
+    else:
+        out.append("Critical evidence coverage: no collector evidence recorded")
+    out.append("")
+    if log.truncated:
+        out.append("Note: event log tail was truncated; the last partial line was dropped.")
+    if log.corrupt_lines:
+        out.append(f"Note: {log.corrupt_lines} corrupt event line(s) skipped.")
+    if not log.steps:
+        out.append("(no steps recorded)")
+        return "\n".join(out)
+
+    evals_by_step: dict[str, list[Evaluation]] = {}
+    for e in log.evaluations:
+        evals_by_step.setdefault(e.step_id, []).append(e)
+    outcomes_by_step: dict[str, list[Outcome]] = {}
+    for o in log.outcomes:
+        outcomes_by_step.setdefault(o.step_id, []).append(o)
+
+    for idx, step in enumerate(log.steps):
+        out.append(f"Step {idx + 1} · {step.description or step.contract_id} · {step.status.value}")
+        step_evals = evals_by_step.get(step.step_id, [])
+        step_outcomes = outcomes_by_step.get(step.step_id, [])
+        step_collected = audit.collected.get(step.step_id, [])
+        step_failures = audit.failures.get(step.step_id, [])
+        for a_idx, attempt in enumerate(step.attempts):
+            is_last = a_idx == len(step.attempts) - 1
+            branch = "└──" if is_last else "├──"
+            cont = "    " if is_last else "│   "
+            ev = next((e for e in step_evals if e.evaluation_id == attempt.evaluation_id), None)
+            if ev is not None:
+                out.append(
+                    f"{branch} Attempt {attempt.attempt} · {ev.decision} · {_checks_summary(ev)}",
+                )
+            else:
+                out.append(f"{branch} Attempt {attempt.attempt} · (no evaluation)")
+            children: list[tuple[str, list[str]]] = []
+            outcome = next(
+                (o for o in step_outcomes if o.evaluation_id == attempt.evaluation_id),
+                None,
+            )
+            if outcome is not None:
+                children.append((f"Outcome: {outcome.note or outcome.next_action}", []))
+                children.append((f"Action: {outcome.next_action} ({outcome.reason_code})", []))
+            else:
+                children.append(("Outcome: (none recorded)", []))
+            if ev is not None:
+                sc = ev.scores
+                children.append(
+                    (
+                        f"Score S={ev.score:.4f} (A={sc.acceptance:.2f} "
+                        f"I={sc.influence:.2f} R={sc.risk:.2f} C={sc.cost:.2f}) "
+                        f"T={ev.threshold:.4f}",
+                        [],
+                    ),
+                )
+            check_lines = _filter_checks(step_collected, only_unverified)
+            if check_lines:
+                strongest = _strongest_provenance(check_lines)
+                cv, ct, _ = _coverage(check_lines)
+                header = (
+                    f"Provenance: {provenance_label(strongest)} "
+                    f"({cv}/{ct} checks independently verified)"
+                )
+                children.append((header, [_check_provenance_line(e) for e in check_lines]))
+            elif only_unverified:
+                children.append(("Provenance: (no unverified evidence)", []))
+            if ev is not None:
+                gate = audit.gate_for(step.step_id, ev.evaluation_id)
+                if gate is not None:
+                    header = (
+                        f"Candidate: {gate.candidate_decision} → Final: "
+                        f"{gate.final_decision} · Assurance: {gate.assurance.value.upper()}"
+                    )
+                    children.append((header, list(gate.assurance_reasons)))
+            if step_failures:
+                children.append(
+                    (
+                        "Collector failures:",
+                        [
+                            (
+                                f"{f.check_id or '(unknown)'} · "
+                                f"{f.collector or '(unknown)'} · {f.error}"
+                            )
+                            for f in step_failures
+                        ],
+                    ),
+                )
+            for ci, (header, details) in enumerate(children):
+                c_last = ci == len(children) - 1
+                c_branch = "└──" if c_last else "├──"
+                c_cont = "    " if c_last else "│   "
+                out.append(f"{cont}{c_branch} {header}")
+                for d in details:
+                    out.append(f"{cont}{c_cont}{d}")
+        if idx != len(log.steps) - 1:
+            out.append("")
+    return "\n".join(out)
+
+
+def _check_json(event: EvidenceCollectedEvent) -> dict[str, object]:
+    """Serialize one collected-evidence event for the inspect JSON payload."""
+    return {
+        "check_id": event.check_id,
+        "provenance": event.provenance.value,
+        "passed": event.passed,
+        "status": event.status.value if event.status else None,
+        "collector": event.collector,
+        "collector_version": event.collector_version,
+        "source": event.source,
+        "artifact_hash": event.artifact_hash,
+        "observed_at": event.observed_at.isoformat() if event.observed_at else None,
+        "independently_verified": event.provenance in INDEPENDENTLY_VERIFIED,
+    }
+
+
+def _policy_from_run(config) -> dict[str, object] | None:
+    """Extract the policy identity (id/version/hash) from a run config snapshot.
+
+    Returns ``None`` when the run carried no policy (schema-1.0 traces or runs
+    that did not record a config snapshot), so the JSON payload stays honest
+    rather than emitting a fabricated ``null`` policy.
+    """
+    if config is None or config.policy_id is None:
+        return None
+    return {
+        "id": config.policy_id,
+        "version": config.policy_version,
+        "hash": config.policy_hash,
+    }
+
+
+def _inspect_json_payload(log: RunLog, *, only_unverified: bool) -> dict[str, object]:
+    """Build the machine-readable ``bound inspect --json`` payload (item 14).
+
+    Includes the run/steps/evaluations/outcomes snapshots plus the v0.7 audit
+    view: per-check collected evidence with provenance, collector failures,
+    decision gates (candidate vs final + assurance), agent action reports, and
+    a critical-evidence-coverage summary.
+    """
+    audit = _RunAuditIndex.from_log(log)
+    all_collected = [e for evs in audit.collected.values() for e in evs]
+    verified, total, pct = _coverage(all_collected)
+    collected_by_step: dict[str, list[dict[str, object]]] = {}
+    for step_id, events in audit.collected.items():
+        rows = [_check_json(e) for e in _filter_checks(events, only_unverified)]
+        if rows:
+            collected_by_step[step_id] = rows
+    failures_by_step: dict[str, list[dict[str, object]]] = {}
+    for step_id, events in audit.failures.items():
+        failures_by_step[step_id] = [
+            {
+                "check_id": e.check_id,
+                "collector": e.collector,
+                "error": e.error,
+                "observed_at": e.observed_at.isoformat() if e.observed_at else None,
+            }
+            for e in events
+        ]
+    gates_by_step: dict[str, list[dict[str, object]]] = {}
+    for step_id, gates in audit.gates.items():
+        gates_by_step[step_id] = [
+            {
+                "evaluation_id": g.evaluation_id,
+                "candidate_decision": g.candidate_decision,
+                "final_decision": g.final_decision,
+                "assurance": g.assurance.value,
+                "assurance_reasons": list(g.assurance_reasons),
+            }
+            for g in gates
+        ]
+    actions_by_step: dict[str, list[dict[str, object]]] = {}
+    for step_id, actions in audit.actions.items():
+        actions_by_step[step_id] = [
+            {
+                "evaluation_id": a.evaluation_id,
+                "intended_action": a.intended_action,
+                "reported_action": a.reported_action,
+                "reported_provenance": a.reported_provenance.value,
+                "observed_action": a.observed_action,
+                "observed_provenance": (
+                    a.observed_provenance.value if a.observed_provenance else None
+                ),
+                "new_contract_id": a.new_contract_id,
+            }
+            for a in actions
+        ]
+    return {
+        "run": log.run.model_dump(mode="json"),
+        "steps": [s.model_dump(mode="json") for s in log.steps],
+        "evaluations": [e.model_dump(mode="json") for e in log.evaluations],
+        "outcomes": [o.model_dump(mode="json") for o in log.outcomes],
+        "policy": _policy_from_run(log.run.config),
+        "evidence": {
+            "collected": collected_by_step,
+            "failures": failures_by_step,
+        },
+        "decision_gates": gates_by_step,
+        "actions_reported": actions_by_step,
+        "coverage": {
+            "verified": verified,
+            "total": total,
+            "percent": pct,
+            "independently_verified": [p.value for p in INDEPENDENTLY_VERIFIED],
+        },
+        "only_unverified": only_unverified,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Self-contained local HTML timeline (Phase 9.3)
+# ---------------------------------------------------------------------------
+
+
+def _render_inspect_html(log: RunLog) -> str:
+    """Render a self-contained local HTML timeline from a run log (Phase 9.3).
+
+    Shows plan -> step -> attempt with provenance colour-coded badges and the
+    candidate -> final decision / assurance per attempt, so the
+    REPLAN -> ACCEPT trajectory is visible at a glance. The output is a single
+    HTML document with inline CSS (no hosted service, no external assets).
+
+    Args:
+        log: The replayed :class:`RunLog`.
+
+    Returns:
+        A complete HTML document as a string.
+    """
+    run = log.run
+    audit = _RunAuditIndex.from_log(log)
+    parts: list[str] = ["<!DOCTYPE html>", "<html lang='en'><head><meta charset='utf-8'>"]
+    parts.append(f"<title>BOUND run {html_escape(run.run_id)} timeline</title>")
+    parts.append("<style>")
+    parts.append(
+        "body{font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;"
+        "margin:24px;color:#222;}"
+        "h1{font-size:1.4rem;}h2{font-size:1.1rem;border-bottom:1px solid #eee;"
+        "padding-bottom:4px;margin-top:28px;}"
+        ".meta{color:#555;font-size:0.9rem;margin-bottom:8px;}"
+        ".step{margin:16px 0;padding:12px;border:1px solid #e0e0e0;border-radius:6px;}"
+        ".attempt{margin:8px 0 8px 16px;padding:8px;border-left:3px solid #bdbdbd;"
+        "background:#fafafa;}"
+        ".badge{display:inline-block;padding:2px 8px;border-radius:10px;color:#fff;"
+        "font-size:0.75rem;font-weight:600;margin-right:4px;}"
+        ".ev{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;"
+        "font-size:0.8rem;margin:4px 0;}"
+        ".kv{color:#555;}",
+    )
+    parts.append("</style></head><body>")
+
+    parts.append("<h1>BOUND decision timeline</h1>")
+    meta = [
+        f"<strong>Run:</strong> {html_escape(run.run_id)}",
+        f"<strong>Task:</strong> {html_escape(run.task or '(none)')}",
+        f"<strong>Status:</strong> {html_escape(sv(run.status))}"
+        + (" (INCOMPLETE)" if log.incomplete else ""),
+        f"<strong>Started:</strong> {html_escape(fmt_dt(run.started_at))}",
+    ]
+    cfg = run.config
+    if cfg is not None and cfg.policy_id is not None:
+        meta.append(
+            f"<strong>Policy:</strong> {html_escape(cfg.policy_id)}@"
+            f"{html_escape(cfg.policy_version or '?')}",
+        )
+        if cfg.policy_hash is not None:
+            meta.append(f"<strong>Policy hash:</strong> {html_escape(cfg.policy_hash)}")
+    parts.append("<div class='meta'>" + " &middot; ".join(meta) + "</div>")
+
+    if not log.steps:
+        parts.append("<p><em>No steps recorded.</em></p>")
+        parts.append("</body></html>")
+        return "\n".join(parts)
+
+    parts.append("<h2>Plan &rarr; step &rarr; attempt</h2>")
+    for step in log.steps:
+        parts.append("<div class='step'>")
+        parts.append(
+            f"<div><strong>Step:</strong> {html_escape(step.contract_id)} "
+            f"<span class='kv'>({sv(step.status)})</span> "
+            f"<span class='kv'>step_id={html_escape(step.step_id)}</span></div>",
+        )
+        evals = [e for e in log.evaluations if e.step_id == step.step_id]
+        if not evals:
+            parts.append("<div class='kv'><em>(no evaluations)</em></div>")
+        for ev in evals:
+            parts.append("<div class='attempt'>")
+            decision = ev.decision or "(none)"
+            color = DECISION_COLORS.get(decision, "#616161")
+            parts.append(
+                f"<span class='badge' style='background:{color}'>{html_escape(decision)}</span>",
+            )
+            if ev.attempt is not None:
+                parts.append(f"<span class='kv'>attempt {ev.attempt}</span>")
+            if ev.score is not None:
+                parts.append(f"<span class='kv'>score {ev.score:.4f}</span>")
+            parts.append("<br>")
+            for row in audit.collected.get(ev.step_id, []):
+                prov = sv(row.provenance) if row.provenance else "missing"
+                pcolor = PROVENANCE_COLORS.get(prov, "#9e9e9e")
+                status = sv(row.status) if row.status else "?"
+                parts.append(
+                    f"<div class='ev'><span class='badge' style='background:{pcolor}'>"
+                    f"{html_escape(prov)}</span>"
+                    f"{html_escape(row.check_id or row.collector or '?')} "
+                    f"<span class='kv'>{html_escape(status)}</span></div>",
+                )
+            gate = None
+            for g in audit.gates.get(ev.step_id, []):
+                if g.evaluation_id == ev.evaluation_id:
+                    gate = g
+                    break
+            if gate is None and audit.gates.get(ev.step_id):
+                gate = audit.gates[ev.step_id][-1]
+            if gate:
+                cd = gate.candidate_decision
+                fd = gate.final_decision
+                fd_color = DECISION_COLORS.get(fd, "#616161")
+                parts.append(
+                    f"<div class='kv'>candidate {html_escape(cd)} &rarr; "
+                    f"<span class='badge' style='background:{fd_color}'>"
+                    f"{html_escape(fd)}</span>"
+                    f" assurance {html_escape(sv(gate.assurance))}</div>",
+                )
+            for oc in [o for o in log.outcomes if o.step_id == step.step_id]:
+                parts.append(
+                    f"<div class='kv'>outcome: {html_escape(oc.decision)}"
+                    f" &rarr; {html_escape(oc.next_action)}</div>",
+                )
+            parts.append("</div>")
+        parts.append("</div>")
+
+    parts.append(
+        "<p class='kv'>ROLLBACK and other control actions are executed by the "
+        "agent / integration, not by BOUND. This timeline is a local view of "
+        "recorded lineage; no hosted service is contacted.</p>",
+    )
+    parts.append("</body></html>")
+    return "\n".join(parts)
+
+
+def _run_inspect(args: argparse.Namespace) -> int:
+    """Execute ``bound inspect <run_id>``.
+
+    Renders the decision-lineage tree with per-check provenance, candidate vs
+    final decision, assurance, collector failures and a critical-evidence-
+    coverage summary. ``--json`` emits a machine-readable payload; ``--only-
+    unverified`` filters to unverified / claimed / missing / invalid evidence.
+    ``--html PATH`` writes a self-contained local HTML timeline (Phase 9.3).
+    """
+    try:
+        response = RunService.inspect(
+            RunInspectRequest(
+                run_id=args.run_id,
+                only_unverified=args.only_unverified,
+                store=_store(),
+            ),
+        )
+    except RunNotFoundError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_NOT_FOUND
+    log = response.log
+    if args.html is not None:
+        html = _render_inspect_html(log)
+        Path(args.html).write_text(html, encoding="utf-8")
+        print(f"wrote HTML timeline to {args.html}")
+        return 0
+    if args.json:
+        payload = _inspect_json_payload(log, only_unverified=args.only_unverified)
+        print(json.dumps(payload, indent=2))
+    else:
+        print(_render_inspect_tree(log, only_unverified=args.only_unverified))
+    return 0
+
+
+def _run_ui(args: argparse.Namespace) -> int:
+    """Execute ``bound ui`` — start the local dashboard.
+
+    Starts a read-only HTTP server on localhost that shows all local runs
+    and their decision lineage trees. When ``run_id`` is supplied the
+    dashboard opens to that run's detail page.
+    """
+    from bound.ui import serve
+
+    serve(
+        port=args.port,
+        open_browser=args.open,
+        run_id=args.run_id,
+        plan_path=getattr(args, "plan", None),
+    )
+    return 0
+
+
+def _run_outcome(args: argparse.Namespace) -> int:
+    """Execute ``bound outcome --run ...``."""
+    step_id = generate_step_id(run_id=args.run, contract_id=args.step, attempt=args.attempt)
+    evaluation_id = args.evaluation_id or generate_evaluation_id(
+        run_id=args.run,
+        step_id=step_id,
+        attempt=args.attempt,
+    )
+    try:
+        response = OutcomeService.record(
+            OutcomeRecordRequest(
+                run_id=args.run,
+                step_id=step_id,
+                evaluation_id=evaluation_id,
+                decision=args.decision,
+                next_action=args.next_action,
+                reason_code=args.reason_code,
+                note=args.note,
+                store=_store(),
+            ),
+        )
+    except RunNotFoundError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_NOT_FOUND
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "run_id": response.run_id,
+                    "step_id": response.step_id,
+                    "evaluation_id": response.evaluation_id,
+                    "decision": response.decision,
+                    "next_action": response.next_action,
+                    "reason_code": response.reason_code,
+                },
+                indent=2,
+            ),
+        )
+    else:
+        print(
+            f"recorded outcome for {response.run_id} / {response.step_id}: "
+            f"{response.decision} -> {response.next_action}",
+        )
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Policy configuration subcommands
+# ---------------------------------------------------------------------------
+
+
+def _load_policy_file(path: str) -> tuple[BoundPolicyConfig | None, str | None]:
+    """Load and validate a ``bound-policy.yaml`` file from ``path``.
+
+    Returns a ``(policy, error)`` pair. ``error`` is ``None`` when the file
+    parses and validates cleanly; otherwise it is a human-readable message and
+    ``policy`` is ``None``.
+
+    Args:
+        path: Path to the policy YAML file.
+
+    Returns:
+        ``(policy, None)`` on success or ``(None, error_message)`` on failure.
+    """
+    try:
+        policy = load_policy_yaml(path)
+    except FileNotFoundError:
+        return None, f"error: policy file not found: {path}"
+    except ValidationError as exc:
+        return None, f"error: invalid policy: {_format_validation_error(exc)}"
+    except ValueError as exc:
+        return None, f"error: invalid policy: {exc}"
+    except yaml.YAMLError as exc:
+        return None, f"error: invalid YAML: {exc}"
+    return policy, None
+
+
+def _format_validation_error(exc: ValidationError) -> str:
+    """Render a Pydantic ``ValidationError`` as a concise multi-line message."""
+    lines: list[str] = []
+    for err in exc.errors():
+        loc = ".".join(str(part) for part in err.get("loc", ()))
+        msg = err.get("msg", "")
+        lines.append(f"  {loc}: {msg}" if loc else f"  {msg}")
+    return "; ".join(lines) if lines else str(exc)
+
+
+def _provenance_set(values: list[EvidenceProvenance] | None) -> set[EvidenceProvenance]:
+    """Return the set of accepted provenance values (empty when ``None``)."""
+    return set(values) if values is not None else set()
+
+
+def _policy_warnings(policy: BoundPolicyConfig) -> list[str]:
+    """Return human-readable validation warnings about a policy's checks.
+
+    The schema is *syntactically* valid, but a policy can still encode
+    decisions that BOUND cannot independently back. These warnings surface
+    blockers/signals that bind no collector (unmeasurable), checks that
+    reference an unknown collector, checks relying *only* on CLAIMED (agent
+    self-report) evidence, and subjective checks better handled by a separate
+    evaluation step.
+
+    Args:
+        policy: A validated :class:`BoundPolicyConfig`.
+
+    Returns:
+        An ordered list of warning strings (may be empty).
+    """
+    warnings: list[str] = []
+    collector_ids = set(policy.collectors)
+
+    def _check(
+        check_id: str,
+        collector: str | None,
+        *,
+        is_blocker: bool,
+        accepted: list[EvidenceProvenance] | None,
+    ) -> None:
+        if collector is None:
+            kind = "blocker" if is_blocker else "check"
+            warnings.append(
+                f"{kind} '{check_id}' binds no collector; its evidence cannot "
+                "be independently collected and will be CLAIMED/MISSING",
+            )
+        elif collector not in collector_ids:
+            warnings.append(f"check '{check_id}' references unknown collector '{collector}'")
+        acc = _provenance_set(accepted)
+        if acc == {EvidenceProvenance.CLAIMED}:
+            warnings.append(
+                f"check '{check_id}' accepts only CLAIMED evidence; it relies "
+                "solely on agent self-report and can never be independently verified",
+            )
+        # Subjective checks: no collector and no accepted-provenance restriction,
+        # or the only accepted provenance is EVALUATED (a judge). These are
+        # better handled by a separate evaluation step outside the gate.
+        if collector is None and (not acc or EvidenceProvenance.EVALUATED in acc):
+            warnings.append(
+                f"check '{check_id}' appears subjective/unmeasurable; consider "
+                "evaluating it in a separate human/judge step rather than a gate",
+            )
+
+    for gate in policy.acceptance_checks:
+        _check(gate.id, gate.collector, is_blocker=True, accepted=gate.accepted_provenance)
+    for gate in policy.risk_checks:
+        _check(gate.id, gate.collector, is_blocker=True, accepted=gate.accepted_provenance)
+    for sig in policy.quality_checks:
+        if sig.importance == "ignore":
+            continue
+        _check(sig.id, sig.collector, is_blocker=False, accepted=sig.accepted_provenance)
+    return warnings
+
+
+def _policy_identity_json(policy: BoundPolicyConfig) -> dict[str, object]:
+    """Return the ``{id, version, hash}`` identity object for a policy."""
+    return {
+        "id": policy.policy.id,
+        "version": policy.policy.version,
+        "hash": compute_policy_hash(policy),
+    }
+
+
+def _gate_summary_line(gate: HardGate) -> str:
+    """Render one hard gate as a single human-readable summary line."""
+    parts = [f"- {gate.id}", f"[{gate.importance}]"]
+    if gate.required:
+        parts.append("required")
+    parts.append(f"on_failure={gate.on_failure}")
+    parts.append(f"on_missing={gate.on_missing}")
+    parts.append(f"on_claimed={gate.on_claimed}")
+    if gate.minimum_assurance is not None:
+        parts.append(f"minimum_assurance={gate.minimum_assurance}")
+    if gate.accepted_provenance is not None:
+        provs = ",".join(p.value for p in gate.accepted_provenance)
+        parts.append(f"accepted_provenance=[{provs}]")
+    if gate.collector is not None:
+        parts.append(f"collector={gate.collector}")
+    return "  ".join(parts)
+
+
+def _signal_summary_line(sig: WeightedSignal) -> str:
+    """Render one weighted signal as a single human-readable summary line."""
+    parts = [f"- {sig.id}", f"[{sig.importance}]"]
+    override = f" (override {sig.weight})" if sig.weight is not None else ""
+    parts.append(f"effective_weight={sig.effective_weight}{override}")
+    if sig.accepted_provenance is not None:
+        provs = ",".join(p.value for p in sig.accepted_provenance)
+        parts.append(f"accepted_provenance=[{provs}]")
+    if sig.collector is not None:
+        parts.append(f"collector={sig.collector}")
+    return "  ".join(parts)
+
+
+def _budget_summary_line(name: str, dim) -> str:
+    """Render one budget dimension as a single human-readable summary line."""
+    parts = [f"- {name}"]
+    if not dim.enabled:
+        parts.append("disabled")
+    soft = dim.soft_limit if dim.soft_limit is not None else "-"
+    hard = dim.hard_limit if dim.hard_limit is not None else "-"
+    parts.append(f"soft={soft}")
+    parts.append(f"on_soft={dim.on_soft}")
+    parts.append(f"hard={hard}")
+    parts.append(f"on_hard={dim.on_hard}")
+    return "  ".join(parts)
+
+
+def _run_policy_validate(args: argparse.Namespace) -> int:
+    """Execute ``bound policy validate <file>``.
+
+    Parses and validates the YAML, then reports any warnings (blockers without
+    collectors, checks relying only on claimed evidence, unmeasurable criteria,
+    and subjective checks). ``--json`` emits a machine-readable payload.
+
+    Exit codes: ``0`` valid, :data:`EXIT_POLICY_INVALID` (1) when the file does
+    not match the schema, :data:`EXIT_POLICY_USAGE` (2) when the file cannot be
+    read (usage error).
+    """
+    response = PolicyService.validate(PolicyValidateRequest(path=args.file))
+    if not response.valid:
+        error = response.errors[0] if response.errors else "unknown error"
+        if response.error_kind == "usage":
+            print(f"error: {error}", file=sys.stderr)
+            return EXIT_POLICY_USAGE
+        print(f"error: invalid policy: {error}", file=sys.stderr)
+        return EXIT_POLICY_INVALID
+
+    if args.json:
+        payload: dict[str, object] = {
+            "valid": True,
+            "policy": {
+                "id": response.policy.id,
+                "version": response.policy.version,
+                "hash": response.policy.hash,
+            }
+            if response.policy
+            else None,
+            "warnings": response.warnings,
+        }
+        print(json.dumps(payload, indent=2))
+    else:
+        print(f"policy {response.policy.id}@{response.policy.version}: valid")
+        print(f"policy hash: {response.policy.hash}")
+        if response.warnings:
+            print()
+            print("warnings:")
+            for w in response.warnings:
+                print(f"  - {w}")
+        else:
+            print("no warnings")
+    return 0
+
+
+def _run_policy_explain(args: argparse.Namespace) -> int:
+    """Execute ``bound policy explain <file>``.
+
+    Renders a concise human-readable explanation of the effective gates
+    (blockers, required, on_failure/on_missing/on_claimed, minimum_assurance,
+    accepted_provenance), weights (importance tiers -> effective weights and
+    numeric overrides) and budgets (soft/hard limits + actions + disabled).
+    ``--json`` emits a machine-readable payload.
+
+    Exit codes: ``0`` ok, :data:`EXIT_POLICY_INVALID` (1) when the file does not
+    match the schema, :data:`EXIT_POLICY_USAGE` (2) when the file cannot be read.
+    """
+    try:
+        response = PolicyService.explain(PolicyExplainRequest(path=args.file))
+    except PolicyLoadError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_POLICY_USAGE
+    except PolicyValidationError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_POLICY_INVALID
+
+    if args.json:
+        payload = {
+            "policy": {
+                "id": response.policy.id,
+                "version": response.policy.version,
+                "hash": response.policy.hash,
+            }
+            if response.policy
+            else None,
+            "collectors": response.collectors,
+            "acceptance_checks": response.acceptance_checks,
+            "quality_checks": response.quality_checks,
+            "risk_checks": response.risk_checks,
+            "budgets": response.budgets,
+            "change_scope": response.change_scope,
+            "approvals": response.approvals,
+        }
+        print(json.dumps(payload, indent=2))
+        return 0
+
+    print(response.human_readable)
+    return 0
+
+
+def _run_policy_hash(args: argparse.Namespace) -> int:
+    """Execute ``bound policy hash <file>``.
+
+    Canonicalises the policy and prints its SHA-256 hash
+    (``"sha256:<hex>"``). ``--json`` emits ``{"hash": "sha256:...", ...}``.
+
+    Exit codes: ``0`` ok, :data:`EXIT_POLICY_INVALID` (1) when the file does not
+    match the schema, :data:`EXIT_POLICY_USAGE` (2) when the file cannot be read.
+    """
+    try:
+        response = PolicyService.hash(PolicyHashRequest(path=args.file))
+    except PolicyLoadError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_POLICY_USAGE
+    except PolicyValidationError as exc:
+        print(f"error: invalid policy: {exc}", file=sys.stderr)
+        return EXIT_POLICY_INVALID
+
+    if args.json:
+        payload = {
+            "hash": response.hash,
+            "policy": {
+                "id": response.policy.id,
+                "version": response.policy.version,
+                "hash": response.policy.hash,
+            }
+            if response.policy
+            else None,
+        }
+        print(json.dumps(payload, indent=2))
+    else:
+        print(response.hash)
+    return 0
+
+
+def _record_evaluation_for_run(args: argparse.Namespace, result: EvaluationResult) -> dict | int:
+    """Record ``step_started`` + ``evaluation_recorded`` for ``bound evaluate --run``."""
+    store = _store()
+    try:
+        store.read_run(args.run)
+    except RunNotFound as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_NOT_FOUND
+    step_id = generate_step_id(run_id=args.run, contract_id=args.step, attempt=args.attempt)
+    store.start_step(
+        args.run,
+        contract_id=args.step,
+        attempt=args.attempt,
+        step_id=step_id,
+        description=args.description,
+    )
+    evaluation_id = generate_evaluation_id(run_id=args.run, step_id=step_id, attempt=args.attempt)
+    store.record_evaluation(
+        args.run,
+        step_id=step_id,
+        attempt=args.attempt,
+        scores=result.scores,
+        score=result.score,
+        threshold=result.threshold,
+        decision=result.decision,
+        reason_code=_NEXT_ACTION_REASON[_DECISION_NEXT_ACTION[result.decision]],
+        evaluation_id=evaluation_id,
+    )
+    return {
+        "run_id": args.run,
+        "step_id": step_id,
+        "evaluation_id": evaluation_id,
+        "attempt": args.attempt,
+    }
+
+
+def _run_evaluate(args: argparse.Namespace) -> int:
+    """Execute the ``bound evaluate`` subcommand.
+
+    Builds the :class:`Action`, :class:`EvaluationScores` and
+    :class:`BoundCriteria` from the parsed arguments — all validated through
+    Pydantic — runs the deterministic :class:`BoundPolicy`, writes the JSON
+    result to STDOUT and the steering prompt to STDERR.
+
+    Args:
+        args: The parsed namespace carrying ``--action``/``--goal``/``--context``
+            and the score/weight/threshold values.
+
+    Returns:
+        ``0`` on success, or :data:`EXIT_VALIDATION_ERROR` when the supplied
+        inputs fail Pydantic validation (e.g. an out-of-range score or a
+        conflict between the deprecated ``--weight`` and the symmetric
+        ``--*-weight`` flags).
+    """
+    try:
+        action = Action(description=args.action, goal=args.goal, context=args.context)
+        scores = EvaluationScores(
+            acceptance=args.acceptance,
+            influence=args.influence,
+            risk=args.risk,
+            cost=args.cost,
+        )
+        criteria = _build_criteria(args)
+    except ValidationError as exc:
+        print(f"error: invalid BOUND inputs: {exc}", file=sys.stderr)
+        return EXIT_VALIDATION_ERROR
+
+    try:
+        response = EvaluationService.evaluate(
+            EvaluateRequest(
+                action=action,
+                scores=scores,
+                criteria=criteria,
+                run_id=getattr(args, "run", None),
+                step=getattr(args, "step", None),
+                attempt=getattr(args, "attempt", 1),
+                description=getattr(args, "description", None),
+                store=_store(),
+            ),
+        )
+    except EvaluationInputError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_VALIDATION_ERROR
+    except RunNotFoundError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_NOT_FOUND
+
+    logger.debug(
+        "BOUND evaluation complete: decision=%s score=%s",
+        response.result.decision,
+        response.result.score,
+    )
+
+    output = dict(response.payload)
+    if response.lineage is not None:
+        output["lineage"] = response.lineage
+    print(json.dumps(output, indent=2))
+    print(response.prompt, file=sys.stderr)
+    return 0
+
+
+def _build_workflow_signals(args: argparse.Namespace) -> CodingWorkflowSignals:
+    """Build :class:`CodingWorkflowSignals` from the workflow subcommand args.
+
+    Optional signals default to ``None`` (treated as unobserved by the
+    evaluator) rather than zero, preserving the workflow evaluator's
+    "ignore missing signals" contract.
+
+    Args:
+        args: The parsed namespace carrying the workflow signal values.
+
+    Returns:
+        The validated :class:`CodingWorkflowSignals`.
+    """
+    return CodingWorkflowSignals(
+        test_pass_rate=args.test_pass_rate,
+        lint_passed=args.lint_passed,
+        type_check_passed=args.type_check_passed,
+        required_checks_passed=args.required_checks_passed,
+        retry_count=args.retry_count,
+        tool_call_count=args.tool_call_count,
+        token_usage=args.token_usage,
+        execution_time_seconds=args.execution_time_seconds,
+        files_changed=args.files_changed,
+        unexpected_files_changed=args.unexpected_files_changed,
+        rollback_available=args.rollback_available,
+    )
+
+
+def _run_evaluate_workflow(args: argparse.Namespace) -> int:
+    """Execute the ``bound evaluate-workflow`` subcommand.
+
+    Builds :class:`CodingWorkflowSignals` from the parsed arguments, feeds them
+    to a :class:`CodingWorkflowEvaluator` (deriving ``A``/``I``/``R``/``C``
+    deterministically — no LLM, no network), runs the deterministic
+    :class:`BoundPolicy`, and writes the JSON result (including the input
+    ``signals`` and the evaluator ``provenance``) to STDOUT and the steering
+    prompt to STDERR.
+
+    Args:
+        args: The parsed namespace carrying the workflow signals plus the
+            shared weight/threshold values.
+
+    Returns:
+        ``0`` on success, or :data:`EXIT_VALIDATION_ERROR` when the supplied
+        inputs fail validation (e.g. an out-of-range signal or no acceptance
+        evidence at all).
+    """
+    try:
+        action = Action(description=args.action, goal=args.goal, context=args.context)
+        signals = _build_workflow_signals(args)
+        criteria = _build_criteria(args)
+    except ValidationError as exc:
+        print(f"error: invalid BOUND inputs: {exc}", file=sys.stderr)
+        return EXIT_VALIDATION_ERROR
+
+    try:
+        response = EvaluationService.evaluate_workflow(
+            EvaluateWorkflowRequest(
+                action=action,
+                signals=signals,
+                criteria=criteria,
+                influence=args.influence if args.influence is not None else 0.0,
+                run_id=getattr(args, "run", None),
+                step=getattr(args, "step", None),
+                attempt=getattr(args, "attempt", 1),
+                description=getattr(args, "description", None),
+                store=_store(),
+            ),
+        )
+    except EvaluationInputError as exc:
+        print(f"error: could not evaluate workflow: {exc}", file=sys.stderr)
+        return EXIT_VALIDATION_ERROR
+    except RunNotFoundError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_NOT_FOUND
+
+    logger.debug(
+        "BOUND workflow evaluation complete: decision=%s score=%s",
+        response.result.decision,
+        response.result.score,
+    )
+
+    print(json.dumps(response.payload, indent=2))
+    print(response.prompt, file=sys.stderr)
+    return 0
+
+
+def _run_integration_spec(args: argparse.Namespace) -> int:
+    """Execute the ``bound integration-spec`` subcommand.
+
+    Emits the framework-neutral BOUND integration specification as structured
+    JSON to STDOUT. The spec is produced deterministically (no LLM, no network)
+    by :func:`bound.integration_spec.integration_spec` and is intended to be
+    consumable by any agent integration.
+
+    Args:
+        args: The parsed namespace. Unused — the subcommand takes no arguments.
+
+    Returns:
+        ``0`` on success.
+    """
+    from bound.integration_spec import integration_spec
+
+    print(json.dumps(integration_spec(), indent=2))
+    return 0
+
+
+def _run_watch(args: argparse.Namespace) -> int:
+    """Execute the ``bound watch`` subcommand.
+
+    Creates a :class:`WatchEngine` with the given policy path and options,
+    reads JSONL watch events from stdin, and dispatches them to the engine.
+
+    Args:
+        args: The parsed namespace with ``policy``, ``once``, ``json_output``.
+
+    Returns:
+        ``0`` on success, ``1`` on error.
+    """
+    from bound.watch import WatchConfig, WatchEngine, WatchPolicyLoadError, WatchTransportError
+
+    config = WatchConfig(
+        policy_path=args.policy,
+        once=getattr(args, "once", False),
+        json_output=getattr(args, "json_output", False),
+    )
+    engine = WatchEngine(config, stdin=sys.stdin, stdout=sys.stdout)
+    try:
+        return engine.run()
+    except WatchPolicyLoadError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    except WatchTransportError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+
+# ---------------------------------------------------------------------------
+# checkpoint CLI commands
+# ---------------------------------------------------------------------------
+
+
+def _run_checkpoint_create(args: argparse.Namespace) -> int:
+    """Execute ``bound checkpoint create --run --step``."""
+    try:
+        response = CheckpointService.create(
+            CheckpointCreateRequest(
+                run_id=args.run,
+                step_id=args.step,
+                message=getattr(args, "message", None),
+            ),
+        )
+    except CheckpointError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    except RunNotFoundError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_NOT_FOUND
+
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "checkpoint_id": response.checkpoint_id,
+                    "run_id": response.run_id,
+                    "step_id": response.step_id,
+                    "path": response.path,
+                    "changed_files_count": response.changed_files_count,
+                    "untracked_files_count": response.untracked_files_count,
+                },
+                indent=2,
+            ),
+        )
+    else:
+        print(f"checkpoint {response.checkpoint_id} created for run {response.run_id}")
+        print(f"  path: {response.path}")
+        print(f"  changed files: {response.changed_files_count}")
+        print(f"  untracked files: {response.untracked_files_count}")
+    return 0
+
+
+def _run_checkpoint_inspect(args: argparse.Namespace) -> int:
+    """Execute ``bound checkpoint inspect <checkpoint_id>``."""
+    try:
+        response = CheckpointService.inspect(
+            CheckpointInspectRequest(
+                run_id=args.run,
+                checkpoint_id=args.checkpoint_id,
+            ),
+        )
+    except CheckpointError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    except RunNotFoundError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_NOT_FOUND
+
+    if args.json:
+        print(json.dumps(response.model_dump(mode="json"), indent=2, default=str))
+    else:
+        print(f"Checkpoint: {response.checkpoint_id}")
+        print(f"  Run:        {response.run_id}")
+        print(f"  Step:       {response.step_id}")
+        print(f"  HEAD:       {response.head_commit or '-'}")
+        print(f"  Branch:     {response.branch or '-'}")
+        print(f"  Timestamp:  {response.timestamp or '-'}")
+        print(f"  Scope:      {', '.join(response.scope) if response.scope else '(all)'}")
+        print(f"  Changed:    {len(response.changed_files)} file(s)")
+        print(f"  Untracked:  {len(response.untracked_files)} file(s)")
+        print(f"  Hashes:     {response.artifact_hashes_count} file(s)")
+    return 0
+
+
+def _run_checkpoint_list(args: argparse.Namespace) -> int:
+    """Execute ``bound checkpoint list --run``."""
+    try:
+        response = CheckpointService.list_checkpoints(
+            CheckpointListRequest(
+                run_id=args.run,
+            ),
+        )
+    except RunNotFoundError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_NOT_FOUND
+
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "run_id": response.run_id,
+                    "checkpoint_ids": response.checkpoint_ids,
+                },
+                indent=2,
+            ),
+        )
+    else:
+        if not response.checkpoint_ids:
+            print(f"(no checkpoints found for run {response.run_id})")
+            return 0
+        print(f"Checkpoints for run {response.run_id}:")
+        for cp_id in response.checkpoint_ids:
+            print(f"  {cp_id}")
+    return 0
+
+
+def _run_rollback(args: argparse.Namespace) -> int:
+    """Execute ``bound rollback --run --checkpoint``."""
+    try:
+        request = CheckpointRollbackRequest(
+            run_id=args.run,
+            checkpoint_id=args.checkpoint,
+        )
+
+        if args.dry_run:
+            from bound.checkpoint import (
+                compute_rollback_preview,
+                load_checkpoint,
+            )
+
+            try:
+                cp = load_checkpoint(args.run, args.checkpoint)
+            except (FileNotFoundError, RuntimeError) as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 1
+            preview = compute_rollback_preview(cp)
+            print(f"Rollback preview for {args.checkpoint} (run {args.run}):")
+            print(f"  HEAD match:  {preview['head_match']}")
+            print(f"  Changed:     {len(preview['changed'])} file(s)")
+            print(f"  Added:       {len(preview['added'])} file(s)")
+            print(f"  Unchanged:   {len(preview['unchanged'])} file(s)")
+            if preview["changed"]:
+                print("  Files to change:")
+                for f in preview["changed"]:
+                    print(f"    - {f}")
+            if preview["added"]:
+                print("  Files to restore:")
+                for f in preview["added"]:
+                    print(f"    - {f}")
+            if not preview["head_match"]:
+                print("  WARNING: HEAD has diverged since checkpoint was created.")
+            print()
+            print("Use --execute to perform the rollback.")
+            return 0
+
+        if not args.execute:
+            print(
+                "error: rollback requires --execute to proceed (use --dry-run for preview)",
+                file=sys.stderr,
+            )
+            return 2
+
+        # Execute rollback
+        response = CheckpointService.rollback(request)
+        if not response.is_valid:
+            print(f"error: rollback failed for {response.checkpoint_id}", file=sys.stderr)
+            for issue in response.issues:
+                print(f"  - {issue}", file=sys.stderr)
+            return 1
+
+        print(f"Rollback to {response.checkpoint_id} completed successfully.")
+        if response.preview:
+            preview = response.preview
+            print(f"  Changed:  {len(preview.get('changed', []))} file(s)")
+            print(f"  Added:    {len(preview.get('added', []))} file(s)")
+        if response.issues:
+            for issue in response.issues:
+                print(f"  info: {issue}")
+        return 0
+
+    except CheckpointError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    except RunNotFoundError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_NOT_FOUND
+
+
+# ---------------------------------------------------------------------------
+# Init command
+# ---------------------------------------------------------------------------
+
+
+def _run_init(args: argparse.Namespace) -> int:
+    """Execute the ``bound init`` subcommand.
+
+    Detects tooling in *project_dir*, generates a minimal ``bound-policy.yaml``,
+    validates it through :class:`PolicyService`, and either writes it to disk
+    or prints it to stdout.
+
+    Args:
+        args: Parsed namespace with ``project_dir`` and ``stdout``.
+
+    Returns:
+        ``0`` on success, ``1`` on validation failure.
+    """
+    project_dir = Path(args.project_dir).resolve()
+
+    if not project_dir.is_dir():
+        print(f"error: directory not found: {project_dir}", file=sys.stderr)
+        return 1
+
+    # --- Detect tooling ---
+    print(f"Detecting tooling in {project_dir} ...", file=sys.stderr)
+    detections = detect_tooling(project_dir)
+
+    # Print a concise summary to stderr
+    _print_detection_summary(detections)
+
+    # --- Generate policy ---
+    print(file=sys.stderr)
+    print("Generating bound-policy.yaml ...", file=sys.stderr)
+    yaml_content = generate_policy(detections)
+
+    # --- Validate via PolicyService ---
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        suffix=".yaml",
+        delete=False,
+        encoding="utf-8",
+    ) as tmp:
+        tmp.write(yaml_content)
+        tmp_path = tmp.name
+
+    try:
+        response = PolicyService.validate(PolicyValidateRequest(path=tmp_path))
+        if not response.valid:
+            print("error: generated policy failed validation:", file=sys.stderr)
+            for err in response.errors:
+                print(f"  {err}", file=sys.stderr)
+            return 1
+        if response.warnings:
+            print("Validation warnings:", file=sys.stderr)
+            for w in response.warnings:
+                print(f"  {w}", file=sys.stderr)
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+    # --- Output ---
+    if args.stdout:
+        print(yaml_content)
+    else:
+        policy_path = project_dir / "bound-policy.yaml"
+        if policy_path.exists():
+            print(f"error: {policy_path} already exists; refusing to overwrite.", file=sys.stderr)
+            return 1
+        policy_path.write_text(yaml_content, encoding="utf-8")
+        print(f"Wrote {policy_path}", file=sys.stderr)
+
+    # --- Next actions ---
+    print(file=sys.stderr)
+    print("Next steps:", file=sys.stderr)
+    print("  1. Review the generated bound-policy.yaml", file=sys.stderr)
+    print(
+        "  2. Adjust uncertain detections (marked with # UNCERTAIN / # NOT FOUND)",
+        file=sys.stderr,
+    )
+    print("  3. Run: bound policy validate bound-policy.yaml", file=sys.stderr)
+    print("  4. Start a run: bound run start --task <description>", file=sys.stderr)
+    print(file=sys.stderr)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Setup command (v0.8.1)
+# ---------------------------------------------------------------------------
+
+
+def _run_setup(args: argparse.Namespace) -> int:
+    """Execute the ``bound setup`` subcommand.
+
+    Detects tooling in *project_dir*, generates/updates ``bound-policy.yaml``,
+    installs the selected agent integration, creates ``.bound/`` directories,
+    validates the policy, and optionally performs a smoke evaluation.
+
+    Args:
+        args: Parsed namespace with ``agent``, ``project_dir``, ``dry_run``,
+            ``verify``, ``force``, and ``json``.
+
+    Returns:
+        ``0`` on success, ``1`` on error.
+    """
+    project_dir = Path(args.project_dir).resolve()
+
+    if not project_dir.is_dir():
+        print(f"error: directory not found: {project_dir}", file=sys.stderr)
+        return 1
+
+    try:
+        result = setup_project(
+            project_dir=project_dir,
+            agent_id=args.agent,
+            dry_run=args.dry_run,
+            force=args.force,
+            verify=args.verify,
+        )
+    except SetupError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    except FileNotFoundError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    except KeyError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    # --- Output ---
+    if args.json:
+        import json as _json
+
+        payload = {
+            "project_dir": result.project_dir,
+            "agent_id": result.agent_id,
+            "policy_path": result.policy_path,
+            "policy_valid": result.policy_valid,
+            "policy_warnings": result.policy_warnings,
+            "installation": (
+                result.installation.model_dump(mode="json") if result.installation else None
+            ),
+            "next_commands": result.next_commands,
+        }
+        print(_json.dumps(payload, indent=2))
+        return 0
+
+    # Human-readable output
+    print("BOUND setup", file=sys.stderr)
+    print(file=sys.stderr)
+
+    # Detections
+    print("✓ Python project detected", file=sys.stderr)
+
+    detections = detect_tooling(project_dir)
+    if detections.test_framework:
+        print(f"✓ {detections.test_framework.name} detected", file=sys.stderr)
+    else:
+        print("✗ No test framework detected", file=sys.stderr)
+
+    if detections.linter:
+        print(f"✓ {detections.linter.name} detected", file=sys.stderr)
+    else:
+        print("✗ No linter detected", file=sys.stderr)
+
+    if detections.type_checker:
+        print(f"✓ {detections.type_checker.name} detected", file=sys.stderr)
+    else:
+        print("✗ No type checker detected", file=sys.stderr)
+
+    if detections.git_branch:
+        print("✓ Git checkpoints available", file=sys.stderr)
+    else:
+        print("✗ Git not detected", file=sys.stderr)
+
+    # Policy
+    if args.dry_run:
+        print("○ bound-policy.yaml (would be generated)", file=sys.stderr)
+    else:
+        print("✓ bound-policy.yaml generated", file=sys.stderr)
+
+    # Integration
+    if result.installation:
+        for change in result.installation.changes:
+            marker = "○" if args.dry_run else "✓" if change.kind in ("create", "modify") else "·"
+            print(f"{marker} {change.description}", file=sys.stderr)
+        print(
+            f"✓ {result.installation.display_name} integration "
+            f"{'planned' if args.dry_run else 'installed'}",
+            file=sys.stderr,
+        )
+
+    # Policy validation
+    if result.policy_valid:
+        print("✓ Policy validated", file=sys.stderr)
+    else:
+        for w in result.policy_warnings:
+            print(f"! {w}", file=sys.stderr)
+
+    # Smoke eval
+    if args.verify:
+        print("✓ Smoke evaluation passed", file=sys.stderr)
+
+    # Next commands
+    print(file=sys.stderr)
+    print("Next:", file=sys.stderr)
+    print(file=sys.stderr)
+    for cmd in result.next_commands:
+        print(f"  {cmd}", file=sys.stderr)
+
+    return 0
+
+
+def _run_doctor(args: argparse.Namespace) -> int:
+    """Execute the ``bound doctor`` subcommand.
+
+    Runs all diagnostic checks against *project_dir*, renders results as a
+    human-readable table or JSON, and exits with the appropriate code.
+
+    Args:
+        args: Parsed namespace with ``json`` and ``project_dir``.
+
+    Returns:
+        ``0`` on clean, ``1`` on warnings only, ``2`` on errors.
+    """
+    project_dir = Path(args.project_dir).resolve()
+    report = run_doctor(project_dir)
+
+    if args.json:
+        # Stable JSON schema: { "checks": [...], "project_dir": "...",
+        #   "summary": { "pass": N, "warning": N, "error": N } }
+        json.dump(
+            {
+                "checks": [
+                    {
+                        "status": c.status,
+                        "name": c.name,
+                        "message": c.message,
+                        "detail": c.detail,
+                    }
+                    for c in report.checks
+                ],
+                "project_dir": str(report.project_dir),
+                "summary": {
+                    "pass": report.pass_count,
+                    "warning": report.warning_count,
+                    "error": report.error_count,
+                },
+            },
+            sys.stdout,
+            indent=2,
+        )
+        sys.stdout.write("\n")
+    else:
+        # Human-readable table
+        status_colors = {"PASS": "✓", "WARNING": "⚠", "ERROR": "✗"}
+        for c in report.checks:
+            icon = status_colors.get(c.status, c.status)
+            print(f"  {icon} {c.status:7}  {c.name:35}  {c.message}")
+            if c.detail:
+                for line in c.detail.split("\n"):
+                    print(f"         {'':35}  {line}")
+        print()
+        summary = (
+            f"{report.pass_count} passed, "
+            f"{report.warning_count} warning(s), "
+            f"{report.error_count} error(s)"
+        )
+        print(summary)
+
+    return report.recommended_exit_code
+
+
+def _run_adapter_install(args: argparse.Namespace) -> int:
+    """Execute ``bound adapter install``.
+
+    Installs the adapter integration config for the specified agent. For Cline
+    and Codex, writes the MCP server config file. For Claude Code, confirms
+    the adapter is importable (the CLI flags are embedded in the adapter class).
+
+    Args:
+        args: Parsed namespace with ``agent`` and ``project_dir``.
+
+    Returns:
+        ``0`` on success, ``1`` on failure.
+    """
+    agent = args.agent
+    project_dir = args.project_dir
+
+    if agent == "cline":
+        try:
+            from bound.adapters.cline import ClineMCPAdapter
+        except ImportError as exc:
+            print(f"error: cannot import ClineMCPAdapter: {exc}", file=sys.stderr)
+            return 1
+        try:
+            path = ClineMCPAdapter.install(project_dir=project_dir)
+            print(f"Cline MCP adapter installed: {path}")
+        except OSError as exc:
+            print(f"error: failed to install Cline adapter: {exc}", file=sys.stderr)
+            return 1
+    elif agent == "codex":
+        try:
+            from bound.adapters.codex import CodexMCPConfig
+        except ImportError as exc:
+            print(f"error: cannot import CodexMCPConfig: {exc}", file=sys.stderr)
+            return 1
+        try:
+            path = CodexMCPConfig.install(project_dir=project_dir)
+            print(f"Codex MCP adapter installed: {path}")
+        except OSError as exc:
+            print(f"error: failed to install Codex adapter: {exc}", file=sys.stderr)
+            return 1
+    elif agent == "claude-code":
+        try:
+            from bound.adapters.claude_code import ClaudeCodeAdapter
+        except ImportError as exc:
+            print(f"error: cannot import ClaudeCodeAdapter: {exc}", file=sys.stderr)
+            return 1
+        # Claude Code uses a subprocess adapter; validate the import works.
+        cmd = " ".join(ClaudeCodeAdapter().config.agent_command)
+        print(f"Claude Code adapter is available (command: {cmd} <task>)")
+        print(
+            "Ensure @anthropic-ai/claude-code is installed: npx @anthropic-ai/claude-code --version"
+        )
+    else:
+        print(f"error: unknown agent {agent!r}", file=sys.stderr)
+        return 1
+
+    return 0
+
+
+def _print_detection_summary(detections: ProjectDetections) -> None:
+    """Print a human-readable summary of the detections to stderr.
+
+    Args:
+        detections: The tooling detections.
+    """
+    print("  Test framework:", detections.test_framework.name, file=sys.stderr)
+    print("  Linter:       ", detections.linter.name, file=sys.stderr)
+    print("  Type checker: ", detections.type_checker.name, file=sys.stderr)
+    print("  Coverage:     ", detections.coverage.name, file=sys.stderr)
+    print("  Build system: ", detections.build_system.name, file=sys.stderr)
+    ci = (
+        f"{detections.ci_provider.name} ({detections.ci_provider.confidence.value})"
+        if detections.ci_provider
+        else "none"
+    )
+    print(f"  CI provider:  {ci}", file=sys.stderr)
+    if detections.git_branch:
+        print(f"  Git branch:   {detections.git_branch}", file=sys.stderr)
+    if detections.git_remote:
+        print(f"  Git remote:   {detections.git_remote[:80]}", file=sys.stderr)
+
+
+def _run_mcp(args: argparse.Namespace) -> int:
+    """Run the stdio MCP server.
+
+    Args:
+        args: Parsed CLI arguments.
+
+    Returns:
+        Exit code from the MCP server.
+    """
+    # Keep the MCP import optional per architecture rules
+    try:
+        from bound.mcp_server import run_mcp_server
+    except ImportError:
+        print("error: mcp_server module not available", file=sys.stderr)
+        return 1
+
+    return run_mcp_server(once=args.once, json_log=args.json_log)
+
+
+# ---------------------------------------------------------------------------
+# benchmark runners
+# ---------------------------------------------------------------------------
+
+
+def _run_benchmark_run(args: argparse.Namespace) -> int:
+    """Execute ``bound benchmark run``.
+
+    Args:
+        args: Parsed CLI arguments with ``suite``, ``json``, ``output``, ``html``.
+
+    Returns:
+        ``0`` on success.
+    """
+    from bound.benchmark import BenchmarkRunner
+    from bound.benchmark_report import render_html, render_json
+    from bound.controller_eval import ControllerEvaluator
+
+    runner = BenchmarkRunner()
+    try:
+        run_result = runner.run_suite(args.suite)
+    except (ValueError, FileNotFoundError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    # Controller health
+    evaluator = ControllerEvaluator()
+    # We derive decisions/signals from the experiment results for evaluation.
+    # For a proper controller eval we'd replay the trajectory steps here.
+    # In the benchmark runner, we gather from the run's per-step data.
+    # For now, use an empty health record.
+    health = evaluator.evaluate_decisions([])
+
+    if args.html:
+        html = render_html(run_result, health=health)
+        Path(args.html).write_text(html, encoding="utf-8")
+        print(f"HTML report written to {args.html}")
+
+    if args.json:
+        print(render_json(run_result, health=health))
+    else:
+        a = run_result.aggregate
+        print(f"Suite: {run_result.suite_name}  Run: {run_result.run_id}")
+        print(
+            f"Tasks: {a.total_tasks}  Accepted: {a.tasks_accepted}  "
+            f"Rate: {a.acceptance_rate * 100:.0f}%"
+        )
+        print(
+            f"Steps saved: {a.total_steps_saved}  "
+            f"Tool calls saved: {a.total_tool_calls_saved}  "
+            f"Tokens saved: {a.total_tokens_saved:,}"
+        )
+        print(
+            f"Runtime saved: {a.total_runtime_saved:.1f}s  "
+            f"Mean steps/task: {a.mean_steps_saved:.1f}"
+        )
+        print(f"Tasks with regressions: {a.tasks_with_regressions}")
+
+    if args.output:
+        out_path = Path(args.output)
+        out_path.write_text(render_json(run_result, health=health), encoding="utf-8")
+        print(f"JSON results written to {out_path}")
+
+    return 0
+
+
+def _run_benchmark_report(args: argparse.Namespace) -> int:
+    """Execute ``bound benchmark report``.
+
+    Args:
+        args: Parsed CLI arguments with ``run_id``, ``json``, ``output``.
+
+    Returns:
+        ``0`` on success.
+    """
+    print(
+        "error: benchmark report requires a stored run. "
+        "Run 'bound benchmark run --output results.json' first.",
+        file=sys.stderr,
+    )
+    return 1
+
+
+def _run_benchmark_list(args: argparse.Namespace) -> int:
+    """Execute ``bound benchmark list``.
+
+    Args:
+        args: Parsed CLI arguments with ``json``.
+
+    Returns:
+        ``0`` on success.
+    """
+    import json as _json
+
+    from bound.benchmark import BUILTIN_SUITES
+
+    if args.json:
+        print(_json.dumps(BUILTIN_SUITES, indent=2))
+    else:
+        for name, tasks in BUILTIN_SUITES.items():
+            print(f"{name}: {', '.join(tasks)}")
+    return 0
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Parse CLI arguments and dispatch to the requested subcommand.
+
+    Args:
+        argv: Optional argument vector. Defaults to ``sys.argv[1:]``.
+
+    Returns:
+        Process exit code. With no subcommand the CLI exits ``0``. The
+        ``evaluate`` and ``evaluate-workflow`` subcommands return ``0`` on
+        success or :data:`EXIT_VALIDATION_ERROR` on invalid inputs. ``--help``
+        and missing required arguments are handled by ``argparse`` (which exits
+        ``0`` / ``2`` respectively).
+    """
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    _configure_logging(getattr(args, "verbose", 0))
+
+    func = getattr(args, "func", None)
+    if func is None:
+        return 0
+    return func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

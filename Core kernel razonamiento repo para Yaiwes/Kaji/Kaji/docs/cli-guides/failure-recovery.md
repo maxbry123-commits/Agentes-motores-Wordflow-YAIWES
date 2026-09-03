@@ -1,0 +1,192 @@
+# Failure Triage / Recovery CLI
+
+Language: English | [日本語](failure-recovery.ja.md)
+
+CLI reference for the failure triage and auto recovery layer (Issue #288). It applies to both
+`provider.type = "github"` and `provider.type = "local"`; the triage comment is posted through the
+active provider.
+
+For the operational rules (what is and is not resumable, why the wait exists), see
+[Workflow guide](../dev/workflow_guide.md) § failure triage と自動再開. For the config keys, see
+[Configuration reference](../reference/configuration.md) § `[execution]`.
+
+## What runs when
+
+`kaji run` classifies the failure and records evidence when the workflow process ends with `ERROR`,
+or with an `ABORT` that is eligible for triage. Failures that happen **before the run directory is
+created** (config discovery, workflow validation, `IssueContext` resolution) are not triaged: there
+is no artifact to reason about, and an evidence-free Issue comment is worse than none.
+
+Two layers exist and do not overlap:
+
+| Layer | Scope | Timescale | Where |
+|-------|-------|-----------|-------|
+| attempt retry | transient CLI failure inside one step dispatch | seconds to minutes, in-process | `execute_cli()` |
+| run recovery | `ERROR` / triage-eligible `ABORT` at the end of the workflow process | fixed 10-minute wait, then a new `kaji run` | this document |
+
+### Interactive terminal: transient provider errors buried in the transcript (Issue #296)
+
+When `agent_runner = "interactive_terminal"` and a tmux pane dies before writing
+`verdict.yaml`, kaji scans the **entire** `terminal.log` transcript (not just the last 2000
+characters) for a known transient pattern (`"at capacity"`, `"rate limit"`, `"overloaded"`, …
+— the same list `execute_cli()` uses). TUI redraw can bury a one-line provider error deep in a
+transcript far larger than the old tail window, so a full-transcript scan is required to avoid
+misclassifying a transient capacity error as non-recoverable.
+
+Only the matched pattern **literal** is placed in `CLIExecutionError` / `result.json.error`
+(e.g. `"...transient provider error detected (pattern: 'at capacity')"`) — never a transcript
+substring. This keeps unrelated text on the same physical line (such as a `Token usage:`
+telemetry line) out of the classifier/sensitive-gate input, so it cannot accidentally trip the
+credential-leak gate. The full ANSI-stripped excerpt and tail are kept for humans only, in
+`pane-metadata.json`'s `terminal_diagnostic` key (`kind`: `provider_error` / `no_pattern` /
+`no_log` / `empty`), which the classifier never reads.
+
+The resulting `dispatch_failure` classification and `--auto-recover` behavior (candidate →
+resume after 10 minutes, or `comment_only` when auto recovery is off) follow the same rules as
+any other transient dispatch failure described below.
+
+### Verdict YAML forbidden control characters no longer trigger re-execution (Issue #298)
+
+Previously, a raw control character outside the YAML 1.2 printable range (e.g. ESC / `U+001B`)
+inside a `verdict.yaml` evidence/reason field made `_parse_yaml_fields` raise `VerdictParseError`,
+even when the step's external side effects (commit, push, comment) had already completed. The
+runner converted this into a `verdict_exception` failure event and a synthetic `ABORT`, and
+recovery classified it as `verdict_resolution_failure` — presenting the same, already-completed
+step as the resume point.
+
+`_parse_yaml_fields` now sanitizes YAML-forbidden control characters (replacing them with
+`U+FFFD`) before parsing, so the artifact's real verdict resolves normally and this failure mode
+no longer reaches recovery at all. TAB / LF / CR and other characters YAML permits are left
+untouched. Sanitized codepoints and their position are recorded in `run.log` as a
+`verdict_sanitization` event (see [logging reference](../reference/python/logging.md) §
+`verdict_sanitization`) — never the raw control character itself. Verdict resolution failures
+unrelated to control characters (e.g. a missing `status` field) still raise `VerdictParseError`
+and are classified as `verdict_resolution_failure` exactly as before.
+
+## `kaji run` options
+
+| flag | Default | Meaning |
+|------|---------|---------|
+| `--failure-triage` / `--no-failure-triage` | config (`true`) | Classify the failure, post the triage comment, write `recovery.json` / `run.log`, print the stderr summary |
+| `--auto-recover` / `--no-auto-recover` | config (`false`) | Start one child run per recovery chain when the decision is `resume` |
+| `--recovery-root <run_id>` | — | Root run_id of the recovery chain (normally added by the handler) |
+| `--recovery-parent <run_id>` | — | Direct parent run_id. Requires `--recovery-root`; alone it exits `2` |
+
+Precedence matches `--agent-runner`: CLI flag > `.kaji/config.local.toml` > `.kaji/config.toml`.
+`--no-failure-triage` also forces `auto_recover` off, because the handler that would start the child
+run never executes.
+
+```bash
+# 1. Normal operation: triage on, auto recovery off (defaults)
+kaji run .kaji/wf/official/dev.yaml 288
+# → on ERROR: triage comment on the Issue, recovery.json saved, summary on stderr. exit 3
+
+# 2. Opt in to auto recovery
+kaji run .kaji/wf/official/dev.yaml 288 --auto-recover
+# → decision: resume starts a child run after 10 minutes. The parent's exit code is the child's
+
+# 3. The command the handler itself runs (you normally do not type this)
+kaji run .kaji/wf/official/dev.yaml 288 --from review-code \
+  --recovery-root 260710120000 --recovery-parent 260710120000
+```
+
+## `kaji recover`
+
+Runs the same handler against an already-failed run's artifacts. Use it to investigate, to re-render
+the triage report after a provider outage, or to opt into a resume after the fact.
+
+```
+kaji recover <workflow.yaml> <issue> [--run-id <run_id>] [--auto-recover] [--workdir <dir>]
+```
+
+- `--run-id` defaults to the newest run under `<artifacts_dir>/<issue>/runs/`.
+- If the target run has no `workflow_end` event, `kaji recover` refuses with `2`. This prevents
+  interfering with a run that is still executing.
+- If the target run ended with a status other than `ERROR` / `ABORT`, it also exits `2`.
+- `<workflow.yaml>` is used to resolve the resume point and to build the resume command; pointing at
+  a different workflow than the one the run used is the operator's responsibility (the workflow path
+  is recorded in `recovery.json`).
+- Re-running it against a run that already performed an auto recovery yields `decision: exhausted`.
+  The budget is one resume per recovery chain; `recovery.json` and the child run directory are the
+  inputs to that decision.
+- For runs produced **before** this feature (their `run.log` `workflow_start` carries no
+  `schema_version`), a missing `failure_event` is not treated as a harness contradiction, so no bug
+  issue is filed.
+
+```bash
+kaji recover .kaji/wf/official/dev.yaml 288
+kaji recover .kaji/wf/official/dev.yaml 288 --run-id 260710120000
+```
+
+## Exit codes
+
+The existing map (`0 = OK`, `1 = ABORT`, `2 = definition error`, `3 = runtime error`) is unchanged.
+
+| Situation | Exit code |
+|-----------|-----------|
+| `kaji run` with triage only (no child run) | the original failure's exit code |
+| `kaji run` that started a child run | the child's exit code (the chain's final result) |
+| `kaji recover`, triage completed (any decision) | `0` |
+| `kaji recover`, run not found / still in progress / flag mismatch / `requires_provider` mismatch | `2` |
+| `kaji recover`, handler internal error | `3` |
+
+## Artifacts
+
+| Path | Content |
+|------|---------|
+| `runs/<run_id>/recovery.json` | `RecoveryDecision` (`schema_version: 1`), overwritten on every decision update. Carries `incident_suppressed` / `incident_suppression_reason` when incident recording was skipped (Issue #322) |
+| `runs/<run_id>/recovery-chain.json` | `{root_run_id, parent_run_id}`, written by a recovery child run at startup |
+| `runs/<run_id>/run.log` | `failure_event`, `recovery_decision`, `recovery_scheduled`, `recovery_attempt_start`, `recovery_attempt_end`, `incident_recorded`, `incident_recording_failed`, `incident_suppressed` |
+| `incidents/occurrences.jsonl` | Local occurrence log of the incident layer (directly under `<artifacts_dir>`, append-only). One line per failure for every provider, **except for the exempted causes below** |
+| Issue comment | Machine-generated triage report (posted before the child launch) plus a follow-up result comment when an auto recovery ran. No kaji-verdict marker (it is not a step verdict) |
+| stderr | A short `--- failure triage ---` summary printed after the existing terminal message |
+
+The `comment:` line of the stderr summary shows `Comment.ref`: the created comment URL for the
+GitHub provider, the repo-root-relative comment file path for the local provider, and `n/a` when the
+reference could not be captured.
+
+### Incident recording exemption (Issue #322 / #403 / #405)
+
+Failures classified as `user_precondition_error`, `user_interrupted`, `agent_declared_abort`, or
+`cycle_exhausted` never enter the incident layer: no incident Issue is opened, no occurrence
+comment is posted, and nothing is appended to `incidents/occurrences.jsonl`. These are known
+user-originated endings that need no investigation, or contractually normal terminations, and
+promoting them to incidents would drown out the real failure signal.
+
+| Cause | Case | Decision input |
+|---|---|---|
+| `user_precondition_error` | The interactive terminal runner was started outside its selected backend session (`TmuxSessionRequiredError` / `HerdrSessionRequiredError`) | `failure_event.exception_type` |
+| `user_interrupted` | The operator interrupted `kaji run` with Ctrl-C | `failure_event.kind == "interrupted"` |
+| `agent_declared_abort` | The agent returned a legitimate ABORT verdict (safe stop / manual confirmation requested) | `failure_event.kind == "agent_abort"` |
+| `cycle_exhausted` | A cycle reached `max_iterations` (safety valve worked as designed) | `failure_event.kind == "cycle_exhausted"` |
+
+All four decisions key off the structured `failure_event` recorded in `run.log`, never off the raw
+error message. A missing backend binary, an insufficient backend version, and every other
+`CLINotFoundError` keep their existing incident recording behavior.
+
+`agent_declared_abort` and `cycle_exhausted` end without an exception, so the identity signature's
+canonical input is always empty and the fingerprint degenerates to a per-cause constant. `cause` is
+itself part of the match key, so the two causes never collapse into each other. Without this
+exemption, unrelated safe stops that share a cause — regardless of their step or actual stop
+reason — would all collapse into a single incident Issue per cause (Issue #405).
+
+An interrupted run ends with `workflow_end status=ERROR`, so `kaji recover` can select it as a triage
+target (`user_interrupted` maps to the `comment_only` decision; it is never auto-resumed). The
+interruption is recorded at run level only — no `result.json` is written for the in-flight attempt.
+The interactive terminal runner leaves the agent pane alive and surfaces its `pane_id` in the triage
+evidence (see the [interactive terminal runner guide](./interactive-terminal-runner.md) § session
+continuation). Only an in-flight attempt — one without a `result.json` — contributes orphan pane
+evidence; a completed attempt's pane has already been cleaned up. Without that distinction an
+interruption that lands before the next attempt directory exists would report the previous,
+already-killed pane as an orphan.
+
+Even when incident recording is suppressed, the console error, the run artifacts, and the triage
+comment on the originating Issue are all preserved. The suppression itself is auditable from the
+`incident_suppressed` event in `run.log` (`cause` / `exception_type` / `failed_step` / `reason`) and
+from the two `recovery.json` fields above.
+
+## Related documents
+
+- [Workflow guide](../dev/workflow_guide.md) — operational rules, non-resumable cases
+- [Configuration reference](../reference/configuration.md) — `[execution] failure_triage` / `auto_recover`
+- [Architecture](../ARCHITECTURE.md) — recovery layer and `kaji_harness/recovery/` package

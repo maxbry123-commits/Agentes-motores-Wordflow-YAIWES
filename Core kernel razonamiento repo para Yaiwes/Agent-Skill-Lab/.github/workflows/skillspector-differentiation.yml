@@ -1,0 +1,124 @@
+name: SkillSpector differentiation
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  static-comparison:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Record runner identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          uname -a
+          docker version
+          git --version
+
+      - name: Fetch pinned public sources
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git clone --filter=blob:none --no-checkout \
+            https://github.com/NVIDIA/SkillSpector.git /tmp/skillspector
+          git -C /tmp/skillspector checkout --detach \
+            34f60308522f45447cd343da0aad77bcea308ad4
+
+          git clone --filter=blob:none --no-checkout \
+            https://github.com/openclaw/agent-skills.git /tmp/openclaw-agent-skills
+          git -C /tmp/openclaw-agent-skills checkout --detach \
+            fe588b1a6267eb47f785d0c748db9f6f3e9a3b4f
+
+          git clone --filter=blob:none --no-checkout \
+            https://github.com/NousResearch/hermes-agent.git /tmp/hermes-agent
+          git -C /tmp/hermes-agent checkout --detach \
+            202140db53536083b85aba7511c555d07f5ada67
+
+          test "$(git -C /tmp/skillspector rev-parse HEAD)" = \
+            "34f60308522f45447cd343da0aad77bcea308ad4"
+          test "$(git -C /tmp/openclaw-agent-skills rev-parse HEAD)" = \
+            "fe588b1a6267eb47f785d0c748db9f6f3e9a3b4f"
+          test "$(git -C /tmp/hermes-agent rev-parse HEAD)" = \
+            "202140db53536083b85aba7511c555d07f5ada67"
+
+      - name: Build pinned SkillSpector image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build --tag skillspector:2.5.0 /tmp/skillspector
+          docker image inspect skillspector:2.5.0 \
+            --format 'image_id={{.Id}} created={{.Created}}'
+
+      - name: Run static offline comparisons
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/skillspector-reports
+
+          run_scan() {
+            local sample_id="$1"
+            local source_mount="$2"
+            local target_path="$3"
+            local report="/tmp/skillspector-reports/${sample_id}.json"
+
+            set +e
+            docker run --rm \
+              --network none \
+              --read-only \
+              --cap-drop ALL \
+              --security-opt no-new-privileges \
+              --pids-limit 256 \
+              --memory 2g \
+              --cpus 2 \
+              --tmpfs /tmp:rw,noexec,nosuid,size=256m \
+              --volume "${source_mount}:/sources:ro" \
+              skillspector:2.5.0 \
+              scan "/sources/${target_path}" \
+              --no-llm \
+              --format json >"${report}"
+            local exit_code=$?
+            set -e
+
+            printf 'sample=%s exit_code=%s\n' "${sample_id}" "${exit_code}"
+            sha256sum "${report}"
+            python3 - "${report}" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          path = pathlib.Path(sys.argv[1])
+          data = json.loads(path.read_text(encoding="utf-8"))
+          print(
+              "execution_successful=",
+              data.get("execution_successful"),
+              "score=",
+              data.get("risk_assessment", {}).get("score"),
+              "severity=",
+              data.get("risk_assessment", {}).get("severity"),
+              "issues=",
+              len(data.get("issues", [])),
+          )
+          PY
+            printf '%s\n' "--- ${sample_id} raw JSON ---"
+            cat "${report}"
+            printf '%s\n' "--- end ${sample_id} raw JSON ---"
+          }
+
+          run_scan \
+            ASL-C004 \
+            /tmp/openclaw-agent-skills \
+            skills/handoff
+          run_scan \
+            ASL-C005 \
+            /tmp/openclaw-agent-skills \
+            skills/autoreview
+          run_scan \
+            ASL-C007 \
+            /tmp/hermes-agent \
+            skills/research/llm-wiki

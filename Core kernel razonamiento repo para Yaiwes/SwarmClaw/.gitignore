@@ -1,0 +1,97 @@
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+# dependencies
+/node_modules
+/.pnp
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+
+# testing
+/coverage
+
+# next.js
+/.next/
+/out/
+
+# production
+/build
+
+# misc
+.DS_Store
+*.pem
+
+# tool-generated screenshots
+*-screenshot.png
+*_screenshot.png
+*_search.png
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+daemon.log
+
+# env files (can opt-in for committing if needed)
+.env*
+/AGENTS.md
+/CLAUDE.md
+/.claude/
+/.swarmclaw-install.json
+/.tmp-*
+
+# runtime data is always private (sessions, credentials, wallets, uploads, etc.)
+/data/*
+!/data/.gitkeep
+!/data/skills/
+/.legacy-browser-profiles/
+
+# user config backup
+/data-backup/
+
+# vercel
+.vercel
+
+# typescript
+*.tsbuildinfo
+next-env.d.ts
+
+# CI artifacts
+/artifacts/
+
+# electron
+/electron-dist/
+/release/
+/dist-electron/
+
+# local scratch files
+todo.html
+IMPROVEMENTS.md
+/agent-harness.md
+/fix-*.js
+/rewrite-*.js
+/split-*.js
+/summarize-*.js
+
+# local scratch dir accidentally created by tooling
+/~/
+
+# git worktrees
+/.worktrees/
+
+# hidden local workbench for private harnesses, comparisons, and scratch artifacts
+/.workbench/
+/workbench/.tmp-*/
+
+# local-only imported skills and runtime scratch should never ship
+/data/skills/
+
+# superpowers skill docs (local only)
+/docs/superpowers/
+
+# spec drafts (local only)
+/docs/specs/

@@ -1,0 +1,9 @@
+[
+  {
+    "repo": "Kaji",
+    "path": "docs/assets/demo.mp4",
+    "chunks_dir": "Kaji/docs/assets/demo.mp4.chunks",
+    "bytes": 11063428,
+    "chunk_bytes": 8388608
+  }
+]

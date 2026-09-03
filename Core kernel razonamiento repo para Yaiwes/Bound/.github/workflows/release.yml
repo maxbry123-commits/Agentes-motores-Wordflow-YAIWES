@@ -1,0 +1,240 @@
+# ──────────────────────────────────────────────────────────────────────
+# Build-once release workflow
+# ──────────────────────────────────────────────────────────────────────
+# This is the ONLY entrypoint for production releases. The workflow:
+#
+#   1. quality-and-build  — verify, test, build ALL artifacts (wheel,
+#      sdist, Skills ZIP, checksums) and upload 1 immutable bundle.
+#   2. publish-github     — download the bundle, push the tag, create
+#      GitHub Release with all assets.
+#   3. publish-pypi       — download assets from the GitHub Release,
+#      publish to PyPI via trusted publishing (OIDC).
+#
+# Steps run sequentially: GitHub Release always exists before PyPI is
+# published. Re-publishing is always possible via publish.yml.
+#
+# Trigger: Actions tab → "Release" → "Run workflow" → enter the version
+# (without leading v, e.g. "0.7.0"). The input MUST match
+# project.version in pyproject.toml AND bound.__version__, which is
+# verified before anything is built or tagged.
+#
+# publish-github uses GITHUB_TOKEN with contents:write to push the tag
+# — no PAT or extra secrets needed.
+# ──────────────────────────────────────────────────────────────────────
+
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, without the leading v (e.g. 0.7.0)"
+        required: true
+        type: string
+
+# ── Concurrency: prevent duplicate builds for the same version ────────
+concurrency:
+  group: release-${{ inputs.version }}
+  cancel-in-progress: false
+
+# ── Minimal root permissions; per-job permissions are elevated ──────
+permissions:
+  contents: read
+
+jobs:
+# ═════════════════════════════════════════════════════════════════
+  #  quality-and-build  — 1x bouwen, 1x uploaden
+  # ═════════════════════════════════════════════════════════════════
+  quality-and-build:
+    name: Quality gate & build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Sync dependencies
+        run: uv sync --locked --all-extras --dev
+
+      # ── Integrity checks ──────────────────────────────────
+      - name: Verify version matches pyproject.toml
+        run: |
+          PACKAGE_VERSION=$(uv run python -c \
+            "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          echo "pyproject.toml version:  $PACKAGE_VERSION"
+          echo "Requested version:       ${{ inputs.version }}"
+          test "$PACKAGE_VERSION" = "${{ inputs.version }}"
+          echo "✅ pyproject.toml version OK"
+
+      - name: Verify version matches bound.__version__
+        run: |
+          CODE_VERSION=$(uv run python -c "import bound; print(bound.__version__)")
+          echo "bound.__version__:  $CODE_VERSION"
+          echo "Requested version:   ${{ inputs.version }}"
+          test "$CODE_VERSION" = "${{ inputs.version }}"
+          echo "✅ bound.__version__ OK"
+
+      - name: Verify changelog has entry for this version
+        run: |
+          grep -q "^## \[${{ inputs.version }}\]" CHANGELOG.md || \
+            { echo "❌ CHANGELOG.md has no entry for [${{ inputs.version }}]"; exit 1; }
+          echo "✅ CHANGELOG.md has entry for ${{ inputs.version }}"
+
+      - name: Check tag does not exist yet
+        run: |
+          TAG="v${{ inputs.version }}"
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "❌ Tag $TAG already exists!"
+            exit 1
+          fi
+          echo "✅ Tag $TAG does not exist yet"
+
+      # ── Quality gates ─────────────────────────────────────────
+      - name: Ruff lint
+        run: uv run ruff check .
+
+      - name: Run tests
+        run: uv run pytest -q
+
+      # ── Build ─────────────────────────────────────────────────
+      - name: Build wheel and sdist
+        run: uv build --out-dir release/python
+
+      - name: Build Skills ZIP (deterministic)
+        run: uv run python scripts/build_skill_zip.py --out-dir release/skills
+
+      - name: Twine check on wheel & sdist
+        run: |
+          uv pip install twine
+          uv run twine check release/python/*
+
+      - name: Wheel smoke test (install in clean venv)
+        run: |
+          WHEEL=$(ls release/python/bound_policy-*.whl | head -1)
+          echo "Testing wheel: $WHEEL"
+          python -m venv /tmp/.bound-wheel-test
+          /tmp/.bound-wheel-test/bin/pip install "$WHEEL"
+          echo "--- import bound ---"
+          /tmp/.bound-wheel-test/bin/python -c "import bound; print(bound.__version__)"
+          echo "--- bound --help ---"
+          /tmp/.bound-wheel-test/bin/bound --help
+          echo "--- bound integration-spec ---"
+          /tmp/.bound-wheel-test/bin/bound integration-spec 2>&1 | head -20
+          echo "--- Done ---"
+          rm -rf /tmp/.bound-wheel-test
+
+      - name: Verify Skills ZIP structure
+        run: |
+          uv run python -c "
+          import zipfile
+          with zipfile.ZipFile('release/skills/BOUND-agent-skill.zip') as zf:
+              names = zf.namelist()
+              assert 'bound/SKILL.md' in names, 'Missing bound/SKILL.md'
+              assert 'bound/agents/openai.yaml' in names, 'Missing agents/openai.yaml'
+              assert 'bound/references/integration-report.md' in names, 'Missing references/integration-report.md'
+              for n in names:
+                  assert '__pycache__' not in n, f'Contains pycache: {n}'
+                  assert not n.endswith('.pyc'), f'Contains .pyc: {n}'
+                  assert not n.endswith('.DS_Store'), f'Contains .DS_Store: {n}'
+              print(f'✅ ZIP structure valid ({len(names)} files)')
+          "
+
+      - name: Generate checksums
+        run: |
+          cd release
+          sha256sum python/* skills/* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          cd ..
+
+      # ── Upload 1 immutable artifact ────────────────────────────
+      - name: Upload release bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-bundle-${{ inputs.version }}
+          path: release/
+          retention-days: 90
+  # ═════════════════════════════════════════════════════════════════
+  #  publish-github  — tag + GitHub Release (downloads bundle)
+  # ═════════════════════════════════════════════════════════════════
+  publish-github:
+    name: Publish to GitHub Release
+    needs: [quality-and-build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download release bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: release-bundle-${{ inputs.version }}
+          path: release/
+
+      - name: Create and push version tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          TAG="v${{ inputs.version }}"
+          # Always start from the latest main to include the release commit itself
+          git fetch origin main
+          git checkout main
+          git reset --hard origin/main
+          # Delete remote tag if it exists from a previous failed attempt
+          git push origin ":refs/tags/$TAG" 2>/dev/null || true
+          # Delete local tag if it exists
+          git tag -d "$TAG" 2>/dev/null || true
+          # Create and push fresh tag
+          git tag -a "$TAG" -m "Release $TAG"
+          git push origin "$TAG"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ inputs.version }}
+          name: v${{ inputs.version }}
+          generate_release_notes: true
+          files: |
+            release/python/*
+            release/skills/*
+            release/SHA256SUMS.txt
+
+  # ═════════════════════════════════════════════════════════════════
+  #  publish-pypi  — PyPI publish (downloads from GitHub Release)
+  # ═════════════════════════════════════════════════════════════════
+  publish-pypi:
+    name: Publish to PyPI
+    needs: [publish-github]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Download assets from GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="v${{ inputs.version }}"
+          mkdir -p release/python
+          echo "Downloading assets from GitHub Release $TAG ..."
+          gh release download "$TAG" \
+            -R "${{ github.repository }}" \
+            --pattern "*.whl" \
+            --pattern "*.tar.gz" \
+            --dir release/python/
+          echo "Downloaded:"
+          ls -la release/python/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@v1.12.4
+        with:
+          packages-dir: release/python/
