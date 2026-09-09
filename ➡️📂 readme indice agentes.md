@@ -1,229 +1,65 @@
 # ➡️📂 README ÍNDICE AGENTES — Agentes-motores-Wordflow-YAIWES
 
-## Alcance
-Índice construido **únicamente desde nombres/rutas y metadatos de la raíz del repositorio**. No se inspeccionó el código fuente de los componentes para crear este archivo.
+## Alcance STEP1
+Índice construido **solo desde nombres/rutas y metadata de la raíz**. No se abrió ni analizó el código de los agentes para este STEP1.
 
 - Repo: `maxbry123-commits/Agentes-motores-Wordflow-YAIWES`
 - Rama: `main`
-- Raíz auditada: árbol root `0ca97d7c7e8a2e20e986d18e273c6171a2684d30`
-- Inventario raíz observado: **160 carpetas + 14 archivos = 174 entradas**.
-- Estado: `ROOT_INDEX_ONLY / CODE_NOT_INSPECTED`
+- Snapshot de raíz: commit `e57c30bd7ff9b5d9469f1fb07f32e5d9bf120ed6`
+- Tree del snapshot: `244fb7857193043ada321f720a7e1ec0836b4ca7`
+- Estado: `STEP1_ROOT_INDEX_COMPLETE / CODE_NOT_INSPECTED`
+- Nota de concurrencia: no se fija un total numérico de entradas porque la raíz está recibiendo cambios; manda el snapshot/commit indicado.
 
-## Agentes / motores canónicos del Wordflow identificables por nombre en la raíz
-| Nombre | Entrada raíz relacionada | Rol Wordflow ya definido | Estado de este índice |
+## Fleet canónico definido por el Director
+| Agente | Rol Wordflow | Evidencia nominal en raíz | Estado STEP1 |
 |---|---|---|---|
-| OpenCode | `OpenCode/` | writer/executor | ENCONTRADO_EN_RAÍZ |
-| OpenHands | `OpenHands/` + `openhands-agent-server/` | review/repair | ENCONTRADO_EN_RAÍZ |
-| OpenClaw | `Openclaw-RL/` | auditor/coordinador auxiliar | FAMILIA_ENCONTRADA; binding exacto pendiente |
-| Claude Code | `claude_code_migration/`, `everything-claude-code/`, `SuperClaude Framework/`, `superclaude/` | flow/execution/wiring review | FAMILIA_ENCONTRADA; binding exacto pendiente |
-| Loop Engineer | `Loop Engineer/` | runtime LOOP determinista | ENCONTRADO_EN_RAÍZ |
+| OpenCode | writer/executor | `OpenCode/` | ENCONTRADO |
+| OpenHands | review/repair | `OpenHands/` | ENCONTRADO |
+| OpenClaw | auditor/coordinador/gateway | `OpenClaw-RL/` + artefactos OpenClaw raíz | FAMILIA_ENCONTRADA |
+| Claude Code CLI | flow/execution/wiring review | `CLAUDE.md` y familias Claude presentes en repositorio | FUENTE_EXACTA_A_RESOLVER_EN_STEP2 |
+| Mimo Code | flow/execution/wiring review | no entrada exacta de primer nivel observada | FUENTE_EXACTA_A_RESOLVER_EN_STEP2 |
+| Codex | auditor técnico | no entrada exacta de primer nivel observada | FUENTE_EXACTA_A_RESOLVER_EN_STEP2 |
+| Hermes | auditor/worker | no entrada exacta de primer nivel observada | FUENTE_EXACTA_A_RESOLVER_EN_STEP2 |
+| Aider | editor/council | no entrada exacta de primer nivel observada | FUENTE_EXACTA_A_RESOLVER_EN_STEP2 |
+| Muse/Glimmer Code | council/revisión | no entrada exacta de primer nivel observada | FUENTE_EXACTA_A_RESOLVER_EN_STEP2 |
+| Kimi K Code CLI | council/revisión | no entrada exacta de primer nivel observada | FUENTE_EXACTA_A_RESOLVER_EN_STEP2 |
+| Smolange | auditor | no entrada exacta de primer nivel observada | FUENTE_EXACTA_A_RESOLVER_EN_STEP2 |
+| Qwen Code CLI | council/contraste | no entrada exacta de primer nivel observada | FUENTE_EXACTA_A_RESOLVER_EN_STEP2 |
+| Cline | agente programación auxiliar | no entrada exacta de primer nivel observada | FUENTE_EXACTA_A_RESOLVER_EN_STEP2 |
+| Goose | investigación auxiliar | no entrada exacta de primer nivel observada | FUENTE_EXACTA_A_RESOLVER_EN_STEP2 |
 
-> Los demás miembros canónicos del Council/agent fleet pueden vivir bajo carpetas agregadoras (`agents/`, `ai_agents/`, `download code/`, etc.). Este STEP1 no abre ni analiza código ni subárboles funcionales; la resolución exacta de fuente se hace en STEP2 solo cuando sea necesaria para cablear.
+## Motor LOOP ya existente
+| Componente | Entrada raíz | Rol |
+|---|---|---|
+| Loop Engineer | `Loop Engineer/` | runtime LOOP determinista |
+| LangGraph | `LangGraph/` | graph/state orchestration |
+| Temporal | `Temporal/` | durable workflow/recovery |
+| Trigger.dev | `Trigger.dev/` | trigger/workflow surface disponible |
 
-## Candidatos adicionales visibles por nombre en la raíz
-Clasificación nominal solamente; no implica selección ni integración.
+## Candidatos adicionales visibles en raíz
+Esta lista es **nominal**, no implica selección ni integración.
 
-- `Agent-Zero/`
-- `BabyAGI/`
-- `CAMEL/`
-- `MetaGPT/`
-- `Roo Code/`
-- `SuperAGI/`
-- `Supreme-Agent/`
-- `TestZeus-Hercules/`
-- `autogen/`
-- `mle-agent/`
-- `mle-agent2/`
-- `multi-agent-orchestrator/`
-- `langgraph-research-agent/`
-- `langgraph-supervisor-py/`
-- `workflow-use/`
-- `web-agents/`
-- `Browser-Use/`
-- `aios-agent/`
-- `microsoftagentframework/`
-- `agent-framework/`
-- `agentic-frameworks/`
-- `agentic-workflow-framework/`
-- `Agentic-Workflow-Framework/`
+- `Open Verification Kernel/` — candidato de verificación independiente.
+- `OpenDev/` — candidato coding fallback.
+- `Agent-Zero/` — candidato worker generalista.
+- `MetaAgent/` — candidato meta-coordinación.
+- `PraisonAI/` — candidato multiagente/orquestación.
+- `MiroThinker/` — candidato reasoning/reviewer.
+- `Solace Agent Mesh/` — candidato mesh/messaging de agentes.
+- `SwarmClaw/` — candidato coordinación swarm.
+- `Yunjue Agent/` — candidato agente adicional.
+- `Zuora Coding Agent/` — candidato coding especializado.
+- `Open Verification Kernel/` — candidato verificador/auditor.
+- `Microsoft Agent Framework/` — framework de agentes.
+- `Semantic Kernel/` — framework/capability routing.
+- `Research Agent Lab/` — familia investigación.
+- `Guardians/` — familia guardian/auditor.
 
-## Inventario completo de carpetas raíz
-1. `.github/`
-2. `.vscode/`
-3. `1️⃣ Agentes Orquestadores/`
-4. `Agent-Job-Hunter/`
-5. `Agent-S/`
-6. `Agent-Zero/`
-7. `Agentic-Workflow-Framework/`
-8. `BabyAGI/`
-9. `Browser-Use/`
-10. `CAMEL/`
-11. `Codebuff/`
-12. `Composio/`
-13. `Cua/`
-14. `Dify/`
-15. `Elspeth/`
-16. `Enconvo/`
-17. `FlashLearn/`
-18. `FlightHunter/`
-19. `Flow/`
-20. `Flowise/`
-21. `GIS-Agent/`
-22. `Giselle/`
-23. `GPTScraper/`
-24. `Gitdiagram/`
-25. `Gitprompt/`
-26. `Gobli/`
-27. `HyperAgent/`
-28. `IncognitoPilot/`
-29. `Langflow/`
-30. `Lightrag/`
-31. `Loop Engineer/`
-32. `MeeseeksAI/`
-33. `MetaGPT/`
-34. `OpenCode/`
-35. `OpenHands/`
-36. `Openai/`
-37. `Openclaw-RL/`
-38. `Openlearn/`
-39. `Outlines/`
-40. `Ragbits/`
-41. `Roo Code/`
-42. `Shannon/`
-43. `SleepScanner/`
-44. `StanfordNerfAgent/`
-45. `SuperAGI/`
-46. `SuperClaude Framework/`
-47. `Supreme-Agent/`
-48. `TestZeus-Hercules/`
-49. `agent-framework/`
-50. `agentic-frameworks/`
-51. `agentic-workflow-framework/`
-52. `agents/`
-53. `ai-agent-frameworks/`
-54. `ai_agents/`
-55. `aios-agent/`
-56. `archerysec/`
-57. `astonishing/`
-58. `autogen/`
-59. `awesome-ai-agents/`
-60. `awesome-ai-system-prompts/`
-61. `awesome-code-ai/`
-62. `browser-use/`
-63. `buildyourownlisp/`
-64. `bytebot/`
-65. `claude_code_migration/`
-66. `cloud-computing-foundations/`
-67. `co-z/`
-68. `cua/`
-69. `cua-ui/`
-70. `dalfox/`
-71. `discussione/`
-72. `dive/`
-73. `django/`
-74. `django-drip-campaigns/`
-75. `download code/`
-76. `ds-cheatsheets/`
-77. `elspeth/`
-78. `everything-claude-code/`
-79. `files-to-prompt/`
-80. `financial-assistant-sql/`
-81. `fuzzing/`
-82. `gemini-fullstack-langgraph-quickstart/`
-83. `genai-agentos/`
-84. `gobli/`
-85. `google-research/`
-86. `google-research2/`
-87. `grafana/`
-88. `graphiti/`
-89. `graphrag-light/`
-90. `graphrag-llm/`
-91. `graphrag-local-ollama-neo4j/`
-92. `graphrag-local-ollamaFAISS/`
-93. `groq-api-cookbook/`
-94. `guardrail/`
-95. `halo/`
-96. `haystack/`
-97. `herculess/`
-98. `hurricane/`
-99. `inbox-zero/`
-100. `inteligenciaartificial/`
-101. `jan/`
-102. `lang/`
-103. `langchain/`
-104. `langchain-academy/`
-105. `langgraph-bigtool/`
-106. `langgraph-codeact/`
-107. `langgraph-research-agent/`
-108. `langgraph-supervisor-py/`
-109. `langmem/`
-110. `learnaing/`
-111. `learning/`
-112. `llm/`
-113. `llm-cli/`
-114. `llm-council/`
-115. `llm-councilllm-council/`
-116. `llm_memory_big_picture_assets/`
-117. `marimo/`
-118. `marimo-team/`
-119. `mcp/`
-120. `meta-AI-systems-handbook/`
-121. `minions/`
-122. `mirrord/`
-123. `microsoftagentframework/`
-124. `mindcraft/`
-125. `mkdocs/`
-126. `mle-agent/`
-127. `mle-agent2/`
-128. `multi-agent-orchestrator/`
-129. `neo4j-graphrag-python/`
-130. `octocode-mcp/`
-131. `onecli/`
-132. `openhands-agent-server/`
-133. `pandas_dataframe_agent/`
-134. `postgres-mcp/`
-135. `prompts/`
-136. `protoc-gen-go/`
-137. `pythagora/`
-138. `pytest-django/`
-139. `python/`
-140. `repository/`
-141. `repo_to_text/`
-142. `repo_to_text2/`
-143. `repo_to_text3/`
-144. `reverse-ssh/`
-145. `rlm/`
-146. `sandbox-mcp/`
-147. `sandbox-mcp2/`
-148. `scira/`
-149. `sdk-codegen/`
-150. `site/`
-151. `superclaude/`
-152. `terraria/`
-153. `tsx/`
-154. `tutorial/`
-155. `voila/`
-156. `web-agents/`
-157. `workflow-use/`
-158. `workflows/`
-159. `x-flux/`
-160. `xyz/`
+## Otras familias de agentes/frameworks visibles en la raíz
+`AI Agent Lab/`, `AI4S Agent Lab/`, `ATLAS/`, `Agent Capability Standard/`, `Agent Framework Samples/`, `Agent Skill Lab/`, `Agentic Workflow Framework/`, `Agents-A1/`, `Agno/`, `Awesome Agent Workflows/`, `Claw AI Lab/`, `Ghost in the Droid/`, `Haystack/`, `Hivemind/`, `IntentKit/`, `Oh-My-Agents/`, `OpenRSI /`, `Rasa/`, `SETA/`.
 
-## Archivos raíz
-1. `.gitattributes`
-2. `.gitignore`
-3. `AGENTS.md`
-4. `AI_AGENT_RULES.md`
-5. `BUS.md`
-6. `LICENSE`
-7. `README.md`
-8. `README_AGENTE_YAIWES_PRINCIPAL.md`
-9. `Readme.md`
-10. `agent-message.schema.json`
-11. `settings.json`
-12. `worker-capabilities.schema.json`
-13. `worker-protocols.yaml`
-14. `worker-registry.yaml`
+## Archivos raíz de gobierno/registro relevantes por nombre
+`AGENTS.md`, `CLAUDE.md`, `README.md`, `README-DESTINOS-YAIWES.md`, `PIPELINE-ACR-CONSOLIDATED.md`, `FORENSIC-INVENTORY-2026-08-21.md`, `INDICE-RAIZ-Y-RESUMEN.md`, `extraction-result.json`, `taxonomy.yaml`.
 
 ## Regla de continuidad
-STEP1 termina con este índice. STEP2 decide y cablea solo lo necesario; STEP3 ejecuta las pruebas. Presencia en este índice **no equivale** a integración.
+STEP1 termina con este índice reconciliado. STEP2 puede abrir únicamente las fuentes necesarias para cablear y debe dejar cada binding `WIRED_UNTESTED`; STEP3 es el único paso autorizado para tests. Presencia en raíz **no equivale** a integración.
