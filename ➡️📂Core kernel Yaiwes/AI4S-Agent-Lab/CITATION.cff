@@ -1,0 +1,21 @@
+cff-version: 1.2.0
+message: "If you use this personal research project, please cite it using the metadata below."
+title: "AI4S Agent Lab: Evidence-First Scientific Agent Engineering Across Four Case Studies"
+type: software
+authors:
+  - family-names: Cong
+    given-names: Wanrun
+repository-code: "https://github.com/Goldenmonstew/ai4s-agent-lab"
+url: "https://github.com/Goldenmonstew/ai4s-agent-lab"
+license: Apache-2.0
+abstract: >-
+  A personal research implementation and notebook by Wanrun Cong, informed by
+  post-competition reflection and covering task contracts, evidence events,
+  verifier-gated promotion, rollback, four bounded case studies, negative
+  results, and explicit reproducibility and provenance boundaries.
+keywords:
+  - scientific agents
+  - AI for Science
+  - agent evaluation
+  - reproducibility
+  - evidence engineering

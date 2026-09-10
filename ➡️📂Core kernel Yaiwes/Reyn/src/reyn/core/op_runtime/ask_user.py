@@ -1,0 +1,116 @@
+"""ask_user kind handler — pause and ask the user a clarifying question.
+
+This op is control-IR-only; the dispatcher in op_runtime/__init__.py rejects
+preprocessor invocations before they reach this handler.
+
+The op routes through `ctx.intervention_bus`. The chat REPL wires a
+`ChatInterventionBus`; the CLI wires a `StdinInterventionBus`. Either way
+the handler emits a free-text `UserIntervention` and awaits the answer.
+"""
+from __future__ import annotations
+
+from reyn.core.events.event_schema import RETIRED_PHASE_FIELD
+from reyn.schemas.models import AskUserIROp
+from reyn.user_intervention import InterventionChoice, UserIntervention
+
+from . import register
+from .context import OpContext
+
+
+def _options_to_choices(options: list[str]) -> list[InterventionChoice]:
+    """Pure: map free-text ask_user options to selectable choices.
+
+    ``id`` is the option text (so the answer is the option itself), ``label`` is
+    ``[N] <option>``, and ``hotkey`` is the 1-based number — the stdin / --cui
+    path types the number, the inline region selects with ↑↓.
+    """
+    return [
+        InterventionChoice(id=opt, label=f"[{i + 1}] {opt}", hotkey=str(i + 1))
+        for i, opt in enumerate(options)
+    ]
+
+
+async def handle(op: AskUserIROp, ctx: OpContext) -> dict:
+    if ctx.intervention_bus is None:
+        raise RuntimeError(
+            "ask_user invoked without an intervention_bus on OpContext. "
+            "Wire a bus (StdinInterventionBus for CLI, ChatInterventionBus "
+            "for chat) when constructing the OpContext."
+        )
+
+    choices = _options_to_choices(op.options or [])
+    iv = UserIntervention(
+        kind="ask_user",
+        prompt=op.question,
+        suggestions=op.suggestions or [],
+        choices=choices,
+        input_type="select" if choices else "",
+        actor=ctx.actor or None,
+        run_id=None,  # set by chat session if it tracks runs; CLI ignores
+    )
+
+    # #4666②: `question`/`suggestions`/`options` are in ②'s opt-in scope
+    # (not ③'s) because this text is the MODEL's own — text the model
+    # directed at the user, the same content type ②'s other kind
+    # (`agent_response_committed`) covers (owner ruling: one knob per
+    # content TYPE). The user's ANSWER to this question is a DIFFERENT
+    # content type and lands on ③'s own, separate knob instead. Emitted
+    # unconditionally HERE, same as before this issue — the redaction
+    # (dropping those 3 free-text fields from the DURABLE record while
+    # `audit_events.completed_response_include_text` is off) happens at
+    # `LocalEventBackend.write()`, not at this call site (mirrors
+    # `agent_response_committed`'s own emit in `Session._put_outbox`; see
+    # that method's docstring for the full ②/③ boundary and the tool-path
+    # leak this does NOT close).
+    ctx.events.emit(
+        "user_intervention_requested",
+        run_id=ctx.run_id,
+        actor=ctx.actor,
+        phase=RETIRED_PHASE_FIELD,
+        question=op.question,
+        intervention_id=iv.id,
+        suggestions=op.suggestions or [],
+        options=op.options or [],
+    )
+
+    answer = await ctx.intervention_bus.request(iv)
+    # #2708 P3-item3: a DELIBERATE, reason'd refusal (a detached/headless spawn with no
+    # attachable operator surface — AuditOnlyInterventionBridge) surfaces as a TYPED outcome:
+    # status="refused" carrying the reason, NOT a fabricated empty "ok" answer and NOT a
+    # park/hang. Distinct from a legacy empty-string auto-refuse (refused=False) which stays
+    # the status="ok", answer="" path below (behaviour unchanged for existing callers).
+    if getattr(answer, "refused", False):
+        ctx.events.emit(
+            "user_intervention_received",
+            run_id=ctx.run_id,
+            actor=ctx.actor,
+            phase=RETIRED_PHASE_FIELD,
+            answer="",
+            intervention_id=iv.id,
+            refused=True,
+            reason=answer.reason,
+        )
+        return {
+            "kind": "ask_user", "question": op.question, "answer": "",
+            "status": "refused", "reason": answer.reason,
+        }
+    # A selected option resolves with choice_id (= the option text); free-text
+    # resolves with text.
+    text = answer.choice_id or answer.text or ""
+    if not text and not op.required:
+        text = ""
+
+    ctx.events.emit(
+        "user_intervention_received",
+        run_id=ctx.run_id,
+        actor=ctx.actor,
+        phase=RETIRED_PHASE_FIELD,
+        answer=text,
+        intervention_id=iv.id,
+    )
+    return {"kind": "ask_user", "question": op.question, "answer": text, "status": "ok"}
+
+
+from reyn.core.offload.canonical import ask_user_to_canonical  # noqa: E402
+
+register("ask_user", handle, canonical=ask_user_to_canonical)

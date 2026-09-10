@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SKILLS_DIR="$HOME/.claude/skills"
+AGENTS_DIR="$HOME/.claude/agents"
+
+mkdir -p "$SKILLS_DIR" "$AGENTS_DIR"
+
+# Warn if not in expected location
+if [[ "$SCRIPT_DIR" != "$SKILLS_DIR/deepresearch" ]]; then
+    echo "Note: repo is at $SCRIPT_DIR"
+    echo "      expected ~/.claude/skills/deepresearch"
+    echo "      Skills will still be installed to ~/.claude/skills/ via symlinks."
+    echo ""
+fi
+
+# Symlink each skill directory
+for skill in dr-new dr-run dr-status dr-review dr-resume dr-report dr-improve; do
+    rm -rf "$SKILLS_DIR/$skill" 2>/dev/null || true
+    ln -sf "$SCRIPT_DIR/$skill" "$SKILLS_DIR/$skill"
+    echo "  ✓ /$skill"
+done
+
+# Symlink agents
+for agent in dr-researcher.md dr-evaluator.md dr-planner.md; do
+    rm -f "$AGENTS_DIR/$agent" 2>/dev/null || true
+    ln -sf "$SCRIPT_DIR/agents/$agent" "$AGENTS_DIR/$agent"
+    echo "  ✓ agent: $agent"
+done
+
+echo ""
+echo "deepresearch installed (7 skills, 3 agents)."
+echo "Open a new Claude Code session and type /dr: to see commands."

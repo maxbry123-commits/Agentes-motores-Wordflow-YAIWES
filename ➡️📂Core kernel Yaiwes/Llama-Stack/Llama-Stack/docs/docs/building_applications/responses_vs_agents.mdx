@@ -1,0 +1,57 @@
+---
+title: Responses API vs Agents API
+description: Understanding which API to use for building AI applications
+sidebar_label: Responses vs Agents
+sidebar_position: 5
+---
+
+# Responses API vs Agents API
+
+OGX provides two APIs for building AI applications with tool calling. The **Responses API** is the recommended path for new applications.
+
+## Use the Responses API
+
+The Responses API is OpenAI-compatible and provides:
+
+- **Dynamic configuration** - change model, tools, and vector stores on every call
+- **Conversation branching** - fork from any previous response via `previous_response_id`
+- **Built-in tool orchestration** - file_search, web_search, MCP, and custom functions
+- **Standard OpenAI SDK** - works with any OpenAI client library
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8321/v1", api_key="fake")
+
+response = client.responses.create(
+    model="llama3.2:3b",
+    input="Search my docs for deployment instructions",
+    tools=[{
+        "type": "file_search",
+        "vector_store_ids": ["vs_abc123"],
+    }],
+)
+
+# Continue the conversation, switch model
+response2 = client.responses.create(
+    model="openai/gpt-4o",
+    input="Now summarize what you found",
+    previous_response_id=response.id,
+)
+```
+
+## Legacy Agents API
+
+The Agents API is an older, OGX-specific API that uses sessions and turns. It is still functional but is not recommended for new applications.
+
+Key differences from Responses:
+
+| | Responses API | Agents API |
+|---|---|---|
+| **SDK** | Standard OpenAI SDK | OGX client only |
+| **Configuration** | Dynamic per call | Static per session |
+| **Conversation model** | Branching via response IDs | Linear sessions |
+| **Tools** | file_search, web_search, MCP, functions | builtin::file_search, code_interpreter |
+| **Guardrails** | `guardrails=true` on request + configured `moderation_endpoint` | Via underlying Responses provider guardrails |
+
+If you have existing code using the Agents API, it will continue to work. For new projects, use the Responses API.

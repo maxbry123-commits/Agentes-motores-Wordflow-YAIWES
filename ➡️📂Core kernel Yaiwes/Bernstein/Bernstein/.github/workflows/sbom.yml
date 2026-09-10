@@ -1,0 +1,149 @@
+name: SBOM
+
+# Generate SPDX + CycloneDX SBOMs for each published release and attach them
+# as release assets. Downstream consumers can ingest these into their own
+# SCA tooling (Grype, Trivy, etc.).
+#
+# Two entry paths reach the same outcome:
+#   * `release: published`, for a release created in the GitHub UI;
+#   * `workflow_dispatch`, which publish.yml uses after it creates the release
+#     itself -- a release created with GITHUB_TOKEN emits no release event.
+# The attachment decision is therefore keyed on whether a release exists for
+# the ref being built, not on which event started the run. Keying it on the
+# event left the dispatch path generating SBOMs it never attached.
+#
+# "A release exists for this ref" is answered by an HTTP status, not by an
+# exit code: only a 404 means no release. Every other API failure fails the
+# job rather than skipping the attach step inside a green run.
+#
+# Ref: #1273, #3323
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to build the SBOM for"
+        required: false
+        default: ""
+
+concurrency:
+  group: sbom-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sbom:
+    name: Generate SBOM
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write  # Required to attach SBOMs to the release
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+
+      - name: Resolve release for ref
+        id: rel
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_REF: ${{ inputs.ref }}
+          EVENT_TAG: ${{ github.event.release.tag_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ -n "$EVENT_TAG" ]; then
+            TAG="$EVENT_TAG"
+          elif [ -n "$INPUT_REF" ]; then
+            TAG="$INPUT_REF"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+          # Only a 404 means "there is no release for this tag". An auth
+          # failure, a rate limit, or a transient 5xx also exits non-zero, and
+          # reading those as "no release" skips the attach step on a release
+          # that does exist -- the SBOMs then live out their retention as a
+          # workflow artifact nobody looks at, in a green run. Ask the API
+          # directly so the status code is the thing being classified.
+          #
+          # The step runs under `set -e`, so errexit is lifted around the
+          # capture to let the exit code reach the classifier.
+          set +e
+          ERR=$(gh api "repos/${REPO}/releases/tags/${TAG}" --silent 2>&1)
+          CODE=$?
+          set -e
+          if [ "$CODE" -eq 0 ]; then
+            echo "release $TAG exists; SBOMs will be attached to it"
+            echo "release_exists=true" >> "$GITHUB_OUTPUT"
+          elif printf '%s' "$ERR" | grep -q 'HTTP 404'; then
+            echo "::notice::no release for $TAG; SBOMs stay a workflow artifact only"
+            echo "release_exists=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::could not determine whether a release exists for ${TAG} (gh exit ${CODE}): ${ERR}"
+            exit 1
+          fi
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
+        with:
+          # SBOMs ship as release assets - the cache is shared across the
+          # repo, so an attacker who can write to PR caches could poison
+          # a release-time build. Disable on this workflow specifically.
+          enable-cache: false
+
+      - name: Build wheel + sdist
+        run: uv build
+
+      - name: Generate SPDX SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610  # v0.24.0
+        with:
+          path: .
+          format: spdx-json
+          artifact-name: bernstein.spdx.json
+          output-file: bernstein.spdx.json
+          upload-artifact: true
+          # Attachment is done by the explicit upload step below, which is the
+          # one code path both entry paths share.
+          upload-release-assets: false
+
+      - name: Generate CycloneDX SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610  # v0.24.0
+        with:
+          path: .
+          format: cyclonedx-json
+          artifact-name: bernstein.cyclonedx.json
+          output-file: bernstein.cyclonedx.json
+          upload-artifact: true
+          upload-release-assets: false
+
+      - name: Upload SBOMs as workflow artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: sbom
+          path: |
+            bernstein.spdx.json
+            bernstein.cyclonedx.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Attach SBOMs to the release
+        if: steps.rel.outputs.release_exists == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ steps.rel.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" \
+            bernstein.spdx.json \
+            bernstein.cyclonedx.json \
+            --repo "$REPO" \
+            --clobber

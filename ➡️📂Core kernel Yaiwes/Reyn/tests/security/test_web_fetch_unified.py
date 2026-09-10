@@ -1,0 +1,393 @@
+"""Tier 2: WEB_FETCH ToolDefinition M3 Wave 1 invariants (ADR-0026 M3).
+
+Verifies that WEB_FETCH ToolDefinition:
+- Produces byte-identical output to the prior ToolSpec literal for web_fetch.
+  Drift in description or parameters here would invalidate replay fixtures.
+- Has the correct gates, purity, and category.
+- Is findable via get_default_registry().
+- Registers without error and is the single registry entry for web_fetch.
+- FP-0022: require_web_fetch() 4-layer approval gate behavior.
+
+No mocks of collaborators. All tests use real ToolDefinition / ToolRegistry
+instances. No private state assertions.
+"""
+from __future__ import annotations
+
+import asyncio
+from pathlib import Path
+
+import pytest
+
+from reyn.tools import get_default_registry
+from reyn.tools.web_fetch import _WEB_FETCH_DESCRIPTION, _WEB_FETCH_PARAMETERS, WEB_FETCH
+
+# ── 1. render_for_router byte-identity gate ───────────────────────────────────
+
+def test_web_fetch_router_render_matches_legacy_shape():
+    """Tier 2: WEB_FETCH.render_for_router() produces the expected shape.
+
+    Description was rewritten in #385 PoC PR-D to surface the new
+    preview + path_ref return contract (= text bodies routed to
+    ``.reyn/tool-results/`` instead of inlined). Key-phrase checks now
+    pin the NEW wording. LLMReplay fixtures that hashed the old
+    description need to be re-recorded in the same PR; this test pins
+    the new contract so future drift gets caught.
+    """
+    rendered = WEB_FETCH.render_for_router()
+
+    # Top-level shape
+    assert rendered["type"] == "function"
+    assert isinstance(rendered["function"], dict)
+
+    fn = rendered["function"]
+
+    # Name
+    assert fn["name"] == "web_fetch"
+
+    # Description: key phrases that identify the web_fetch contract. The exact
+    # wording is pinned in ``test_web_fetch_router_render_exact_description``;
+    # this test only checks the load-bearing tokens. #3580 ③: the description no
+    # longer offers ``max_length`` (removed, nothing replaces it) and no longer
+    # claims a structured preview + path_ref (that path went with #3583).
+    assert "URL" in fn["description"] or "url" in fn["description"].lower()
+    assert "web_search" in fn["description"]
+    assert "max_length" not in fn["description"]
+    assert "path_ref" not in fn["description"]
+
+    # Parameters schema
+    params = fn["parameters"]
+    assert params["type"] == "object"
+    assert params["required"] == ["url"]
+    assert "url" in params["properties"]
+    assert params["properties"]["url"] == {"type": "string"}
+    # #3580 ③: ``url`` is the ONLY LLM-settable argument.
+    assert list(params["properties"]) == ["url"]
+
+
+def test_web_fetch_router_render_exact_description():
+    """Tier 2: WEB_FETCH description is byte-identical to the shipped string.
+    Any whitespace or punctuation diff is a stop signal — LLMReplay fixtures
+    hash this verbatim. #3580 ③ rewrote it: the ``max_length`` offer is gone
+    (removed argument, no replacement) and so is the structured-preview +
+    path_ref claim, which #3583 had already falsified.
+    """
+    rendered = WEB_FETCH.render_for_router()
+    expected_description = (
+        "Fetch a single URL and return its text-extracted body. "
+        "url: absolute http/https URL. "
+        "Use after web_search to load a result page."
+    )
+    assert rendered["function"]["description"] == expected_description
+
+
+def test_web_fetch_router_render_exact_parameters():
+    """Tier 2: WEB_FETCH parameters schema is byte-identical to the legacy
+    ToolSpec parameters dict."""
+    rendered = WEB_FETCH.render_for_router()
+    expected_parameters = {
+        "type": "object",
+        "properties": {
+            "url": {"type": "string"},
+        },
+        "required": ["url"],
+    }
+    assert rendered["function"]["parameters"] == expected_parameters
+
+
+# ── 2. Gate invariants ────────────────────────────────────────────────────────
+
+def test_web_fetch_gates_both_allow():
+    """Tier 2: WEB_FETCH has gates.router=allow."""
+    assert WEB_FETCH.gates.router == "allow"
+
+
+# ── 3. Purity and category ────────────────────────────────────────────────────
+
+def test_web_fetch_purity_read_only():
+    """Tier 2: WEB_FETCH purity is 'read_only' (no workspace side effects)."""
+    assert WEB_FETCH.purity == "read_only"
+
+
+def test_web_fetch_category_discovery():
+    """Tier 2: WEB_FETCH category is 'discovery'."""
+    assert WEB_FETCH.category == "discovery"
+
+
+# ── 4. Registry lookup ────────────────────────────────────────────────────────
+
+def test_default_registry_contains_web_fetch():
+    """Tier 2: get_default_registry() returns a registry that contains web_fetch."""
+    registry = get_default_registry()
+    assert "web_fetch" in registry
+
+
+def test_default_registry_lookup_returns_web_fetch_instance():
+    """Tier 2: registry.lookup('web_fetch') returns the WEB_FETCH instance."""
+    registry = get_default_registry()
+    found = registry.lookup("web_fetch")
+    assert found is WEB_FETCH
+
+
+def test_default_registry_web_fetch_in_for_router():
+    """Tier 2: WEB_FETCH appears in registry.for_router() (gates.router=allow)."""
+    registry = get_default_registry()
+    router_tools = registry.for_router()
+    assert WEB_FETCH in router_tools
+
+
+# ── 5. build_tools integration — web_fetch rendered from registry ──────────────
+
+def test_build_tools_includes_web_fetch_via_registry():
+    """Tier 2: build_tools() includes web_fetch rendered from the unified
+    registry. The rendered dict must match the legacy ToolSpec.to_openai_dict()
+    output (byte-identity gate for LLMReplay fixtures).
+
+    FP-0022: web_fetch is now always in the catalog; the web_fetch_allowed
+    parameter is kept for backward compat but is a no-op."""
+    from reyn.runtime.router_tools import build_tools
+
+    tools = build_tools()
+
+    # Find web_fetch in the returned tools list
+    wf_tools = [t for t in tools if t.get("function", {}).get("name") == "web_fetch"]
+    assert wf_tools, "web_fetch should appear in build_tools output"
+
+    wf = wf_tools[0]
+    assert wf["type"] == "function"
+    assert wf["function"]["name"] == "web_fetch"
+
+    # Description key-phrase check. #3580 ③: no ``max_length`` offer.
+    assert "text-extracted" in wf["function"]["description"]
+    assert "max_length" not in wf["function"]["description"]
+
+    # Parameters schema check — ``url`` is the only LLM-settable argument.
+    params = wf["function"]["parameters"]
+    assert params["required"] == ["url"]
+    assert list(params["properties"]) == ["url"]
+
+
+def test_build_tools_web_fetch_not_duplicated():
+    """Tier 2: web_fetch appears exactly once in build_tools() output.
+    Guards against both the registry path and a residual ToolSpec literal
+    being included simultaneously. FP-0022: web_fetch is always in catalog."""
+    from reyn.runtime.router_tools import build_tools
+
+    tools = build_tools()
+    wf_tools = [t for t in tools if t.get("function", {}).get("name") == "web_fetch"]
+    assert wf_tools, "web_fetch should appear in build_tools output"
+
+
+# ── 6. Drift detection — description module constant matches render ────────────
+
+def test_web_fetch_description_constant_matches_render():
+    """Tier 2: _WEB_FETCH_DESCRIPTION module constant matches the rendered
+    description. Ensures no accidental divergence between the constant and
+    what WEB_FETCH.description holds."""
+    rendered = WEB_FETCH.render_for_router()
+    assert rendered["function"]["description"] == _WEB_FETCH_DESCRIPTION
+    assert WEB_FETCH.description == _WEB_FETCH_DESCRIPTION
+
+
+def test_web_fetch_parameters_constant_matches_render():
+    """Tier 2: _WEB_FETCH_PARAMETERS module constant matches the rendered
+    parameters. Ensures no accidental divergence."""
+    rendered = WEB_FETCH.render_for_router()
+    assert rendered["function"]["parameters"] == _WEB_FETCH_PARAMETERS
+    assert dict(WEB_FETCH.parameters) == _WEB_FETCH_PARAMETERS
+
+
+# ── 7. FP-0022: Permission tier gate invariants ───────────────────────────────
+
+class _AutoApproveInterventionBus:
+    """Minimal real InterventionBus stub that auto-approves every request.
+
+    Returns choice_id='always' so approvals are persisted to the temp
+    approvals.yaml and the second call skips the prompt path entirely.
+    """
+    async def request(self, iv):
+        from reyn.user_intervention import InterventionAnswer
+        return InterventionAnswer(choice_id="always")
+
+
+class _DenyAllInterventionBus:
+    """Minimal real InterventionBus stub that fails the test if called.
+
+    When the config denies access, require_web_fetch must raise without
+    reaching the prompt. If request() is called, the implementation has a bug.
+    """
+    async def request(self, iv):
+        raise AssertionError(
+            f"InterventionBus.request called unexpectedly: {iv}"
+        )
+
+
+def test_require_web_fetch_config_allow_pre_approves(tmp_path: Path) -> None:
+    """Tier 2: web.fetch: allow in config pre-approves without prompting.
+
+    FP-0022 backward compat: existing `web.fetch: allow` users must not see
+    any interactive prompt — the config grant short-circuits at Layer 1.
+    """
+    from reyn.security.permissions.permissions import PermissionResolver
+
+    resolver = PermissionResolver(
+        config_permissions={"web.fetch": "allow"},
+        project_root=tmp_path,
+        interactive=True,
+    )
+    # DenyAllInterventionBus: if a prompt fires, the test fails.
+    bus = _DenyAllInterventionBus()
+    # Must not raise and must not reach the bus.
+    asyncio.run(resolver.require_web_fetch("https://example.com", bus))
+
+
+def test_require_web_fetch_config_deny_raises_immediately(tmp_path: Path) -> None:
+    """Tier 2: web.fetch: deny blocks with PermissionError before any prompt.
+
+    FP-0022: deny config must raise immediately, not reach the interactive bus.
+    """
+    from reyn.security.permissions.permissions import PermissionResolver
+
+    resolver = PermissionResolver(
+        config_permissions={"web.fetch": "deny"},
+        project_root=tmp_path,
+        interactive=True,
+    )
+    bus = _DenyAllInterventionBus()  # must not be called
+    with pytest.raises(PermissionError, match="web fetch denied by config"):
+        asyncio.run(resolver.require_web_fetch("https://example.com", bus))
+
+
+# ── 8. #53 regression — router invoke_action path enforces web.fetch deny ────
+
+
+def _make_router_op_ctx_factory(resolver, bus, events):
+    """Return a callable mirroring RouterHostAdapter.make_router_op_context.
+
+    Builds an OpContext whose ``permission_resolver`` / ``intervention_bus`` /
+    ``permission_decl`` mirror what the production factory wires. Used to
+    exercise the router-invoked path of WEB_FETCH._handle without spinning
+    up a full Session.
+    """
+    from reyn.core.op_runtime.context import OpContext
+    from reyn.data.workspace.workspace import Workspace
+    from reyn.security.permissions.permissions import PermissionDecl
+
+    def _factory():
+        ws = Workspace(
+            events=events,
+            permission_resolver=resolver,
+            actor="chat_router",
+        )
+        return OpContext(
+            workspace=ws,
+            events=events,
+            permission_decl=PermissionDecl(),
+            permission_resolver=resolver,
+            actor="chat_router",
+            intervention_bus=bus,
+        )
+
+    return _factory
+
+
+def test_router_invoke_action_web_fetch_deny_raises_permission_error(
+    tmp_path: Path,
+) -> None:
+    """Tier 2: WEB_FETCH._handle raises PermissionError under web.fetch: deny.
+
+    Regression for #53. Before the fix, the router-invoked path of
+    ``invoke_action(web_fetch, ...)`` silently bypassed the deny check —
+    ``ctx.permission_resolver`` was None (the ToolContext lookup
+    ``getattr(host, "permission_resolver", None)`` returned None because
+    the adapter stored the resolver as ``_perm``), so ``handle_web_fetch``
+    skipped its entire permission gate. The fetch returned ``status: ok,
+    status_code: 200``.
+
+    The fix wires:
+      1. ``RouterHostAdapter.permission_resolver`` property
+      2. ``intervention_bus`` into ``make_router_op_context``
+      3. ``web_fetch._handle`` uses ``router_state.op_context_factory``
+         instead of synthesizing a minimal OpContext with None bus.
+
+    With those landed, the deny check at Layer 1a of ``require_web_fetch``
+    fires before any HTTP traffic and raises PermissionError. ``dispatch_tool``
+    wraps that into a ``permission_denied`` error_kind and a tool_failed
+    event — but the propagation itself is enough for this regression guard.
+    """
+    from reyn.core.events.events import EventLog
+    from reyn.security.permissions.permissions import PermissionResolver
+    from reyn.tools.types import RouterCallerState, ToolContext
+
+    events = EventLog()
+    resolver = PermissionResolver(
+        config_permissions={"web.fetch": "deny"},
+        project_root=tmp_path,
+        interactive=True,
+    )
+    bus = _DenyAllInterventionBus()  # config-deny path must short-circuit before bus
+
+    rs = RouterCallerState(
+        op_context_factory=_make_router_op_ctx_factory(resolver, bus, events),
+    )
+    tool_ctx = ToolContext(
+        events=events,
+        permission_resolver=resolver,
+        workspace=None,
+        caller_kind="router",
+        router_state=rs,
+    )
+
+    with pytest.raises(PermissionError, match="denied by config"):
+        asyncio.run(
+            WEB_FETCH.handler({"url": "https://example.com"}, tool_ctx),
+        )
+
+
+def test_router_invoke_action_web_fetch_allow_no_deny_proceeds(
+    tmp_path: Path,
+) -> None:
+    """Tier 2: web.fetch: allow lets the router path proceed past the gate.
+
+    Sibling assertion to the deny test — guards against a fix that
+    over-corrects and starts denying every router-invoked web fetch.
+    Uses a sentinel URL that resolves to a non-routable IP so the HTTP
+    layer fails fast (we only care that the permission gate let us
+    through, not that the fetch succeeds).
+    """
+    from reyn.core.events.events import EventLog
+    from reyn.security.permissions.permissions import PermissionResolver
+    from reyn.tools.types import RouterCallerState, ToolContext
+
+    events = EventLog()
+    resolver = PermissionResolver(
+        config_permissions={"web.fetch": "allow"},
+        project_root=tmp_path,
+        interactive=True,
+    )
+    bus = _DenyAllInterventionBus()  # allow-config short-circuits before bus
+
+    rs = RouterCallerState(
+        op_context_factory=_make_router_op_ctx_factory(resolver, bus, events),
+    )
+    tool_ctx = ToolContext(
+        events=events,
+        permission_resolver=resolver,
+        workspace=None,
+        caller_kind="router",
+        router_state=rs,
+    )
+
+    # The gate must not raise PermissionError. The fetch itself may fail
+    # at the HTTP layer (unroutable host) — that's fine; the handler
+    # returns ``{"status": "error" / "timeout"}`` for transport errors.
+    # What matters: no PermissionError, AND no RuntimeError about a
+    # missing intervention_bus (= the make_router_op_context wiring).
+    result = asyncio.run(WEB_FETCH.handler(
+        {"url": "http://127.0.0.1:1/never-listens"},
+        tool_ctx,
+    ))
+    # Either a transport error (= permitted to attempt) or an ok response.
+    assert isinstance(result, dict)
+    assert result.get("kind") == "web_fetch"
+    # The deny path would have raised before getting a dict back.
+

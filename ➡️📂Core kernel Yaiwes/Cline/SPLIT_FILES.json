@@ -1,0 +1,16 @@
+[
+  {
+    "repo": "Cline",
+    "path": "assets/docs/demo.gif",
+    "chunks_dir": "Cline/assets/docs/demo.gif.chunks",
+    "bytes": 19108207,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "Cline",
+    "path": "docs/assets/jupyter-explain-improve-cell.gif",
+    "chunks_dir": "Cline/docs/assets/jupyter-explain-improve-cell.gif.chunks",
+    "bytes": 9359793,
+    "chunk_bytes": 8388608
+  }
+]

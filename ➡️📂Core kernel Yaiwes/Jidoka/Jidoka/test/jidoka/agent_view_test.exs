@@ -1,0 +1,322 @@
+defmodule Jidoka.AgentViewTest do
+  use ExUnit.Case, async: true
+
+  @agent_view_uuid7_regex ~r/\Aagent_view_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\z/
+
+  alias Jidoka.Agent
+  alias Jidoka.AgentView
+  alias Jidoka.Event
+  alias Jidoka.Effect
+  alias Jidoka.Turn
+
+  defmodule DemoAgent do
+    use Jidoka.Agent
+
+    agent :demo_agent
+  end
+
+  defmodule DemoView do
+    use Jidoka.AgentView, agent: DemoAgent
+  end
+
+  defmodule RuntimeAgent do
+    def id, do: "runtime_agent"
+  end
+
+  defmodule RuntimeView do
+    use Jidoka.AgentView, agent: RuntimeAgent
+
+    @impl true
+    def prepare(%{reject?: true}), do: {:error, :rejected}
+    def prepare(_input), do: :ok
+
+    @impl true
+    def runtime_context(input) do
+      %{tenant: Map.get(input, :tenant, "default")}
+    end
+  end
+
+  defmodule SpecView do
+    use Jidoka.AgentView
+
+    @impl true
+    def agent_module(_input) do
+      Jidoka.Agent.Spec.new!(
+        id: "agent_view_spec_agent",
+        instructions: "Return one view result.",
+        model: %{provider: :test, id: "model"}
+      )
+    end
+  end
+
+  defmodule MissingAgentView do
+    use Jidoka.AgentView
+  end
+
+  test "initial view projects identity without owning runtime state" do
+    assert {:ok, %AgentView{} = view} = DemoView.initial(%{conversation_id: "VIP Case!"})
+
+    assert view.agent_id == "demo_agent-vip_case"
+    assert view.conversation_id == "vip_case"
+    assert view.runtime_context == %{session: "vip_case"}
+    assert view.metadata.agent.id == "demo_agent"
+
+    attrs = Map.from_struct(view)
+    refute Map.has_key?(attrs, :pid)
+    refute Map.has_key?(attrs, :thread)
+    refute Map.has_key?(attrs, :transcript)
+    refute Map.has_key?(attrs, :storage)
+  end
+
+  test "before_turn and after_turn keep visible messages and tool events as projections" do
+    {:ok, view} = DemoView.initial(%{conversation_id: "case_123"})
+
+    running = DemoView.before_turn(view, " Check order A1001 ")
+
+    assert running.status == :running
+
+    assert [%{role: :user, content: "Check order A1001", pending?: true}] =
+             running.visible_messages
+
+    result =
+      Turn.Result.new!(
+        content: "Order A1001 is in transit.",
+        agent_state:
+          Agent.State.new!(
+            operation_results: [
+              Effect.OperationResult.new!(
+                operation: "lookup_order",
+                arguments: %{"order_id" => "A1001"},
+                output: %{"status" => "in_transit"},
+                effect_id: "eff_lookup"
+              )
+            ]
+          ),
+        journal: Effect.Journal.new!()
+      )
+
+    finished = DemoView.after_turn(running, {:ok, result})
+
+    assert finished.status == :idle
+
+    assert [
+             %{role: :user, pending?: false},
+             %{role: :assistant, content: "Order A1001 is in transit."}
+           ] = finished.visible_messages
+
+    assert [
+             %{
+               id: "eff_lookup",
+               kind: :operation_result,
+               label: "tool result: lookup_order",
+               refs: %{operation: "lookup_order"}
+             }
+           ] = finished.events
+  end
+
+  test "view runners execute bound DSL agents and data-only specs" do
+    llm = fn _intent, %Effect.Journal{}, _ctx ->
+      {:ok, %{type: :final, content: "View runner result."}}
+    end
+
+    assert {:ok, demo_view} = DemoView.initial(%{conversation_id: "runner_dsl"})
+
+    assert %AgentView{status: :idle, outcome: {:ok, %Turn.Result{}}} =
+             DemoView.run(demo_view, "Run the DSL agent.",
+               llm: llm,
+               request_id: "req_view_dsl"
+             )
+
+    assert {:ok, spec_view} = SpecView.initial(%{conversation_id: "runner_spec"})
+
+    assert %AgentView{
+             status: :idle,
+             visible_messages: [
+               %{role: :user, pending?: false},
+               %{role: :assistant, content: "View runner result."}
+             ]
+           } =
+             SpecView.run(spec_view, "Run the spec.",
+               llm: llm,
+               request_id: "req_view_spec"
+             )
+  end
+
+  test "default helpers normalize ids and expose lifecycle hooks" do
+    assert AgentView.default_conversation_id(%{"conversation_id" => "Billing / VIP"}) ==
+             "billing_vip"
+
+    assert AgentView.default_conversation_id(%{conversation_id: "!!!"}) == "default"
+    assert AgentView.normalize_id(nil, "fallback") == "fallback"
+    assert AgentView.request_id() =~ @agent_view_uuid7_regex
+    assert AgentView.lifecycle_hooks() == [:before_turn, :after_turn, :snapshot]
+  end
+
+  test "streamed events update an in-flight assistant draft and debug activity" do
+    {:ok, view} = DemoView.initial(%{conversation_id: "case_123"})
+    running = DemoView.before_turn(view, "Need help", "req_agent_view")
+
+    delta =
+      Event.new!(
+        event: :llm_delta,
+        request_id: "req_agent_view",
+        data: %{chunk_type: :content, delta: "Working"}
+      )
+
+    updated = DemoView.apply_event(running, delta)
+
+    assert [
+             %{role: :user, content: "Need help"},
+             %{role: :assistant, content: "Working", streaming?: true}
+           ] = DemoView.visible_messages(updated)
+
+    event = Event.build(:effect_started, [], request_id: "req_agent_view", effect_kind: :llm)
+    updated = DemoView.apply_event(updated, event)
+
+    assert [%{kind: :effect_started, refs: %{request_id: "req_agent_view"}}] = updated.events
+  end
+
+  test "view error, hibernate, empty input, duplicate events, and thinking deltas stay stable" do
+    {:ok, view} = RuntimeView.initial(%{conversation_id: "case_456", tenant: "acme"})
+
+    assert view.agent_id == "runtime_agent-case_456"
+    assert view.runtime_context == %{tenant: "acme"}
+
+    idle = RuntimeView.before_turn(view, "   ")
+    assert idle == view
+
+    errored =
+      view
+      |> RuntimeView.activate_request("req_error")
+      |> RuntimeView.after_turn({:error, :failed})
+
+    assert errored.status == :error
+    assert errored.error == :failed
+    assert is_binary(errored.error_text)
+
+    snapshot = snapshot()
+
+    interrupted =
+      view
+      |> RuntimeView.activate_request("req_hibernate")
+      |> RuntimeView.after_turn({:hibernate, snapshot})
+
+    assert interrupted.status == :interrupted
+    assert interrupted.metadata.last_snapshot.snapshot_id == snapshot.snapshot_id
+
+    thinking =
+      Event.new!(
+        event: :llm_delta,
+        request_id: "req_thinking",
+        data: %{chunk_type: :thinking, delta: "Analyzing"}
+      )
+
+    updated =
+      view
+      |> RuntimeView.activate_request("req_thinking")
+      |> RuntimeView.apply_event(thinking)
+
+    assert [%{role: :assistant, content: "Thinking...", thinking: "Analyzing"}] =
+             RuntimeView.visible_messages(updated)
+
+    event =
+      Event.new!(
+        event: :effect_started,
+        seq: 0,
+        request_id: "req_duplicate",
+        effect_id: "effect_1",
+        effect_kind: :llm
+      )
+
+    updated =
+      updated
+      |> RuntimeView.activate_request("req_duplicate")
+      |> RuntimeView.apply_event(event)
+      |> RuntimeView.apply_event(event)
+      |> RuntimeView.apply_event(%{ignored: true})
+
+    assert Enum.count(updated.events, &(&1.id == "event-req_duplicate-0-effect_started-effect_1")) ==
+             1
+
+    assert {:error, :rejected} = RuntimeView.initial(%{reject?: true})
+
+    assert_raise ArgumentError, ~r/must pass `agent:`/, fn ->
+      MissingAgentView.agent_module(%{})
+    end
+  end
+
+  test "only the active request can change the view lifecycle" do
+    {:ok, view} = DemoView.initial(%{conversation_id: "case_scoped"})
+
+    current =
+      view
+      |> DemoView.before_turn("Old request", "req_old")
+      |> DemoView.before_turn("Current request", "req_current")
+
+    stale_delta =
+      Event.new!(
+        event: :llm_delta,
+        request_id: "req_old",
+        data: %{chunk_type: :content, delta: "stale"}
+      )
+
+    assert DemoView.apply_event(current, stale_delta) == current
+    assert DemoView.after_turn(current, {:error, :stale_result}, "req_old") == current
+    assert DemoView.before_turn(current, "   ") == current
+
+    active_delta =
+      Event.new!(
+        event: :llm_delta,
+        request_id: "req_current",
+        data: %{chunk_type: :content, delta: "current"}
+      )
+
+    streaming = DemoView.apply_event(current, active_delta)
+    assert streaming.streaming_message.content == "current"
+
+    terminal = Event.build(:turn_finished, [], request_id: "req_current")
+    finished = DemoView.apply_event(streaming, terminal)
+
+    assert finished.status == :idle
+    assert finished.streaming_message == nil
+    assert finished.metadata.request_lifecycle == :terminal
+
+    contradictory =
+      Event.build(:turn_failed, [], request_id: "req_current", data: %{reason: :late_failure})
+
+    assert DemoView.apply_event(finished, contradictory) == finished
+    assert DemoView.after_turn(finished, {:error, :late_failure}, "req_current") == finished
+
+    result =
+      Turn.Result.new!(
+        content: "Current result",
+        agent_state: Agent.State.new!(),
+        journal: Effect.Journal.new!()
+      )
+
+    settled = DemoView.after_turn(finished, {:ok, result}, "req_current")
+    assert settled.metadata.request_lifecycle == :settled
+    assert DemoView.active_request_id(settled) == nil
+  end
+
+  defp snapshot do
+    spec =
+      Agent.Spec.new!(
+        id: "agent_view_snapshot_agent",
+        instructions: "Snapshot for AgentView.",
+        model: %{provider: :test, id: "model"}
+      )
+
+    request = Turn.Request.new!(input: "Hello")
+
+    state =
+      Turn.State.new!(
+        spec: spec,
+        plan: Turn.Plan.new!(spec),
+        request: request,
+        agent_state: request.agent_state
+      )
+
+    Jidoka.Snapshot.from_turn_state!(state, Turn.Cursor.after_prompt())
+  end
+end

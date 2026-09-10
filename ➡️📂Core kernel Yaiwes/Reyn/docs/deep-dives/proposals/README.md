@@ -1,0 +1,129 @@
+# Feature Proposals
+
+A directory collecting proposals for feature implementation.
+
+ADRs (`decisions/`) record "why a particular design was chosen."
+This directory holds proposals for "what should be implemented."
+
+---
+
+## File Naming Convention
+
+```
+NNNN-<kebab-case-title>.md
+```
+
+Example: `0001-a2a-task-lifecycle.md`
+
+---
+
+## Status Values
+
+| Value | Meaning |
+|---|---|
+| `proposed` | Proposed, not yet started |
+| `accepted` | Implementation approved |
+| `in-progress` | Implementation underway (include PR number) |
+| `done` | Implementation complete (include commit/PR) |
+| `deferred` | On hold (include reason) |
+| `rejected` | Rejected (include reason) |
+
+---
+
+## Format
+
+Each proposal file should include the following sections:
+
+```markdown
+# FP-NNNN: Title
+
+**Status**: proposed
+**Proposed**: YYYY-MM-DD
+**Author**: (session name or owner)
+
+## Summary
+One paragraph describing what to implement and why.
+
+## Motivation
+Use cases, background, comparison with alternatives, etc.
+
+## Proposed implementation
+Overview of the implementation approach (detailed design delegated to ADR).
+
+## Dependencies
+Prerequisites — other implementations or PRs this depends on.
+
+## Cost estimate
+SMALL / MEDIUM / LARGE (with rationale).
+
+## Related
+Links to related ADRs, PRs, and docs.
+```
+
+---
+
+## Index
+
+| # | Title | Status | Cost |
+|---|---|---|---|
+| [0001](0001-a2a-task-lifecycle.md) | A2A task lifecycle — ask_user / push notification support | proposed | MEDIUM |
+| [0002](0002-index-docs-recall-docs.md) | index_docs / recall_docs — unified document retrieval skill | done (ADR-0033 Accepted, 1e6f153) | LARGE |
+| [0003](0003-budget-exceed-user-approval.md) | User approval and resume flow on budget exceed | proposed | SMALL |
+| [0004](0004-safety-config-ux.md) | safety config UX improvements — alignment with conceptual layer | proposed | MEDIUM |
+| [0005](0005-safety-as-checkpoint.md) | Treat safety limits as checkpoints — integration with Permission model | proposed | LARGE |
+| [0006](0006-skill-self-improvement.md) | Skill self-improvement — execution-trace-driven + versioning + rollback | proposed | MEDIUM |
+| [0007](0007-evaluation-infrastructure.md) | Agent evaluation infrastructure — P6 trace export + skill regression evaluation | proposed | LARGE |
+| [0008](0008-swe-bench-integration.md) | SWE-bench participation infrastructure — stdlib skill + batch execution | proposed | LARGE |
+| [0009](0009-operational-intelligence.md) | Operational Intelligence — RAG indexing of event logs | proposed | MEDIUM |
+| [0010](0010-rag-routing.md) | RAG routing — semantic pre-filter for skill catalog + routing history | proposed | MEDIUM |
+| [0011](0011-remove-narrator.md) | Remove `skill_narrator` — let the router LLM narrate skill results | proposed | SMALL |
+| [0012](0012-async-skill-execution.md) | Async skill/agent/plan execution — non-blocking long-running tasks | done (LANDED 2026-05-10, commit `c9e79d6`) | LARGE |
+| [0013](0013-unified-inbox-outbox-transport.md) | Unified inbox/outbox transport abstraction — collapse CUI vs MCP/A2A skew | accepted (ADR-A green-light 2026-05-11) | LARGE |
+| [0014](0014-python-step-api-package.md) | Python step API package + rename modes (pure→safe, trusted→unsafe) | partial-landed 2026-05-11 (A–F + ADR-G Phase 1; commits `5b435e1`/`b405975`/`527e11f`) | MEDIUM |
+| [0015](0015-fine-grained-python-step-audit.md) | Fine-grained per-call Python step audit (bidirectional RPC) | deferred (= awaiting enterprise audit requirement) | MEDIUM |
+| [0016](0016-agent-authentication.md) | Agent authentication — OAuth delegation, token lifecycle, and MCP auth headers | Component A landed 2026-05-11 (commit `ec94a06`); B/C/D/E proposed | LARGE |
+| [0017](0017-sandboxed-execution.md) | Sandboxed execution — policy/backend abstraction and exec op deprecation | Components A+D landed 2026-05-11 (commit `ddf2d05`); B/C/E proposed | MEDIUM |
+| [0018](0018-event-store-backend.md) | Event Store backend abstraction — JSONL / SQLite / DuckDB (priority: LOW) | proposed | MEDIUM |
+| [0019](0019-chat-session-refactor.md) | ChatSession responsibility separation — extracting services from session.py | proposed | MEDIUM |
+| [0020](0020-runtime-layer-decomposition.md) | OSRuntime layer decomposition — splitting runtime.py into vertical layers | proposed | MEDIUM |
+| [0021](0021-event-log-audit-completeness.md) | Event log audit completeness — add run_id/skill to missing events + permission_granted | proposed | SMALL |
+
+> **FP-0022–0026 files no longer exist in the repo** (their index rows pointed at
+> dead links — #4021 audit, 2026-08-10) — dropped rather than "fixed", since no
+> replacement file or tracking issue was found anywhere in the repo for any of
+> the five. If one of these proposals is later revived, re-add its row then.
+
+> **FP-0027–0030 were tracked directly in GitHub Issues** (see below) rather
+> than as files here. **FP-0044 onwards returned to file-based numbered
+> proposals** — every proposal since #44 is a file in this directory again,
+> not an issue stub; the note above is retained for the 0027–0030 historical
+> record only.
+
+| # | Issue | Title | Status | Cost |
+|---|---|---|---|---|
+| 0027 | [#28](https://github.com/tya5/reyn/issues/28) | Plan step failure transparency | proposed | SMALL |
+| 0028 | [#29](https://github.com/tya5/reyn/issues/29) | Plan progress UX | proposed | SMALL |
+| 0029 | [#30](https://github.com/tya5/reyn/issues/30) | Plan step iteration budget | proposed | SMALL |
+| 0030 | [#31](https://github.com/tya5/reyn/issues/31) | Plan step result quality | proposed | SMALL |
+
+| # | Title | Status | Cost |
+|---|---|---|---|
+| [0044](0044-chat-package-decomposition.md) | `reyn.chat` decomposition — runtime namespace + cluster split + god-file seams | proposed | MEDIUM |
+| [0050](0050-content-threat-scan.md) | Content-layer threat scan (prompt-injection / pre-exec command) | S1 merged (#1844); awaiting S2 lead re-review | MEDIUM |
+| [0051](0051-tool-result-viewer-registry-llm-template.md) | Tool-result viewer registry + LLM-generated viewer templates | superseded — premise (Textual TUI right panel) deleted before implementation | SMALL |
+| [0052](0052-high-cost-model-preconfirm.md) | High-cost model pre-confirmation | draft | SMALL |
+| [0053](0053-tool-result-schema-redesign.md) | Tool-result schema redesign | done (IMPLEMENTED 2026-07-08; all PRs merged) | MEDIUM |
+| [0054](0054-present-layer.md) | Present layer — user-facing presentation without an LLM token round-trip | done (IMPLEMENTED 2026-07-08, v1 display-only) | LARGE |
+| [0055](0055-render-template-op-and-present-defaults.md) | `render_template` op + present defaults | done (IMPLEMENTED 2026-07-09) | SMALL |
+| [0056](0056-canonical-coverage-enforcement.md) | Canonical-mapping coverage enforcement | done (IMPLEMENTED 2026-07-09) | SMALL |
+| [0057](0057-rag-retrieval-redesign.md) | RAG / Retrieval redesign | owner-validated; Phases 1/2a/2b/4 landed (#2846/#2848/#2851/#2854); near-term-deferred scope unbuilt by design | LARGE |
+| [0058](0058-web-surface-modularity.md) | Web surface modularity + Chainlit retire | owner-ratified; Phases 1-4 landed (#2837/#2849/#2850), Phase 5 (optional refactor fold) open | LARGE |
+| [0059](0059-hook-event-redesign.md) | Hook-Event Redesign (Event Bus / reactivity substrate) | owner-ratified; Phases 1-5 landed (#2871–#2885) | LARGE |
+| [0060](0060-llm-wielding-foundation.md) | LLM-Wielding Foundation — making the agent actually use what it can build | closed (2026-07-13); floor + show delivered, Addenda A/B/C settled, enhancement/loop layers de-scoped by owner | LARGE |
+| [0061](0061-repo-self-access-and-packaging-standardization.md) | Repo self-access + packaging standardization | done — all 3 tracked PRs merged (#2923/#2924/#2925) | MEDIUM |
+| [0062](0062-structured-output-ephemeral-sessions-agent-steps.md) | Structured output for ephemeral sessions + pipeline agent steps | done — landed same day (2026-07-13, #2934) | SMALL |
+| [0063](0063-builtin-turnkey-user-rag.md) | Builtin turnkey user RAG (builtin mcp + skill + pipeline) | landed — PC/P2/P3/P4 merged (#2949/#2952/#2966/#3008), folded into 0064 P5 (#3078) | LARGE |
+| [0064](0064-plugin-model.md) | Plugin model for reyn (author → test → promote reusable capabilities) | Accepted + Implemented — all 5 phases landed, umbrella #3066 CLOSED | LARGE |
+| [0065](0065-orchestration-foundation.md) | Orchestration foundation — external-event plugins as a first-class unit | Proposed (awaiting owner review, 2026-07-20) | LARGE |
+| [0066](0066-retrieval-two-groups-two-axes.md) | Retrieval redesign: two groups (action / knowledge) × two axes (scheme × transport) | Proposed — owner design-of-record (2026-07-24/25), awaiting owner GO to phase-implement | LARGE |
+| [0067](0067-task-model-and-arbiter.md) | Task model and the inbox arbiter — sequencing and interface for [ADR-0040](../decisions/0040-task-as-os-concept.md) | Accepted (2026-08-10, owner) — **not yet implemented**; tracking #3978 | LARGE |

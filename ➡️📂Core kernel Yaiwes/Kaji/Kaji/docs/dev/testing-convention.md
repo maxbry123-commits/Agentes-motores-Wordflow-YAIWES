@@ -1,0 +1,228 @@
+# Testing Convention
+
+テスト規約。設計・実装・レビュー時に参照する。
+
+## テストサイズ定義
+
+テストはリソース制約（外部依存の有無）によって S/M/L の3サイズに分類する。
+
+| サイズ | 名称 | 特徴 | 実行速度 |
+|--------|------|------|---------|
+| **S** | Small | 外部依存なし。純粋なロジック・バリデーション・マッピング | 高速（ms） |
+| **M** | Medium | ファイルI/O・DB・内部サービスとの結合 | 中速（秒） |
+| **L** | Large | 実API・E2E・外部サービス疎通 | 低速（秒〜分） |
+
+### マーカー
+
+```python
+@pytest.mark.small
+@pytest.mark.medium
+@pytest.mark.large
+# Large の細分（必要に応じて large と併記）
+@pytest.mark.large_local   # subprocess あり / ネットワーク無し
+@pytest.mark.large_forge   # 実 GitHub API 疎通
+```
+
+実行前提と Make ターゲットは [`testing-size-guide.md` § Large の細分マーカー](../reference/testing-size-guide.md) を参照。
+
+### 判定基準
+
+```
+外部 API / 実サービス疎通あり → Large
+DB / ファイル / 内部サービス結合あり → Medium
+それ以外（純粋関数・モック完結） → Small
+```
+
+## テストファイル命名規約
+
+テストファイルは、テスト対象のモジュール / ドメイン名で命名する。
+
+- **基本形**: `test_<domain>.py`。`<domain>` はテスト対象のモジュール名または振る舞いドメイン名（例: `test_dispatcher.py` / `test_provider_type.py`）。
+- **フェーズ番号を含めない**: 開発フェーズ番号・マイルストーン番号（`phase3c` / `phase4` 等）はファイル名に含めない。これらは開発プロジェクトの内部進行を表す時間的アーティファクトであり、フェーズ完了後はファイル名としての情報量がゼロになる。機能名でテストへ到達できる発見性を優先する。
+- **テスト種別サフィックスは許容**: pytest marker と対応するテスト種別サフィックス（`_large_local` 等）は命名に含めてよい（例: `test_local_cli_large_local.py`）。これは時間的アーティファクトではなく、ファイルの実行特性を表す恒久的な情報である。
+
+## テスト戦略の原則
+
+> **変更の性質に応じて、恒久回帰テストと変更固有の一時検証を切り分ける。**
+
+まず「その変更が repo に残る恒久回帰テストを増やすべきか」を判断し、その上で必要な
+検証手段を選ぶ。
+
+### 変更タイプごとの期待値
+
+| 変更タイプ | 恒久回帰テスト | 期待される検証 |
+|-----------|----------------|----------------|
+| 実行時の振る舞いを変えるコード変更 | 原則必要 | 影響範囲に応じて Small / Medium / Large を設計・実装 |
+| docs-only | 原則不要 | リンク、コマンド例、参照先、運用ルールの整合確認 |
+| metadata-only | 原則不要 | フィールド値、配布メタデータ、ビルド設定の変更固有検証 |
+| packaging-only | 原則不要 | インストール、配布物、entry point などの変更固有検証 |
+
+`docs-only / metadata-only / packaging-only` の変更では、**新規ロジックや持続的な回帰リスクが
+ない限り、機械的に S/M/L 全サイズを要求しない**。
+
+### 実行時の振る舞いを変える変更
+
+設計書の「テスト戦略」には、影響範囲に応じて Small / Medium / Large の各観点を定義する。
+全サイズが不要だと判断する場合も、「変更固有検証で十分な理由」を明記すること。
+
+### docs-only / metadata-only / packaging-only 変更
+
+以下をすべて満たす場合、新規の恒久回帰テストは不要:
+
+1. 独自ロジックの追加・変更をほぼ含まない
+2. 想定される不具合パターンが既存テストまたは既存品質ゲートで捕捉済み
+3. 新規テストを追加しても回帰検出情報がほとんど増えない
+4. テスト未追加の理由をレビュー可能な形で説明できる
+
+## 恒久回帰テストと変更固有検証
+
+### 恒久回帰テスト
+
+repo にコミットし、今後も継続実行するテスト。以下を満たす場合に追加する:
+
+- ユーザー影響のある振る舞いを継続的に保護する
+- 将来の変更でも同種の回帰が再発しうる
+- 既存ゲートでは検出できない新しい回帰シグナルを増やせる
+
+### 変更固有の一時検証
+
+今回の変更の妥当性確認に必要だが、repo に恒久化する価値は低い検証。例:
+
+- `make verify-docs` — docs のリンク・参照整合チェック
+- `make verify-packaging` — 隔離 venv で `uv pip install -e .` → entry point・metadata 確認
+- `python -m build` や `importlib.metadata` を用いた一時確認
+
+この種の検証は、設計書や実装報告に「なぜ必要か」「なぜ恒久テストにしないか」を記録する。
+
+## `uv pip install -e .` の扱い
+
+`uv pip install -e .` は packaging / metadata 変更で有効な検証手段になりうるが、shared 環境を汚染
+しやすい。以下を原則とする:
+
+- shared `.venv` を前提にした常設の恒久テストにはしない
+- 日常の `pytest` や共用 worktree 検証に機械的に組み込まない
+- 実施する場合は使い捨ての隔離環境で行う
+
+推奨される隔離手段:
+
+- 一時ディレクトリに作成した専用 virtualenv (`uv venv`)
+- CI のジョブごとに破棄される環境
+- `uv venv` 等で作る disposable 環境
+
+## 省略してよい理由 / 省略してはいけない理由
+
+### 正当化できる理由
+
+| 理由 | 例 |
+|------|-----|
+| 実行時ロジック変更がなく、変更固有検証で十分 | docs-only / metadata-only / packaging-only |
+| 既存ゲートで不具合パターンを捕捉できる | link checker、既存の CLI / unit tests |
+| 物理的に作成不可 | サンドボックス未提供、対象インターフェース自体が存在しない |
+
+### 不正当な理由（自動的に Changes Requested）
+
+| 不正当な理由 | 対応 |
+|------------|------|
+| 「実行時間が長い」 | サンプル期間等で短縮可能 |
+| 「API キーがない」「DB が起動していない」 | 環境不備は修正対象。ユーザーに相談するか自分で解決 |
+| 「Small テストで十分カバーされている」 | 実行時コード変更ならサイズごとの検証観点を定義する |
+| 「軽微な変更なのでテスト不要」 | 実行時コード変更なら変更の大小だけでは省略できない |
+| 「Large テストはステージング環境で検証」 | 恒久テストなら CI で再現できる構成にすること |
+
+## `subprocess.run` / `shutil.which` patch スコープ
+
+`subprocess.run` / `shutil.which` の属性 patch（`patch("subprocess.run")` 等。#284 以前の
+旧表記 `kaji_harness.cli_main.subprocess.run` /
+`kaji_harness.providers._worktree.subprocess.run` も prefix module の束縛を経由するだけで
+同一 `sys.modules` singleton へ global に波及する）の許可/禁止は、表記ではなく
+**テストの実行経路が worktree 解決（`providers/_worktree.py` の git 呼び出し）に届くか**
+で判定する。
+
+dispatch / provider 結合テストで worktree 解決の git 経路まで盲目 stub すると、
+`MagicMock != 0` の truthy 評価などで暗黙の分岐依存が忍び込む
+（gl:21 で fail-fast 化した直前の構造）。
+
+| テスト層 | 属性 patch | 代替 / 条件 |
+|---------|-----------|-------------|
+| dispatch / provider 結合のうち **worktree 解決に届く経路**（local provider 構築・`--commit` の git 動線等）の盲目 stub | **禁止** | 系統 A: 実 git fixture / real-run passthrough spy。系統 B: `patch("kaji_harness.providers.resolve_main_worktree", return_value=...)` |
+| dispatch / provider 結合のうち worktree 解決に届かない経路（github passthrough の gh 転送境界検証・provider 構築前 fail-fast の不呼出し検証・転送層関数の直接駆動） | 許可 | 到達すれば必ず fail する assertion（`rc` / `call_count` / `argv[0] == "gh"` / `assert_not_called()`）を伴うこと。gl:21 の fail-fast により偶発到達は silent に通らない |
+| `resolve_main_worktree()` 自身の Small unit test | 許可 | `subprocess.run` の戻り値・例外分岐を検証する経路では mock 必須 |
+
+詳細は gl:21 設計書 [`draft/design/issue-21-refactor-drop-test-compat-fallback-in-re.md`](../../draft/design/issue-21-refactor-drop-test-compat-fallback-in-re.md)
+§ 制約・前提条件 を参照。
+
+## AI のテスト省略傾向への警告
+
+> **AI には、実行時コード変更でも都合よくテストを減らす傾向がある。**
+>
+> ただしその警告を、docs-only / metadata-only / packaging-only 変更に機械適用してはならない。
+> 重要なのは「変更タイプに対して妥当な検証か」である。
+
+## 設計書テスト戦略セクションの書き方
+
+```markdown
+## テスト戦略
+
+> **CRITICAL**: 変更タイプに応じて妥当な検証方針を定義すること。
+> 実行時コード変更では Small / Medium / Large の観点を検討し、
+> docs-only / metadata-only / packaging-only 変更では変更固有検証を定義する。
+
+### 実行時コード変更の場合
+
+#### Small テスト
+- (検証対象を列挙: 単体ロジック、バリデーション、マッピング等)
+
+#### Medium テスト
+- (検証対象を列挙: DB連携、内部サービス結合等)
+
+#### Large テスト
+- (検証対象を列挙: 実API疎通、E2Eデータフロー等)
+
+### docs-only / metadata-only / packaging-only の場合
+
+#### 変更固有検証
+- (例: link check、`importlib.metadata` 確認、隔離環境での `uv pip install -e .`)
+
+#### 恒久テストを追加しない理由
+- (上記 4 条件に沿って記載)
+```
+
+## レビュー時のチェックリスト
+
+```
+- [ ] 変更タイプ（実行時コード変更 / docs-only / metadata-only / packaging-only）が明示されているか
+- [ ] 実行時コード変更なら Small / Medium / Large の検証観点が定義されているか
+- [ ] 恒久テストを追加しない場合、その理由が 4 条件に沿って説明されているか
+- [ ] `uv pip install -e .` など副作用のある検証を行う場合、隔離方針が定義されているか
+```
+
+## 既存テストの棚卸し基準
+
+既存テストが過剰かを見直すときは、以下を確認する:
+
+1. そのテストは実行時の振る舞いではなく、docs / metadata / packaging の一時確認を恒久化していないか
+2. 既存ゲートで同じ不具合を既に検出できないか
+3. shared 環境を汚染する副作用を持っていないか
+4. 保守コストに対して回帰価値が見合っているか
+
+棚卸しが広範囲になり、複数ファイルの削除・再分類・ワークフロー変更を伴う場合は、
+この Issue で抱え込まず派生 Issue を切って追跡する。
+
+## テスト実行マトリクス
+
+いつ、何を実行するかの基準。
+
+| タイミング | 実行するもの | 根拠 |
+|-----------|-------------|------|
+| 実装中（Red/Green サイクル） | `pytest`（対象テストまたは全体） | 開発中の動作確認 |
+| コミット前 | `ruff check` + `ruff format --check` + `mypy` + `pytest` | 品質ゲート（`make check` 相当。非破壊。整形は `make fmt`） |
+| PR 前（`/i-dev-final-check`） | `make check` | 最終品質確認 |
+| docs-only PR 前（`/i-doc-final-check`） | `make verify-docs` | リンク整合性確認 |
+| CI | `make check` + `make verify-docs` | 自動品質検証 |
+
+### 実行の原則
+
+- **実行時コード変更**: `pytest` は必ず全テスト実行（`-m` フィルタなし）。特定テストのみの実行は開発中の補助に留める
+- **docs-only 変更**: `make verify-docs` で十分。`pytest` は回帰確認として実行するが、新規テスト追加は不要
+- **baseline failure がある場合**: [baseline-check.md](baseline-check.md) の構造化 artifact と
+  `--compare` を使い、新規 FAILED/ERROR のみを regression とする

@@ -1,0 +1,83 @@
+name: codeql
+
+# GitHub's semantic security scanner. Same engine that powers their
+# security advisories — catches SQL/command/path injection, hardcoded
+# credentials, unsafe deserialization, weak crypto, and other classes
+# the test/lint workflows can't see. Free for public repos and uses
+# its own runner pool, so it doesn't eat install/test minutes.
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+  # Re-scan weekly even without commits — query packs are updated by
+  # GitHub regularly and a stale code base can pick up new findings.
+  schedule:
+    - cron: '0 6 * * 1'  # Mondays 06:00 UTC
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: codeql (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    permissions:
+      # Required to write findings to the Security tab.
+      security-events: write
+      # Required for actions/checkout on private repos; harmless on public.
+      contents: read
+      actions: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [python, go]
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+
+      # setup-go must run BEFORE codeql init: init injects a traced go
+      # wrapper into PATH, and a later setup-go would repoint PATH at the
+      # toolcache go, bypassing CodeQL's build tracing.
+      - name: setup go
+        if: matrix.language == 'go'
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          # 1.26 covers both modules (tui requires 1.26+ via go.mod;
+          # proxy's 1.24 floor builds fine on it). setup-go v6 pins
+          # GOTOOLCHAIN=local, so the version here must satisfy every
+          # module — no auto-fetch.
+          go-version: '1.26'
+          # The modules live in proxy/ and tui/ (no root go.mod); without
+          # this the default cache lookup warns and never caches.
+          cache-dependency-path: |
+            proxy/go.sum
+            tui/go.sum
+
+      - name: init codeql (${{ matrix.language }})
+        uses: github/codeql-action/init@7188fc363630916deb702c7fdcf4e481b751f97a  # v4.37.1
+        with:
+          languages: ${{ matrix.language }}
+          # security-and-quality runs the broader pack — catches both
+          # security bugs and general correctness issues. Default
+          # security-extended is also fine; we pick the wider one
+          # because we already gate Pyflakes via ruff.
+          queries: security-and-quality
+
+      - name: build go modules
+        # CodeQL needs to observe a real compile to extract dataflow.
+        # autobuild can't handle our two-module layout (proxy/ + tui/)
+        # so we do it manually. Each module's `go build ./...` is enough
+        # for extraction — we don't need the artifacts.
+        if: matrix.language == 'go'
+        run: |
+          (cd proxy && go build ./...)
+          (cd tui   && go build ./...)
+
+      - name: analyze
+        uses: github/codeql-action/analyze@7188fc363630916deb702c7fdcf4e481b751f97a  # v4.37.1
+        with:
+          category: "/language:${{ matrix.language }}"

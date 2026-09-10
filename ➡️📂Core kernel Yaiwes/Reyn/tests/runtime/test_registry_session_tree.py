@@ -1,0 +1,176 @@
+"""Tier 2: AgentRegistry.session_tree() — read-only snapshot accessor.
+
+Exercises ``session_tree()`` against a REAL AgentRegistry with REAL Sessions
+loaded through the public sync path (``get_or_load`` / ``spawn_session`` + a real
+session factory — same pattern as test_registry_multi_session_1726). State is
+never set up by mutating private attrs. Covers the shape contract, multi-agent /
+multi-session listing, sid sorting, the unattached (all-false) marking, and
+snapshot isolation. Attached=True *rendering* (the ▸ marker) is covered by the
+``_agent_expansion`` test in test_inline_pr3b_status_bar.py.
+"""
+from __future__ import annotations
+
+from pathlib import Path
+
+from reyn.runtime.budget.budget import BudgetTracker, CostConfig
+from reyn.runtime.profile import AgentProfile
+from reyn.runtime.registry import AgentRegistry
+from reyn.runtime.session import Session
+from tests._support.agent_session import make_session
+
+
+def _entry_for(tree: "list[dict]", name: str) -> dict:
+    """The tree entry for `name` — never assumes an index. #5094:
+    `session_tree()` now iterates `list_active_names()` (alphabetical),
+    so `alpha` sorts BEFORE `default` — any test that cared specifically
+    about `default`'s own entry must look it up by name, not `[0]`."""
+    by_name = {e["agent"]: e for e in tree}
+    assert name in by_name, f"{name!r} missing from session_tree(): {tree!r}"
+    return by_name[name]
+
+
+def _make_registry(tmp_path: Path) -> AgentRegistry:
+    """A real AgentRegistry whose factory builds real Sessions on demand."""
+    def factory(profile: AgentProfile) -> Session:
+        agent_dir = tmp_path / ".reyn" / "agents" / profile.name
+        agent_dir.mkdir(parents=True, exist_ok=True)
+        return make_session(
+            agent_name=profile.name,
+            agent_role=profile.role,
+            output_language="en",
+            budget_tracker=BudgetTracker(CostConfig()),
+            snapshot_path=agent_dir / "state" / "snapshot.json",
+        )
+
+    reg = AgentRegistry(project_root=tmp_path, session_factory=factory)
+    # A second agent on disk so multi-agent listing is reachable via get_or_load.
+    AgentProfile.new("alpha", role="").save(tmp_path / ".reyn" / "agents" / "alpha")
+    return reg
+
+
+def test_session_tree_lists_declared_agents_even_with_no_sessions_loaded(
+    tmp_path: Path,
+) -> None:
+    """Tier 2: #5094 — session_tree() lists every DECLARED (on-disk,
+    non-archived) agent even when NOTHING has been loaded/attached yet —
+    the exact owner-measured gap (a remote agent tab showed nothing for
+    any agent not yet attached in that process, regardless of how many
+    the workspace actually had). Each entry's own `sessions` list is empty
+    (nothing loaded), distinguishing "declared but not yet attached" from
+    "does not exist" (#4996 family) rather than omitting the row.
+
+    Strip-falsifier: reverting `session_tree()`'s own iteration from
+    `list_active_names()` back to `loaded_names()` makes this assert `[]`
+    again (`test_session_tree_returns_only_loaded_agents_via_the_narrower_
+    call` below pins that DIFFERENT, still-correct behaviour for
+    `loaded_names()` itself) — verified locally."""
+    reg = _make_registry(tmp_path)
+    names = {e["agent"] for e in reg.session_tree()}
+    assert names == {"default", "alpha"}, (
+        f"expected every declared agent even unattached; got {names!r}"
+    )
+    assert all(e["sessions"] == [] for e in reg.session_tree())
+
+
+def test_session_tree_returns_only_loaded_agents_via_the_narrower_call(
+    tmp_path: Path,
+) -> None:
+    """Tier 2: regression guard for `loaded_names()` itself — #5094 did
+    NOT change this method; it answers a DIFFERENT question ("who is
+    running right now") than `session_tree()` now does."""
+    reg = _make_registry(tmp_path)
+    assert reg.loaded_names() == []
+    reg.get_or_load("default")
+    assert reg.loaded_names() == ["default"]
+
+
+def test_session_tree_entry_shape_for_loaded_agent(tmp_path: Path) -> None:
+    """Tier 2: a loaded agent's entry has 'agent', 'attached', 'sessions' keys; with
+    nothing attached its flag is False and its 'main' session is listed."""
+    reg = _make_registry(tmp_path)
+    reg.get_or_load("default")
+
+    by_name = {e["agent"]: e for e in reg.session_tree()}
+    assert "default" in by_name
+    entry = by_name["default"]
+    assert set(entry.keys()) == {"agent", "attached", "sessions"}
+    assert entry["attached"] is False          # nothing attached yet
+    by_sid = {s["sid"]: s for s in entry["sessions"]}
+    assert "main" in by_sid
+
+
+def test_session_tree_session_entry_shape(tmp_path: Path) -> None:
+    """Tier 2: each session entry has exactly 'sid' and 'attached' keys."""
+    reg = _make_registry(tmp_path)
+    reg.get_or_load("default")
+
+    sess_list = _entry_for(reg.session_tree(), "default")["sessions"]
+    by_sid = {s["sid"]: s for s in sess_list}
+    assert set(by_sid["main"].keys()) == {"sid", "attached"}
+
+
+def test_session_tree_lists_multiple_agents(tmp_path: Path) -> None:
+    """Tier 2: each declared agent appears once, in list_active_names()
+    order (#5094 — no longer loaded_names(), which only lists agents with
+    a live in-memory Session; declared-but-unattached agents belong here
+    too, see the test above)."""
+    reg = _make_registry(tmp_path)
+    reg.get_or_load("default")
+    reg.get_or_load("alpha")
+
+    names = [e["agent"] for e in reg.session_tree()]
+    assert names == reg.list_active_names()
+    assert set(names) == {"default", "alpha"}
+
+
+def test_session_tree_lists_spawned_sessions(tmp_path: Path) -> None:
+    """Tier 2: a spawned session shows up alongside 'main' under the same agent."""
+    reg = _make_registry(tmp_path)
+    reg.get_or_load("default")
+    sid = reg.spawn_session("default", "sub1", presentation_consumer=None, intervention_bridge=None)
+
+    sids = {s["sid"] for s in _entry_for(reg.session_tree(), "default")["sessions"]}
+    assert {"main", sid} <= sids
+
+
+def test_session_tree_sids_sorted(tmp_path: Path) -> None:
+    """Tier 2: sessions within an agent are sorted by sid regardless of spawn order."""
+    reg = _make_registry(tmp_path)
+    reg.get_or_load("default")
+    reg.spawn_session("default", "zz", presentation_consumer=None, intervention_bridge=None)
+    reg.spawn_session("default", "aa", presentation_consumer=None, intervention_bridge=None)
+
+    sids = [s["sid"] for s in _entry_for(reg.session_tree(), "default")["sessions"]]
+    assert sids == sorted(sids)
+
+
+def test_session_tree_all_false_when_nothing_attached(tmp_path: Path) -> None:
+    """Tier 2: with no attached agent (fresh registry) every flag is False, at both
+    the agent and session level."""
+    reg = _make_registry(tmp_path)
+    reg.get_or_load("default")
+    reg.spawn_session("default", "sub1", presentation_consumer=None, intervention_bridge=None)
+    assert reg.attached_name is None           # public-surface precondition
+
+    entry = _entry_for(reg.session_tree(), "default")
+    assert entry["attached"] is False
+    assert all(s["attached"] is False for s in entry["sessions"])
+
+
+def test_session_tree_returns_snapshot_copy(tmp_path: Path) -> None:
+    """Tier 2: the returned structure is a snapshot — mutating it does not corrupt a
+    second call (it must NOT hand out a handle to live registry state)."""
+    reg = _make_registry(tmp_path)
+    reg.get_or_load("default")
+
+    first = reg.session_tree()
+    default_idx = next(i for i, e in enumerate(first) if e["agent"] == "default")
+    first[default_idx]["agent"] = "MUTATED"
+    first[default_idx]["sessions"][0]["sid"] = "MUTATED"
+    first.append({"bogus": True})
+
+    by_name = {e["agent"]: e for e in reg.session_tree()}
+    assert "default" in by_name, "second call still reflects live 'default'"
+    by_sid = {s["sid"]: s for s in by_name["default"]["sessions"]}
+    assert "main" in by_sid, "second call still reflects live 'main' session"
+    assert all("bogus" not in e for e in by_name.values())

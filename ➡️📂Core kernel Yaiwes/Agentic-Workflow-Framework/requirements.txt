@@ -1,0 +1,7 @@
+# Runtime dependency: the official Anthropic Python SDK.
+# Required only for the live AnthropicBackend / support_triage_workflow example.
+# The framework core, the offline demo, and the test suite run without it.
+anthropic>=0.50
+
+# Development / testing only:
+#   pytest>=8.0

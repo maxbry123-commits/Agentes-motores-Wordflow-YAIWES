@@ -1,0 +1,16 @@
+[
+  {
+    "repo": "OpenRSI",
+    "path": "OpenMLE-Gym/builder_core/info.csv",
+    "chunks_dir": "OpenRSI/OpenMLE-Gym/builder_core/info.csv.chunks",
+    "bytes": 40552270,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "OpenRSI",
+    "path": "docs/assets/videos/frontis-ma1-openmle-release-teaser.mp4",
+    "chunks_dir": "OpenRSI/docs/assets/videos/frontis-ma1-openmle-release-teaser.mp4.chunks",
+    "bytes": 20018539,
+    "chunk_bytes": 8388608
+  }
+]

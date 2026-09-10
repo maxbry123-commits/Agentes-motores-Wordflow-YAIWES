@@ -1,0 +1,157 @@
+"""Structural assertions for the branch protection audit workflow."""
+
+from __future__ import annotations
+
+import json
+import re
+from pathlib import Path
+from typing import TypedDict, cast
+
+import yaml
+
+
+class WorkflowJob(TypedDict, total=False):
+    name: object
+    permissions: dict[str, object]
+    env: dict[str, object]
+    steps: list[object]
+
+
+class WorkflowFile(TypedDict, total=False):
+    on: object
+    permissions: object
+    jobs: dict[str, WorkflowJob]
+
+
+WORKFLOW = Path(".github/workflows/branch-protection-audit.yml")
+CANARY = Path(".github/workflows/required-check-canary.yml")
+REQUIRED_CONTEXTS = {"CI gate", "shipped bundle matches the lockfile"}
+
+
+def _workflow_text() -> str:
+    return WORKFLOW.read_text(encoding="utf-8")
+
+
+def _workflow() -> WorkflowFile:
+    return cast("WorkflowFile", yaml.safe_load(_workflow_text()))
+
+
+def _on(workflow: WorkflowFile) -> dict[str, object]:
+    # PyYAML 1.1 parses bare ``on:`` as boolean True; tolerate both.
+    raw_workflow = cast("dict[object, object]", workflow)
+    value = raw_workflow.get(True, workflow.get("on"))
+    assert isinstance(value, dict), "workflow must define triggers"
+    return cast("dict[str, object]", value)
+
+
+def _audit_job(workflow: WorkflowFile) -> WorkflowJob:
+    jobs = workflow.get("jobs", {})
+    assert isinstance(jobs, dict), "workflow must define jobs"
+    job = jobs.get("audit")
+    assert isinstance(job, dict), "workflow must define an audit job"
+    return job
+
+
+def _canary_expected_contexts() -> set[str]:
+    canary = cast("dict[str, object]", yaml.safe_load(CANARY.read_text(encoding="utf-8")))
+    jobs = canary.get("jobs")
+    assert isinstance(jobs, dict)
+    job_map = cast("dict[str, object]", jobs)
+    verify = job_map.get("verify")
+    assert isinstance(verify, dict)
+    verify_map = cast("dict[str, object]", verify)
+    steps = verify_map.get("steps")
+    assert isinstance(steps, list)
+    for step_value in cast("list[object]", steps):
+        if not isinstance(step_value, dict):
+            continue
+        step = cast("dict[str, object]", step_value)
+        if step.get("name") != "Verify required-check invariants":
+            continue
+        env = step.get("env")
+        assert isinstance(env, dict)
+        env_map = cast("dict[str, object]", env)
+        raw = env_map.get("BRANCH_PROTECTION_CONTEXTS_JSON")
+        assert isinstance(raw, str)
+        parsed = json.loads(raw)
+        assert isinstance(parsed, list)
+        parsed_items = cast("list[object]", parsed)
+        assert all(isinstance(item, str) for item in parsed_items)
+        return {cast("str", item) for item in parsed_items}
+    raise AssertionError("canary must define BRANCH_PROTECTION_CONTEXTS_JSON")
+
+
+def test_branch_protection_audit_workflow_exists() -> None:
+    assert WORKFLOW.exists(), "branch-protection-audit.yml is missing"
+
+
+def test_branch_protection_audit_is_scheduled_and_manual_only() -> None:
+    triggers = _on(_workflow())
+    assert "schedule" in triggers, "audit must run on a schedule"
+    assert "workflow_dispatch" in triggers, "audit must be manually runnable"
+    assert "pull_request" not in triggers, "live branch protection audit must not run on untrusted PR events"
+    assert "push" not in triggers, "live branch protection audit must not run on every push"
+
+    schedule = triggers["schedule"]
+    assert isinstance(schedule, list)
+    assert schedule, "scheduled audit must include at least one cron entry"
+
+
+def test_branch_protection_audit_permissions() -> None:
+    workflow = _workflow()
+    assert workflow.get("permissions") in ({}, "{}"), "workflow-level permissions must be default-deny"
+    assert _audit_job(workflow).get("permissions") == {"contents": "read", "issues": "write"}
+
+
+def test_branch_protection_audit_toggles_marker_issue_on_failure_and_recovery() -> None:
+    workflow_text = _workflow_text()
+    assert "scripts/toggle_branch_protection_audit_marker.py" in workflow_text
+    assert Path("scripts/toggle_branch_protection_audit_marker.py").exists()
+
+
+def test_branch_protection_audit_does_not_read_the_legacy_protection_endpoint() -> None:
+    """Classic protection has no field for `merge_queue` or `bypass_actors`.
+
+    An audit built on it would stay green exactly when the merge-queue
+    rule is dropped or a bypass actor is added - the regressions the
+    ruleset read exists to catch. It is retired outright, not kept as a
+    secondary probe: see the workflow header for why.
+    """
+    workflow_text = _workflow_text()
+    assert "repos/${GITHUB_REPOSITORY}/branches/main/protection" not in workflow_text
+    assert "gh api" not in workflow_text, (
+        "the workflow delegates to the audited, unit-tested script, not inline gh api calls"
+    )
+
+
+def test_branch_protection_audit_documents_why_the_legacy_endpoint_was_retired() -> None:
+    """`branch-protection-audit.yml` line ~69 used to be the only place this
+    reasoning lived. Pin it in the header so the rationale survives even
+    if nobody reads the PR that made the change."""
+    workflow_text = _workflow_text()
+    assert "merge_queue" in workflow_text
+    assert "bypass_actors" in workflow_text
+    assert "not read here" in workflow_text or "not read" in workflow_text
+
+
+def test_branch_protection_audit_delegates_to_the_ruleset_audit_script_without_mutating() -> None:
+    workflow_text = _workflow_text()
+    assert "scripts/check_branch_ruleset_audit.py" in workflow_text
+    assert Path("scripts/check_branch_ruleset_audit.py").exists()
+    assert not re.search(r"\b(?:POST|PUT|PATCH|DELETE)\b", workflow_text), "audit workflow must not mutate settings"
+    assert "--method" not in workflow_text
+    assert " -X " not in workflow_text
+
+
+def test_branch_protection_audit_canary_still_defines_the_required_contexts() -> None:
+    """The script reads this file directly; pin its shape here too so a
+    canary regression is caught at the workflow-suite level as well as in
+    `tests/unit/scripts/test_check_branch_ruleset_audit.py`."""
+    canary_text = CANARY.read_text(encoding="utf-8")
+    assert _canary_expected_contexts() == REQUIRED_CONTEXTS
+    assert "BRANCH_PROTECTION_CONTEXTS_JSON" in canary_text
+
+
+def test_branch_protection_audit_step_is_not_advisory() -> None:
+    workflow_text = _workflow_text()
+    assert "continue-on-error: true" not in workflow_text

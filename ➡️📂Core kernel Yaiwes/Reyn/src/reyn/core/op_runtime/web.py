@@ -1,0 +1,542 @@
+"""web kind handlers — web_fetch and web_search."""
+from __future__ import annotations
+
+import asyncio
+import html.parser
+
+from reyn._network import build_async_http_client
+from reyn.schemas.models import WebFetchIROp, WebSearchIROp
+
+from . import register
+from .context import OpContext
+from .context import sandbox_policy_from_ctx as _sandbox_policy_from_ctx
+
+
+class _TextExtractor(html.parser.HTMLParser):
+    _SKIP = {"script", "style", "head", "noscript", "svg", "iframe"}
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._parts: list[str] = []
+        self._skip_depth = 0
+
+    def handle_starttag(self, tag: str, attrs: object) -> None:
+        if tag in self._SKIP:
+            self._skip_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in self._SKIP and self._skip_depth > 0:
+            self._skip_depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        if self._skip_depth == 0:
+            stripped = data.strip()
+            if stripped:
+                self._parts.append(stripped)
+
+    def text(self) -> str:
+        return "\n".join(self._parts)
+
+
+def _extract_html_text(html_content: str) -> tuple[str, str]:
+    """Extract readable text from HTML.
+
+    Tries `trafilatura` (= production-grade extractor, optional `reyn[fetch]`
+    extra) first; falls back to the stdlib `_TextExtractor` when trafilatura
+    is unavailable OR returns no main content. Issue #355.
+
+    Returns ``(text, extractor_name)`` where extractor_name is
+    ``"trafilatura"`` or ``"stdlib"``.
+    """
+    try:
+        import trafilatura
+    except ImportError:
+        trafilatura = None  # type: ignore[assignment]
+
+    if trafilatura is not None:
+        extracted = trafilatura.extract(html_content)
+        if extracted:
+            return extracted, "trafilatura"
+
+    parser = _TextExtractor()
+    parser.feed(html_content)
+    return parser.text(), "stdlib"
+
+
+class _HtmlPreviewParser(html.parser.HTMLParser):
+    """Distill an HTML page to (title, outline, first_paragraph, link_count).
+
+    Pure-function deterministic preview generator for #385 PoC. Designed so
+    the same input HTML always produces the same preview output — required
+    to keep sandbox_2 dogfood measurement N-runs reproducible (= the
+    "preview deterministic 化" cofounder warning).
+
+    No LLM involvement; pure structural extraction so the preview is a
+    stable function of the input bytes.
+    """
+
+    _HEADING_TAGS = {"h1", "h2", "h3"}
+    # #4431: preview-only cap, not a data-loss point — this class builds a
+    # PREVIEW (title/outline/first_paragraph), and the caller already has the
+    # full `extracted_text` alongside it (see `_generate_web_fetch_preview`),
+    # so a heading past #8 is never lost, only left out of the outline
+    # summary. 8 has no measured basis beyond "a preview should stay short";
+    # unlike a hard data cap this doesn't need a config knob (owner ruling:
+    # a knob is for values a real environment could need widened — a preview
+    # length is a display choice, not a correctness bound). What it DID need
+    # (and lacked) is visibility: `result()` now reports `outline_truncated`
+    # so a page with more headings doesn't read as "this IS the whole outline".
+    _OUTLINE_MAX = 8
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._title_parts: list[str] = []
+        self._in_title = False
+        self._outline: list[tuple[str, list[str]]] = []  # (tag, buf)
+        self._heading_count = 0  # ALL headings seen, uncapped — #4431 visibility
+        self._current_heading: tuple[str, list[str]] | None = None
+        self._first_paragraph_parts: list[str] = []
+        self._in_first_paragraph = False
+        self._first_paragraph_done = False
+        self._link_count = 0
+
+    def handle_starttag(self, tag: str, attrs: object) -> None:
+        if tag == "title":
+            self._in_title = True
+        elif tag in self._HEADING_TAGS:
+            self._heading_count += 1
+            if len(self._outline) < self._OUTLINE_MAX:
+                self._current_heading = (tag, [])
+        elif (
+            tag == "p"
+            and not self._first_paragraph_done
+            and not self._in_first_paragraph
+        ):
+            self._in_first_paragraph = True
+        elif tag == "a":
+            self._link_count += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "title":
+            self._in_title = False
+        elif tag in self._HEADING_TAGS and self._current_heading is not None:
+            heading = self._current_heading
+            self._outline.append(heading)
+            self._current_heading = None
+        elif tag == "p" and self._in_first_paragraph:
+            self._in_first_paragraph = False
+            if self._first_paragraph_parts:
+                self._first_paragraph_done = True
+
+    def handle_data(self, data: str) -> None:
+        stripped = data.strip()
+        if not stripped:
+            return
+        if self._in_title:
+            self._title_parts.append(stripped)
+        if self._current_heading is not None:
+            self._current_heading[1].append(stripped)
+        if self._in_first_paragraph and not self._first_paragraph_done:
+            self._first_paragraph_parts.append(stripped)
+
+    def result(self) -> dict:
+        title = " ".join(self._title_parts).strip()
+        outline = [
+            f"{tag.upper()}: {' '.join(parts).strip()}"[:120]
+            for tag, parts in self._outline
+            if parts
+        ]
+        first_paragraph = " ".join(self._first_paragraph_parts).strip()
+        if len(first_paragraph) > 280:
+            first_paragraph = first_paragraph[:277] + "…"
+        out: dict = {
+            "title": title,
+            "outline": outline,
+            "first_paragraph": first_paragraph,
+            "link_count": self._link_count,
+        }
+        # #4431: the page's own full text is available alongside this preview
+        # (see _generate_web_fetch_preview) — nothing is lost — but the
+        # OUTLINE itself must say when it isn't the whole heading list.
+        if self._heading_count > len(self._outline):
+            out["outline_truncated"] = True
+            out["outline_heading_count"] = self._heading_count
+        return out
+
+
+def _generate_web_fetch_preview(
+    raw_html: str,
+    *,
+    extracted_text: str,
+    content_type: str,
+) -> dict:
+    """Build a structured preview dict for a web_fetch result (#385 PoC).
+
+    Pure function — same inputs produce same output. HTML inputs use
+    :class:`_HtmlPreviewParser` to extract title / outline / first paragraph
+    / link count. Non-HTML text falls back to a small structured summary
+    of the first lines so the LLM still has something to gauge "is the
+    extracted body the answer I need".
+
+    Returns a dict with keys appropriate to the content type:
+
+      HTML  → ``{title, outline, first_paragraph, link_count, content_chars}``
+      other → ``{first_lines, line_count, content_chars}``
+    """
+    content_chars = len(extracted_text)
+    if "text/html" in content_type:
+        try:
+            parser = _HtmlPreviewParser()
+            parser.feed(raw_html)
+            html_preview = parser.result()
+        except Exception:
+            html_preview = {
+                "title": "", "outline": [],
+                "first_paragraph": "", "link_count": 0,
+            }
+        html_preview["content_chars"] = content_chars
+        return html_preview
+    # Plain text / JSON / unknown — surface the head of the extracted body.
+    lines = extracted_text.splitlines()
+    first_lines = lines[:10]
+    return {
+        "first_lines": first_lines,
+        "line_count": len(lines),
+        "content_chars": content_chars,
+    }
+
+
+def _resolve_ssl_verify(ctx: OpContext) -> bool | str:
+    """Resolve the SSL verify value for httpx from config + env fallback.
+
+    Priority (highest → lowest):
+      1. ``web_fetch.ca_bundle`` set in config → returns the CA bundle path (str).
+      2. ``web_fetch.verify_ssl`` set to False → returns False (disable SSL check).
+      3. ``web_fetch.verify_ssl`` set to True  → returns True (force SSL check).
+      4. Both unset (None) → falls through to litellm.get_ssl_verify()
+         (= SSL_VERIFY env → litellm.ssl_verify → SSL_CERT_FILE → True).
+    """
+    cfg = ctx.web_fetch_config
+    if cfg is not None:
+        if cfg.ca_bundle:
+            return cfg.ca_bundle  # custom CA bundle path (corporate PKI)
+        if cfg.verify_ssl is False:
+            return False
+        if cfg.verify_ssl is True:
+            return True
+        # cfg.verify_ssl is None → fall through to litellm's own env-var chain
+    # perf/log-routing chokepoint: a web op (e.g. the flagship web_search→agent
+    # pipeline) can be the FIRST litellm import in the process — funnel it
+    # through ensure_litellm_ready() so litellm's import-time console log
+    # routing (#2929) wraps this import too (idempotent; cheap on 2nd+ call).
+    # Only reached here (not unconditionally at the top) — an explicit
+    # ca_bundle/verify_ssl config above never needs litellm at all.
+    #
+    # #4395 (owner-observed, live: `AttributeError: module 'litellm' has no
+    # attribute 'exceptions'` from a different chokepoint-bypass site):
+    # this used to call `ensure_litellm_ready()` and ignore its return
+    # value, then do its own unconditional `from litellm... import
+    # get_ssl_verify` right after — a chokepoint-bypass with a NEW failure
+    # mode PR-2's background warming thread exposed (Python places a
+    # module into `sys.modules` at the START of import, before its
+    # top-level code finishes; a second, independent import touch while
+    # the warming thread is mid-import can observe the same, genuinely
+    # incomplete module). Fixed the same way as `pricing.py`'s
+    # `_usage_object_for` (#4413): read `get_ssl_verify` off the
+    # ALREADY-confirmed module returned by `ensure_litellm_ready()`
+    # instead of a separate import statement. If litellm is unavailable,
+    # falls back to `True` (verify SSL) — the safe default, matching what
+    # this same fallback chain would eventually resolve to anyway absent
+    # any litellm-side override.
+    from reyn.llm.litellm_bootstrap import ensure_litellm_ready
+    litellm = ensure_litellm_ready()
+    if litellm is None:
+        return True
+    return litellm.llms.custom_httpx.http_handler.get_ssl_verify()
+
+
+async def handle_web_fetch(op: WebFetchIROp, ctx: OpContext) -> dict:
+    from urllib.parse import urljoin, urlparse
+
+    import httpx
+
+    from reyn import _ssrf_guard
+
+    # #1956 SSRF: the http.get allowlist (require_http_get) used to be validated
+    # ONLY on the initial url, then follow_redirects=True let httpx reach ANY
+    # host — an allowlisted host could redirect to a link-local / metadata /
+    # loopback / private target (e.g. 169.254.169.254 → cloud IAM creds). We now
+    # follow redirects MANUALLY and re-gate EACH hop: Layer 1 = allowlist
+    # re-validate (require_http_get), Layer 2 = IP-deny (reyn._ssrf_guard).
+    # ``allow_private`` is the operator opt-in (web_fetch.allow_private_ips).
+    _allow_private = (
+        ctx.web_fetch_config.allow_private_ips if ctx.web_fetch_config is not None else False
+    )
+
+    async def _gate_hop(hop_url: str) -> dict | None:
+        """L1 (allowlist) + L2 (SSRF IP-deny) for one hop's host. Returns an
+        error envelope to short-circuit on block, else None."""
+        host = urlparse(hop_url).hostname or ""
+        if not host:
+            return {
+                "kind": "web_fetch", "url": op.url, "status": "error",
+                "error": f"web_fetch: cannot resolve host from URL {hop_url!r}",
+            }
+        # L1 — #571 Phase 7 unified http.get axis (specific hosts pass silently;
+        # wildcard fires the per-host prompt). #1199 S3.1c-2: a sandbox with
+        # network:false vetoes the fetch. Re-run on EVERY hop (not just initial).
+        if ctx.permission_resolver is not None:
+            # #5052: `ctx.agent_name or ctx.actor` is the SAME fallback
+            # `present.py` already uses to obtain a real running-agent
+            # identity — `ctx.actor` alone is a per-call role label (the
+            # session bridge passes a fixed constant), not the agent
+            # dimension a saved approval's scope needs to be checked/
+            # recorded against.
+            await ctx.permission_resolver.require_http_get(
+                ctx.permission_decl, host, ctx.intervention_bus, ctx.actor,
+                sandbox_policy=_sandbox_policy_from_ctx(ctx),
+                agent_name=ctx.agent_name or ctx.actor,
+            )
+        # L2 — SSRF IP-deny (always; independent of the permission system).
+        try:
+            await asyncio.to_thread(
+                _ssrf_guard.assert_fetch_host_allowed, host, allow_private=_allow_private,
+            )
+        except _ssrf_guard.SSRFBlocked as exc:
+            ctx.events.emit("web_fetch_ssrf_blocked", url=hop_url, host=host, reason=str(exc))
+            return {"kind": "web_fetch", "url": op.url, "status": "blocked", "error": str(exc)}
+        return None
+
+    ctx.events.emit("web_fetch_started", url=op.url)
+    # #1913: hard ceiling on the downloaded body to prevent an unbounded-memory
+    # DoS. Stream instead, rejecting on a declared Content-Length over the cap
+    # and on the running byte total exceeding it (covers chunked / no-CL).
+    _max_dl = (
+        ctx.web_fetch_config.max_download_bytes
+        if ctx.web_fetch_config is not None
+        else 10 * 1024 * 1024
+    )
+
+    def _too_large(n: int) -> dict:
+        ctx.events.emit("web_fetch_too_large", url=op.url, downloaded=n, limit=_max_dl)
+        return {
+            "kind": "web_fetch", "url": op.url, "status": "too_large",
+            "error": (
+                f"response body ({n} bytes) exceeds the {_max_dl}-byte download "
+                f"cap (web_fetch.max_download_bytes)"
+            ),
+        }
+
+    _REDIRECT_CODES = (301, 302, 303, 307, 308)
+    body = b""
+    try:
+        # SSL verification — priority: reyn.yaml web_fetch config → env-var chain.
+        # #1956: follow_redirects=False — we follow manually so each hop is gated.
+        # #1972/#3075: pin_ssrf=True routes through PinnedAsyncHTTPTransport,
+        # which pins each hop's connect to the pre-validated IP
+        # (resolve_and_validate at gate time) so the client never re-resolves
+        # the host at connect time — closing the DNS-rebind TOCTOU — AND (as of
+        # #3075) is proxy-aware: when the standard HTTP(S)_PROXY env is set, the
+        # proxy endpoint is validated once and final-target rebind protection is
+        # delegated to it (see ``ssrf_aware_client_kwargs`` docstring). The
+        # manual redirect loop's _gate_hop L1+L2 logic is preserved either way.
+        async with build_async_http_client(
+            timeout=op.timeout,
+            follow_redirects=False,
+            headers={"User-Agent": "reyn/1.0"},
+            verify=_resolve_ssl_verify(ctx),
+            pin_ssrf=True,
+            events=ctx.events,
+            egress="web_fetch",
+        ) as client:
+            _url = op.url
+            for _hop in range(_ssrf_guard.MAX_REDIRECTS + 1):
+                _blocked = await _gate_hop(_url)
+                if _blocked is not None:
+                    return _blocked
+                async with client.stream("GET", _url) as response:
+                    _loc = response.headers.get("location")
+                    if response.status_code in _REDIRECT_CODES and _loc:
+                        # next hop — the redirect response body is drained on
+                        # the ``async with`` exit; only its Location matters.
+                        _url = urljoin(_url, _loc)
+                        continue
+                    _cl = response.headers.get("content-length")
+                    if _cl is not None and _cl.isdigit() and int(_cl) > _max_dl:
+                        return _too_large(int(_cl))
+                    _chunks: list[bytes] = []
+                    _total = 0
+                    async for _chunk in response.aiter_bytes():
+                        _total += len(_chunk)
+                        if _total > _max_dl:
+                            return _too_large(_total)
+                        _chunks.append(_chunk)
+                    body = b"".join(_chunks)
+                    break
+            else:
+                ctx.events.emit(
+                    "web_fetch_too_many_redirects", url=op.url,
+                    limit=_ssrf_guard.MAX_REDIRECTS,
+                )
+                return {
+                    "kind": "web_fetch", "url": op.url, "status": "error",
+                    "error": f"too many redirects (exceeded {_ssrf_guard.MAX_REDIRECTS})",
+                }
+    except httpx.TimeoutException:
+        _timeout_msg = f"request timed out after {op.timeout}s"
+        ctx.events.emit("web_fetch_failed", url=op.url, status="timeout", error=_timeout_msg)
+        return {"kind": "web_fetch", "url": op.url, "status": "timeout", "error": _timeout_msg}
+    except httpx.RequestError as exc:
+        ctx.events.emit("web_fetch_failed", url=op.url, status="error", error=str(exc))
+        return {"kind": "web_fetch", "url": op.url, "status": "error", "error": str(exc)}
+
+    content_type = response.headers.get("content-type", "")
+
+    # Issue #364: when the response is a binary image, switch to
+    # bytes + base64 + media_blocks instead of decoding as text. Apply the
+    # shared media-size gate (config: multimodal.max_bytes / on_oversize)
+    # before allocating any large payloads into the LLM context. Other
+    # binary types (audio/video) are deferred — fall through to the text
+    # path's errors="replace" behaviour, which preserves the pre-#364
+    # output for non-image binary.
+    if content_type.startswith("image/"):
+        image_bytes = body  # #1913: the streamed, size-capped bytes
+        if ctx.permission_resolver is not None and ctx.multimodal_config is not None:
+            if ctx.intervention_bus is None:
+                raise RuntimeError(
+                    "web_fetch op requires intervention_bus when loading "
+                    "binary media (multimodal gate)"
+                )
+            try:
+                await ctx.permission_resolver.require_media_load(
+                    size_bytes=len(image_bytes),
+                    source=f"web fetch {op.url}",
+                    mime_type=content_type,
+                    max_bytes=ctx.multimodal_config.max_bytes,
+                    on_oversize=ctx.multimodal_config.on_oversize,
+                    bus=ctx.intervention_bus,
+                )
+            except PermissionError as exc:
+                ctx.events.emit(
+                    "web_fetch_media_denied",
+                    url=op.url, size_bytes=len(image_bytes),
+                    mime_type=content_type,
+                )
+                return {
+                    "kind": "web_fetch", "url": op.url, "status": "denied",
+                    "content_type": content_type, "size_bytes": len(image_bytes),
+                    "error": str(exc),
+                }
+        # Issue #383 PR-C: emit a path-ref media block when MediaStore is
+        # available (= production path). Without a MediaStore (= direct
+        # OpContext in tests / legacy callers) fall back to inline base64
+        # so the pre-PR-C behaviour is preserved.
+        media_block: dict
+        if ctx.media_store is not None:
+            media_block = ctx.media_store.save_media(
+                image_bytes, mime_type=content_type,
+                chain_id=ctx.run_id or "", tool="web_fetch", seq=1,
+            )
+        else:
+            import base64
+            data_b64 = base64.b64encode(image_bytes).decode("ascii")
+            media_block = {
+                "type": "image", "data": data_b64, "mimeType": content_type,
+            }
+        ctx.events.emit(
+            "web_fetch_completed",
+            url=op.url, status_code=response.status_code,
+            content_type=content_type, content_length=len(image_bytes),
+            extractor="binary", media_block_count=1,
+            stored_as=("path_ref" if ctx.media_store is not None else "inline_b64"),
+        )
+        return {
+            "kind": "web_fetch", "url": op.url, "status": "ok",
+            "status_code": response.status_code, "content_type": content_type,
+            "content": "", "extractor": "binary",
+            "total_length": len(image_bytes),
+            "media_blocks": [media_block],
+        }
+
+    # #1913: decode the streamed bytes ourselves (the stream is consumed, so
+    # ``response.text`` is unavailable). Use the header-declared charset
+    # (``charset_encoding`` needs no body) with the same errors="replace"
+    # tolerance the old ``.text`` path relied on for malformed bytes.
+    raw = body.decode(response.charset_encoding or "utf-8", errors="replace")
+
+    if "text/html" in content_type:
+        content, extractor_name = _extract_html_text(raw)
+    else:
+        content = raw
+        extractor_name = "none"
+
+    # #3580 ③: no size cap here. The extracted text is returned WHOLE — the only
+    # ceiling on what reaches the model is the OS-level tool-result cap
+    # (``offload.enabled``, default false = uncapped), not a per-tool one. The
+    # removed ``max_length``/``start_index`` slice reported ``truncated`` +
+    # ``next_start`` in this result, i.e. it told the model "there is more, resume
+    # at N" while ``start_index`` was absent from the tool schema (measured: never
+    # present, `git log -S` on this file is empty) — the model could not act on it.
+    # Download volume is still bounded, by ``web_fetch.max_download_bytes``, above.
+    total_length = len(content)
+
+    ctx.events.emit(
+        "web_fetch_completed",
+        url=op.url,
+        status_code=response.status_code,
+        content_length=len(content),
+        extractor=extractor_name,
+        total_length=total_length,
+    )
+    return {
+        "kind": "web_fetch",
+        "url": op.url,
+        "status": "ok",
+        "status_code": response.status_code,
+        "content_type": content_type,
+        "content": content,
+        "extractor": extractor_name,
+        "media_blocks": [],
+        "total_length": total_length,
+    }
+
+
+async def handle_web_search(op: WebSearchIROp, ctx: OpContext) -> dict:
+    from reyn.tools.search_backends import get_backend
+
+    # FP-0022: Tier 1 config deny path. web_search is read-only (no side effects),
+    # so operator `deny` is the only sensible restriction — no interactive prompt needed.
+    if ctx.permission_resolver is not None and ctx.permission_resolver._is_config_denied("web.search"):
+        raise PermissionError("web search denied by config (web.search: deny)")
+
+    ctx.events.emit("web_search_started", query=op.query, backend=op.backend)
+    try:
+        backend = get_backend(op.backend)
+        results = await asyncio.to_thread(backend.search, op.query, op.max_results)
+    except Exception as exc:
+        ctx.events.emit("web_search_failed", query=op.query, backend=op.backend, error=str(exc))
+        return {
+            "kind": "web_search",
+            "query": op.query,
+            "backend": op.backend,
+            "status": "error",
+            "error": str(exc),
+        }
+
+    ctx.events.emit("web_search_completed", query=op.query, backend=op.backend, result_count=len(results))
+    return {
+        "kind": "web_search",
+        "query": op.query,
+        "backend": op.backend,
+        "status": "ok",
+        "results": results,
+    }
+
+
+from reyn.core.offload.canonical import (  # noqa: E402
+    web_fetch_to_canonical,
+    web_search_to_canonical,
+)
+
+register("web_fetch", handle_web_fetch, canonical=web_fetch_to_canonical)
+register("web_search", handle_web_search, canonical=web_search_to_canonical)

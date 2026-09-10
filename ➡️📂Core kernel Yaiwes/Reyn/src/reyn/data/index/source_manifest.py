@@ -1,0 +1,435 @@
+"""SourceManifest singleton + sources.yaml file SSoT (ADR-0033 Phase 1).
+
+Registry of indexed sources. File SSoT under ``<workspace_root>/.reyn/config/index/sources.yaml``
+with a per-process in-memory cache. Singleton per workspace via
+``get_source_manifest(workspace_root)``.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import time
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, AsyncIterator, Literal
+
+import yaml
+
+from reyn.data.index.backend import sources_manifest_path
+from reyn.data.index.backends.sqlite import _within_paths
+from reyn.data.index.build_lock import pid_alive as _pid_alive
+
+# ── Data model ────────────────────────────────────────────────────────────────
+
+# FP-0066 P2a (#3247 firm §2): the IndexCoordinator dirty-state contract.
+# ``clean`` = built and current; ``dirty`` = a provider/build failure or an
+# explicit invalidation left this source needing a (re)build; ``building`` =
+# a build is in flight (this process or another, per the cross-process
+# build_lock); ``error`` = the last build attempt failed and ``last_error``
+# carries why. ``dirty``/``error`` both mean "needs a build" — kept distinct
+# so an operator/log can tell "never tried since the mark" from "tried and
+# failed" at a glance; ``IndexCoordinator.search_await`` treats both the same
+# (heal by rebuilding).
+SourceState = Literal["clean", "dirty", "building", "error"]
+_VALID_SOURCE_STATES: frozenset[str] = frozenset({"clean", "dirty", "building", "error"})
+
+# FP-0066 P2b (#3247 firm §2): per-kind source taxonomy. ``dynamic`` = a
+# source whose content changes via an operator-driven op (skill load/
+# install, remember, index_update) — P2c wires these to sync-in-op
+# ``ensure_built(await_completion=True)``. ``static`` = a source that
+# changes out-of-band of any single op (the builtin action-catalog,
+# repo_doc, repo_src) — built in the BACKGROUND per the firm's §3
+# sync-vs-background table (never a foreground surprise to an unaware
+# operation). ``backfill`` = a source that already existed before
+# ``embedding.enabled`` was ever flipped on — the SAFE coercion default
+# for any pre-P2b ``sources.yaml`` entry (or one missing/garbled ``kind``),
+# since "assume this predates the taxonomy" is the least-surprising read
+# (mirrors the ``state`` coercion default rationale below).
+SourceKind = Literal["dynamic", "static", "backfill"]
+_VALID_SOURCE_KINDS: frozenset[str] = frozenset({"dynamic", "static", "backfill"})
+
+
+@dataclass
+class SourceEntry:
+    """A single source entry in the manifest."""
+
+    name: str
+    description: str
+    path: str
+    backend: str = "sqlite"
+    last_indexed: str | None = None  # ISO 8601 UTC
+    chunk_count: int = 0
+    embedding_model: str | None = None
+    # FP-0066 P2a (#3247 firm §2): dirty-state, persisted here (sources.yaml
+    # is the single SSoT — workspace-SSoT band; no second state store). This
+    # is the crash-recovery-of-record for the IndexCoordinator: durable,
+    # WAL-independent (see coordinator.py module docstring / the P2a
+    # truncate-falsify test).
+    state: SourceState = "clean"
+    last_error: str | None = None
+    # FP-0066 P2b (#3247 firm §2): per-kind taxonomy, persisted alongside
+    # ``state`` (same file SSoT — no second state store). Defaults to
+    # "backfill" for the dataclass itself (a freshly-constructed entry with
+    # no caller-supplied kind is, by construction, not yet classified as
+    # dynamic/static — "predates the taxonomy" is the safe read, same
+    # rationale as the on-disk coercion default in ``from_dict``).
+    kind: SourceKind = "backfill"
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialise to the on-disk YAML structure (name is the key, not a field)."""
+        d: dict[str, Any] = {
+            "description": self.description,
+            "path": self.path,
+            "backend": self.backend,
+            "chunk_count": self.chunk_count,
+            "state": self.state,
+            "kind": self.kind,
+        }
+        if self.last_indexed is not None:
+            d["last_indexed"] = self.last_indexed
+        if self.embedding_model is not None:
+            d["embedding_model"] = self.embedding_model
+        if self.last_error is not None:
+            d["last_error"] = self.last_error
+        return d
+
+    @classmethod
+    def from_dict(cls, name: str, data: dict[str, Any]) -> "SourceEntry":
+        """Deserialise from on-disk YAML structure.
+
+        Resilient to a malformed ``chunk_count`` (defaults to 0). ``.get(k, 0)``
+        only defaults a *missing* key, so an operator-edited ``sources.yaml`` with
+        ``chunk_count: null`` or a non-numeric value would otherwise crash the
+        whole manifest reload (``int(None)`` → TypeError, ``int("x")`` → ValueError);
+        ``_coerce_int`` closes that gap. Mirrors the #1906 TokenUsage fix.
+
+        ``state``: defaults to (and is coerced to, if garbage/missing)
+        ``"clean"`` — a pre-P2a ``sources.yaml`` (or an operator-edited one
+        with a typo'd value) has no usable dirty signal, and "assume clean"
+        is the safe read (a truly dirty source gets re-marked on its next
+        provider failure; it does not silently masquerade as needing an
+        unwanted rebuild).
+        """
+        def _coerce_int(v: object) -> int:
+            try:
+                return int(v)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                return 0
+
+        def _coerce_state(v: object) -> SourceState:
+            if isinstance(v, str) and v in _VALID_SOURCE_STATES:
+                return v  # type: ignore[return-value]
+            return "clean"
+
+        def _coerce_kind(v: object) -> SourceKind:
+            if isinstance(v, str) and v in _VALID_SOURCE_KINDS:
+                return v  # type: ignore[return-value]
+            # Missing/garbled kind on a pre-P2b (or operator-edited)
+            # sources.yaml → "backfill" (predates the taxonomy), per this
+            # field's own docstring.
+            return "backfill"
+
+        return cls(
+            name=name,
+            description=data.get("description", ""),
+            path=data.get("path", ""),
+            backend=data.get("backend", "sqlite"),
+            last_indexed=data.get("last_indexed"),
+            chunk_count=_coerce_int(data.get("chunk_count", 0)),
+            embedding_model=data.get("embedding_model"),
+            state=_coerce_state(data.get("state")),
+            last_error=data.get("last_error"),
+            kind=_coerce_kind(data.get("kind")),
+        )
+
+
+# ── Errors ────────────────────────────────────────────────────────────────────
+
+
+class SourceLockedError(Exception):
+    """Raised when acquire_source_lock fails because source is in use."""
+
+
+# ── Main class ────────────────────────────────────────────────────────────────
+
+
+class SourceManifest:
+    """Registry of indexed sources. File SSoT + per-process mem cache.
+
+    Singleton-per-workspace via ``get_source_manifest(workspace_root)``.
+    Atomic file write on update; mem cache invalidated on update.
+
+    Cross-process cache invalidation: ``get_all`` / ``get`` / ``format_for_prompt``
+    check ``sources.yaml`` mtime before returning cached data.  If mtime advanced
+    (another process wrote the file), the cache is reloaded transparently.
+
+    NOTE — race window: the mtime comparison is best-effort.  A write that
+    completes between our ``stat()`` call and the previous ``stat()`` is
+    technically invisible until the next call.  For strict multi-process safety
+    (e.g. indexer + agent writing simultaneously), use ``fcntl``-based file
+    locking (phase 2).  ``acquire_source_lock`` provides write-write advisory
+    locking; the mtime poll handles read-after-external-write.
+    """
+
+    def __init__(self, workspace_root: Path) -> None:
+        self._workspace_root = workspace_root
+        self._path = sources_manifest_path(workspace_root)
+        self._cache: dict[str, SourceEntry] | None = None
+        self._loaded_mtime: float | None = None
+        self._lock = asyncio.Lock()  # async safety for concurrent updates
+
+    # ── Private ───────────────────────────────────────────────────────────────
+
+
+    @property
+    def loaded_mtime(self) -> "float | None":
+        """Read-only accessor for the cached mtime of the last load.
+        ``None`` before the first load; updated on each cache miss /
+        reload. Tests probe this to verify the cache-freshness contract."""
+        return self._loaded_mtime
+
+    @property
+    def path(self) -> Path:
+        """The ``sources.yaml`` file SSoT path this manifest persists to
+        (#2248 PR-A2: the config-recovery emit site needs the persisted path)."""
+        return self._path
+
+    async def snapshot(self) -> dict[str, Any]:
+        """The FULL on-disk registry content — the same ``{name: entry.to_dict()}``
+        shape ``_atomic_write`` persists to ``sources.yaml`` (#2248 PR-A2: the
+        config-recovery emit needs the full post-mutation content, not a delta)."""
+        entries = await self.get_all()
+        return {name: entry.to_dict() for name, entry in entries.items()}
+    def _is_cache_stale(self) -> bool:
+        """Return True if sources.yaml has changed since the cache was loaded.
+
+        Best-effort mtime check — see class docstring for race window caveat.
+        """
+        try:
+            current_mtime = self._path.stat().st_mtime
+        except FileNotFoundError:
+            # File was deleted after we cached it → treat non-empty cache as stale.
+            return self._cache is not None and bool(self._cache)
+        return self._loaded_mtime is None or current_mtime > self._loaded_mtime
+
+    async def _reload_from_file(self) -> None:
+        """Read sources.yaml into cache and update _loaded_mtime.
+
+        Caller MUST hold ``self._lock``.
+        """
+        if self._path.exists():
+            raw: dict[str, Any] = yaml.safe_load(
+                self._path.read_text(encoding="utf-8")
+            ) or {}
+            self._cache = {
+                name: SourceEntry.from_dict(name, data)
+                for name, data in raw.items()
+            }
+            self._loaded_mtime = self._path.stat().st_mtime
+        else:
+            self._cache = {}
+            self._loaded_mtime = None
+
+    async def _atomic_write(
+        self, *, sandbox_write_paths: "list[str] | None" = None,
+    ) -> None:
+        """Write current mem cache to disk atomically (write → fsync → rename).
+
+        Caller MUST hold ``self._lock``.  Updates ``_loaded_mtime`` to the
+        newly written file so the next ``get_all`` does not trigger an
+        unnecessary reload.
+
+        #2856 Part B: ``sandbox_write_paths``, when set (the phase sandbox
+        policy's ``write_paths``, forwarded by the op — mirrors
+        ``SqliteIndexBackend``'s own ``write``/``delete``/``drop`` self-gate),
+        self-gates ``sources.yaml`` against the cap BEFORE the write — this is
+        the manifest's OWN write site (the backend's ``db_file`` self-gate
+        does not cover it — F3). Taken as a per-call arg (not stored on
+        ``__init__``/the instance) because ``SourceManifest`` is a
+        per-workspace SINGLETON (``get_source_manifest``); storing the cap on
+        the instance would let one caller's cap leak into (or be clobbered
+        by) a concurrent caller's request on the same workspace. ``None`` =
+        no cap (current behavior, in-process callers already gated at the op
+        layer).
+        """
+        if sandbox_write_paths is not None and not _within_paths(
+            self._path, sandbox_write_paths
+        ):
+            raise PermissionError(
+                f"source manifest write to {str(self._path)!r} denied by the "
+                f"active sandbox policy (path outside "
+                f"write_paths={sandbox_write_paths!r})."
+            )
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self._path.with_suffix(".yaml.tmp")
+        payload = {
+            name: entry.to_dict()
+            for name, entry in (self._cache or {}).items()
+        }
+        text = yaml.safe_dump(payload, sort_keys=True, allow_unicode=True)
+        tmp.write_text(text, encoding="utf-8")
+        # fsync for durability before rename
+        with open(tmp, "rb+") as f:
+            os.fsync(f.fileno())
+        tmp.replace(self._path)  # atomic rename on POSIX
+        # Record the mtime of the file we just wrote so subsequent reads
+        # don't trigger a spurious reload caused by our own write.
+        try:
+            self._loaded_mtime = self._path.stat().st_mtime
+        except FileNotFoundError:
+            self._loaded_mtime = None
+
+    # ── Public async API ──────────────────────────────────────────────────────
+
+    async def load(self) -> dict[str, SourceEntry]:
+        """Load from file (or empty dict). Populates mem cache."""
+        async with self._lock:
+            await self._reload_from_file()
+            return dict(self._cache)  # type: ignore[arg-type]
+
+    async def get_all(self) -> dict[str, SourceEntry]:
+        """Return all entries, reloading from file if the cache is stale.
+
+        Staleness is detected via ``sources.yaml`` mtime so that writes from
+        another process are picked up without an explicit ``load()`` call.
+        """
+        async with self._lock:
+            if self._cache is None or self._is_cache_stale():
+                await self._reload_from_file()
+            return dict(self._cache)  # type: ignore[arg-type]
+
+    async def get(self, name: str) -> SourceEntry | None:
+        """Get a single entry by name."""
+        entries = await self.get_all()
+        return entries.get(name)
+
+    async def upsert(
+        self, entry: SourceEntry, *, sandbox_write_paths: "list[str] | None" = None,
+    ) -> None:
+        """Add or update entry. Atomic file write + mem cache update.
+
+        ``sandbox_write_paths``: #2856 Part B — the phase sandbox cap,
+        forwarded by the caller (op) at the real write site. See
+        ``_atomic_write``.
+        """
+        async with self._lock:
+            if self._cache is None:
+                await self._reload_from_file()
+            assert self._cache is not None
+            self._cache[entry.name] = entry
+            await self._atomic_write(sandbox_write_paths=sandbox_write_paths)
+
+    async def remove(
+        self, name: str, *, sandbox_write_paths: "list[str] | None" = None,
+    ) -> bool:
+        """Remove entry. Returns True if removed, False if it didn't exist.
+
+        Atomic file write + mem cache update. ``sandbox_write_paths``: see
+        ``upsert``/``_atomic_write`` (#2856 Part B).
+        """
+        async with self._lock:
+            if self._cache is None:
+                await self._reload_from_file()
+            assert self._cache is not None
+            if name not in self._cache:
+                return False
+            del self._cache[name]
+            await self._atomic_write(sandbox_write_paths=sandbox_write_paths)
+            return True
+
+    async def format_for_prompt(self) -> str:
+        """Render sources list for router system prompt injection.
+
+        Empty case: returns a getting-started hint (UX gap fix A).
+
+        Non-empty case: returns markdown with N sources listed.
+        """
+        entries = await self.get_all()
+
+        if not entries:
+            # JSON-form invocation (= flag form does not exist; the previous
+            # text was hard-coded into the router system prompt and was
+            # actively teaching the LLM the wrong syntax — fixed in the
+            # 1.0 release-readiness wave).
+            return (
+                "## Indexed sources (0 available)\n"
+                "\n"
+                "No indexed sources yet. To enable retrieval over your data:\n"
+                "\n"
+                "```\n"
+                "reyn run index_docs '{\"source\":\"<name>\",\"path\":\"<glob>\","
+                "\"description\":\"<text>\"}'\n"
+                "```\n"
+                "\n"
+                "Examples:\n"
+                '- `reyn run index_docs \'{"source":"memory","path":".reyn/memory/*.md",'
+                '"description":"User notes"}\'`\n'
+                '- `reyn run index_docs \'{"source":"my_code","path":"src/**/*.py",'
+                '"description":"Python source"}\'`\n'
+            )
+
+        n = len(entries)
+        lines = [f"## Indexed sources ({n} available)", ""]
+        for entry in entries.values():
+            lines.append(
+                f"- **{entry.name}** — {entry.description} ({entry.chunk_count} chunks)"
+            )
+        lines.append("")
+        lines.append(
+            "These sources are OS-internal (FP-0066 P1b: there is no "
+            "agent-callable search tool over them)."
+        )
+        return "\n".join(lines)
+
+    @asynccontextmanager
+    async def acquire_source_lock(self, name: str) -> AsyncIterator[None]:
+        """Async context manager for source-level advisory lock (UX gap fix D).
+
+        Writes a marker file at ``.reyn/cache/index/<name>/.lock`` with PID + timestamp.
+        Raises ``SourceLockedError`` if the source is currently being indexed by
+        a live process.  Stale locks (dead PID) are reaped automatically.
+        """
+        lock_path = self._workspace_root / ".reyn" / "cache" / "index" / name / ".lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Check if an existing lock is held by a live process
+        if lock_path.exists():
+            try:
+                lock_data = json.loads(lock_path.read_text(encoding="utf-8"))
+                holder_pid = int(lock_data.get("pid", 0))
+                if holder_pid and _pid_alive(holder_pid):
+                    raise SourceLockedError(
+                        f"Source '{name}' is currently being indexed by PID"
+                        f" {holder_pid}. Wait for completion or kill the holder."
+                    )
+                # Stale lock — fall through and take over
+            except (json.JSONDecodeError, ValueError):
+                pass  # Corrupted lock file; take over
+
+        # Acquire the lock
+        lock_path.write_text(
+            json.dumps({"pid": os.getpid(), "ts": time.time()}),
+            encoding="utf-8",
+        )
+        try:
+            yield
+        finally:
+            try:
+                lock_path.unlink()
+            except FileNotFoundError:
+                pass
+
+
+# ── Module-level singleton registry (per-workspace) ───────────────────────────
+
+_MANIFESTS: dict[Path, SourceManifest] = {}
+
+
+def get_source_manifest(workspace_root: Path) -> SourceManifest:
+    """Get or create the SourceManifest singleton for a workspace."""
+    workspace_root = workspace_root.resolve()
+    if workspace_root not in _MANIFESTS:
+        _MANIFESTS[workspace_root] = SourceManifest(workspace_root)
+    return _MANIFESTS[workspace_root]

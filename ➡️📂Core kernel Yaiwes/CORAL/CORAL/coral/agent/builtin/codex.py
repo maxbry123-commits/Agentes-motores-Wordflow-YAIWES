@@ -1,0 +1,304 @@
+"""OpenAI Codex CLI subprocess lifecycle."""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import subprocess
+import sys
+import threading
+from pathlib import Path
+from typing import Any
+
+from coral.agent.exit_classifier import classify_by_uptime
+from coral.agent.process import open_agent_stderr_for_log_dir
+from coral.agent.runtime import (
+    AgentHandle,
+    apply_run_as_user,
+    apply_sandbox,
+    apply_sandbox_env,
+    write_coral_log_entry,
+)
+from coral.sandbox.protocol import AgentSandboxSpec
+from coral.venv_paths import venv_bin_dir
+from coral.workspace.repo import _clean_env
+
+logger = logging.getLogger(__name__)
+
+_CODEX_RUNTIME_OPTION_KEYS = {
+    "model_reasoning_effort",
+    "fast_mode",
+    "personality",
+    "web_search",
+}
+
+
+def _extract_codex_session_id(log_path: Path) -> str | None:
+    """Extract the resumable thread ID from a Codex JSONL log.
+
+    Older Codex versions emitted ``session_id`` while current versions emit a
+    ``thread.started`` event with ``thread_id``. Accept both formats so a
+    heartbeat interrupt can resume the existing conversation instead of
+    silently starting a fresh one.
+    """
+    try:
+        lines = log_path.read_text(encoding="utf-8").strip().splitlines()
+        for line in reversed(lines):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+                if not isinstance(data, dict):
+                    continue
+                sid = data.get("session_id")
+                if not sid and data.get("type") == "thread.started":
+                    sid = data.get("thread_id")
+                if isinstance(sid, str) and sid:
+                    return sid
+            except json.JSONDecodeError:
+                continue
+    except Exception as e:
+        logger.debug(f"Failed to extract session_id from {log_path}: {e}")
+    return None
+
+
+class CodexRuntime:
+    """Spawn and manage OpenAI Codex CLI agent subprocesses."""
+
+    @property
+    def instruction_filename(self) -> str:
+        return "AGENTS.md"
+
+    @property
+    def shared_dir_name(self) -> str:
+        return ".codex"
+
+    def extract_session_id(self, log_path: Path) -> str | None:
+        return _extract_codex_session_id(log_path)
+
+    def classify_exit(
+        self,
+        log_path: Path,
+        exit_code: int | None,
+        uptime_seconds: float | None,
+        min_clean_runtime_seconds: int = 60,
+    ) -> str:
+        """Classify a Codex CLI subprocess exit using the uptime fallback.
+
+        Codex does not emit a stable terminal marker we can rely on, so an
+        `exit_code==0` only counts as clean when the agent ran for at least
+        `min_clean_runtime_seconds`.
+        """
+        return classify_by_uptime(exit_code, uptime_seconds, min_clean_runtime_seconds)
+
+    def start(
+        self,
+        worktree_path: Path,
+        coral_md_path: Path,
+        model: str = "gpt-5.4",
+        runtime_options: dict[str, Any] | None = None,
+        max_turns: int = 0,
+        log_dir: Path | None = None,
+        verbose: bool = False,
+        resume_session_id: str | None = None,
+        prompt: str | None = None,
+        prompt_source: str | None = None,
+        task_name: str | None = None,
+        task_description: str | None = None,
+        gateway_url: str | None = None,
+        gateway_api_key: str | None = None,
+        run_as_user: dict[str, Any] | None = None,
+        sandbox: AgentSandboxSpec | None = None,
+    ) -> AgentHandle:
+        """Start a Codex agent in the given worktree.
+
+        Uses `codex exec` for non-interactive operation.
+        Resume uses `codex exec resume <session_id> "prompt"`.
+        """
+        agent_id_file = worktree_path / ".coral_agent_id"
+        agent_id = (
+            agent_id_file.read_text(encoding="utf-8").strip()
+            if agent_id_file.exists()
+            else "unknown"
+        )
+
+        if log_dir is None:
+            log_dir = worktree_path / ".codex" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+
+        log_idx = len(list(log_dir.glob(f"{agent_id}*.log")))
+        log_path = log_dir / f"{agent_id}.{log_idx}.log"
+
+        if prompt is None:
+            if resume_session_id:
+                prompt = "Session resumed. Continue evolving your solutions where you left off. There is no user in the loop — make decisions, run evals, accumulate knowledge, and iterate without waiting for input."
+                logger.info(f"Resuming agent {agent_id} session {resume_session_id}")
+            else:
+                prompt = "Begin working on your task and iterating on the seed solution. There is no user in the loop — make decisions, run evals, accumulate knowledge, and iterate without waiting for input."
+
+        option_args = _build_codex_runtime_option_args(runtime_options)
+
+        if resume_session_id:
+            # codex exec resume <session_id> "follow-up prompt"
+            cmd = [
+                "codex",
+                "exec",
+                "resume",
+                resume_session_id,
+                prompt,
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--model",
+                model,
+                *option_args,
+                "--json",
+            ]
+        else:
+            # codex exec "prompt"
+            cmd = [
+                "codex",
+                "exec",
+                prompt,
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--model",
+                model,
+                *option_args,
+                "--json",
+            ]
+
+        cmd = apply_sandbox(cmd, sandbox)
+
+        logger.info(f"Starting Codex agent {agent_id} in {worktree_path}")
+        logger.info(f"Command: {' '.join(cmd)}")
+
+        agent_env = _clean_env()
+        worktree_venv = str(worktree_path / ".venv")
+        agent_env["UV_PROJECT_ENVIRONMENT"] = worktree_venv
+        # Set VIRTUAL_ENV so login shells (which reset PATH) can restore it
+        # via /etc/profile.d/coral-venv.sh in Docker containers.
+        agent_env["VIRTUAL_ENV"] = worktree_venv
+        # Prepend the venv executable dir (bin or Scripts) to PATH for non-login shells
+        venv_bin = str(venv_bin_dir(worktree_path / ".venv"))
+        agent_env["PATH"] = venv_bin + os.pathsep + agent_env.get("PATH", "")
+
+        # Route through gateway if configured
+        if gateway_url:
+            agent_env["OPENAI_BASE_URL"] = gateway_url
+            logger.info(f"Codex agent {agent_id}: routing via gateway at {gateway_url}")
+        if gateway_api_key:
+            agent_env["OPENAI_API_KEY"] = gateway_api_key
+
+        apply_sandbox_env(agent_env, sandbox)
+
+        # OS-user isolation: drop the agent subprocess to the unprivileged user
+        # (no-op when run_as_user is None). Adjusts HOME so codex finds its creds
+        # in the agent's home; returns Popen user=/group= kwargs.
+        user_kwargs = apply_run_as_user(agent_env, run_as_user)
+
+        log_file = open(log_path, "w", buffering=1, encoding="utf-8", errors="replace")
+
+        # Per-agent stderr capture under public/diagnostics/<agent_id>/agent.err.
+        err_path: Path | None = None
+        err_file: Any = None
+        stderr_target: Any = subprocess.STDOUT
+        opened = open_agent_stderr_for_log_dir(log_dir, agent_id)
+        if opened is not None:
+            err_path, err_file = opened
+            stderr_target = err_file
+
+        write_coral_log_entry(
+            log_file,
+            prompt=prompt,
+            source=prompt_source or ("restart" if resume_session_id else "start"),
+            agent_id=agent_id,
+            session_id=resume_session_id,
+            task_name=task_name,
+            task_description=task_description,
+        )
+
+        if verbose:
+            process = subprocess.Popen(
+                cmd,
+                cwd=str(worktree_path),
+                stdout=subprocess.PIPE,
+                stderr=stderr_target,
+                start_new_session=True,
+                env=agent_env,
+                **user_kwargs,
+            )
+
+            def _tee_output(proc: subprocess.Popen, log_f, agent: str) -> None:
+                try:
+                    if proc.stdout is None:
+                        return
+                    for line in iter(proc.stdout.readline, b""):
+                        decoded = line.decode("utf-8", errors="replace")
+                        sys.stdout.write(f"[{agent}] {decoded}")
+                        sys.stdout.flush()
+                        log_f.write(decoded)
+                        log_f.flush()
+                except Exception as e:
+                    logger.error(f"Tee thread error: {e}")
+                finally:
+                    log_f.close()
+                    if proc.stdout:
+                        try:
+                            proc.stdout.close()
+                        except Exception:
+                            pass
+
+            tee_thread = threading.Thread(
+                target=_tee_output,
+                args=(process, log_file, agent_id),
+                daemon=True,
+            )
+            tee_thread.start()
+            log_file_ref = None
+        else:
+            process = subprocess.Popen(
+                cmd,
+                cwd=str(worktree_path),
+                stdout=log_file,
+                stderr=stderr_target,
+                start_new_session=True,
+                env=agent_env,
+                **user_kwargs,
+            )
+            log_file_ref = log_file
+
+        logger.info(f"Codex agent {agent_id} started with PID {process.pid}")
+
+        return AgentHandle(
+            agent_id=agent_id,
+            process=process,
+            worktree_path=worktree_path,
+            log_path=log_path,
+            session_id=resume_session_id,
+            err_file=err_file,
+            err_path=err_path,
+            _log_file=log_file_ref,
+        )
+
+
+def _toml_literal(value: Any) -> str:
+    """Serialize a scalar value for `codex -c key=value`."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int | float):
+        return str(value)
+    return json.dumps(str(value))
+
+
+def _build_codex_runtime_option_args(runtime_options: dict[str, Any] | None) -> list[str]:
+    """Translate runtime options into `codex exec -c key=value` arguments."""
+    if not runtime_options:
+        return []
+
+    args: list[str] = []
+    for key in sorted(runtime_options):
+        if key not in _CODEX_RUNTIME_OPTION_KEYS:
+            logger.warning(f"Ignoring unsupported Codex runtime option: {key}")
+            continue
+        args.extend(["-c", f"{key}={_toml_literal(runtime_options[key])}"])
+    return args

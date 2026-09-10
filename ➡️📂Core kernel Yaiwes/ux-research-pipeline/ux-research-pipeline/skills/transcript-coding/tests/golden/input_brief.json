@@ -1,0 +1,49 @@
+{
+  "project_id": "TICKET-123",
+  "project_name": "Reviews and news",
+  "context": "Qualitative study of how users perceive the review mechanics on business listing cards and the news block. Respondents are active users who previously completed a survey on this topic.",
+  "research_questions": [
+    {
+      "id": "rq_1",
+      "question": "How do users decide whether to trust a review or not?",
+      "notes": "We're interested in trust signals: the number, recency, and detail of reviews, and the author's reputation."
+    },
+    {
+      "id": "rq_2",
+      "question": "In what situations do users leave reviews themselves, and in what situations do they not?",
+      "notes": "Motivation to write, barriers, perceived impact."
+    },
+    {
+      "id": "rq_3",
+      "question": "How do users use the news block on the search page?",
+      "notes": "Frequency of use, whether they notice it, what they click on."
+    }
+  ],
+  "hypotheses": [
+    {
+      "id": "h_1",
+      "statement": "Users look first at the number of reviews rather than at their content.",
+      "notes": "Tested through behavioral observation and questions about what they notice first."
+    },
+    {
+      "id": "h_2",
+      "statement": "Users are more willing to write negative reviews than positive ones.",
+      "notes": "Asymmetry of motivation."
+    },
+    {
+      "id": "h_3",
+      "statement": "The news block on the results page is perceived as noise and ignored.",
+      "notes": ""
+    }
+  ],
+  "respondents": [
+    {
+      "id": "r_1",
+      "segment": "active users",
+      "city": "metro area",
+      "age": 34,
+      "gender": "m",
+      "notes": "Previously took part in a survey about reviews."
+    }
+  ]
+}

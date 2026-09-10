@@ -1,0 +1,1384 @@
+"""Tier 2: OS invariant — ADR 0064 plugin model P2 (plugin_install / plugin_uninstall).
+
+Tests:
+  1. e2e install + uninstall roundtrip: a real local plugin dir (skills
+     capability) is copied to ~/.reyn/plugins/<name>/, registered into
+     .reyn/config/skills.yaml (tagged plugin_id), then plugin_uninstall
+     removes both the registry entry and the global copy.
+  2. enforcement (real PermissionResolver, no approval): the global-copy
+     write is denied — demonstrates the gate is load-bearing, not decorative
+     (CLAUDE.md: gate strip-falsify, real resolver not None).
+  2b. #3088: the mcp register's OWN require_file_write gate on mcp.yaml
+     (distinct from the global-copy gate) — denied without approval for that
+     path (nothing written), approved → registered + mcp_server_installed
+     audit event fires.
+  3. reconcile: a plugin dir left with an _install_state.json marker AND a
+     mid-register registry entry (a simulated crash between register and
+     completion) is rolled back — BOTH the registry entry and the copy — by
+     the next reconcile pass (drop-registry-first, §3.11).
+  4. name-collision precedence (§3.8): a `local` install refuses to shadow
+     an already-installed `builtin`-sourced plugin of the same name.
+  5. run-code trust gate (§3.10 item 3, security core): a {kind:git} install
+     requires a per-install operator-trust decision that a persistent
+     http.get / web.fetch approval does NOT satisfy. Strip it → PermissionError,
+     nothing fetched/written. Operator YES → proceeds; operator NO → denied.
+  6. register-only (#3209): a plugin with an mcp capability registers its
+     ``mcp.json`` server ``command`` AS-IS — no dep materialise, no venv,
+     no command rewrite. A ``requirements.txt`` at the plugin root is inert
+     data install never reads.
+  7. #3048 seal: require_http_get(host) with a bus wired but unanswered
+     awaits indefinitely (confirmed root cause of the codeact-30s-budget
+     kill — a never-answered prompt, not a slow download or exhaustion).
+     Tests the general PermissionResolver mechanism directly (no longer a
+     plugin_install call path since #3209's register-only redesign removed
+     plugin_install's own pypi.org derive caller).
+  8. #3048 security witness: ``session_approve_host`` derives a grant scoped
+     to EXACTLY the named host — an unrelated host (evil.com) is still
+     gated (not a blanket http.get grant — confused-deputy guard). Tests
+     the general PermissionResolver mechanism directly, same reason as #7.
+
+Real PermissionResolver + OpContext + a real RequestBus-compatible Fake
+(scriptable answers) throughout (no mocks). HOME is monkeypatched per-test so
+~/.reyn/plugins/ never touches the real home dir.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import subprocess
+from pathlib import Path
+
+import pytest
+import yaml
+
+from reyn.core.op_runtime.context import OpContext
+from reyn.core.op_runtime.plugin_install import (
+    _bake_all_tokens,
+    _bake_mcp_json_fields,
+    _bake_plugin_root_only,
+    _build_mcp_entries,
+    _write_install_state,
+    plugin_data_root,
+    plugins_root,
+    reconcile_plugin_installs,
+)
+from reyn.core.op_runtime.plugin_install import (
+    handle as install_handle,
+)
+from reyn.core.op_runtime.plugin_uninstall import handle as uninstall_handle
+from reyn.data.workspace.workspace import Workspace
+from reyn.intervention_choices import NO, YES
+from reyn.plugins.manifest import PLUGIN_MANIFEST_SCHEMA_URL
+from reyn.schemas.models import PluginInstallIROp, PluginUninstallIROp
+from reyn.security.permissions.permissions import PermissionDecl, PermissionResolver
+from reyn.user_intervention import InterventionAnswer, UserIntervention
+
+# ── shared stubs (real API surface, no mocks) ─────────────────────────────────
+# #4597 slice ①: _StubWorkspace removed — a real Workspace(events=...,
+# permission_resolver=..., base_dir=...) is cheaply constructible (#4581's
+# own 1-line precedent) and only ever creates <base_dir>/.reyn/, which is
+# always a disposable pytest tmp_path/project_root here, not the real CWD.
+
+
+class _Events:
+    """Minimal real-callable event log stub — records emitted calls (for
+    audit-event witnessing) without any other side effect."""
+    subscribers: list = []
+
+    def __init__(self) -> None:
+        self.calls: list[tuple] = []
+
+    def emit(self, *args, **kwargs) -> None:
+        self.calls.append((args, kwargs))
+
+
+class _FakeBus:
+    """Real RequestBus-compatible Fake that pre-answers with a scripted choice
+    (same pattern as tests/security/test_require_file_jit_ask_1505.py's _FakeBus — a
+    scriptable Fake, not a mock: it implements the real ``request`` surface)."""
+
+    def __init__(self, choice: str) -> None:
+        self._choice = choice
+        self.asks: list[UserIntervention] = []
+
+    async def request(self, iv: UserIntervention) -> InterventionAnswer:
+        self.asks.append(iv)
+        return InterventionAnswer(text=self._choice, choice_id=self._choice)
+
+
+class _NeverAnswersBus:
+    """Real RequestBus-compatible Fake whose ``request`` coroutine never
+    resolves (#3048): models the codeact/headless dispatch scenario where a
+    bus IS wired (so ``require_http_get`` takes the ``await self._approve``
+    branch, not the ``bus is None`` fast-fail) but nobody is listening to
+    answer the intervention — the confirmed root cause of the indefinite
+    await that the caller's compute-budget timeout then guillotines. This is
+    a real, minimal implementation of the ``RequestBus`` protocol (not a
+    mock/patch): its ``request`` genuinely never completes, exactly like an
+    unattended bus in production."""
+
+    def __init__(self) -> None:
+        self.asks: list[UserIntervention] = []
+
+    async def request(self, iv: UserIntervention) -> InterventionAnswer:
+        self.asks.append(iv)
+        await asyncio.Event().wait()  # never set — never returns
+        raise AssertionError("unreachable: the wait() above never resolves")
+
+
+def _make_git_plugin_repo(base: Path, name: str = "gitplugin") -> Path:
+    """A real local git repo containing a minimal plugin (skills capability),
+    usable as a file:// {kind:git} source."""
+    repo = base / "repo"
+    repo.mkdir(parents=True, exist_ok=True)
+    (repo / "plugin.json").write_text(
+        json.dumps({
+            "$schema": PLUGIN_MANIFEST_SCHEMA_URL,
+            "name": name, "version": "0.1.0", "description": "git plugin",
+        }),
+        encoding="utf-8",
+    )
+    (repo / "skills" / "hi").mkdir(parents=True, exist_ok=True)
+    (repo / "skills" / "hi" / "SKILL.md").write_text(
+        "---\nname: hi\ndescription: from git\n---\n\nBody.\n", encoding="utf-8",
+    )
+    subprocess.run(["git", "init"], cwd=repo, capture_output=True, check=True)
+    subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=repo, capture_output=True, check=True)
+    subprocess.run(["git", "config", "user.name", "T"], cwd=repo, capture_output=True, check=True)
+    subprocess.run(["git", "add", "."], cwd=repo, capture_output=True, check=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True, check=True)
+    return repo
+
+
+def _make_plugin_source(base: Path, name: str = "myplugin") -> Path:
+    """A minimal local plugin dir: manifest + one skills capability."""
+    plugin_dir = base / name
+    plugin_dir.mkdir(parents=True, exist_ok=True)
+    (plugin_dir / "plugin.json").write_text(
+        json.dumps({
+            "$schema": PLUGIN_MANIFEST_SCHEMA_URL,
+            "name": name, "version": "0.1.0", "description": "test plugin",
+        }),
+        encoding="utf-8",
+    )
+    (plugin_dir / "skills" / "hello").mkdir(parents=True, exist_ok=True)
+    (plugin_dir / "skills" / "hello" / "SKILL.md").write_text(
+        "---\nname: hello\ndescription: says hi\n---\n\nSkill body.\n",
+        encoding="utf-8",
+    )
+    return plugin_dir
+
+
+def _make_ctx(
+    tmp_path: Path,
+    *,
+    approve_plugins_root: bool = True,
+    approve_mcp_yaml: bool = True,
+    interactive: bool = False,
+    bus: object | None = None,
+    approve_all_http: bool = False,
+    config_permissions: dict | None = None,
+) -> OpContext:
+    """Build a real OpContext with a PermissionResolver. When
+    ``approve_plugins_root`` is True, session-approves ~/.reyn/plugins/
+    (recursive) + the three registry config files — the granted-path
+    baseline every non-enforcement test needs. The enforcement test passes
+    False to demonstrate the gate actually denies without it.
+
+    ``approve_mcp_yaml`` (default True, independent of ``approve_plugins_root``)
+    controls whether ``.reyn/config/mcp.yaml`` specifically is session-approved
+    — the mcp register's OWN require_file_write gate (#3088), distinct from the
+    global-copy write gate on ``~/.reyn/plugins/``. A test demonstrating THAT
+    gate is load-bearing passes False here while leaving
+    ``approve_plugins_root`` True (the copy proceeds; the mcp registration
+    write is what gets denied).
+
+    ``approve_all_http`` session-approves the http.get wildcard host — this is
+    the FETCH axis (git clone / pypi reachability). The run-code trust gate is
+    a SEPARATE axis, so approving this must NOT let a {kind:git} install run
+    without the run-code prompt (test 5 asserts exactly that). ``interactive``
+    + ``bus`` drive the run-code trust prompt (which never persists).
+
+    ``config_permissions`` (default None → ``{}``) is passed straight to the
+    ``PermissionResolver`` — used by the #3048 config-deny witness test to
+    prove config-tier ``deny`` still wins over the derived pypi.org grant."""
+    project_root = tmp_path / "proj"
+    project_root.mkdir(parents=True, exist_ok=True)
+
+    resolver = PermissionResolver(
+        config_permissions=config_permissions or {},
+        project_root=project_root, interactive=interactive,
+    )
+    if approve_plugins_root:
+        resolver.session_approve_path(str(plugins_root()), "test", "file.write", recursive=True)
+        for cfg in ("pipelines.yaml", "skills.yaml"):
+            resolver.session_approve_path(
+                str(project_root / ".reyn" / "config" / cfg), "test", "file.write",
+            )
+    if approve_mcp_yaml:
+        resolver.session_approve_path(
+            str(project_root / ".reyn" / "config" / "mcp.yaml"), "test", "file.write",
+        )
+    if approve_all_http:
+        # http.get is EXACT-host-matched at the gate (a "*" session approval
+        # does not cover a specific host), so approve the concrete host the
+        # dep-materialisation fetch uses. This is the FETCH axis only — it must
+        # not (and does not) satisfy the run-code trust gate (test 5).
+        resolver.session_approve_host("*", "test")
+        resolver.session_approve_host("pypi.org", "test")
+
+    decl = PermissionDecl(
+        file_write=[{"path": str(plugins_root()), "scope": "recursive"}],
+        http_get=[{"host": "*"}],
+    )
+    events = _Events()
+    return OpContext(
+        workspace=Workspace(events=events, permission_resolver=resolver, base_dir=project_root),
+        events=events,
+        permission_decl=decl,
+        permission_resolver=resolver,
+        actor="test",
+        intervention_bus=bus,
+    )
+
+
+# ── Test 1: e2e install + uninstall roundtrip ─────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_plugin_install_uninstall_roundtrip(tmp_path, monkeypatch):
+    """Tier 2: a real plugin_install op copies the plugin to ~/.reyn/plugins/<name>/,
+    registers its skills capability into .reyn/config/skills.yaml (tagged
+    plugin_id), and plugin_uninstall removes both. RED if the copy, the
+    registry entry, the plugin_id tag, or the uninstall's removal is missing."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+
+    source = _make_plugin_source(tmp_path / "src")
+    ctx = _make_ctx(tmp_path)
+
+    op = PluginInstallIROp(kind="plugin_install", source={"kind": "local", "path": str(source)})
+    result = await install_handle(op, ctx)
+
+    assert result["status"] == "installed", f"install failed: {result}"
+    assert result["name"] == "myplugin"
+    assert result["capabilities"] == ["skills"]
+
+    plugin_root = plugins_root() / "myplugin"
+    assert plugin_root.is_dir(), "plugin was not copied to ~/.reyn/plugins/<name>/"
+    assert (plugin_root / "skills" / "hello" / "SKILL.md").exists()
+
+    skills_yaml = ctx.workspace.base_dir / ".reyn" / "config" / "skills.yaml"
+    raw = yaml.safe_load(skills_yaml.read_text(encoding="utf-8"))
+    entry = raw["skills"]["entries"]["hello"]
+    assert entry["plugin_id"] == "myplugin", "registered entry missing plugin_id provenance (§3.7)"
+
+    # ── uninstall ──
+    uop = PluginUninstallIROp(kind="plugin_uninstall", name="myplugin")
+    uresult = await uninstall_handle(uop, ctx)
+
+    assert uresult["status"] == "uninstalled"
+    assert uresult["removed"]["skills"] == ["hello"]
+    assert uresult["copy_removed"] is True
+    assert not plugin_root.exists(), "plugin copy was not removed by uninstall"
+
+    raw_after = yaml.safe_load(skills_yaml.read_text(encoding="utf-8"))
+    assert raw_after["skills"]["entries"] == {}, "registry entry survived uninstall"
+
+
+@pytest.mark.asyncio
+async def test_plugin_uninstall_never_deletes_plugin_data_and_discloses_where_it_is(
+    tmp_path, monkeypatch,
+):
+    """Tier 2: (#4570 conversion D, lead-coder ruling) plugin_uninstall
+    NEVER removes ``~/.reyn/plugin-data/<name>/`` — data outliving code
+    is the safe direction, the reverse is unrecoverable — and does not
+    silently leave that fact unstated: the result dict names exactly
+    where the retained data lives."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+
+    source = _make_plugin_source(tmp_path / "src", name="dataplugin")
+    ctx = _make_ctx(tmp_path)
+    op = PluginInstallIROp(kind="plugin_install", source={"kind": "local", "path": str(source)})
+    result = await install_handle(op, ctx)
+    assert result["status"] == "installed", f"install failed: {result}"
+
+    # Simulate the plugin having actually written data at runtime (this
+    # test does not exercise the ${PLUGIN_DATA} bake itself — see the
+    # dedicated _bake_mcp_json_fields tests above — only the uninstall
+    # retention/disclosure contract).
+    data_dir = plugin_data_root() / "dataplugin"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    (data_dir / "corpus.sqlite").write_text("not really sqlite", encoding="utf-8")
+
+    uop = PluginUninstallIROp(kind="plugin_uninstall", name="dataplugin")
+    uresult = await uninstall_handle(uop, ctx)
+
+    assert uresult["status"] == "uninstalled"
+    assert data_dir.is_dir(), "plugin-data must survive uninstall"
+    assert (data_dir / "corpus.sqlite").is_file(), "plugin-data CONTENT must survive uninstall"
+    assert uresult["plugin_data_retained_at"] == str(data_dir)
+
+
+@pytest.mark.asyncio
+async def test_plugin_uninstall_omits_the_disclosure_key_when_no_data_exists(
+    tmp_path, monkeypatch,
+):
+    """Tier 2: (accept-side) a plugin that never wrote any
+    ``${PLUGIN_DATA}`` content has no data directory to disclose —
+    ``plugin_data_retained_at`` is absent, not a false claim of an
+    empty/nonexistent path."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+
+    source = _make_plugin_source(tmp_path / "src", name="nodataplugin")
+    ctx = _make_ctx(tmp_path)
+    op = PluginInstallIROp(kind="plugin_install", source={"kind": "local", "path": str(source)})
+    result = await install_handle(op, ctx)
+    assert result["status"] == "installed", f"install failed: {result}"
+
+    uop = PluginUninstallIROp(kind="plugin_uninstall", name="nodataplugin")
+    uresult = await uninstall_handle(uop, ctx)
+
+    assert uresult["status"] == "uninstalled"
+    assert "plugin_data_retained_at" not in uresult
+
+
+# ── Test 2: enforcement (real resolver, gate strip-falsify) ──────────────────
+
+
+@pytest.mark.asyncio
+async def test_plugin_install_denied_without_write_approval(tmp_path, monkeypatch):
+    """Tier 2: security-critical gate — WITHOUT an approval/JIT-ask grant for
+    ~/.reyn/plugins/, a real PermissionResolver denies the global-copy write
+    (require_file_write's decl-less "zone OR approved" invariant: a mere
+    PermissionDecl declaration does not itself grant). RED if plugin_install
+    writes the global copy despite no approval — the exact unauthorized-write
+    this gate exists to prevent (ADR 0064 §3.10 item 1)."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+
+    source = _make_plugin_source(tmp_path / "src", name="unapproved-plugin")
+    ctx = _make_ctx(tmp_path, approve_plugins_root=False)
+
+    op = PluginInstallIROp(
+        kind="plugin_install", source={"kind": "local", "path": str(source)},
+    )
+    with pytest.raises(PermissionError):
+        await install_handle(op, ctx)
+
+    assert not (plugins_root() / "unapproved-plugin").exists(), (
+        "plugin copy was written despite a denied permission gate"
+    )
+
+
+# ── Test 2b: mcp register's OWN write gate (#3088) ────────────────────────────
+
+
+def _make_mcp_plugin_source(base: Path, name: str = "mcpplugin") -> Path:
+    """A minimal local plugin dir: manifest + one mcp capability (no
+    requirements.txt — offline, no materialise step at all)."""
+    plugin_dir = base / name
+    plugin_dir.mkdir(parents=True, exist_ok=True)
+    (plugin_dir / "plugin.json").write_text(
+        json.dumps({
+            "$schema": PLUGIN_MANIFEST_SCHEMA_URL,
+            "name": name, "version": "0.1.0", "description": "mcp test plugin",
+        }),
+        encoding="utf-8",
+    )
+    (plugin_dir / "mcp.json").write_text(
+        json.dumps({"mcpServers": {"srv": {"command": "python", "args": ["-m", "srv"]}}}),
+        encoding="utf-8",
+    )
+    return plugin_dir
+
+
+@pytest.mark.asyncio
+async def test_register_mcp_denied_without_mcp_yaml_write_approval(tmp_path, monkeypatch):
+    """Tier 2: security-critical gate — #3088. ``_register_mcp`` writes
+    ``.reyn/config/mcp.yaml`` via its OWN ``require_file_write`` gate, DISTINCT
+    from the global-copy write gate on ``~/.reyn/plugins/`` (which IS approved
+    here). Without a grant for mcp.yaml specifically, a real PermissionResolver
+    denies the mcp registration write. RED if plugin_install writes mcp.yaml
+    despite no approval for that path — the exact asymmetric ungated write
+    #3088 reports (sibling skill/pipeline registers already gated their own
+    config write; mcp's register did not)."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+
+    source = _make_mcp_plugin_source(tmp_path / "src")
+    ctx = _make_ctx(tmp_path, approve_plugins_root=True, approve_mcp_yaml=False)
+
+    op = PluginInstallIROp(kind="plugin_install", source={"kind": "local", "path": str(source)})
+    with pytest.raises(PermissionError):
+        await install_handle(op, ctx)
+
+    mcp_yaml = ctx.workspace.base_dir / ".reyn" / "config" / "mcp.yaml"
+    assert not mcp_yaml.exists(), (
+        "mcp.yaml was written despite a denied permission gate on that path"
+    )
+    # The global copy DID proceed (that gate was granted) — demonstrating the
+    # mcp.yaml denial is this OP's own gate, not a knock-on of the copy gate.
+    assert (plugins_root() / "mcpplugin").is_dir()
+
+
+@pytest.mark.asyncio
+async def test_register_mcp_gate_allows_and_emits_audit_event(tmp_path, monkeypatch):
+    """Tier 2: with mcp.yaml write approved, the register proceeds — the entry
+    lands in mcp.yaml (tagged plugin_id) AND the ``mcp_server_installed`` audit
+    event fires through ``ctx.events``. Complements the denial test above:
+    together they show the new gate blocks when unapproved and does not
+    regress the approved (existing-behavior) path."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+
+    source = _make_mcp_plugin_source(tmp_path / "src")
+    ctx = _make_ctx(tmp_path)  # approve_mcp_yaml defaults True
+
+    op = PluginInstallIROp(kind="plugin_install", source={"kind": "local", "path": str(source)})
+    result = await install_handle(op, ctx)
+
+    assert result["status"] == "installed", f"install failed: {result}"
+
+    mcp_yaml = ctx.workspace.base_dir / ".reyn" / "config" / "mcp.yaml"
+    servers = yaml.safe_load(mcp_yaml.read_text(encoding="utf-8"))["mcp"]["servers"]
+    assert servers["srv"]["plugin_id"] == "mcpplugin"
+
+    audit_event_names = [call[0][0] for call in ctx.events.calls if call[0]]
+    assert "mcp_server_installed" in audit_event_names, (
+        "mcp registration succeeded but emitted no mcp_server_installed audit event"
+    )
+
+
+# ── Test 3: reconcile rolls back a crashed partial install ───────────────────
+
+
+@pytest.mark.asyncio
+async def test_reconcile_rolls_back_partial_install_registry_and_copy(tmp_path, monkeypatch):
+    """Tier 2: reconcile (§3.11) rolls back a mid-REGISTER partial — BOTH the
+    dangling registry entry AND the copy, drop-registry-first.
+
+    Simulates a crash AFTER a capability was registered (a skills.yaml entry
+    tagged plugin_id) but BEFORE plugin_install_completed (the marker still
+    present). RED if reconcile removes only the copy and leaves the registry
+    entry — a dangling skill whose path no longer exists (the exact
+    co-vet-flagged gap: 'reconcile が partial copy を rmtree するが mid-register が
+    書いた registry entry を drop していない')."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    project_root = tmp_path / "proj"
+    project_root.mkdir()
+
+    # A partial copy (marker present = never completed) that DID register a skill.
+    # #3212: the marker now carries a pid; a DEAD pid is what distinguishes a
+    # genuinely-crashed partial (this test) from a concurrent still-in-progress
+    # install of the same name (test_3212's "the race" scenario) — the current
+    # process (an alive pid) would be treated as a live, in-progress install
+    # and correctly SKIPPED rather than rolled back.
+    partial = plugins_root() / "crashed-plugin"
+    (partial / "skills" / "s").mkdir(parents=True)
+    _write_install_state(partial, "local", pid=2**31 - 1)
+
+    skills_yaml = project_root / ".reyn" / "config" / "skills.yaml"
+    skills_yaml.parent.mkdir(parents=True, exist_ok=True)
+    skills_yaml.write_text(
+        yaml.dump({"skills": {"entries": {
+            "orphan": {"path": str(partial / "skills" / "s"), "plugin_id": "crashed-plugin", "enabled": True},
+            "kept": {"path": "/somewhere/else", "enabled": True},  # NOT this plugin — must survive
+        }}}),
+        encoding="utf-8",
+    )
+
+    # A completed install (no marker) — reconcile must NOT touch it.
+    completed = plugins_root() / "completed-plugin"
+    completed.mkdir(parents=True)
+    (completed / "content.txt").write_text("ok", encoding="utf-8")
+
+    rolled_back = await reconcile_plugin_installs(
+        plugins_root(), project_root=project_root, state_log=None, events=_Events(),
+    )
+
+    assert rolled_back == ["crashed-plugin"]
+    assert not partial.exists(), "the crashed partial copy was not rolled back"
+    assert completed.exists(), "reconcile incorrectly removed a completed install"
+
+    after = yaml.safe_load(skills_yaml.read_text(encoding="utf-8"))["skills"]["entries"]
+    assert "orphan" not in after, "reconcile left a dangling registry entry (registry-drop missing)"
+    assert "kept" in after, "reconcile dropped an unrelated registry entry"
+
+
+def test_reconcile_bare_sweep_without_project_root_drops_only_copies(tmp_path, monkeypatch):
+    """Tier 2: reconcile with no project_root (a bare filesystem sweep — the
+    standalone/CLI path) removes the partial copy but touches no registry
+    (there is none in scope). RED if it errors or removes a completed copy."""
+    import asyncio
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+
+    partial = plugins_root() / "crashed"
+    partial.mkdir(parents=True)
+    _write_install_state(partial, "git", pid=2**31 - 1)  # #3212: dead pid = crashed
+    completed = plugins_root() / "done"
+    completed.mkdir(parents=True)
+
+    rolled_back = asyncio.run(reconcile_plugin_installs(plugins_root()))
+    assert rolled_back == ["crashed"]
+    assert not partial.exists()
+    assert completed.exists()
+
+
+# ── Test 4: name-collision precedence (§3.8) ──────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_plugin_install_refuses_lower_trust_shadow(tmp_path, monkeypatch):
+    """Tier 2: a `local`-sourced install refuses to shadow an already
+    -installed `builtin`-sourced plugin of the SAME name (ADR 0064 §3.8: the
+    lower-trust-risk source never silently shadows a higher-trust-risk one).
+    RED if the local re-install silently overwrites the builtin copy."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+
+    # Simulate a builtin plugin registered under src/reyn/builtin/plugins/.
+    builtin_src_root = tmp_path / "builtin_plugins"
+    builtin_source = _make_plugin_source(builtin_src_root, name="shared-name")
+    monkeypatch.setattr(
+        "reyn.core.op_runtime.plugin_install._builtin_plugin_dir",
+        lambda name: builtin_src_root / name,
+    )
+
+    ctx = _make_ctx(tmp_path)
+    builtin_op = PluginInstallIROp(kind="plugin_install", source={"kind": "builtin", "name": "shared-name"})
+    builtin_result = await install_handle(builtin_op, ctx)
+    assert builtin_result["status"] == "installed", f"builtin install failed: {builtin_result}"
+
+    local_source = _make_plugin_source(tmp_path / "local_src", name="shared-name")
+    local_op = PluginInstallIROp(kind="plugin_install", source={"kind": "local", "path": str(local_source)})
+    local_result = await install_handle(local_op, ctx)
+
+    assert local_result["status"] == "skipped", f"expected skipped, got {local_result}"
+    assert "shared-name" in local_result["error"]
+
+
+# ── Test 5: run-code trust gate (§3.10 item 3 — the RCE boundary) ────────────
+
+
+@pytest.mark.asyncio
+async def test_git_install_denied_when_run_code_trust_not_granted(tmp_path, monkeypatch):
+    """Tier 2: SECURITY CORE — a {kind:git} install is denied when the operator
+    has NOT granted per-install run-code trust — EVEN THOUGH the http.get /
+    web.fetch host is fully approved. This is the co-vet BLOCK: fetch approval
+    (per-host, persistent, web.fetch-shared) must NEVER satisfy the run-code
+    axis, or an approved-once host becomes silent-RCE for every future git
+    plugin. Strip the run-code grant (non-interactive → the gate cannot be
+    satisfied) and assert PermissionError + NOTHING cloned/written.
+
+    RED if require_http_get alone lets the git install proceed (the exact
+    conflation the run-code gate closes)."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+
+    repo = _make_git_plugin_repo(tmp_path)
+    # http.get approved for ALL hosts (fetch axis fully granted), but the
+    # resolver is NON-interactive so the run-code trust gate cannot be granted.
+    ctx = _make_ctx(tmp_path, approve_all_http=True, interactive=False, bus=None)
+
+    op = PluginInstallIROp(kind="plugin_install", source={"kind": "git", "url": repo.as_uri()})
+    with pytest.raises(PermissionError) as exc:
+        await install_handle(op, ctx)
+    assert "run" in str(exc.value).lower(), "deny message should name the run-code trust boundary"
+
+    installed = [p for p in plugins_root().glob("*") if not p.name.startswith(".")]
+    assert installed == [], f"git plugin was installed despite no run-code trust: {installed}"
+    # No dangling staging clone either.
+    staging = plugins_root() / ".staging"
+    assert not staging.exists() or not any(staging.iterdir()), "a clone happened before the run-code gate"
+
+
+@pytest.mark.asyncio
+async def test_git_install_run_code_trust_yes_proceeds(tmp_path, monkeypatch):
+    """Tier 2: with an interactive operator who answers YES to the run-code
+    trust prompt, a {kind:git} install proceeds (the gate is a real decision
+    point, not an always-deny). Proves the deny above is the gate firing, not a
+    blanket non-interactive refusal of everything."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+
+    repo = _make_git_plugin_repo(tmp_path)
+    bus = _FakeBus(YES)
+    ctx = _make_ctx(tmp_path, approve_all_http=True, interactive=True, bus=bus)
+
+    op = PluginInstallIROp(kind="plugin_install", source={"kind": "git", "url": repo.as_uri()})
+    result = await install_handle(op, ctx)
+
+    assert result["status"] == "installed", f"YES answer did not install: {result}"
+    # The run-code trust prompt actually fired (distinct kind), and it is the
+    # git-run-code gate specifically.
+    assert any(iv.kind == "permission.plugin_git_run_code_trust" for iv in bus.asks), (
+        "the run-code trust prompt did not fire for a {kind:git} install"
+    )
+    assert (plugins_root() / "gitplugin").is_dir()
+
+
+@pytest.mark.asyncio
+async def test_git_install_run_code_trust_no_denies(tmp_path, monkeypatch):
+    """Tier 2: an interactive operator who answers NO to the run-code trust
+    prompt gets a PermissionError; nothing is installed."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+
+    repo = _make_git_plugin_repo(tmp_path)
+    bus = _FakeBus(NO)
+    ctx = _make_ctx(tmp_path, approve_all_http=True, interactive=True, bus=bus)
+
+    op = PluginInstallIROp(kind="plugin_install", source={"kind": "git", "url": repo.as_uri()})
+    with pytest.raises(PermissionError):
+        await install_handle(op, ctx)
+    assert not (plugins_root() / "gitplugin").exists()
+
+
+def test_run_code_trust_choices_offer_no_persist_option():
+    """Tier 1: the run-code trust choice set is yes/no ONLY — no ALWAYS/NEVER.
+    The non-persistence of the run-code decision (§3.10 'never auto-run') is a
+    STRUCTURAL property (the UI cannot present a persist option), not a
+    resolver convention. RED if a persist choice is ever added."""
+    from reyn.intervention_choices import (
+        ALWAYS,
+        NEVER,
+        plugin_run_code_trust_choices,
+    )
+
+    ids = {c.id for c in plugin_run_code_trust_choices()}
+    assert ids == {YES, NO}, f"run-code trust choices must be yes/no only, got {ids}"
+    assert ALWAYS not in ids and NEVER not in ids, "run-code trust must NOT offer a persist option"
+
+
+# ── Test 6: register-only (#3209) — no materialise, no venv, no rewrite ───────
+
+
+@pytest.mark.asyncio
+async def test_plugin_install_register_only_no_venv_no_rewrite(tmp_path, monkeypatch):
+    """Tier 2: #3209 headline property — a plugin with a requirements.txt AT
+    ITS ROOT + an mcp capability (command: python) is installed WITHOUT any
+    venv/materialise step: no ``.venv`` directory is created under the
+    plugin's global copy, and the registered mcp spawn ``command`` is the
+    plugin's OWN ``mcp.json`` value, unrewritten. RED if a ``.venv`` appears
+    or the registered command differs from the literal ``mcp.json`` value
+    — either would mean plugin_install still touches dependency provisioning,
+    which #3209 moved entirely to skill-driven, user-managed venvs."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+
+    src = tmp_path / "src" / "registeronly"
+    src.mkdir(parents=True)
+    (src / "plugin.json").write_text(
+        json.dumps({
+            "$schema": PLUGIN_MANIFEST_SCHEMA_URL,
+            "name": "registeronly", "version": "0.1.0",
+        }),
+        encoding="utf-8",
+    )
+    (src / "mcp.json").write_text(
+        json.dumps({"mcpServers": {"srv": {"command": "python", "args": ["-m", "srv"]}}}),
+        encoding="utf-8",
+    )
+    (src / "requirements.txt").write_text("sqlite-vec>=0.1.9\napsw>=3.51\n", encoding="utf-8")
+
+    ctx = _make_ctx(tmp_path, approve_all_http=True)
+    op = PluginInstallIROp(kind="plugin_install", source={"kind": "local", "path": str(src)})
+    result = await install_handle(op, ctx)
+
+    assert result["status"] == "installed", f"install failed: {result}"
+
+    plugin_root = plugins_root() / "registeronly"
+    assert (plugin_root / "requirements.txt").exists(), "requirements.txt was not copied"
+    assert not (plugin_root / ".venv").exists(), (
+        "a .venv was materialised — plugin_install must be register-only (#3209), "
+        "never provision external dependencies"
+    )
+
+    mcp_yaml = ctx.workspace.base_dir / ".reyn" / "config" / "mcp.yaml"
+    servers = yaml.safe_load(mcp_yaml.read_text(encoding="utf-8"))["mcp"]["servers"]
+    assert servers["srv"]["command"] == "python", (
+        "registered mcp command was rewritten away from the plugin's own "
+        "mcp.json value — #3209 register-only means AS-IS registration"
+    )
+    assert servers["srv"]["plugin_id"] == "registeronly"
+
+    # No audit event emitted for a materialise step that no longer exists.
+    audit_event_names = [call[0][0] for call in ctx.events.calls if call[0]]
+    assert "plugin_install_deps_materialised" not in audit_event_names, (
+        "a materialise audit-event fired despite the materialise step being removed (#3209)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_plugin_install_never_reads_requirements_txt_content(tmp_path, monkeypatch):
+    """Tier 2: #3209 clean-break witness — a requirements.txt with content
+    that would fail a real pip install (a malformed/unresolvable pin) does
+    NOT fail plugin_install: the file is copied verbatim as inert data,
+    never parsed or executed by the install op. RED if plugin_install still
+    attempts to interpret/install it (the exact foreign responsibility
+    #3209 removes)."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+
+    src = tmp_path / "src" / "badreqs"
+    src.mkdir(parents=True)
+    (src / "plugin.json").write_text(
+        json.dumps({
+            "$schema": PLUGIN_MANIFEST_SCHEMA_URL,
+            "name": "badreqs", "version": "0.1.0",
+        }),
+        encoding="utf-8",
+    )
+    (src / "requirements.txt").write_text(
+        "this-package-definitely-does-not-exist-anywhere===999.999.999\n", encoding="utf-8",
+    )
+
+    ctx = _make_ctx(tmp_path)
+    op = PluginInstallIROp(kind="plugin_install", source={"kind": "local", "path": str(src)})
+    result = await install_handle(op, ctx)
+
+    assert result["status"] == "installed", (
+        f"install failed on an unresolvable requirements.txt — plugin_install "
+        f"must never attempt to resolve/install it (#3209): {result}"
+    )
+    plugin_root = plugins_root() / "badreqs"
+    assert not (plugin_root / ".venv").exists()
+
+
+# ── Test 6b: fail-fast on a missing/incomplete venv at MCP spawn time ─────────
+#
+# #3060 by-construction requirement, preserved across #3209: a server whose
+# registered command names a venv interpreter that was never created (the
+# operator skipped the skill's venv-setup step) fails at SPAWN with a clear
+# OS-level error — plugin_install/mcp spawn never falls back to a runtime
+# fetch to paper over it.
+
+
+@pytest.mark.asyncio
+async def test_registered_command_pointing_at_missing_venv_fails_fast_no_fetch(tmp_path):
+    """Tier 2: a plugin's ``mcp.json`` naming an absolute venv-python path
+    that does not exist on disk is registered AS-IS (register-only, #3209);
+    actually spawning it (via ``probe_mcp_server``, the same probe
+    ``_register_mcp`` itself uses) fails with a clear, non-network error —
+    never a silent hang or an attempted runtime package fetch. RED if the
+    probe raises a network-fetch-shaped error, or hangs, instead of a plain
+    'no such file' / spawn failure."""
+    from reyn.core.op_runtime.mcp_install import probe_mcp_server
+
+    missing_venv_python = tmp_path / "nonexistent-venv" / "bin" / "python"
+    assert not missing_venv_python.exists()
+
+    entry = {
+        "type": "stdio", "command": str(missing_venv_python), "args": ["-m", "srv"],
+    }
+    probe_err = await probe_mcp_server("srv", entry, agent_id=None, cancel_event=None)
+
+    assert probe_err is not None, (
+        "expected a fail-fast probe error for a missing venv interpreter, got success"
+    )
+    assert "network" not in probe_err.lower() and "fetch" not in probe_err.lower(), (
+        f"probe error suggests a runtime-fetch fallback occurred instead of "
+        f"failing fast on the missing interpreter: {probe_err!r}"
+    )
+
+
+def test_build_mcp_entries_registers_command_as_is():
+    """Tier 1: `_build_mcp_entries` registers a server's ``command`` value
+    UNCHANGED (#3209 — no venv-interpreter rewrite of any kind, on any
+    platform-shaped path) — confirming the single-argument signature and
+    AS-IS pass-through this redesign left behind."""
+    windows_style_path = "C:/plugins/srv/.venv/Scripts/python.exe"
+    mcp_json = {
+        "mcpServers": {"srv": {"command": windows_style_path, "args": ["-m", "srv"]}},
+    }
+    import tempfile
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".json", delete=False,
+    ) as fh:
+        json.dump(mcp_json, fh)
+        mcp_json_path = Path(fh.name)
+    try:
+        entries = _build_mcp_entries(mcp_json_path)
+    finally:
+        mcp_json_path.unlink()
+
+    assert entries["srv"]["command"] == windows_style_path
+
+
+def _build_mcp_entries_from_dict(mcp_json: dict) -> dict:
+    """Round-trips *mcp_json* through a real temp file into
+    ``_build_mcp_entries`` — same real-file-I/O shape as
+    ``test_build_mcp_entries_registers_command_as_is`` above, factored out
+    for the transport-type pass-through tests below (#4570 conversion C1
+    added the round-trip helper; #4604 removed the translation those
+    tests originally covered)."""
+    import tempfile
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as fh:
+        json.dump(mcp_json, fh)
+        mcp_json_path = Path(fh.name)
+    try:
+        return _build_mcp_entries(mcp_json_path)
+    finally:
+        mcp_json_path.unlink()
+
+
+def test_build_mcp_entries_passes_streamable_http_through_unchanged():
+    """Tier 1: (#4604) the Agent Plugins 1.0 spec's own HTTP-family
+    spelling, ``"streamable-http"``, is now ALSO reyn's own vocabulary
+    (``mcp/client.py``'s ``_SUPPORTED_TYPES``) — no translation happens
+    any more (#4570 conversion C1's temporary adapter was removed once
+    #4604 landed)."""
+    entries = _build_mcp_entries_from_dict(
+        {"mcpServers": {"srv": {"type": "streamable-http", "url": "http://localhost:1234"}}},
+    )
+
+    assert entries["srv"]["type"] == "streamable-http"
+
+
+def test_build_mcp_entries_leaves_sse_unswept(tmp_path):
+    """Tier 1: (accept-side) ``"sse"`` passes through unchanged — never
+    swept into ``"streamable-http"`` by any pattern-matching mistake in
+    the (now-removed) adapter's former translation logic."""
+    entries = _build_mcp_entries_from_dict(
+        {"mcpServers": {"srv": {"type": "sse", "url": "http://localhost:1234"}}},
+    )
+
+    assert entries["srv"]["type"] == "sse"
+
+
+def test_build_mcp_entries_defaults_missing_type_to_streamable_http():
+    """Tier 1: (accept-side) a url-bearing entry omitting ``type``
+    entirely defaults to ``"streamable-http"`` — both the spec's own
+    default and reyn's own vocabulary agree since #4604, so this is a
+    plain default, not a translation."""
+    entries = _build_mcp_entries_from_dict(
+        {"mcpServers": {"srv": {"url": "http://localhost:1234"}}},
+    )
+
+    assert entries["srv"]["type"] == "streamable-http"
+
+
+# ── #4570 conversion D: field-aware ${PLUGIN_ROOT}/${PLUGIN_DATA} bake ─────
+
+
+def test_bake_mcp_json_fields_expands_args_env_cwd_but_never_command_or_url(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """Tier 1: (#4570 conversion D, lead-coder's REQUIRED falsify pair)
+    ``${PLUGIN_ROOT}`` expands inside ``args``/``env``/``cwd`` but is left
+    LITERAL inside ``command``/``url`` — the spec's own exclusion
+    (injection: a token whose value this module resolves must not be
+    able to choose WHAT gets executed or WHERE a request goes). Both
+    halves asserted together: an implementation that expands nowhere
+    would fail the first half; one that expands everywhere (the
+    pre-#4570-conversion-D behavior) would fail the second — only a
+    genuinely field-aware bake passes both."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+
+    from reyn.plugins.tokens import PluginTokenContext
+
+    plugin_root = tmp_path / "src-plugin"
+    plugin_root.mkdir()
+    mcp_json_path = plugin_root / "mcp.json"
+    mcp_json_path.write_text(
+        json.dumps({
+            "mcpServers": {
+                "srv": {
+                    "type": "stdio",
+                    "command": "${PLUGIN_ROOT}/bin/srv",
+                    "args": ["--root", "${PLUGIN_ROOT}/data"],
+                    "env": {"ROOT": "${PLUGIN_ROOT}"},
+                    "cwd": "${PLUGIN_ROOT}/work",
+                },
+            },
+        }),
+        encoding="utf-8",
+    )
+    token_ctx = PluginTokenContext(plugin_root=plugin_root, project_dir=tmp_path)
+
+    _bake_mcp_json_fields(mcp_json_path, token_ctx)
+
+    baked = json.loads(mcp_json_path.read_text(encoding="utf-8"))
+    srv = baked["mcpServers"]["srv"]
+    # Half 1: args/env/cwd DID expand.
+    assert srv["args"] == ["--root", f"{plugin_root}/data"]
+    assert srv["env"] == {"ROOT": str(plugin_root)}
+    assert srv["cwd"] == f"{plugin_root}/work"
+    # Half 2: command stays LITERAL — never expanded.
+    assert srv["command"] == "${PLUGIN_ROOT}/bin/srv"
+
+
+def test_bake_mcp_json_fields_url_stays_literal_too(tmp_path: Path, monkeypatch) -> None:
+    """Tier 1: (#4570 conversion D) same exclusion as ``command``, for a
+    url-bearing (HTTP-family) server entry."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+
+    from reyn.plugins.tokens import PluginTokenContext
+
+    plugin_root = tmp_path / "src-plugin"
+    plugin_root.mkdir()
+    mcp_json_path = plugin_root / "mcp.json"
+    mcp_json_path.write_text(
+        json.dumps({
+            "mcpServers": {
+                "srv": {"type": "streamable-http", "url": "${PLUGIN_ROOT}/mcp"},
+            },
+        }),
+        encoding="utf-8",
+    )
+    token_ctx = PluginTokenContext(plugin_root=plugin_root, project_dir=tmp_path)
+
+    _bake_mcp_json_fields(mcp_json_path, token_ctx)
+
+    baked = json.loads(mcp_json_path.read_text(encoding="utf-8"))
+    assert baked["mcpServers"]["srv"]["url"] == "${PLUGIN_ROOT}/mcp"
+
+
+def test_bake_mcp_json_fields_expands_plugin_data_and_creates_the_directory(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """Tier 1: (#4570 conversion D, lead-coder ruling) ``${PLUGIN_DATA}``
+    expands to ``plugin_data_root() / <plugin name>`` — a SIBLING of
+    ``plugins_root()``, surviving a future reinstall — and that directory
+    is created eagerly (the spec's own "clients PROVIDE a persistent
+    writable PLUGIN_DATA directory" wording)."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+
+    from reyn.plugins.tokens import PluginTokenContext
+
+    plugin_root = plugins_root() / "dataplugin"
+    plugin_root.mkdir(parents=True)
+    mcp_json_path = plugin_root / "mcp.json"
+    mcp_json_path.write_text(
+        json.dumps({
+            "mcpServers": {
+                "srv": {"type": "stdio", "command": "python", "args": ["${PLUGIN_DATA}/db"]},
+            },
+        }),
+        encoding="utf-8",
+    )
+    token_ctx = PluginTokenContext(plugin_root=plugin_root, project_dir=tmp_path)
+
+    _bake_mcp_json_fields(mcp_json_path, token_ctx)
+
+    expected_data_dir = plugin_data_root() / "dataplugin"
+    assert expected_data_dir.is_dir(), "PLUGIN_DATA directory must be created, not just referenced"
+    baked = json.loads(mcp_json_path.read_text(encoding="utf-8"))
+    assert baked["mcpServers"]["srv"]["args"] == [f"{expected_data_dir}/db"]
+
+
+def test_bake_mcp_json_fields_is_a_noop_when_mcp_json_is_absent(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """Tier 1: (accept-side) a plugin with no mcp.json at all — the
+    common "just skills"/"just pipelines" shape (§1) — is a graceful
+    no-op, no PLUGIN_DATA directory fabricated for a plugin that never
+    references it."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+
+    from reyn.plugins.tokens import PluginTokenContext
+
+    plugin_root = tmp_path / "no-mcp-plugin"
+    plugin_root.mkdir()
+    token_ctx = PluginTokenContext(plugin_root=plugin_root, project_dir=tmp_path)
+
+    _bake_mcp_json_fields(plugin_root / "mcp.json", token_ctx)
+
+    assert not (plugin_data_root() / "no-mcp-plugin").exists()
+
+
+# ── #4610: two token vocabularies, one per file — a wrong guess must warn ───
+
+
+def test_bake_mcp_json_fields_warns_on_a_stale_reyn_token_in_args(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """Tier 1: (#4610) a plugin author who mistakenly writes
+    ``${REYN_PLUGIN_ROOT}`` (the WRONG vocabulary — that name belongs to
+    pipelines/SKILL.md, not mcp.json) in an args entry gets a warning —
+    the token stays literal (nothing recognizes it here) but the install
+    no longer succeeds in total silence about it."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+
+    from reyn.plugins.tokens import PluginTokenContext
+
+    plugin_root = tmp_path / "src-plugin"
+    plugin_root.mkdir()
+    mcp_json_path = plugin_root / "mcp.json"
+    mcp_json_path.write_text(
+        json.dumps({
+            "mcpServers": {
+                "srv": {
+                    "type": "stdio",
+                    "command": "python",
+                    "args": ["${REYN_PLUGIN_ROOT}/data"],
+                },
+            },
+        }),
+        encoding="utf-8",
+    )
+    token_ctx = PluginTokenContext(plugin_root=plugin_root, project_dir=tmp_path)
+
+    warnings = _bake_mcp_json_fields(mcp_json_path, token_ctx)
+
+    assert any("REYN_PLUGIN_ROOT" in w and str(mcp_json_path) in w for w in warnings), warnings
+    # The token itself must still be LITERAL — this function never
+    # recognizes ${REYN_*}, so nothing expands it.
+    baked = json.loads(mcp_json_path.read_text(encoding="utf-8"))
+    assert baked["mcpServers"]["srv"]["args"] == ["${REYN_PLUGIN_ROOT}/data"]
+
+
+def test_bake_mcp_json_fields_never_warns_about_command_or_url(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """Tier 1: (#4610, accept-side) ${PLUGIN_ROOT} surviving inside
+    ``command``/``url`` is CORRECT (the spec's own exclusion this whole
+    conversion exists to honor) — never flagged as a mistake."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+
+    from reyn.plugins.tokens import PluginTokenContext
+
+    plugin_root = tmp_path / "src-plugin"
+    plugin_root.mkdir()
+    mcp_json_path = plugin_root / "mcp.json"
+    mcp_json_path.write_text(
+        json.dumps({
+            "mcpServers": {
+                "srv": {
+                    "type": "stdio",
+                    "command": "${PLUGIN_ROOT}/bin/srv",
+                    "args": ["ok"],
+                },
+            },
+        }),
+        encoding="utf-8",
+    )
+    token_ctx = PluginTokenContext(plugin_root=plugin_root, project_dir=tmp_path)
+
+    warnings = _bake_mcp_json_fields(mcp_json_path, token_ctx)
+
+    assert warnings == []
+
+
+def test_bake_all_tokens_warns_on_a_stale_spec_token(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """Tier 1: (#4610) a pipeline DSL file mistakenly using
+    ``${PLUGIN_ROOT}`` (mcp.json's own spec vocabulary — meaningless in
+    a pipeline) gets a warning naming the file and the correct token."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+
+    from reyn.plugins.tokens import PluginTokenContext
+
+    plugin_root = tmp_path / "src-plugin"
+    path = plugin_root / "pipelines" / "x.yaml"
+    path.parent.mkdir(parents=True)
+    path.write_text("pipeline: x\nsteps:\n  - transform: {value: \"${PLUGIN_ROOT}\"}\n", encoding="utf-8")
+    token_ctx = PluginTokenContext(plugin_root=plugin_root, project_dir=tmp_path)
+
+    warnings = _bake_all_tokens(path, token_ctx)
+
+    assert any(
+        "PLUGIN_ROOT" in w and "REYN_PLUGIN_ROOT" in w for w in warnings
+    ), warnings  # names the CORRECT token for this file
+
+
+def test_bake_all_tokens_no_warning_for_the_correct_reyn_token(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """Tier 1: (#4610, accept-side) using the RIGHT vocabulary for a
+    pipeline (${REYN_PLUGIN_ROOT}) produces no warning at all."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+
+    from reyn.plugins.tokens import PluginTokenContext
+
+    plugin_root = tmp_path / "src-plugin"
+    path = plugin_root / "pipelines" / "x.yaml"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        "pipeline: x\nsteps:\n  - transform: {value: \"${REYN_PLUGIN_ROOT}\"}\n", encoding="utf-8",
+    )
+    token_ctx = PluginTokenContext(plugin_root=plugin_root, project_dir=tmp_path)
+
+    warnings = _bake_all_tokens(path, token_ctx)
+
+    assert warnings == []
+
+
+def test_bake_plugin_root_only_warns_on_a_stale_spec_token(
+    tmp_path: Path,
+) -> None:
+    """Tier 1: (#4610) a SKILL.md mistakenly using ${PLUGIN_DATA} (never
+    valid in a skill — that name is mcp.json's own) gets a warning."""
+    plugin_root = tmp_path / "src-plugin"
+    path = plugin_root / "skills" / "hello" / "SKILL.md"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        "---\nname: hello\ndescription: d\n---\n\nData at ${PLUGIN_DATA}.\n", encoding="utf-8",
+    )
+
+    warnings = _bake_plugin_root_only(path, plugin_root)
+
+    assert any("PLUGIN_DATA" in w for w in warnings), warnings
+
+
+@pytest.mark.asyncio
+async def test_plugin_install_surfaces_stale_token_warnings_in_the_result(
+    tmp_path, monkeypatch,
+):
+    """Tier 2: end-to-end — a real ``plugin_install`` call whose mcp.json
+    uses the wrong vocabulary surfaces the #4610 warning in the actual
+    install result, not just at the unit level."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+
+    src = tmp_path / "src" / "wrongtoken"
+    src.mkdir(parents=True)
+    (src / "plugin.json").write_text(
+        json.dumps({
+            "$schema": PLUGIN_MANIFEST_SCHEMA_URL,
+            "name": "wrongtoken", "version": "0.1.0",
+        }),
+        encoding="utf-8",
+    )
+    (src / "mcp.json").write_text(
+        json.dumps({
+            "mcpServers": {
+                "srv": {
+                    "type": "stdio", "command": "python",
+                    "args": ["${REYN_PLUGIN_ROOT}/x"],
+                },
+            },
+        }),
+        encoding="utf-8",
+    )
+
+    ctx = _make_ctx(tmp_path, approve_all_http=True)
+    op = PluginInstallIROp(kind="plugin_install", source={"kind": "local", "path": str(src)})
+    result = await install_handle(op, ctx)
+
+    assert result["status"] == "installed", result
+    assert any(
+        "REYN_PLUGIN_ROOT" in w for w in result["stale_token_warnings"]
+    ), result["stale_token_warnings"]
+
+
+@pytest.mark.asyncio
+async def test_plugin_install_stale_token_warning_fires_a_paired_audit_event(
+    tmp_path, monkeypatch,
+):
+    """Tier 2: (#4610 follow-up) the result-dict field above is
+    discoverable only by whoever kept THIS install call's return value —
+    a plugin installed once and never re-inspected would have the finding
+    silently drop out of view otherwise. `plugin_install_token_vocabulary_
+    mismatch` is the durable P6 record, same "install-time, discrete,
+    named condition" class as `mcp_server_install_skipped` (#4580) /
+    `pipeline_install_skipped`/`skill_install_skipped` (#4590): one event
+    per finding, `name` + `warning` (the same string the result's own
+    `stale_token_warnings` list carries)."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+
+    src = tmp_path / "src" / "wrongtoken2"
+    src.mkdir(parents=True)
+    (src / "plugin.json").write_text(
+        json.dumps({
+            "$schema": PLUGIN_MANIFEST_SCHEMA_URL,
+            "name": "wrongtoken2", "version": "0.1.0",
+        }),
+        encoding="utf-8",
+    )
+    (src / "mcp.json").write_text(
+        json.dumps({
+            "mcpServers": {
+                "srv": {
+                    "type": "stdio", "command": "python",
+                    "args": ["${REYN_PLUGIN_ROOT}/x"],
+                },
+            },
+        }),
+        encoding="utf-8",
+    )
+
+    ctx = _make_ctx(tmp_path, approve_all_http=True)
+    op = PluginInstallIROp(kind="plugin_install", source={"kind": "local", "path": str(src)})
+    result = await install_handle(op, ctx)
+
+    assert result["status"] == "installed", result
+    # ctx.events is this file's own _Events fake (emit-recording only) —
+    # each call is `(args, kwargs)`; args[0] is the kind string.
+    findings = [
+        {"name": kwargs["name"], "warning": kwargs["warning"]}
+        for args, kwargs in ctx.events.calls
+        if args and args[0] == "plugin_install_token_vocabulary_mismatch"
+    ]
+    # Identity, not just count: every result-dict warning has a paired
+    # event carrying the SAME string, and vice versa — neither surface
+    # drops or invents a finding the other doesn't have.
+    assert sorted(f["warning"] for f in findings) == sorted(result["stale_token_warnings"])
+    assert {f["name"] for f in findings} == {"wrongtoken2"}
+
+
+def test_build_mcp_entries_stdio_type_is_unaffected_by_the_url_branch():
+    """Tier 1: (accept-side) the ``spec_type`` default/pass-through only
+    ever applies to the url-bearing (HTTP-family) branch — a stdio
+    entry's ``"type": "stdio"`` is set unconditionally by the ELSE
+    branch, never touched by that logic at all."""
+    entries = _build_mcp_entries_from_dict(
+        {"mcpServers": {"srv": {"type": "stdio", "command": "python"}}},
+    )
+
+    assert entries["srv"]["type"] == "stdio"
+
+
+# ── #3048 seal: require_http_get awaits indefinitely when a bus is wired ──────
+# but nothing answers it (the confirmed root cause — NOT budget exhaustion,
+# NOT a slow download: a permission prompt raised into a bus with no
+# responder). Live-confirms the mechanism the corollary test below relies on
+# (plugin_install now avoids this path entirely — #3209 register-only).
+
+
+@pytest.mark.asyncio
+async def test_require_http_get_awaits_indefinitely_when_unanswered(tmp_path):
+    """Tier 1: #3048 seal — require_http_get(host) with a bus PRESENT (not
+    None, so the fast-fail ``bus is None`` branch is NOT taken) and the host
+    NOT approved awaits the intervention response with no internal timeout.
+    Real PermissionResolver + a real RequestBus implementation
+    (``_NeverAnswersBus``) whose ``request`` coroutine genuinely never
+    resolves (the codeact/headless scenario: a bus is wired but no
+    responder is listening). Confirms the ④-a dogfood witness's structural
+    diagnosis (30s codeact kill on a never-answered prompt, not a slow
+    download) — the caller's own ``asyncio.wait_for`` bound is what
+    terminates this test, not anything inside ``require_http_get`` itself.
+
+    ``interactive=True`` mirrors the real dispatch (``sys.stdin.isatty()``
+    at an interactive terminal — the chat session IS interactive; nobody
+    just happens to answer this particular prompt, e.g. an
+    auto-driving/dogfood loop). With ``interactive=False`` (a genuinely
+    headless dispatch), ``_approve`` fast-denies instead — that path is
+    NOT #3048's mechanism and is covered by the other gate tests."""
+    resolver = PermissionResolver(config_permissions={}, project_root=tmp_path, interactive=True)
+    decl = PermissionDecl(http_get=[{"host": "pypi.org"}])
+    bus = _NeverAnswersBus()
+
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(
+            resolver.require_http_get(decl, "pypi.org", bus, "test"), timeout=0.2,
+        )
+    assert bus.asks, "no intervention request was raised — require_http_get did not reach the prompt path"
+    assert bus.asks[0].kind == "permission.generic", (
+        f"unexpected intervention kind {bus.asks[0].kind!r}: not the http.get permission prompt"
+    )
+
+
+# ── #3209: register-only never reaches http.get for deps, no #3048 exposure ──
+
+
+@pytest.mark.asyncio
+async def test_plugin_install_never_hangs_on_pypi_with_unanswering_bus(tmp_path, monkeypatch):
+    """Tier 2: #3209 corollary — since plugin_install no longer performs ANY
+    dep-fetch (the whole materialise step + its pypi.org derive is removed),
+    a plugin with a requirements.txt at its root installs cleanly even with a
+    ``_NeverAnswersBus`` wired (the exact codeact/headless scenario #3048's
+    derive used to need to work around) — because install never reaches for
+    http.get on pypi.org at all any more. Bounded with ``asyncio.wait_for``:
+    RED if this hangs (would mean a dep-fetch path was reintroduced without
+    the derive) or if the bus is asked anything."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+
+    src = tmp_path / "src" / "needsdeps4"
+    src.mkdir(parents=True)
+    (src / "plugin.json").write_text(
+        json.dumps({
+            "$schema": PLUGIN_MANIFEST_SCHEMA_URL,
+            "name": "needsdeps4", "version": "0.1.0",
+        }),
+        encoding="utf-8",
+    )
+    (src / "requirements.txt").write_text("somepkg==1.0\n", encoding="utf-8")
+
+    bus = _NeverAnswersBus()
+    ctx = _make_ctx(
+        tmp_path, approve_plugins_root=True, approve_all_http=False,
+        interactive=True, bus=bus,
+    )
+
+    op = PluginInstallIROp(kind="plugin_install", source={"kind": "local", "path": str(src)})
+    result = await asyncio.wait_for(install_handle(op, ctx), timeout=10.0)
+
+    assert result["status"] == "installed", f"install failed/denied: {result}"
+    assert not (plugins_root() / "needsdeps4" / ".venv").exists()
+    assert not bus.asks, (
+        "an intervention prompt was raised for a requirements.txt-carrying "
+        "plugin — plugin_install must never touch dep-fetch permissions "
+        "at all any more (#3209 register-only)"
+    )
+
+
+# ── #3048 security witness: the derive is host-scoped, not blanket http.get ───
+
+
+@pytest.mark.asyncio
+async def test_derived_pypi_grant_is_host_scoped_not_blanket(tmp_path):
+    """Tier 1: #3048 security witness — confused-deputy guard, on the general
+    PermissionResolver mechanism directly (plugin_install.py itself no
+    longer calls this — #3209's register-only redesign removed its one
+    pypi.org derive call site; the mechanism remains general-purpose
+    PermissionResolver infra another op-author may reuse the same way).
+    ``session_approve_host("pypi.org", ..., kind="http.get")`` covers
+    EXACTLY pypi.org — never http.get generally. Approving pypi.org must
+    NOT silently authorise a fetch from an unrelated host. Uses ONLY the
+    public PermissionResolver surface (``session_approve_host`` /
+    ``require_http_get``), real instances throughout, no private-state
+    assertions."""
+    resolver = PermissionResolver(config_permissions={}, project_root=tmp_path, interactive=False)
+    resolver.session_approve_host("pypi.org", "test", kind="http.get")
+
+    decl = PermissionDecl(http_get=[{"host": "*"}])
+    # pypi.org: covered by the derive — resolves with no bus/prompt at all.
+    await resolver.require_http_get(decl, "pypi.org", None, "test")
+    # evil.com: NOT covered by the derive — falls through to the interactive
+    # prompt path, which fast-fails (bus=None) rather than silently passing.
+    # This is the exact evidence the derive is not a blanket http.get grant.
+    with pytest.raises(PermissionError, match="requires an interactive prompt"):
+        await resolver.require_http_get(decl, "evil.com", None, "test")

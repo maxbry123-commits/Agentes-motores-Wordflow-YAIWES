@@ -1,0 +1,441 @@
+defmodule Jidoka.Operation.Source.Workflow do
+  @moduledoc """
+  Operation source for deterministic Jidoka workflows.
+
+  The model sees one operation. The workflow module owns the deterministic
+  step graph behind that operation. Sources can opt into async execution for
+  independent workflow steps.
+  """
+
+  @behaviour Jidoka.Operation.Source
+
+  alias Jidoka.Agent.Spec.Operation
+  alias Jidoka.Context
+  alias Jidoka.Effect
+  alias Jidoka.Operation.Continuation
+  alias Jidoka.Operation.Source
+  alias Jidoka.Schema
+  alias Jidoka.Workflow.Resolver
+  alias Jidoka.Workflow.Spec
+
+  @result_modes [:output, :structured]
+
+  @type forward_context ::
+          :public | :none | {:only, [atom() | String.t()]} | {:except, [atom() | String.t()]}
+  @type result_mode :: :output | :structured
+
+  @context_key_schema Zoi.union([Zoi.atom(), Zoi.string()])
+  @forward_context_schema Zoi.union(
+                            [
+                              Zoi.enum([:public, :none]),
+                              Zoi.tuple({Zoi.enum([:only, :except]), Zoi.array(@context_key_schema)})
+                            ],
+                            typespec: quote(do: forward_context())
+                          )
+  @positive_integer_schema Zoi.integer(typespec: quote(do: pos_integer())) |> Zoi.positive()
+
+  @schema Zoi.struct(
+            __MODULE__,
+            %{
+              workflow: Zoi.module(),
+              name: Zoi.string(),
+              description: Zoi.string() |> Zoi.nullable(),
+              timeout: @positive_integer_schema |> Zoi.default(30_000),
+              async: Zoi.boolean() |> Zoi.default(false),
+              max_concurrency: @positive_integer_schema |> Zoi.nullable(),
+              forward_context: @forward_context_schema |> Zoi.default(:public),
+              result: Schema.atom_enum(@result_modes) |> Zoi.default(:output),
+              idempotency: Schema.atom_enum(Operation.valid_idempotencies()) |> Zoi.default(:idempotent),
+              metadata: Zoi.map() |> Zoi.default(%{}),
+              definition: Schema.typed_struct(Spec, quote(do: Spec.t()))
+            },
+            coerce: true,
+            unrecognized_keys: :error
+          )
+
+  @type t :: unquote(Zoi.type_spec(@schema))
+  @enforce_keys Zoi.Struct.enforce_keys(@schema)
+  defstruct Zoi.Struct.struct_fields(@schema)
+
+  @doc false
+  @spec schema() :: Zoi.schema()
+  def schema, do: @schema
+
+  @doc "Builds a deterministic workflow operation source."
+  @spec new(keyword() | map()) :: {:ok, t()} | {:error, term()}
+  def new(attrs) do
+    attrs = Schema.normalize_attrs(attrs)
+
+    with {:ok, definition} <- normalize_workflow(Schema.get_key(attrs, :workflow)),
+         {:ok, name} <-
+           normalize_name(
+             Schema.get_key(attrs, :name) || Schema.get_key(attrs, :as),
+             definition.id
+           ),
+         {:ok, timeout} <- normalize_timeout(Schema.get_key(attrs, :timeout, 30_000)),
+         {:ok, async} <- normalize_async(Schema.get_key(attrs, :async, false)),
+         {:ok, max_concurrency} <- normalize_max_concurrency(Schema.get_key(attrs, :max_concurrency)),
+         {:ok, forward_context} <-
+           normalize_forward_context(Schema.get_key(attrs, :forward_context, :public)),
+         {:ok, result} <- normalize_result(Schema.get_key(attrs, :result, :output)),
+         {:ok, idempotency} <- normalize_idempotency(Schema.get_key(attrs, :idempotency, :idempotent)),
+         {:ok, metadata} <- normalize_metadata(Schema.get_key(attrs, :metadata, %{})) do
+      Schema.parse(@schema, %{
+        workflow: definition.module,
+        name: name,
+        description: Schema.get_key(attrs, :description) || definition.description,
+        timeout: timeout,
+        async: async,
+        max_concurrency: max_concurrency,
+        forward_context: forward_context,
+        result: result,
+        idempotency: idempotency,
+        metadata: metadata,
+        definition: definition
+      })
+    end
+  end
+
+  @doc "Builds a workflow source and raises if the settings are invalid."
+  @spec new!(keyword() | map()) :: t()
+  def new!(attrs) do
+    case new(attrs) do
+      {:ok, source} -> source
+      {:error, reason} -> raise ArgumentError, "invalid workflow source: #{inspect(reason)}"
+    end
+  end
+
+  @impl true
+  def compile(%__MODULE__{} = source, opts) do
+    with {:ok, operations} <- operations(source, opts),
+         {:ok, capability} <- capability(source, opts) do
+      Source.compiled(operations, capability)
+    end
+  end
+
+  @impl true
+  def operations(%__MODULE__{} = source, _opts) do
+    {:ok,
+     [
+       Operation.new!(
+         name: source.name,
+         description: source.description || "Run #{source.definition.id} workflow.",
+         idempotency: source.idempotency,
+         metadata:
+           source.metadata
+           |> Map.merge(%{
+             "source" => "workflow",
+             "kind" => "workflow",
+             "workflow" => source.definition.id,
+             "module" => inspect(source.workflow),
+             "timeout" => source.timeout,
+             "async" => source.async,
+             "max_concurrency" => source.max_concurrency,
+             "forward_context" => inspect(source.forward_context),
+             "result" => Atom.to_string(source.result),
+             "idempotency" => Atom.to_string(source.idempotency),
+             "parameters_schema" => source.definition.parameters_schema
+           })
+           |> reject_nil_values()
+       )
+     ]}
+  end
+
+  @impl true
+  def capability(%__MODULE__{} = source, _opts) do
+    {:ok,
+     fn
+       %Effect.Intent{kind: :operation, payload: payload} = intent, %Effect.Journal{}, %Context{} = context ->
+         with {:ok, request} <- Effect.OperationRequest.from_input(payload),
+              :ok <- ensure_operation_name(source, request.name) do
+           case run_workflow(source, intent, request.arguments, context) do
+             {:ok, output} -> {:ok, workflow_result(source, output)}
+             {:hibernate, %Continuation{} = continuation} -> {:hibernate, continuation}
+             {:error, _reason} = error -> error
+           end
+         end
+
+       %Effect.Intent{kind: kind}, _journal, %Context{} ->
+         {:error, {:unsupported_effect_kind, kind}}
+     end}
+  end
+
+  defp run_workflow(%__MODULE__{} = source, %Effect.Intent{} = intent, arguments, context) do
+    task_context = child_context(source, context, arguments)
+
+    with {:ok, continuations} <- operation_continuations(context) do
+      case Continuation.find(continuations, intent, :workflow, source.name) do
+        {:ok, continuation} ->
+          resume_continuation(source, continuation, task_context, context, intent)
+
+        :none ->
+          source
+          |> start_workflow(arguments, task_context, context)
+          |> normalize_workflow_result(source, intent)
+
+        {:error, _reason} = error ->
+          error
+      end
+    end
+  end
+
+  defp resume_continuation(source, continuation, task_context, context, intent) do
+    case validate_continuation(source, continuation) do
+      :ok ->
+        source
+        |> resume_workflow(continuation, task_context, context)
+        |> normalize_workflow_result(source, intent)
+
+      {:error, reason} ->
+        normalize_workflow_result({:error, reason}, source, intent)
+    end
+  end
+
+  defp start_workflow(source, arguments, task_context, context) do
+    Jidoka.Workflow.run(source.workflow, arguments,
+      context: task_context,
+      timeout: source.timeout,
+      async: source.async,
+      max_concurrency: source.max_concurrency,
+      agent_opts: agent_opts(context)
+    )
+  end
+
+  defp resume_workflow(source, continuation, task_context, context) do
+    opts =
+      [
+        context: task_context,
+        timeout: source.timeout,
+        async: source.async,
+        max_concurrency: source.max_concurrency,
+        agent_opts: agent_opts(context)
+      ]
+      |> Keyword.merge(nested_resume_opts(context))
+
+    Jidoka.Workflow.resume(continuation.snapshot, opts)
+  end
+
+  defp normalize_workflow_result({:ok, output}, _source, _intent), do: {:ok, output}
+
+  defp normalize_workflow_result({:hibernate, snapshot}, source, intent) do
+    with {:ok, continuation} <-
+           Continuation.new(
+             intent_id: intent.id,
+             operation: source.name,
+             kind: :workflow,
+             source: source.name,
+             snapshot: snapshot,
+             metadata: %{"workflow" => source.definition.id}
+           ) do
+      {:hibernate, continuation}
+    end
+  end
+
+  defp normalize_workflow_result({:error, reason}, source, _intent),
+    do: {:error, {:workflow_failed, source.name, reason}}
+
+  defp validate_continuation(
+         %__MODULE__{workflow: workflow, definition: %{id: workflow_id}},
+         %Continuation{snapshot: %Jidoka.Workflow.Snapshot{} = snapshot}
+       ) do
+    if snapshot.workflow == workflow and snapshot.workflow_id == workflow_id do
+      :ok
+    else
+      {:error, {:workflow_continuation_mismatch, workflow, workflow_id, snapshot.workflow, snapshot.workflow_id}}
+    end
+  end
+
+  defp operation_continuations(context) do
+    context
+    |> Context.get_runtime(:operation_continuations, [])
+    |> Continuation.list_from_input()
+  end
+
+  defp nested_resume_opts(context) do
+    case Context.get_runtime(context, :nested_resume_opts, []) do
+      opts when is_list(opts) -> opts
+      _opts -> []
+    end
+  end
+
+  defp workflow_result(%__MODULE__{result: :output}, output), do: output
+
+  defp workflow_result(%__MODULE__{} = source, output) do
+    %{
+      workflow: source.definition.id,
+      operation: source.name,
+      output: output,
+      module: inspect(source.workflow)
+    }
+  end
+
+  defp child_context(%__MODULE__{} = source, parent_context, arguments) do
+    arguments = normalize_context(arguments)
+    runtime = runtime_context(source, parent_context)
+
+    forwarded_data =
+      parent_context
+      |> public_context_data()
+      |> normalize_context()
+      |> forward_context(source.forward_context)
+
+    case Schema.get_key(arguments, :context, %{}) do
+      task_context when is_map(task_context) or is_list(task_context) ->
+        Context.from_data!(
+          Map.merge(forwarded_data, normalize_context(task_context)),
+          runtime: runtime
+        )
+
+      _other ->
+        Context.from_data!(forwarded_data, runtime: runtime)
+    end
+  end
+
+  defp public_context_data(%Context{} = context), do: Context.data(context)
+
+  defp runtime_context(%__MODULE__{forward_context: :public}, %Context{} = context),
+    do: Context.runtime(context)
+
+  defp runtime_context(%__MODULE__{}, _context), do: %{}
+
+  defp ensure_operation_name(%__MODULE__{name: expected}, name) do
+    if name == expected, do: :ok, else: {:error, {:missing_operation_handler, name}}
+  end
+
+  defp forward_context(context, :public) when is_map(context), do: context
+  defp forward_context(_context, :none), do: %{}
+
+  defp forward_context(context, {:only, keys}) when is_map(context) and is_list(keys) do
+    keys
+    |> Enum.reduce(%{}, fn key, acc ->
+      case fetch_context(context, key) do
+        {:ok, value} -> Map.put(acc, key, value)
+        :error -> acc
+      end
+    end)
+  end
+
+  defp forward_context(context, {:except, keys}) when is_map(context) and is_list(keys) do
+    blocked = MapSet.new(Enum.flat_map(keys, &[&1, to_string(&1)]))
+    Map.reject(context, fn {key, _value} -> MapSet.member?(blocked, key) end)
+  end
+
+  defp forward_context(_context, _policy), do: %{}
+
+  defp fetch_context(context, key) when is_atom(key) do
+    case Map.fetch(context, key) do
+      {:ok, value} -> {:ok, value}
+      :error -> Map.fetch(context, Atom.to_string(key))
+    end
+  end
+
+  defp fetch_context(context, key), do: Map.fetch(context, key)
+
+  defp normalize_workflow(workflow) when is_atom(workflow),
+    do: Resolver.definition(workflow)
+
+  defp normalize_workflow(workflow), do: {:error, {:invalid_workflow_module, workflow}}
+
+  defp normalize_name(nil, default_name), do: normalize_name(default_name, default_name)
+
+  defp normalize_name(name, _default_name) when is_atom(name) and not is_nil(name) do
+    name |> Atom.to_string() |> normalize_name(nil)
+  end
+
+  defp normalize_name(name, _default_name) when is_binary(name) do
+    name = String.trim(name)
+
+    if Regex.match?(~r/^[a-z][a-z0-9_]*$/, name) do
+      {:ok, name}
+    else
+      {:error, {:invalid_workflow_name, name}}
+    end
+  end
+
+  defp normalize_name(name, _default_name), do: {:error, {:invalid_workflow_name, name}}
+
+  defp normalize_timeout(timeout) when is_integer(timeout) and timeout > 0, do: {:ok, timeout}
+  defp normalize_timeout(timeout), do: {:error, {:invalid_workflow_timeout, timeout}}
+
+  defp normalize_async(async) when is_boolean(async), do: {:ok, async}
+  defp normalize_async(async), do: {:error, {:invalid_workflow_async, async}}
+
+  defp normalize_max_concurrency(nil), do: {:ok, nil}
+
+  defp normalize_max_concurrency(max_concurrency)
+       when is_integer(max_concurrency) and max_concurrency > 0 do
+    {:ok, max_concurrency}
+  end
+
+  defp normalize_max_concurrency(max_concurrency),
+    do: {:error, {:invalid_workflow_max_concurrency, max_concurrency}}
+
+  defp normalize_forward_context(policy) when policy in [:public, :none], do: {:ok, policy}
+
+  defp normalize_forward_context({mode, keys} = policy)
+       when mode in [:only, :except] and is_list(keys) do
+    {:ok, policy}
+  end
+
+  defp normalize_forward_context(policy),
+    do: {:error, {:invalid_workflow_forward_context, policy}}
+
+  defp normalize_result(result) when result in @result_modes, do: {:ok, result}
+
+  defp normalize_result(result) when is_binary(result) do
+    @result_modes
+    |> Enum.find(&(Atom.to_string(&1) == String.trim(result)))
+    |> case do
+      nil -> {:error, {:invalid_workflow_result, result}}
+      result -> {:ok, result}
+    end
+  end
+
+  defp normalize_result(result), do: {:error, {:invalid_workflow_result, result}}
+
+  defp normalize_idempotency(idempotency) when is_atom(idempotency) do
+    if idempotency in Operation.valid_idempotencies() do
+      {:ok, idempotency}
+    else
+      {:error, {:invalid_workflow_idempotency, idempotency}}
+    end
+  end
+
+  defp normalize_idempotency(idempotency) when is_binary(idempotency) do
+    idempotency = String.trim(idempotency)
+
+    Operation.valid_idempotencies()
+    |> Enum.find(&(Atom.to_string(&1) == idempotency))
+    |> case do
+      nil -> {:error, {:invalid_workflow_idempotency, idempotency}}
+      idempotency -> {:ok, idempotency}
+    end
+  end
+
+  defp normalize_idempotency(idempotency), do: {:error, {:invalid_workflow_idempotency, idempotency}}
+
+  defp normalize_metadata(nil), do: {:ok, %{}}
+  defp normalize_metadata(metadata) when is_map(metadata), do: {:ok, metadata}
+  defp normalize_metadata(metadata), do: {:error, {:invalid_workflow_metadata, metadata}}
+
+  defp reject_nil_values(map) do
+    map
+    |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+    |> Map.new()
+  end
+
+  defp agent_opts(context) do
+    case Context.get_runtime(context, :agent_opts, []) do
+      opts when is_list(opts) -> opts
+      _other -> []
+    end
+  end
+
+  defp normalize_context(context) when is_map(context), do: context
+
+  defp normalize_context(context) when is_list(context) do
+    if Keyword.keyword?(context), do: Map.new(context), else: %{}
+  end
+
+  defp normalize_context(_context), do: %{}
+end

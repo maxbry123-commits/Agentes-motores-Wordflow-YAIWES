@@ -1,0 +1,202 @@
+name: CI gate stub
+
+# Synthetic emitter for the `CI gate` required check on PRs whose diff
+# is entirely paths-ignored by `.github/workflows/ci.yml`.
+#
+# Problem
+# -------
+# Branch protection on `main` requires a single context named `CI gate`,
+# emitted by the `ci-gate` job in `ci.yml`. `ci.yml` is configured with
+# a `paths-ignore:` list (SDKs, packaging, docs, infra configs, etc.)
+# so PRs whose diff is fully contained in those paths never trigger
+# `ci.yml` at all - and therefore never publish a `CI gate` check.
+# Such PRs sit `BLOCKED` indefinitely (e.g. Renovate lockfile bumps
+# under `sdk/typescript/**` or `packages/vscode/**`).
+#
+# Why the trigger filter alone is not enough
+# ------------------------------------------
+# `paths:` and `paths-ignore:` are evaluated per file with OR semantics:
+# a workflow fires when *at least one* changed file matches. On a mixed
+# diff (some files ignored, some not) `ci.yml` fires because of the
+# non-ignored files AND this stub fires because of the ignored ones.
+# Both then publish `CI gate`, and the synthetic one finishes in seconds
+# while the real test matrix is still queued. Branch protection saw a
+# completed `CI gate` success and allowed the merge; the code was never
+# tested. No `on:` filter can express "every changed file is ignored",
+# so the decision is made in-job instead.
+#
+# How this workflow decides
+# -------------------------
+# The `classify` job reads the PR's changed paths and evaluates them
+# against `ci.yml`'s own `on.pull_request.paths-ignore` list (read from
+# the file, not copied), then the emitting job takes its check-run name
+# from that verdict:
+#
+#   every changed path ignored -> `CI gate`  (real CI will never report)
+#   any changed path not ignored -> `CI gate stub (not applicable)`
+#
+# A check-run name is what branch protection keys on, so under the
+# second name this workflow is structurally incapable of satisfying the
+# requirement. The real `ci-gate` job in `ci.yml` is then the only
+# emitter, which is the intended behaviour for any diff carrying code.
+#
+# Note that a *skipped* job is not a safe way to express this: GitHub
+# reports a skipped job as a passing required check, so gating the
+# emitter with `if:` would leave the hole open. The name has to change.
+#
+# IMPORTANT - keep in sync
+# ------------------------
+# The `paths:` list below MUST stay aligned with the `paths-ignore:`
+# list in `.github/workflows/ci.yml`. It is only a trigger filter now -
+# the `classify` job re-derives the authoritative verdict - so drift
+# can no longer produce a false `CI gate`, but a missing entry means
+# the stub never fires and a fully-ignored PR stays blocked. The canary
+# `tests/unit/test_required_check_canary_workflow_yaml.py` asserts the
+# mirror, and
+# `tests/unit/test_ci_gate_stub_workflow_yaml.py` asserts the guard.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      # Documentation & prose
+      - "docs/**"
+      - "!docs/operations/ci-topology.md"
+      - "!docs/observability/**"
+      - "!docs/skills/**"
+      - "!docs/benchmarks/**"
+      - "*.md"
+      - "!README.md"
+      - "LICENSE"
+      - "CONTRIBUTORS.md"
+      # Runtime state (never committed)
+      - ".sdd/**"
+      # Non-Python packages & SDKs
+      - "sdk/typescript/**"
+      - "packages/vscode/**"
+      - "packages/cursor-plugin/**"
+      - "packaging/**"
+      # packaging/rpm is NOT ignored: the spec decides whether the shipped
+      # RPM works at all, and `install-smoke-rpm` is its covering test
+      # (#3558). A spec-only diff must run CI.
+      - "!packaging/rpm/**"
+      - "Formula/**"
+      # Deployment & infra configs
+      - "deploy/**"
+      - "docker/**"
+      - "docker-compose.yaml"
+      - "Dockerfile"
+      - "action.yml"
+      - "action/**"
+      # CI tool configs
+      - "codecov.yml"
+      # GitHub meta
+      - ".github/ISSUE_TEMPLATE/**"
+      - ".github/FUNDING.yml"
+      - ".github/CODEOWNERS"
+      - ".github/pull_request_template.md"
+      - ".github/labeler.yml"
+      - ".github/copilot-instructions.md"
+      - ".github/codeql/**"
+      # Non-code project files
+      - "benchmarks/**"
+      - "examples/**"
+      - "plans/**"
+      - "agents/**"
+      - "commands/**"
+      - "rules/**"
+      - ".bernstein/**"
+      - ".plugin/**"
+      - "scripts/gen_tickets_*.py"
+      - "scripts/gen_roadmap_*.py"
+      - "scripts/generate_benchmark_docs.py"
+
+concurrency:
+  group: ci-gate-stub-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  classify:
+    name: Classify diff against ci.yml paths-ignore
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      all_ignored: ${{ steps.guard.outputs.all_ignored }}
+    steps:
+      - name: Harden runner (audit mode)
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Collect changed paths
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          # The REST file list is the same diff GitHub itself filters on,
+          # so this needs no base-ref fetch and no merge-base arithmetic.
+          gh api --paginate "repos/${REPO}/pulls/${PR_NUMBER}/files" \
+            --jq '.[].filename' > changed-paths.txt
+          echo "Collected $(wc -l < changed-paths.txt) changed path(s)."
+      - name: Evaluate against ci.yml paths-ignore
+        id: guard
+        run: python3 scripts/ci_gate_stub_guard.py --changed-paths changed-paths.txt
+
+  ci-gate:
+    # The check-run name posted to the PR is taken from this `name:`, and
+    # branch protection keys on that exact string. Resolving it from the
+    # classify verdict is what makes the stub incapable of satisfying the
+    # `CI gate` requirement for a diff that contains a non-ignored path:
+    # under the fallback name there is simply no such context to satisfy.
+    #
+    # `needs` is available to `jobs.<job_id>.name`, and the expression
+    # resolves because this job always runs. Do not convert this into an
+    # `if:` skip - GitHub posts a skipped job's check run with the
+    # unresolved template as its name, and counts a skipped required check
+    # as passing. The canary
+    # (required-check-canary.yml + tests/unit/test_required_check_canary_workflow_yaml.py)
+    # allow-lists this file alongside ci.yml as the only two emitters.
+    name: ${{ needs.classify.outputs.all_ignored == 'true' && 'CI gate' || 'CI gate stub (not applicable)' }}
+    needs: classify
+    if: always() && !cancelled()
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      contents: read
+    steps:
+      - name: Harden runner (audit mode)
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+      - name: Report verdict
+        env:
+          ALL_IGNORED: ${{ needs.classify.outputs.all_ignored }}
+          CLASSIFY_RESULT: ${{ needs.classify.result }}
+        run: |
+          if [ "$CLASSIFY_RESULT" != "success" ]; then
+            echo "::error::classify job did not succeed (result: ${CLASSIFY_RESULT})."
+            echo "No verdict means no synthetic gate. If this PR's diff is fully"
+            echo "paths-ignored it will stay blocked until classify is re-run."
+            exit 1
+          fi
+          if [ "$ALL_IGNORED" = "true" ]; then
+            echo "Every changed path is contained in ci.yml's paths-ignore list, so"
+            echo "the real CI gate will never report for this PR."
+            echo "Publishing the synthetic 'CI gate' success so branch protection on"
+            echo "main does not block PRs whose only changes are in"
+            echo "SDK/packaging/docs/infra paths."
+          else
+            echo "At least one changed path is NOT covered by ci.yml's paths-ignore"
+            echo "list, so ci.yml runs and publishes the real 'CI gate' for this PR."
+            echo "This check is published under a non-required name and cannot"
+            echo "satisfy branch protection. Wait for the real CI gate."
+          fi

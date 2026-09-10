@@ -1,0 +1,46 @@
+name: Stale cleanup
+
+on:
+  schedule:
+    - cron: "0 4 * * *"
+
+concurrency:
+  group: stale-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  stale:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    timeout-minutes: 10
+    steps:
+      - name: Harden runner (audit mode)
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+      - uses: actions/stale@4391f3da665fdf50b6810c1a66712fb9ba21aa93 # v11
+        with:
+          days-before-stale: 60
+          days-before-close: 14
+          days-before-pr-stale: 45
+          days-before-pr-close: 14
+          stale-issue-message: >-
+            This issue has been automatically marked as stale because it has
+            not had recent activity. It will be closed in 14 days if no further
+            activity occurs.
+          stale-pr-message: >-
+            This pull request has been automatically marked as stale due to
+            inactivity. It will be closed in 14 days if no further activity
+            occurs.
+          close-issue-message: "Closing as stale due to inactivity."
+          close-pr-message: "Closing PR as stale due to inactivity."
+          stale-issue-label: "stale"
+          stale-pr-label: "stale"
+          exempt-issue-labels: "pinned,security,bernstein:in-progress"
+          exempt-pr-labels: "pinned,work-in-progress,do-not-close"

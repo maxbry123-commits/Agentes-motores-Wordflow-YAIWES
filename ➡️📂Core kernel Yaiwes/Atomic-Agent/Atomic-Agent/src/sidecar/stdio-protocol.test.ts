@@ -1,0 +1,270 @@
+import { describe, it, expect } from "vitest";
+import { PassThrough } from "node:stream";
+import { StdioProtocol } from "./stdio-protocol.js";
+import type {
+  ApprovalRequestPayload,
+  HostRequest,
+} from "./sidecar-events.js";
+
+function createProtocol() {
+  const input = new PassThrough();
+  const output = new PassThrough();
+  output.setEncoding("utf8");
+  const parseErrors: Error[] = [];
+  const protocol = new StdioProtocol({
+    input,
+    output,
+    onParseError: (err) => parseErrors.push(err),
+  });
+  return { input, output, protocol, parseErrors };
+}
+
+async function readLines(stream: PassThrough, count: number, timeoutMs = 1000) {
+  return new Promise<string[]>((resolve, reject) => {
+    const lines: string[] = [];
+    let buffer = "";
+    const timer = setTimeout(() => {
+      reject(new Error(`timeout waiting for ${count} lines, got ${lines.length}`));
+    }, timeoutMs);
+    const onData = (chunk: string) => {
+      buffer += chunk;
+      let idx = buffer.indexOf("\n");
+      while (idx !== -1) {
+        lines.push(buffer.slice(0, idx));
+        buffer = buffer.slice(idx + 1);
+        if (lines.length >= count) {
+          clearTimeout(timer);
+          stream.off("data", onData);
+          resolve(lines);
+          return;
+        }
+        idx = buffer.indexOf("\n");
+      }
+    };
+    stream.on("data", onData);
+  });
+}
+
+describe("StdioProtocol", () => {
+  it("parses a single NDJSON request line and invokes the handler", async () => {
+    const { input, protocol } = createProtocol();
+    const received: HostRequest[] = [];
+    protocol.onRequest((req) => received.push(req));
+    const request: HostRequest = {
+      kind: "request",
+      id: "r1",
+      type: "ping",
+      payload: {},
+    };
+    input.write(`${JSON.stringify(request)}\n`);
+    await new Promise((r) => setImmediate(r));
+    expect(received).toHaveLength(1);
+    expect(received[0]?.id).toBe("r1");
+    expect(received[0]?.type).toBe("ping");
+  });
+
+  it("handles multiple concatenated frames in one chunk", async () => {
+    const { input, protocol } = createProtocol();
+    const received: HostRequest[] = [];
+    protocol.onRequest((req) => received.push(req));
+    const a: HostRequest = { kind: "request", id: "a", type: "ping", payload: {} };
+    const b: HostRequest = { kind: "request", id: "b", type: "cancel", payload: { sessionId: "s1" } };
+    input.write(`${JSON.stringify(a)}\n${JSON.stringify(b)}\n`);
+    await new Promise((r) => setImmediate(r));
+    expect(received.map((m) => m.id)).toEqual(["a", "b"]);
+  });
+
+  it("handles partial frames split across chunks", async () => {
+    const { input, protocol } = createProtocol();
+    const received: HostRequest[] = [];
+    protocol.onRequest((req) => received.push(req));
+    const msg: HostRequest = { kind: "request", id: "split", type: "ping", payload: {} };
+    const raw = JSON.stringify(msg);
+    const half = Math.floor(raw.length / 2);
+    input.write(raw.slice(0, half));
+    await new Promise((r) => setImmediate(r));
+    expect(received).toHaveLength(0);
+    input.write(`${raw.slice(half)}\n`);
+    await new Promise((r) => setImmediate(r));
+    expect(received).toHaveLength(1);
+  });
+
+  it("reports parse errors for malformed lines without crashing", async () => {
+    const { input, protocol, parseErrors } = createProtocol();
+    const received: HostRequest[] = [];
+    protocol.onRequest((req) => received.push(req));
+    input.write("{not json\n");
+    const good: HostRequest = { kind: "request", id: "ok", type: "ping", payload: {} };
+    input.write(`${JSON.stringify(good)}\n`);
+    await new Promise((r) => setImmediate(r));
+    expect(parseErrors).toHaveLength(1);
+    expect(received).toHaveLength(1);
+    expect(received[0]?.id).toBe("ok");
+  });
+
+  it("emitEvent writes a single newline-terminated JSON line", async () => {
+    const { output, protocol } = createProtocol();
+    const linesPromise = readLines(output, 1);
+    protocol.emitEvent("pong", { at: 42 });
+    const [line] = await linesPromise;
+    const parsed = JSON.parse(line!) as { kind: string; type: string; payload: { at: number } };
+    expect(parsed.kind).toBe("event");
+    expect(parsed.type).toBe("pong");
+    expect(parsed.payload.at).toBe(42);
+  });
+
+  it("respond returns the correct correlationId and ok flag", async () => {
+    const { output, protocol } = createProtocol();
+    const linesPromise = readLines(output, 1);
+    protocol.respond("req-123", { echoed: true });
+    const [line] = await linesPromise;
+    const parsed = JSON.parse(line!) as {
+      kind: string;
+      correlationId: string;
+      ok: boolean;
+      payload: { echoed: boolean };
+    };
+    expect(parsed.kind).toBe("response");
+    expect(parsed.correlationId).toBe("req-123");
+    expect(parsed.ok).toBe(true);
+    expect(parsed.payload.echoed).toBe(true);
+  });
+
+  it("round-trips an approval_request payload with its ladder category", async () => {
+    // R5: the prompt's `ApprovalCategory` must survive the wire so a host
+    // can render *why* the gate fired. Emit → NDJSON line → parse back.
+    const { output, protocol } = createProtocol();
+    const linesPromise = readLines(output, 1);
+    const payload: ApprovalRequestPayload = {
+      approvalId: "ap-1",
+      sessionId: "s1",
+      tool: "os.fs.write",
+      category: "trust_config",
+      reason: "write config.json",
+      affectedResources: ["/state/config.json"],
+    };
+    protocol.emitEvent("approval_request", payload);
+    const [line] = await linesPromise;
+    const parsed = JSON.parse(line!) as {
+      type: string;
+      payload: ApprovalRequestPayload;
+    };
+    expect(parsed.type).toBe("approval_request");
+    expect(parsed.payload.category).toBe("trust_config");
+    expect(parsed.payload.tool).toBe("os.fs.write");
+  });
+
+  it("accepts an approval_request payload without a category (pre-ladder host)", async () => {
+    // Back-compat: `category` is optional. A frame emitted by / for a host
+    // that predates the ladder omits it entirely and must still parse
+    // cleanly, with no parse error and `category` simply absent.
+    const { input, protocol, parseErrors } = createProtocol();
+    const received: HostRequest[] = [];
+    protocol.onRequest((req) => received.push(req));
+    // A request frame carrying a category-less approval payload exercises
+    // the same JSON path the host uses; the parser must not choke on the
+    // missing optional field.
+    const legacy = {
+      kind: "request" as const,
+      id: "legacy-1",
+      type: "approval_response" as const,
+      payload: {
+        approvalId: "ap-2",
+        sessionId: "s1",
+        tool: "os.fs.write",
+        reason: "legacy frame, no category",
+      },
+    };
+    input.write(`${JSON.stringify(legacy)}\n`);
+    await new Promise((r) => setImmediate(r));
+    expect(parseErrors).toHaveLength(0);
+    expect(received).toHaveLength(1);
+    expect(received[0]?.id).toBe("legacy-1");
+    expect(
+      (received[0]?.payload as { category?: string }).category,
+    ).toBeUndefined();
+  });
+
+  it("ignores blank lines between frames", async () => {
+    const { input, protocol } = createProtocol();
+    const received: HostRequest[] = [];
+    protocol.onRequest((req) => received.push(req));
+    const msg: HostRequest = { kind: "request", id: "x", type: "ping", payload: {} };
+    input.write(`\n\n${JSON.stringify(msg)}\n\n`);
+    await new Promise((r) => setImmediate(r));
+    expect(received).toHaveLength(1);
+  });
+});
+
+describe("StdioProtocol output that died under us", () => {
+  /** A writable whose far end has gone: every write raises EPIPE. */
+  function brokenOutput() {
+    const output = new PassThrough();
+    output.setEncoding("utf8");
+    const original = output.write.bind(output);
+    let broken = false;
+    return {
+      output,
+      break() {
+        broken = true;
+        output.emit(
+          "error",
+          Object.assign(new Error("write EPIPE"), {
+            code: "EPIPE",
+            syscall: "write",
+          }),
+        );
+      },
+      install() {
+        output.write = ((chunk: string) => {
+          if (broken) {
+            throw Object.assign(new Error("write EPIPE"), { code: "EPIPE" });
+          }
+          return original(chunk);
+        }) as typeof output.write;
+      },
+    };
+  }
+
+  it("does not rethrow when the host pipe errors — the peer left, we did not break", () => {
+    const input = new PassThrough();
+    const broken = brokenOutput();
+    const protocol = new StdioProtocol({ input, output: broken.output });
+    expect(protocol.isOutputClosed()).toBe(false);
+    expect(() => broken.break()).not.toThrow();
+    expect(protocol.isOutputClosed()).toBe(true);
+  });
+
+  it("silently stops emitting once the output is closed", () => {
+    const input = new PassThrough();
+    const broken = brokenOutput();
+    broken.install();
+    const protocol = new StdioProtocol({ input, output: broken.output });
+    broken.break();
+    // The runtime keeps fanning events out at its own pace; none of them
+    // may resurrect the dead pipe or throw out of `emitEvent`.
+    expect(() => protocol.emitEvent("log", { message: "after" })).not.toThrow();
+    expect(() => protocol.respond("c1", { ok: true })).not.toThrow();
+  });
+
+  it("swallows a synchronous EPIPE from a destroyed stream", () => {
+    const input = new PassThrough();
+    const output = new PassThrough();
+    output.destroy();
+    const protocol = new StdioProtocol({ input, output });
+    expect(() => protocol.emitEvent("log", { message: "x" })).not.toThrow();
+  });
+
+  it("leaves a non-broken-pipe stream error alone", async () => {
+    const input = new PassThrough();
+    const output = new PassThrough();
+    new StdioProtocol({ input, output });
+    const thrown = new Promise<unknown>((resolve) => {
+      process.once("uncaughtException", resolve);
+    });
+    output.emit("error", new Error("genuinely broken"));
+    await expect(thrown).resolves.toMatchObject({
+      message: "genuinely broken",
+    });
+  });
+});

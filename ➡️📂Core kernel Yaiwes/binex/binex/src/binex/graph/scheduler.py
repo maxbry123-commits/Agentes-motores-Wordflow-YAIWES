@@ -1,0 +1,168 @@
+"""Scheduler — tracks ready nodes based on dependency completion."""
+
+from __future__ import annotations
+
+from collections import deque
+
+from binex.graph.dag import DAG
+
+
+class Scheduler:
+    """Tracks node completion and yields ready nodes for execution."""
+
+    def __init__(self, dag: DAG) -> None:
+        self._dag = dag
+        self._completed: set[str] = set()
+        self._failed: set[str] = set()
+        self._running: set[str] = set()
+        self._skipped: set[str] = set()
+        self._execution_count: dict[str, int] = {}
+        self._pending: set[str] = set(dag.nodes)
+        # Push-based readiness: track unsatisfied dep count per node
+        self._dep_count: dict[str, int] = {
+            nid: len(dag.dependencies(nid)) for nid in dag.nodes
+        }
+        self._ready: set[str] = {nid for nid, cnt in self._dep_count.items() if cnt == 0}
+
+    @property
+    def completed(self) -> set[str]:
+        """Return the set of completed node IDs."""
+        return self._completed
+
+    @property
+    def failed(self) -> set[str]:
+        """Return the set of failed node IDs."""
+        return self._failed
+
+    @property
+    def skipped(self) -> set[str]:
+        """Return the set of skipped node IDs."""
+        return self._skipped
+
+    def ready_nodes(self) -> list[str]:
+        """Return node IDs whose dependencies are all completed/skipped
+        and not already running/done."""
+        return list(self._ready)
+
+    def _satisfy(self, node_id: str) -> None:
+        """Mark node_id as satisfied (completed or skipped); unlock its dependents."""
+        for dep in self._dag.dependents(node_id):
+            if dep not in self._pending:
+                continue
+            self._dep_count[dep] -= 1
+            if self._dep_count[dep] == 0:
+                self._ready.add(dep)
+
+    def mark_running(self, node_id: str) -> None:
+        self._pending.discard(node_id)
+        self._ready.discard(node_id)
+        self._running.add(node_id)
+
+    def mark_completed(self, node_id: str) -> None:
+        self._pending.discard(node_id)
+        self._ready.discard(node_id)
+        self._running.discard(node_id)
+        self._completed.add(node_id)
+        self._satisfy(node_id)
+
+    def mark_failed(self, node_id: str) -> None:
+        self._pending.discard(node_id)
+        self._ready.discard(node_id)
+        self._running.discard(node_id)
+        self._failed.add(node_id)
+
+    def mark_skipped(self, node_id: str) -> None:
+        self._pending.discard(node_id)
+        self._ready.discard(node_id)
+        self._skipped.add(node_id)
+        self._satisfy(node_id)
+
+    def add_node(self, node_id: str, dep_count: int) -> None:
+        """Register a node added at runtime — dynamic fan-out (#77).
+
+        ``dep_count`` is the number of not-yet-satisfied dependencies; 0 means
+        immediately ready. The DAG must already contain the node's edges so that
+        completing its dependencies unlocks it via :meth:`_satisfy`.
+        """
+        self._pending.add(node_id)
+        self._dep_count[node_id] = dep_count
+        if dep_count == 0:
+            self._ready.add(node_id)
+
+    def satisfy_dependents(self, node_id: str) -> None:
+        """Unlock dependents of ``node_id`` without marking it completed.
+
+        Used for a ``foreach`` worker that failed under ``on_item_failure:
+        continue`` — the failure is recorded, but the aggregator must still run.
+        """
+        self._satisfy(node_id)
+
+    def get_execution_count(self, node_id: str) -> int:
+        """Return how many times a node has been re-executed (0 = never reset)."""
+        return self._execution_count.get(node_id, 0)
+
+    def mark_pending_again(self, node_id: str) -> None:
+        """Reset a completed/failed node back to pending for re-execution."""
+        was_satisfied = node_id in self._completed or node_id in self._skipped
+        self._completed.discard(node_id)
+        self._failed.discard(node_id)
+        self._running.discard(node_id)
+        self._ready.discard(node_id)
+        self._pending.add(node_id)
+        self._execution_count[node_id] = self._execution_count.get(node_id, 0) + 1
+        # Recompute dep_count for this node from current satisfied set
+        satisfied = self._completed | self._skipped
+        self._dep_count[node_id] = sum(
+            1 for d in self._dag.dependencies(node_id) if d not in satisfied
+        )
+        if self._dep_count[node_id] == 0:
+            self._ready.add(node_id)
+        # If this node was satisfied before, its dependents lose one satisfied dep
+        if was_satisfied:
+            for dep in self._dag.dependents(node_id):
+                if dep in self._pending:
+                    self._dep_count[dep] += 1
+                    self._ready.discard(dep)
+
+    def reset_chain(self, from_node: str, to_node: str, dag: DAG) -> list[str]:
+        """Reset all nodes on any path from from_node to to_node (inclusive)."""
+        # Forward reachable from from_node (bounded by to_node)
+        forward_reachable: set[str] = set()
+        queue = deque([from_node])
+        while queue:
+            current = queue.popleft()
+            if current in forward_reachable:
+                continue
+            forward_reachable.add(current)
+            if current == to_node:
+                continue  # don't go past to_node
+            for dep in dag.dependents(current):
+                queue.append(dep)
+
+        # Backward reachable from to_node (bounded by from_node)
+        backward_reachable: set[str] = set()
+        queue = deque([to_node])
+        while queue:
+            current = queue.popleft()
+            if current in backward_reachable:
+                continue
+            backward_reachable.add(current)
+            if current == from_node:
+                continue
+            for dep in dag.dependencies(current):
+                queue.append(dep)
+
+        # Intersection = nodes on path from from_node to to_node
+        on_path = forward_reachable & backward_reachable
+        result = []
+        for node_id in on_path:
+            self.mark_pending_again(node_id)
+            result.append(node_id)
+        return sorted(result)
+
+    def is_complete(self) -> bool:
+        return not self._pending and not self._running
+
+    def is_blocked(self) -> bool:
+        """True if no more progress can be made (failed nodes block remaining)."""
+        return not self.is_complete() and not self._ready and not self._running

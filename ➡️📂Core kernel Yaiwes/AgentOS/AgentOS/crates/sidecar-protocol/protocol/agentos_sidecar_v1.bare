@@ -1,0 +1,1341 @@
+# AgentOS language execution sidecar protocol schema, version 1.
+# This schema is generator-ready: numeric ordinals are intentionally omitted
+# and type blocks are ordered before first use.
+
+type JsonUtf8 str
+
+type ProtocolSchema struct {
+  name: str
+  version: u16
+}
+
+type RequestId i64
+
+type ExtEnvelope struct {
+  namespace: str
+  payload: data
+}
+
+type ConnectionOwnership struct {
+  connectionId: str
+}
+
+type SessionOwnership struct {
+  connectionId: str
+  sessionId: str
+}
+
+type VmOwnership struct {
+  connectionId: str
+  sessionId: str
+  vmId: str
+}
+
+type OwnershipScope union {
+  ConnectionOwnership |
+  SessionOwnership |
+  VmOwnership
+}
+
+type AuthenticateRequest struct {
+  clientName: str
+  authToken: str
+  protocolVersion: u16
+  bridgeVersion: u32
+}
+
+type SidecarPlacementShared struct {
+  pool: optional<str>
+}
+
+type SidecarPlacementExplicit struct {
+  sidecarId: str
+}
+
+type SidecarPlacement union {
+  SidecarPlacementShared |
+  SidecarPlacementExplicit
+}
+
+type OpenSessionRequest struct {
+  placement: SidecarPlacement
+  metadata: map<str><str>
+}
+
+type GuestRuntimeKind enum {
+  JAVA_SCRIPT
+  PYTHON
+  WEB_ASSEMBLY
+}
+
+type RootFilesystemMode enum {
+  EPHEMERAL
+  READ_ONLY
+}
+
+type RootFilesystemEntryKind enum {
+  FILE
+  DIRECTORY
+  SYMLINK
+}
+
+type RootFilesystemEntryEncoding enum {
+  UTF8
+  BASE64
+}
+
+type RootFilesystemEntry struct {
+  path: str
+  kind: RootFilesystemEntryKind
+  mode: optional<u32>
+  uid: optional<u32>
+  gid: optional<u32>
+  content: optional<str>
+  encoding: optional<RootFilesystemEntryEncoding>
+  target: optional<str>
+  executable: bool
+}
+
+type SnapshotRootFilesystemLower struct {
+  entries: list<RootFilesystemEntry>
+}
+
+type BundledBaseFilesystemLower void
+
+type RootFilesystemLowerDescriptor union {
+  SnapshotRootFilesystemLower |
+  BundledBaseFilesystemLower
+}
+
+type RootFilesystemDescriptor struct {
+  mode: RootFilesystemMode
+  disableDefaultBaseLayer: bool
+  lowers: list<RootFilesystemLowerDescriptor>
+  bootstrapEntries: list<RootFilesystemEntry>
+}
+
+type PermissionMode enum {
+  ALLOW
+  ASK
+  DENY
+}
+
+type FsPermissionRule struct {
+  mode: PermissionMode
+  operations: list<str>
+  paths: list<str>
+}
+
+type FsPermissionRuleSet struct {
+  default: optional<PermissionMode>
+  rules: list<FsPermissionRule>
+}
+
+type FsPermissionScope union {
+  PermissionMode |
+  FsPermissionRuleSet
+}
+
+type PatternPermissionRule struct {
+  mode: PermissionMode
+  operations: list<str>
+  patterns: list<str>
+}
+
+type PatternPermissionRuleSet struct {
+  default: optional<PermissionMode>
+  rules: list<PatternPermissionRule>
+}
+
+type PatternPermissionScope union {
+  PermissionMode |
+  PatternPermissionRuleSet
+}
+
+type PermissionsPolicy struct {
+  fs: optional<FsPermissionScope>
+  network: optional<PatternPermissionScope>
+  childProcess: optional<PatternPermissionScope>
+  process: optional<PatternPermissionScope>
+  env: optional<PatternPermissionScope>
+  binding: optional<PatternPermissionScope>
+}
+
+type CreateVmRequest struct {
+  runtime: GuestRuntimeKind
+  config: JsonUtf8
+}
+
+type DisposeReason enum {
+  REQUESTED
+  CONNECTION_CLOSED
+  HOST_SHUTDOWN
+}
+
+type DisposeVmRequest struct {
+  reason: DisposeReason
+}
+
+type BootstrapRootFilesystemRequest struct {
+  entries: list<RootFilesystemEntry>
+}
+
+type MountPluginDescriptor struct {
+  id: str
+  config: JsonUtf8
+}
+
+type MountDescriptor struct {
+  guestPath: str
+  guestSource: str
+  guestFstype: str
+  readOnly: bool
+  plugin: MountPluginDescriptor
+}
+
+type MountInfo struct {
+  path: str
+  kind: str
+  readOnly: bool
+}
+
+type SoftwareDescriptor struct {
+  packageName: str
+  root: str
+}
+
+type ProjectedModuleDescriptor struct {
+  packageName: str
+  entrypoint: str
+}
+
+type WasmPermissionTier enum {
+  FULL
+  READ_WRITE
+  READ_ONLY
+  ISOLATED
+}
+
+# agentOS package descriptor. `path` is the trusted host path of the package:
+# normally the packed `.aospkg` file (header + vbare manifest + mount index +
+# mount tar; see crates/vfs/package-format/v1.bare). The sidecar reads the
+# vbare chunk1 manifest, projects the package read-only under
+# `<packagesMountAt>/pkgs/<name>/<version>`, and links its `bin/` commands onto
+# $PATH. A directory path is accepted only for local transition fixtures and is
+# projected as a read-only host-dir leaf (manifest read from the dir's
+# `agentos-package.json`, a toolchain-input file that packed packages no longer
+# ship at runtime).
+type PackageDescriptor struct {
+  path: str
+}
+
+type AgentosProjectedAgent struct {
+  id: str
+  acpEntrypoint: str
+  adapterEntrypoint: str
+}
+
+type LinkPackageRequest struct {
+  package: PackageDescriptor
+}
+
+type PackageCommands struct {
+  packageName: str
+  commands: list<str>
+}
+
+type ProvidedCommandsRequest void
+
+type ProvidedCommandsResponse struct {
+  packages: list<PackageCommands>
+}
+
+type ProjectedCommand struct {
+  name: str
+  guestPath: str
+}
+
+type PackageLinkedResponse struct {
+  projectedCommands: list<ProjectedCommand>
+  agents: list<AgentosProjectedAgent>
+}
+
+type ConfigureVmRequest struct {
+  mounts: list<MountDescriptor>
+  software: list<SoftwareDescriptor>
+  permissions: optional<PermissionsPolicy>
+  moduleAccessCwd: optional<str>
+  instructions: list<str>
+  projectedModules: list<ProjectedModuleDescriptor>
+  commandPermissions: map<str><WasmPermissionTier>
+  loopbackExemptPorts: list<u16>
+  packages: list<PackageDescriptor>
+  packagesMountAt: str
+  bootstrapCommands: list<str>
+  bindingShimCommands: list<str>
+}
+
+type RegisteredHostCallbackExample struct {
+  description: str
+  input: JsonUtf8
+}
+
+type RegisteredHostCallbackDefinition struct {
+  description: str
+  inputSchema: JsonUtf8
+  timeoutMs: optional<u64>
+  examples: list<RegisteredHostCallbackExample>
+}
+
+type RegisterHostCallbacksRequest struct {
+  name: str
+  description: str
+  commandAliases: list<str>
+  registryCommandAliases: list<str>
+  callbacks: map<str><RegisteredHostCallbackDefinition>
+}
+
+type CreateLayerRequest void
+
+type SealLayerRequest struct {
+  layerId: str
+}
+
+type ImportSnapshotRequest struct {
+  entries: list<RootFilesystemEntry>
+}
+
+type ExportSnapshotRequest struct {
+  layerId: str
+}
+
+type CreateOverlayRequest struct {
+  mode: RootFilesystemMode
+  upperLayerId: optional<str>
+  lowerLayerIds: list<str>
+}
+
+type GuestFilesystemOperation enum {
+  READ_FILE
+  WRITE_FILE
+  CREATE_DIR
+  MKDIR
+  EXISTS
+  STAT
+  LSTAT
+  READ_DIR
+  READ_DIR_RECURSIVE
+  REMOVE_FILE
+  REMOVE_DIR
+  REMOVE
+  COPY
+  MOVE
+  RENAME
+  REALPATH
+  SYMLINK
+  READ_LINK
+  LINK
+  CHMOD
+  CHOWN
+  UTIMES
+  TRUNCATE
+  PREAD
+  PWRITE
+}
+
+type GuestFilesystemCallRequest struct {
+  operation: GuestFilesystemOperation
+  path: str
+  destinationPath: optional<str>
+  target: optional<str>
+  content: optional<str>
+  encoding: optional<RootFilesystemEntryEncoding>
+  recursive: bool
+  maxDepth: optional<u32>
+  mode: optional<u32>
+  uid: optional<u32>
+  gid: optional<u32>
+  atimeMs: optional<u64>
+  mtimeMs: optional<u64>
+  len: optional<u64>
+  offset: optional<u64>
+}
+
+type GuestKernelCallRequest struct {
+  executionId: str
+  operation: str
+  payload: data
+}
+
+type SnapshotRootFilesystemRequest struct {
+  maxBytes: u64
+}
+
+type ListMountsRequest void
+
+type ExecuteRequest struct {
+  processId: str
+  command: optional<str>
+  runtime: optional<GuestRuntimeKind>
+  entrypoint: optional<str>
+  args: list<str>
+  env: map<str><str>
+  cwd: optional<str>
+  wasmPermissionTier: optional<WasmPermissionTier>
+}
+
+# First-class execution lifecycle. The legacy process request above remains an
+# internal kernel transport while clients migrate in lockstep to these semantic
+# operations; language/package command construction belongs to the sidecar.
+type ExecutionState enum {
+  CREATING
+  IDLE
+  RUNNING
+  RESETTING
+  DELETING
+  FAILED
+}
+
+type ExecutionOutcome enum {
+  SUCCEEDED
+  FAILED
+  CANCELLED
+  TIMED_OUT
+}
+
+type RetainedExecutionLanguage enum {
+  JAVA_SCRIPT
+  PYTHON
+}
+
+type ExecutionStreamChannel enum {
+  STDOUT
+  STDERR
+  PTY
+}
+
+type JavaScriptModuleFormat enum {
+  MODULE
+  COMMON_JS
+}
+
+type ExecutionIdentityOptions struct {
+  contextId: optional<str>
+}
+
+type ExecutionPtyOptions struct {
+  cols: optional<u16>
+  rows: optional<u16>
+}
+
+type ExecutionOutputCapture enum {
+  NONE
+  STDERR
+  ALL
+}
+
+type ExecutionOutputOptions struct {
+  capture: optional<ExecutionOutputCapture>
+  retainEvents: optional<bool>
+}
+
+type ProcessExecutionOptions struct {
+  identity: ExecutionIdentityOptions
+  output: ExecutionOutputOptions
+  operationId: optional<str>
+  background: optional<bool>
+  cwd: optional<str>
+  env: optional<map<str><str>>
+  args: list<str>
+  stdin: optional<data>
+  timeoutMs: optional<u64>
+  pty: optional<ExecutionPtyOptions>
+}
+
+type ShellExecutionRequest struct {
+  process: ProcessExecutionOptions
+  command: str
+}
+
+type ArgvExecutionRequest struct {
+  process: ProcessExecutionOptions
+  command: str
+}
+
+type JavaScriptExecutionRequest struct {
+  process: ProcessExecutionOptions
+  source: str
+  format: optional<JavaScriptModuleFormat>
+  filePath: optional<str>
+  inputs: optional<JsonUtf8>
+}
+
+type JavaScriptEvaluationRequest struct {
+  process: ProcessExecutionOptions
+  expression: str
+  format: optional<JavaScriptModuleFormat>
+  filePath: optional<str>
+  inputs: optional<JsonUtf8>
+}
+
+type JavaScriptFileExecutionRequest struct {
+  process: ProcessExecutionOptions
+  path: str
+}
+
+type TypeScriptExecutionRequest struct {
+  process: ProcessExecutionOptions
+  source: str
+  filePath: optional<str>
+  tsconfigPath: optional<str>
+  compilerOptions: optional<JsonUtf8>
+  inputs: optional<JsonUtf8>
+}
+
+type TypeScriptEvaluationRequest struct {
+  process: ProcessExecutionOptions
+  expression: str
+  filePath: optional<str>
+  tsconfigPath: optional<str>
+  compilerOptions: optional<JsonUtf8>
+  inputs: optional<JsonUtf8>
+}
+
+type TypeScriptFileExecutionRequest struct {
+  process: ProcessExecutionOptions
+  path: str
+  tsconfigPath: optional<str>
+  compilerOptions: optional<JsonUtf8>
+}
+
+type TypeScriptCheckRequest struct {
+  identity: ExecutionIdentityOptions
+  output: ExecutionOutputOptions
+  source: str
+  cwd: optional<str>
+  filePath: optional<str>
+  tsconfigPath: optional<str>
+  compilerOptions: optional<JsonUtf8>
+  timeoutMs: optional<u64>
+}
+
+type TypeScriptProjectCheckRequest struct {
+  identity: ExecutionIdentityOptions
+  output: ExecutionOutputOptions
+  cwd: optional<str>
+  tsconfigPath: optional<str>
+  timeoutMs: optional<u64>
+}
+
+type NpmProjectInstallRequest struct {
+  identity: ExecutionIdentityOptions
+  output: ExecutionOutputOptions
+  cwd: optional<str>
+  env: optional<map<str><str>>
+  timeoutMs: optional<u64>
+  frozen: optional<bool>
+}
+
+type NpmPackageInstallRequest struct {
+  identity: ExecutionIdentityOptions
+  output: ExecutionOutputOptions
+  cwd: optional<str>
+  env: optional<map<str><str>>
+  timeoutMs: optional<u64>
+  packages: list<str>
+  dev: optional<bool>
+  global: optional<bool>
+}
+
+type NpmScriptExecutionRequest struct {
+  process: ProcessExecutionOptions
+  script: str
+}
+
+type NpmPackageExecutionRequest struct {
+  process: ProcessExecutionOptions
+  packageSpec: str
+  binary: optional<str>
+}
+
+type PythonExecutionRequest struct {
+  process: ProcessExecutionOptions
+  source: str
+  inputs: optional<JsonUtf8>
+}
+
+type PythonEvaluationRequest struct {
+  process: ProcessExecutionOptions
+  expression: str
+  inputs: optional<JsonUtf8>
+}
+
+type PythonFileExecutionRequest struct {
+  process: ProcessExecutionOptions
+  path: str
+}
+
+type PythonModuleExecutionRequest struct {
+  process: ProcessExecutionOptions
+  module: str
+}
+
+type PythonInstallRequest struct {
+  identity: ExecutionIdentityOptions
+  output: ExecutionOutputOptions
+  cwd: optional<str>
+  env: optional<map<str><str>>
+  timeoutMs: optional<u64>
+  packages: list<str>
+  upgrade: optional<bool>
+  requirementsFile: optional<str>
+  indexUrl: optional<str>
+  extraIndexUrls: list<str>
+}
+
+type CreateContextRequest struct {
+  contextId: str
+}
+
+type GetExecutionRequest struct {
+  executionId: str
+}
+
+type ListExecutionsRequest void
+
+type WaitExecutionRequest struct {
+  executionId: str
+}
+
+type CancelExecutionRequest struct {
+  executionId: str
+}
+
+type SignalExecutionRequest struct {
+  executionId: str
+  signal: str
+}
+
+type ResetExecutionRequest struct {
+  executionId: str
+}
+
+type DeleteExecutionRequest struct {
+  executionId: str
+}
+
+type WriteExecutionStdinRequest struct {
+  executionId: str
+  chunk: data
+}
+
+type CloseExecutionStdinRequest struct {
+  executionId: str
+}
+
+type ResizeExecutionPtyRequest struct {
+  executionId: str
+  cols: u16
+  rows: u16
+}
+
+type ReadExecutionOutputRequest struct {
+  executionId: str
+  cursor: optional<str>
+  limit: optional<u32>
+}
+
+type WriteStdinRequest struct {
+  processId: str
+  chunk: data
+}
+
+type ResizePtyRequest struct {
+  processId: str
+  cols: u16
+  rows: u16
+}
+
+type CloseStdinRequest struct {
+  processId: str
+}
+
+type KillProcessRequest struct {
+  processId: str
+  signal: str
+}
+
+type GetProcessSnapshotRequest void
+
+type GetResourceSnapshotRequest void
+
+type FindListenerRequest struct {
+  host: optional<str>
+  port: optional<u16>
+  path: optional<str>
+}
+
+type FindBoundUdpRequest struct {
+  host: optional<str>
+  port: optional<u16>
+}
+
+type GetSignalStateRequest struct {
+  processId: str
+}
+
+type GetZombieTimerCountRequest void
+
+type FilesystemOperation enum {
+  READ
+  WRITE
+  STAT
+  READ_DIR
+  MKDIR
+  REMOVE
+  RENAME
+}
+
+type HostFilesystemCallRequest struct {
+  operation: FilesystemOperation
+  path: str
+  payloadSizeBytes: u64
+}
+
+type PersistenceLoadRequest struct {
+  key: str
+}
+
+type PersistenceFlushRequest struct {
+  key: str
+  payloadSizeBytes: u64
+}
+
+type VmFetchRequest struct {
+  port: u16
+  method: str
+  path: str
+  headersJson: str
+  body: optional<str>
+  bodyBase64: optional<str>
+  streamOperation: optional<str>
+  streamId: optional<str>
+  maxBytes: optional<u32>
+}
+
+type RequestPayload union {
+  AuthenticateRequest |
+  OpenSessionRequest |
+  CreateVmRequest |
+  DisposeVmRequest |
+  BootstrapRootFilesystemRequest |
+  ConfigureVmRequest |
+  RegisterHostCallbacksRequest |
+  CreateLayerRequest |
+  SealLayerRequest |
+  ImportSnapshotRequest |
+  ExportSnapshotRequest |
+  CreateOverlayRequest |
+  GuestFilesystemCallRequest |
+  SnapshotRootFilesystemRequest |
+  ExecuteRequest |
+  WriteStdinRequest |
+  CloseStdinRequest |
+  KillProcessRequest |
+  GetProcessSnapshotRequest |
+  FindListenerRequest |
+  FindBoundUdpRequest |
+  GetSignalStateRequest |
+  GetZombieTimerCountRequest |
+  HostFilesystemCallRequest |
+  PersistenceLoadRequest |
+  PersistenceFlushRequest |
+  VmFetchRequest |
+  ExtEnvelope |
+  GuestKernelCallRequest |
+  ResizePtyRequest |
+  GetResourceSnapshotRequest |
+  LinkPackageRequest |
+  ProvidedCommandsRequest |
+  ListMountsRequest |
+  ShellExecutionRequest |
+  ArgvExecutionRequest |
+  JavaScriptExecutionRequest |
+  JavaScriptEvaluationRequest |
+  JavaScriptFileExecutionRequest |
+  TypeScriptExecutionRequest |
+  TypeScriptEvaluationRequest |
+  TypeScriptFileExecutionRequest |
+  TypeScriptCheckRequest |
+  TypeScriptProjectCheckRequest |
+  NpmProjectInstallRequest |
+  NpmPackageInstallRequest |
+  NpmScriptExecutionRequest |
+  NpmPackageExecutionRequest |
+  PythonExecutionRequest |
+  PythonEvaluationRequest |
+  PythonFileExecutionRequest |
+  PythonModuleExecutionRequest |
+  PythonInstallRequest |
+  CreateContextRequest |
+  GetExecutionRequest |
+  ListExecutionsRequest |
+  WaitExecutionRequest |
+  CancelExecutionRequest |
+  SignalExecutionRequest |
+  ResetExecutionRequest |
+  DeleteExecutionRequest |
+  WriteExecutionStdinRequest |
+  CloseExecutionStdinRequest |
+  ResizeExecutionPtyRequest |
+  ReadExecutionOutputRequest
+}
+
+type RequestFrame struct {
+  schema: ProtocolSchema
+  requestId: RequestId
+  ownership: OwnershipScope
+  payload: RequestPayload
+}
+
+type AuthenticatedResponse struct {
+  sidecarId: str
+  connectionId: str
+  maxFrameBytes: u32
+}
+
+type SessionOpenedResponse struct {
+  sessionId: str
+  ownerConnectionId: str
+}
+
+type VmCreatedResponse struct {
+  vmId: str
+}
+
+type VmDisposedResponse struct {
+  vmId: str
+}
+
+type RootFilesystemBootstrappedResponse struct {
+  entryCount: u32
+}
+
+type VmConfiguredResponse struct {
+  appliedMounts: u32
+  appliedSoftware: u32
+  projectedCommands: list<ProjectedCommand>
+  agents: list<AgentosProjectedAgent>
+}
+
+type HostCallbacksRegisteredResponse struct {
+  registration: str
+  commandCount: u32
+}
+
+type LayerCreatedResponse struct {
+  layerId: str
+}
+
+type LayerSealedResponse struct {
+  layerId: str
+}
+
+type SnapshotImportedResponse struct {
+  layerId: str
+}
+
+type SnapshotExportedResponse struct {
+  layerId: str
+  entries: list<RootFilesystemEntry>
+}
+
+type OverlayCreatedResponse struct {
+  layerId: str
+}
+
+type GuestFilesystemStat struct {
+  mode: u32
+  size: u64
+  blocks: u64
+  dev: u64
+  rdev: u64
+  isDirectory: bool
+  isSymbolicLink: bool
+  atimeMs: u64
+  mtimeMs: u64
+  ctimeMs: u64
+  birthtimeMs: u64
+  ino: u64
+  nlink: u64
+  uid: u32
+  gid: u32
+}
+
+type GuestDirEntry struct {
+  name: str
+  path: str
+  isDirectory: bool
+  isSymbolicLink: bool
+  size: u64
+}
+
+type GuestFilesystemResultResponse struct {
+  operation: GuestFilesystemOperation
+  path: str
+  content: optional<str>
+  encoding: optional<RootFilesystemEntryEncoding>
+  entries: optional<list<GuestDirEntry>>
+  stat: optional<GuestFilesystemStat>
+  exists: optional<bool>
+  target: optional<str>
+}
+
+type GuestKernelResultResponse struct {
+  payload: data
+}
+
+type RootFilesystemSnapshotResponse struct {
+  entries: list<RootFilesystemEntry>
+}
+
+type ListMountsResponse struct {
+  mounts: list<MountInfo>
+}
+
+type ProcessStartedResponse struct {
+  processId: str
+  pid: optional<u32>
+}
+
+type StdinWrittenResponse struct {
+  processId: str
+  acceptedBytes: u64
+}
+
+type PtyResizedResponse struct {
+  processId: str
+  cols: u16
+  rows: u16
+}
+
+type StdinClosedResponse struct {
+  processId: str
+}
+
+type ProcessKilledResponse struct {
+  processId: str
+}
+
+type ProcessSnapshotStatus enum {
+  RUNNING
+  EXITED
+  STOPPED
+}
+
+type ProcessSnapshotEntry struct {
+  processId: str
+  pid: u32
+  ppid: u32
+  pgid: u32
+  sid: u32
+  driver: str
+  command: str
+  args: list<str>
+  cwd: str
+  status: ProcessSnapshotStatus
+  exitCode: optional<i32>
+}
+
+type ProcessSnapshotResponse struct {
+  processes: list<ProcessSnapshotEntry>
+}
+
+type QueueSnapshotEntry struct {
+  name: str
+  category: str
+  depth: u64
+  highWater: u64
+  capacity: u64
+  fillPercent: u64
+}
+
+type ResourceSnapshotResponse struct {
+  runningProcesses: u64
+  exitedProcesses: u64
+  fdTables: u64
+  openFds: u64
+  pipes: u64
+  pipeBufferedBytes: u64
+  ptys: u64
+  ptyBufferedInputBytes: u64
+  ptyBufferedOutputBytes: u64
+  sockets: u64
+  socketListeners: u64
+  socketConnections: u64
+  socketBufferedBytes: u64
+  socketDatagramQueueLen: u64
+  queueSnapshots: list<QueueSnapshotEntry>
+}
+
+type SocketStateEntry struct {
+  processId: str
+  host: optional<str>
+  port: optional<u16>
+  path: optional<str>
+}
+
+type ListenerSnapshotResponse struct {
+  listener: optional<SocketStateEntry>
+}
+
+type BoundUdpSnapshotResponse struct {
+  socket: optional<SocketStateEntry>
+}
+
+type SignalDispositionAction enum {
+  DEFAULT
+  IGNORE
+  USER
+}
+
+type SignalHandlerRegistration struct {
+  action: SignalDispositionAction
+  mask: list<u32>
+  flags: u32
+}
+
+type SignalStateResponse struct {
+  processId: str
+  handlers: map<u32><SignalHandlerRegistration>
+}
+
+type ZombieTimerCountResponse struct {
+  count: u64
+}
+
+type FilesystemResultResponse struct {
+  operation: FilesystemOperation
+  status: str
+  payloadSizeBytes: u64
+}
+
+type PermissionDecisionResponse struct {
+  capability: str
+  decision: PermissionMode
+}
+
+type PersistenceStateResponse struct {
+  key: str
+  found: bool
+  payloadSizeBytes: u64
+}
+
+type PersistenceFlushedResponse struct {
+  key: str
+  committedBytes: u64
+}
+
+type RejectedResponse struct {
+  code: str
+  message: str
+  limitName: optional<str>
+  configuredLimit: optional<u64>
+  currentUsage: optional<u64>
+  requested: optional<u64>
+  unit: optional<str>
+  scope: optional<str>
+  vmId: optional<str>
+  sessionGeneration: optional<u64>
+  capabilityId: optional<u64>
+  operation: optional<str>
+  configurationPath: optional<str>
+  retryable: optional<bool>
+  errno: optional<str>
+}
+
+type VmFetchResponse struct {
+  responseJson: str
+}
+
+type ExecutionDescriptor struct {
+  executionId: str
+  generation: u64
+  state: ExecutionState
+  retainedLanguage: optional<RetainedExecutionLanguage>
+  processId: optional<str>
+  pid: optional<u32>
+  createdAtMs: u64
+  lastStartedAtMs: optional<u64>
+  lastCompletedAtMs: optional<u64>
+  lastOutcome: optional<ExecutionOutcome>
+  lastExitCode: optional<i32>
+}
+
+type ExecutionErrorData struct {
+  code: str
+  name: str
+  message: str
+  stack: optional<str>
+  details: optional<JsonUtf8>
+}
+
+type ExecutionAcceptedResponse struct {
+  operationId: str
+  execution: optional<ExecutionDescriptor>
+}
+
+type ExecutionCompletedResponse struct {
+  execution: optional<ExecutionDescriptor>
+  outcome: ExecutionOutcome
+  exitCode: optional<i32>
+  error: optional<ExecutionErrorData>
+  stdout: optional<data>
+  stderr: optional<data>
+  stdoutTruncated: optional<bool>
+  stderrTruncated: optional<bool>
+  evaluationValue: optional<JsonUtf8>
+  typeScriptCheckResult: optional<JsonUtf8>
+}
+
+type ExecutionEvaluationResponse struct {
+  result: ExecutionCompletedResponse
+  value: optional<JsonUtf8>
+}
+
+type TypeScriptDiagnostic struct {
+  code: u32
+  category: str
+  message: str
+  filePath: optional<str>
+  line: optional<u32>
+  column: optional<u32>
+}
+
+type TypeScriptCheckResponse struct {
+  result: ExecutionCompletedResponse
+  hasErrors: optional<bool>
+  diagnostics: list<TypeScriptDiagnostic>
+}
+
+type ExecutionDescriptorResponse struct {
+  execution: ExecutionDescriptor
+}
+
+type ExecutionListResponse struct {
+  executions: list<ExecutionDescriptor>
+}
+
+type ExecutionDeletedResponse struct {
+  executionId: str
+}
+
+type ExecutionIoResponse struct {
+  executionId: str
+  acceptedBytes: optional<u64>
+}
+
+type ExecutionOutputEvent struct {
+  executionId: str
+  generation: u64
+  processId: optional<str>
+  sequence: u64
+  channel: ExecutionStreamChannel
+  chunk: data
+  timestampMs: u64
+}
+
+type ExecutionOutputPageResponse struct {
+  executionId: str
+  generation: u64
+  events: list<ExecutionOutputEvent>
+  nextCursor: str
+  hasMore: bool
+  truncated: bool
+}
+
+type ResponsePayload union {
+  AuthenticatedResponse |
+  SessionOpenedResponse |
+  VmCreatedResponse |
+  VmDisposedResponse |
+  RootFilesystemBootstrappedResponse |
+  VmConfiguredResponse |
+  HostCallbacksRegisteredResponse |
+  LayerCreatedResponse |
+  LayerSealedResponse |
+  SnapshotImportedResponse |
+  SnapshotExportedResponse |
+  OverlayCreatedResponse |
+  GuestFilesystemResultResponse |
+  RootFilesystemSnapshotResponse |
+  ProcessStartedResponse |
+  StdinWrittenResponse |
+  StdinClosedResponse |
+  ProcessKilledResponse |
+  ProcessSnapshotResponse |
+  ListenerSnapshotResponse |
+  BoundUdpSnapshotResponse |
+  SignalStateResponse |
+  ZombieTimerCountResponse |
+  FilesystemResultResponse |
+  PermissionDecisionResponse |
+  PersistenceStateResponse |
+  PersistenceFlushedResponse |
+  RejectedResponse |
+  VmFetchResponse |
+  ExtEnvelope |
+  GuestKernelResultResponse |
+  PtyResizedResponse |
+  ResourceSnapshotResponse |
+  PackageLinkedResponse |
+  ProvidedCommandsResponse |
+  ListMountsResponse |
+  ExecutionAcceptedResponse |
+  ExecutionCompletedResponse |
+  ExecutionEvaluationResponse |
+  TypeScriptCheckResponse |
+  ExecutionDescriptorResponse |
+  ExecutionListResponse |
+  ExecutionDeletedResponse |
+  ExecutionIoResponse |
+  ExecutionOutputPageResponse
+}
+
+type ResponseFrame struct {
+  schema: ProtocolSchema
+  requestId: RequestId
+  ownership: OwnershipScope
+  payload: ResponsePayload
+}
+
+type VmLifecycleState enum {
+  CREATING
+  READY
+  DISPOSING
+  DISPOSED
+  FAILED
+}
+
+type VmLifecycleEvent struct {
+  state: VmLifecycleState
+}
+
+type StreamChannel enum {
+  STDOUT
+  STDERR
+}
+
+type ProcessOutputEvent struct {
+  processId: str
+  channel: StreamChannel
+  chunk: data
+}
+
+type ProcessExitedEvent struct {
+  processId: str
+  exitCode: i32
+}
+
+type ExecutionCompletedEvent struct {
+  executionId: str
+  generation: u64
+  outcome: ExecutionOutcome
+  exitCode: optional<i32>
+  error: optional<ExecutionErrorData>
+}
+
+type StructuredEvent struct {
+  name: str
+  detail: map<str><str>
+}
+
+type EventPayload union {
+  VmLifecycleEvent |
+  ProcessOutputEvent |
+  ProcessExitedEvent |
+  StructuredEvent |
+  ExtEnvelope |
+  ExecutionOutputEvent |
+  ExecutionCompletedEvent
+}
+
+type EventFrame struct {
+  schema: ProtocolSchema
+  ownership: OwnershipScope
+  payload: EventPayload
+}
+
+type HostCallbackRequest struct {
+  invocationId: str
+  callbackKey: str
+  input: JsonUtf8
+  timeoutMs: u64
+}
+
+type JsBridgeCallRequest struct {
+  callId: str
+  mountId: str
+  operation: str
+  args: JsonUtf8
+}
+
+type SidecarRequestPayload union {
+  HostCallbackRequest |
+  JsBridgeCallRequest |
+  ExtEnvelope
+}
+
+type SidecarRequestFrame struct {
+  schema: ProtocolSchema
+  requestId: RequestId
+  ownership: OwnershipScope
+  payload: SidecarRequestPayload
+}
+
+type HostCallbackResultResponse struct {
+  invocationId: str
+  result: optional<JsonUtf8>
+  error: optional<str>
+}
+
+type JsBridgeResultResponse struct {
+  callId: str
+  result: optional<JsonUtf8>
+  error: optional<str>
+}
+
+type SidecarResponsePayload union {
+  HostCallbackResultResponse |
+  JsBridgeResultResponse |
+  ExtEnvelope
+}
+
+type SidecarResponseFrame struct {
+  schema: ProtocolSchema
+  requestId: RequestId
+  ownership: OwnershipScope
+  payload: SidecarResponsePayload
+}
+
+type ShutdownControl struct {
+  reason: str
+}
+
+type ControlPayload union {
+  ShutdownControl
+}
+
+type ControlFrame struct {
+  schema: ProtocolSchema
+  payload: ControlPayload
+}
+
+type ProtocolFrame union {
+  RequestFrame |
+  ResponseFrame |
+  EventFrame |
+  SidecarRequestFrame |
+  SidecarResponseFrame |
+  ControlFrame
+}

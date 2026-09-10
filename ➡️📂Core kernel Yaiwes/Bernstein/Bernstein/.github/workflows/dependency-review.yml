@@ -1,0 +1,113 @@
+name: Dependency Review
+
+# Block PRs that introduce dependencies with known high-severity CVEs or
+# licenses outside the project's accepted set. Runs on every PR targeting
+# main.
+#
+# Ref: #1273
+
+on:
+  pull_request:
+    branches: [main]
+    # Dependency review only has signal when a manifest actually changes.
+    # Path-filter to the dependency-bearing files so PRs that touch no
+    # manifest skip this lane instead of spinning up a runner for nothing.
+    paths:
+      - "pyproject.toml"
+      - "uv.lock"
+      - "requirements*.txt"
+      - ".github/workflows/**"
+      - "Dockerfile"
+
+concurrency:
+  group: dependency-review-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  review:
+    name: Dependency review
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Dependency Review
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294  # v5.0.0
+        with:
+          fail-on-severity: high
+          comment-summary-in-pr: on-failure
+          # Accepted OSS-permissive licenses. Keep in sync with
+          # .github/workflows/license-compliance.yml.
+          # MIT-0 (MIT No Attribution) and PSF-2.0 are permissive members of
+          # the already-accepted MIT / Python license families. Both are
+          # already shipped in the distributed wheel via runtime dependencies
+          # (cffi -> MIT-0, reached through cryptography; defusedxml -> PSF-2.0,
+          # a direct dependency) and both already pass license-compliance.yml,
+          # so the allow-list was simply incomplete. Pinning the docs toolchain
+          # (docs/requirements.txt) surfaces these same packages with resolved
+          # versions on that manifest, which is what makes the omission visible.
+          allow-licenses: >-
+            Apache-2.0,
+            MIT,
+            MIT-0,
+            BSD-2-Clause,
+            BSD-3-Clause,
+            ISC,
+            MPL-2.0,
+            Python-2.0,
+            PSF-2.0,
+            Unlicense,
+            CC0-1.0
+          # Specific dependencies exempted from the license allow-list.
+          # trufflesecurity/trufflehog is AGPL-3.0 (CI-only GitHub Action,
+          # runs in an isolated workflow runner and is never linked into or
+          # distributed with the wheel, so its copyleft obligations do not
+          # propagate to the project's binaries).
+          #
+          # protobuf ships BSD-3-Clause, which is on the allow-list above, but
+          # from 7.35.1 its published metadata declares the compound expression
+          # "BSD-3-Clause AND LicenseRef-scancode-protobuf". The second half is
+          # a scancode identifier for the same upstream LICENSE text, not an
+          # additional grant, and the reviewer has no rule for LicenseRef-*
+          # terms, so the compound fails as a whole. The package is the same
+          # one already vendored at 6.x under the same terms.
+          #
+          # crosshair-tool declares "Apache-2.0 AND LicenseRef-scancode-psf-3.7.2
+          # AND MIT AND Python-2.0". Every named half is on the allow-list; the
+          # scancode LicenseRef is the PSF text the allow-list already accepts
+          # as PSF-2.0, under a version-specific identifier the reviewer has no
+          # rule for, so the compound fails as a whole. It is a dev-only
+          # dependency (concolic execution in the security test lane) and is
+          # never resolved into a wheel install.
+          #
+          # python-telegram-bot is LGPL-3.0 (its metadata also names GPL-3.0,
+          # which LGPL-3.0 incorporates by reference). It is an opt-in extra -
+          # `pip install 'bernstein[telegram]'` - so it is absent from a default
+          # install, is imported at arm's length rather than modified or
+          # statically linked, and its copyleft terms do not reach this
+          # project's own Apache-2.0 sources. Already present in the tree at
+          # 22.7 under identical terms; the bump is what made the reviewer look.
+          # numpy ships BSD-3-Clause, which is on the allow-list above, but
+          # from 2.5.2 its published metadata declares the compound expression
+          # "BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0" - the project's
+          # own terms plus the terms of the code it vendors. Every named half is
+          # permissive and Apache-2.0 compatible, and three of the five are
+          # already on the allow-list, but the reviewer matches the expression
+          # as one string rather than per term, so the compound fails as a
+          # whole. Same package, same upstream terms as 2.5.1; the metadata got
+          # more precise, not more restrictive.
+          allow-dependencies-licenses: >-
+            pkg:githubactions/trufflesecurity/trufflehog,
+            pkg:pypi/protobuf,
+            pkg:pypi/crosshair-tool,
+            pkg:pypi/numpy,
+            pkg:pypi/python-telegram-bot

@@ -1,0 +1,179 @@
+import Editor from "@monaco-editor/react";
+import type { ReactNode } from "react";
+import { Streamdown } from "streamdown";
+import { useTheme } from "@/hooks/use-theme";
+import { cn, normalizeNewlines } from "@/lib/utils";
+import { CopyButton } from "./copy-button";
+
+// Returns prettified JSON text if `text` parses to an object/array, else null.
+function tryPrettyJson(text: string): string | null {
+  const trimmed = text.trim();
+  if (
+    !(
+      (trimmed.startsWith("{") && trimmed.endsWith("}")) ||
+      (trimmed.startsWith("[") && trimmed.endsWith("]"))
+    )
+  ) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(trimmed);
+    if (parsed && typeof parsed === "object") {
+      return JSON.stringify(parsed, null, 2);
+    }
+  } catch {
+    // not JSON
+  }
+  return null;
+}
+
+const MONACO_LINE_HEIGHT = 16;
+const MONACO_PADDING = 12; // top + bottom + scrollbar slack
+
+// Monaco's built-in language IDs are sometimes named differently from the
+// markdown fence label. Normalize the common aliases so syntax highlighting
+// kicks in for bash/sh/zsh, ts/tsx, yml, etc.
+const LANGUAGE_ALIASES: Record<string, string> = {
+  bash: "shell",
+  sh: "shell",
+  zsh: "shell",
+  console: "shell",
+  ts: "typescript",
+  tsx: "typescript",
+  js: "javascript",
+  jsx: "javascript",
+  yml: "yaml",
+  py: "python",
+  rb: "ruby",
+};
+
+export function MonacoCodeBlock({
+  language,
+  value,
+  fill = false,
+}: {
+  language: string;
+  value: string;
+  /**
+   * Fill the parent's height and let Monaco own vertical scrolling. Use when
+   * the block renders a whole file rather than a snippet: the default height
+   * comes from the source newline count, which under `wordWrap` badly
+   * under-measures a long or minified single line — an 80px box with no way to
+   * reach the rest of the content.
+   */
+  fill?: boolean;
+}) {
+  const { theme } = useTheme();
+  const resolvedLanguage = LANGUAGE_ALIASES[language] ?? language;
+  const lineCount = value.split("\n").length;
+  // Size to fit all content; the parent container (tooltip / card / collapsible)
+  // already provides a scroll boundary via its own max-h + overflow-auto.
+  // Floor at 80 so a single-line snippet doesn't render a near-empty editor.
+  const height = Math.max(80, lineCount * MONACO_LINE_HEIGHT + MONACO_PADDING);
+  return (
+    <div
+      className={cn(
+        "relative w-full border-y border-border overflow-hidden",
+        fill ? "h-full" : "my-2",
+      )}
+      data-monaco-block="markdown-view"
+      style={fill ? undefined : { height }}
+    >
+      <CopyButton value={value} />
+      <Editor
+        language={resolvedLanguage}
+        theme={theme === "dark" ? "vs-dark" : "vs"}
+        value={value}
+        options={{
+          readOnly: true,
+          minimap: { enabled: false },
+          scrollBeyondLastLine: false,
+          // Monaco's own scrollbars are disabled so the outer container is the
+          // single source of scroll truth — except in `fill` mode, where the
+          // editor owns its viewport and must scroll itself.
+          scrollbar: fill
+            ? { vertical: "auto", horizontal: "auto", handleMouseWheel: true }
+            : { vertical: "hidden", horizontal: "auto", handleMouseWheel: false },
+          fontSize: 12,
+          lineHeight: MONACO_LINE_HEIGHT,
+          lineNumbers: "off",
+          wordWrap: "on",
+          folding: false,
+          automaticLayout: true,
+          padding: { top: 4, bottom: 4 },
+        }}
+        height="100%"
+        width="100%"
+      />
+    </div>
+  );
+}
+
+// Streamdown component overrides: route fenced code blocks (anything with a
+// `language-*` className) through Monaco; unwrap the outer <pre> since Monaco
+// brings its own container; keep inline code as a small styled chip.
+const STREAMDOWN_COMPONENTS = {
+  code({ className, children, ...rest }: { className?: string; children?: ReactNode }) {
+    const m = /language-([\w-]+)/.exec(className ?? "");
+    if (m) {
+      const value = (Array.isArray(children) ? children.join("") : String(children ?? "")).replace(
+        /\n$/,
+        "",
+      );
+      return <MonacoCodeBlock language={m[1]} value={value} />;
+    }
+    return (
+      <code className="rounded bg-muted px-1 py-0.5 font-mono text-xs" {...rest}>
+        {children}
+      </code>
+    );
+  },
+  pre({ children }: { children?: ReactNode }) {
+    return <>{children}</>;
+  },
+  // Markdown links always open in a new tab — markdown is rendered inside
+  // dialogs/panels where in-place navigation would lose state.
+  a({ children, href }: { children?: ReactNode; href?: string }) {
+    return (
+      <a
+        href={href}
+        target="_blank"
+        rel="noreferrer"
+        className="text-primary underline underline-offset-2 hover:opacity-80"
+      >
+        {children}
+      </a>
+    );
+  },
+};
+
+/**
+ * Markdown renderer used across the app. Wraps Streamdown with:
+ *   - Auto JSON detection (raw JSON input is reflowed into a fenced ```json block).
+ *   - Code blocks rendered with a read-only Monaco editor (theme-aware, word-wrapped).
+ *   - Inline code styled as a small `bg-muted` chip.
+ */
+export function MarkdownView({
+  text,
+  normalizeSoftBreaks = true,
+}: {
+  text: string;
+  /**
+   * Whether single newlines are promoted to paragraph breaks (`normalizeNewlines`).
+   * Correct for LLM/agent output, which routinely separates paragraphs with one
+   * newline. WRONG for hand-authored documents (SKILL.md, schedule task
+   * templates) that hard-wrap prose at ~80 columns — there, promoting every
+   * wrap point shatters each paragraph into one-line fragments. Pass `false`
+   * for authored documents so standard markdown paragraph rules apply.
+   */
+  normalizeSoftBreaks?: boolean;
+}) {
+  const pretty = tryPrettyJson(text);
+  const body =
+    pretty != null
+      ? `\`\`\`json\n${pretty}\n\`\`\``
+      : normalizeSoftBreaks
+        ? normalizeNewlines(text)
+        : text;
+  return <Streamdown components={STREAMDOWN_COMPONENTS}>{body}</Streamdown>;
+}

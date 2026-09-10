@@ -1,0 +1,25 @@
+name: Sync docs
+
+# Docs live here; rivet.dev publishes them. On merge to main this copies the
+# docs/ bundle into the website's vendor/agentos and opens a PR there, which is
+# also what triggers the site rebuild.
+#
+# examples/ travels with the bundle because agentOS docs embed snippets from it
+# by repo-root-relative path, and Dynamic Apps docs resolve their snippets here
+# too via snippetFrom in the website's product-metadata.ts.
+on:
+  push:
+    branches: [main]
+    paths: ["docs/**", "examples/**"]
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rivet-dev/website/.github/actions/sync-docs@main
+        with:
+          product: agentos
+          token: ${{ secrets.RIVET_WEBSITE_TOKEN }}
+          extra-paths: examples

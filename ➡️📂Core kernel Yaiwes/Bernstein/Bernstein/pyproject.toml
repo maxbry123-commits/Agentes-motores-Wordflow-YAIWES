@@ -1,0 +1,1102 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "bernstein"
+version = "3.18.2"
+description = "Deterministic orchestrator for CLI coding agents (Claude Code, Codex, Gemini CLI, and 40+ more). No model in the coordination loop, so parallel runs in per-task git worktrees replay byte-identically. Signed lineage plus an opt-in HMAC audit chain a reviewer checks offline, without rerunning it. Cluster mode, air-gap deploy."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+authors = [{ name = "Alex Chernysh", email = "alex@alexchernysh.com" }]
+keywords = [
+    "ai",
+    "agents",
+    "orchestration",
+    "multi-agent",
+    "coding",
+    "cli",
+    "llm",
+    "automation",
+    "devtools",
+    "deterministic",
+    "replay",
+    "audit",
+    "provenance",
+    "lineage",
+    "worktree",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development",
+    "Topic :: Software Development :: Build Tools",
+    "Topic :: Software Development :: Code Generators",
+    "Topic :: Software Development :: Quality Assurance",
+    "Topic :: System :: Distributed Computing",
+    "Typing :: Typed",
+]
+dependencies = [
+    # No ceiling: the route-table walk that the agent task-scope gate compiles
+    # its matchers from lives in ``core/routes/route_table.py`` and descends
+    # through the ``include_router`` wrappers FastAPI keeps from 0.137 onward,
+    # so it resolves the same templates on both sides of that change.
+    # ``tests/unit/test_route_table.py`` holds the floor.
+    "fastapi>=0.115",
+    # Direct floor for the Starlette ASGI layer so the resolved lockfile stays
+    # above PYSEC-2026-161 even when pulled through FastAPI or MCP.
+    "starlette>=1.0.1",
+    "uvicorn>=0.30",
+    "httpx>=0.27",
+    "cryptography>=50.0.0",
+    "pyyaml>=6.0",
+    "rich>=13.0",
+    "textual>=1.0",
+    "click>=8.3.3",
+    "openai>=2.36.0",
+    "pydantic-settings>=2.13.1",
+    "python-dotenv>=1.2.2",
+    "setproctitle>=1.3",
+    "prometheus-client>=0.21",
+    "pluggy>=1.5",
+    "mcp>=1.28.1,<2",
+    "watchdog>=4.0",
+    "opentelemetry-api>=1.41.1",
+    "opentelemetry-sdk>=1.41.1",
+    "opentelemetry-exporter-otlp>=1.41.1",
+    "pillow>=12.3.0",
+    "pyfiglet>=1.0",
+    "terminaltexteffects>=0.11",
+    "websockets>=14.0",
+    # SAML XML signature verification. Pure-Python via lxml+cryptography.
+    # Required to validate IdP assertions in src/bernstein/core/security/auth.py;
+    # enabling SAML without this library installed is a hard error.
+    "signxml>=4.0",
+    # Hardened XML parser. Used in src/bernstein/core/security/auth.py to
+    # parse SAML assertions without expanding internal entities. Mitigates
+    # billion-laughs / quadratic-blowup DoS on unauthenticated IdP responses.
+    # defusedxml.ElementTree is a drop-in for xml.etree.ElementTree.
+    "defusedxml>=0.7.1",
+    # OS-keychain transport for the credential vault (release 1.9). Pulls in
+    # macOS Keychain / Linux Secret Service / Windows Credential Manager
+    # backends. AES-GCM file fallback uses the existing ``cryptography`` dep.
+    "keyring>=25.0",
+    # Strict per-phase artefact validation in
+    # ``src/bernstein/core/orchestration/phase_schemas.py``.  Already pulled in
+    # transitively by several deps; promoted to a direct dep so the phase
+    # pipeline does not silently degrade if a transitive owner drops it.
+    "jsonschema>=4.20",
+    # RFC 3161 TimeStampToken ASN.1 parsing for the multi-tenant audit
+    # export verifier. Pure-Python, MIT-licensed, ~250KB wheel; ships the
+    # ``tsp.TSTInfo`` / ``cms.ContentInfo`` types we need without us
+    # hand-rolling a DER parser. Used exclusively by
+    # ``bernstein.core.security.rfc3161_verifier``.
+    "asn1crypto>=1.5",
+    # Canonical CBOR encoding for the COSE_Sign1 (RFC 9052) audit receipt.
+    # MIT-licensed; deterministic-encoding mode gives byte-identical receipt
+    # replay. Used by ``bernstein.core.security.audit_receipt`` and the
+    # standalone ``tools/verify_audit_receipt.py`` verifier.
+    "cbor2>=5.6",
+    # Pure-Python PDF generation for the EU AI Act Article 12 evidence pack
+    # rendered by `bernstein compliance pack`. MIT-licensed, no native deps.
+    # Used exclusively by ``bernstein.core.compliance.article12``.
+    "reportlab>=5,<6",
+    # YAML frontmatter parsing for `bernstein ticket validate` (SDD ticket
+    # schema). Lightweight, MIT-licensed; piggybacks on the already-pinned
+    # PyYAML for the YAML body. The validator gracefully falls back to a
+    # PyYAML-only parser so the dep is not strictly required at runtime,
+    # but pinning it here keeps downstream behaviour consistent.
+    "python-frontmatter>=1.1",
+    # Pulled in transitively by httpx / anyio. Pin directly to >=3.15 so we
+    # stay above the CVE-2026-45409 floor regardless of which transitive
+    # owner resolves first; pip-audit gates the production closure on this.
+    "idna>=3.15",
+    # PEP 440 version parsing/comparison. Imported directly at runtime by the
+    # ``bernstein doctor`` last-green advisory (``cli/commands/doctor_cmd.py``)
+    # and the adapter security-floor / advisory gates
+    # (``adapters/security_floor.py``, ``adapters/advisories.py``). Only ever
+    # pulled into the lockfile transitively by dev/test tooling (pytest,
+    # pip-audit, e2b, ...), so a clean ``uv tool install`` shipped without it
+    # and ``bernstein doctor`` crashed with ModuleNotFoundError. Promoted to a
+    # direct dependency so the resolver always installs it. Pure-Python.
+    "packaging>=24",
+]
+
+[project.urls]
+Homepage = "https://bernstein.run"
+Documentation = "https://bernstein.readthedocs.io"
+Repository = "https://github.com/sipyourdrink-ltd/bernstein"
+Source = "https://github.com/sipyourdrink-ltd/bernstein"
+Issues = "https://github.com/sipyourdrink-ltd/bernstein/issues"
+Changelog = "https://github.com/sipyourdrink-ltd/bernstein/releases"
+Funding = "https://github.com/sponsors/chernistry"
+Author = "https://alexchernysh.com"
+Twitter = "https://x.com/alex_chernysh"
+
+[project.optional-dependencies]
+# Mirrored from [dependency-groups].dev so `pip install bernstein[dev]` works
+# for users not on uv. Keep floors in sync with [dependency-groups].dev.
+dev = [
+    "pytest>=9.0.2",
+    "pytest-asyncio>=1.3.0",
+    "pytest-cov>=7.1.0",
+    "pytest-benchmark>=4.0",
+    "pytest-timeout>=2.4.0",
+    "hypothesis>=6.100",
+    "respx>=0.22",
+    "ruff>=0.9",
+    "pyright>=1.1",
+    # Declared so `uv run mypy` resolves the project interpreter instead of
+    # falling through to whatever `mypy` sits on PATH. A PATH mypy bound to
+    # Python < 3.12 cannot parse PEP 695 `type` aliases and aborts the run.
+    "mypy>=1.18.2",
+    "import-linter>=2.0",  # Architecture contracts (`uv run lint-imports`)
+    # CI hardening 2026 - see docs/contributing/testing.md.
+    "schemathesis>=4.18.1",  # OpenAPI fuzz / contract sweep on FastAPI app
+    "crosshair-tool>=0.0.95",  # Concolic execution on pure security fns
+    "bandit>=1.8",  # Static security analyzer (HIGH-severity gate)
+    "pip-audit>=2.7",  # PyPI dep CVE scanner (production strict)
+    "beartype>=0.21",  # Test-time runtime type enforcement
+    "syrupy>=4.6",  # Snapshot testing for JSONL/audit/prompt drift
+    "diff-cover>=9.0",  # Per-PR diff coverage gate
+    # PDF re-parse for tests that assert reportlab-emitted Article 12
+    # PDFs are well-formed (tests/unit/compliance/test_article12.py).
+    # Floor raised to the patched release for CVE-2026-59935 (fixed
+    # 6.14.2) and CVE-2026-59936 (fixed 6.14.1): crafted-PDF inline-image
+    # denial of service.
+    "pypdf>=6.14.2",
+    # Resource-leak / RSS / fd-count probes for the TC-C stress suite
+    # (tests/stress/*). Pure-Python wrappers around platform APIs, MIT-
+    # licensed, no native compile required. Tests degrade gracefully when
+    # absent; this floor only matters for nightly stress CI.
+    "psutil>=5.9",
+    # Flake detection + auto-quarantine PR generator. Driven by the
+    # nightly .github/workflows/flake-quarantine.yml workflow; not used
+    # at PR time. pytest-json-report is a transitive requirement of
+    # pytest-xflaky. pytest-randomly is intentionally NOT a dev dep -
+    # it auto-activates on import and would shuffle every other CI
+    # job's test order; the nightly workflow installs it ad-hoc into
+    # its own env. See docs/contributing/flake-handling.md.
+    "pytest-xflaky>=1.0.3",
+    "pytest-json-report>=1.5",
+    # TRACE 0.2 Trust Record emitter tests.
+    "agentrust-trace-tests>=0.5,<0.6",
+    # Error-telemetry SDK for the operator-managed Sentry-protocol-compatible
+    # error sink. Imported lazily in src/bernstein/cli/main.py and only
+    # initialised when BERNSTEIN_TELEMETRY_DSN is set. Kept in dev so the
+    # test-suite can exercise the no-op + initialised paths.
+    "sentry-sdk[fastapi]>=2.20",
+    # Cron expression parser. Optional at runtime - trigger_manager imports it
+    # inside try/except ImportError and yields no events without it - but
+    # required here so the cron-evaluation regression tests execute instead of
+    # being skipped by importorskip. types-croniter below stubs the same
+    # library for mypy.
+    "croniter>=6.0",
+    # Rendering-fetcher tests (#3120) exercise the headless browser against
+    # a local fixture server. Runtime extra: bernstein[research-render].
+    "playwright>=1.62.0",
+    # NOTE: semgrep is intentionally NOT a dev dep. Its transitive pins
+    # (click<8.2, opentelemetry-sdk<1.38) collide with our production
+    # floors (click>=8.3.3, opentelemetry-sdk>=1.41.1). Install via
+    # `uv tool install semgrep` (isolated env). See .github/workflows/ci.yml
+    # and docs/contributing/testing.md.
+    #
+    # Type stubs for dependencies that ship no inline annotations. Mirror of
+    # [dependency-groups].dev. Everything below is typeshed's own `types-*`
+    # distribution except lxml-stubs (published by the lxml developers) and
+    # boto3-stubs / botocore-stubs (published by the mypy_boto3 project).
+    # Stub-only wheels: no runtime code, no import cost. They are dev-only
+    # because they are consumed by `uv run mypy src`.
+    "types-pyyaml>=6.0.12.20260724",  # pyyaml
+    "types-jsonschema>=4.26.0.20260518",  # jsonschema
+    "types-reportlab>=4.5.1.20260724",  # reportlab
+    "types-defusedxml>=0.7.0.20260504",  # defusedxml
+    "types-psutil>=7.2.2.20260518",  # psutil
+    "types-croniter>=6.2.4.20260711",  # croniter
+    "types-qrcode>=8.2.0.20260518",  # qrcode (gui extra)
+    "types-grpcio>=1.82.1.20260724",  # grpcio (grpc extra)
+    "types-grpcio-reflection>=1.0.0.20260508",  # grpcio-reflection (grpc extra)
+    "lxml-stubs>=0.5.1",  # lxml, via signxml (SAML assertion parsing)
+    "boto3-stubs>=1.43.56",  # boto3 (s3 / r2 extras), published by the mypy_boto3 project
+    "botocore-stubs>=1.43.14",  # botocore, same publisher
+]
+grpc = ["grpcio>=1.68", "grpcio-tools>=1.68", "grpcio-reflection>=1.68", "protobuf>=7.35.1"]
+voice = ["faster-whisper>=1.0.0", "sounddevice>=0.4.0", "numpy>=1.20.0"]
+k8s = ["kubernetes>=35.0.0"]
+# SPIFFE/SPIRE workload-identity integration
+# (src/bernstein/core/identity/spiffe/workload_api.py). The py-spiffe SDK talks
+# to a running SPIRE agent's Workload API to fetch X.509-SVIDs. Optional so the
+# default self-contained Ed25519 identity path stays dependency-free and works
+# with a truthy regression suite when the extra is absent. Enable with:
+#   pip install 'bernstein[spiffe]'
+spiffe = ["spiffe>=0.2"]
+ml = ["scikit-learn>=1.5"]
+# Browser activity driver (src/bernstein/core/orchestration/browser_driver.py).
+# Declared empty (like `graphics` below) so a default install and the project
+# lock stay lean and license-clean: the live `browser-use` backend pulls a large
+# transitive tree with licenses outside the accepted set (see
+# .github/workflows/dependency-review.yml), and vendoring it here would bind that
+# surface onto every install. The recorded-tape driver runs every offline replay
+# and verification path with no extra installed, and asking for a live driver
+# without the backend raises a typed refusal naming the package to install.
+# Enable the live driver on demand with: pip install 'browser-use>=0.7'.
+browser = []
+graphics = []  # term-image disabled: caps pillow<11, conflicts with CVE-2026-25990 fix
+# OpenAI Agents SDK v2 integration (src/bernstein/adapters/openai_agents.py).
+# Declared as an optional extra so users who don't spawn OpenAI Agents agents
+# don't need the SDK installed.  Enable with: pip install 'bernstein[openai]'.
+openai = ["openai-agents>=0.4.0"]
+# Sandbox backend extras. Each pulls in the provider SDK for the
+# corresponding SandboxBackend. Kept optional so minimal installs stay lean.
+docker = ["docker>=7.1.0"]
+e2b = ["e2b-code-interpreter>=1.0"]
+modal = ["modal>=1.4.2"]
+# Cloud artifact storage sinks. Each extra pulls in the provider SDK
+# needed by the corresponding ArtifactSink. Kept optional so local-only
+# installs stay lean. R2 reuses boto3 under the hood.
+s3 = ["boto3>=1.43.6"]
+gcs = ["google-cloud-storage>=3.10.1"]
+azure = ["azure-storage-blob>=12.20"]
+r2 = ["boto3>=1.43.6"]
+# Chat-control bridge backends. Enable with:
+#   pip install 'bernstein[telegram]'
+# Standard Telegram bot integration via long-poll: configure the bot
+# token (from @BotFather) and the chat id, no external services.
+telegram = ["python-telegram-bot>=22.7"]
+# Slack bidirectional driver over Socket Mode. Enable with:
+#   pip install 'bernstein[slack]'
+# Configure a Slack app with bot scopes (``chat:write``, ``commands``),
+# enable Socket Mode, and set ``BERNSTEIN_SLACK_TOKEN`` (xoxb-...) plus
+# ``BERNSTEIN_SLACK_APP_TOKEN`` (xapp-...) before invoking ``bernstein
+# chat serve --platform=slack``.
+slack = ["slack-sdk>=3.27", "aiohttp>=3.9"]
+# Discord bidirectional driver over the gateway. Enable with:
+#   pip install 'bernstein[discord]'
+# Configure a Discord bot application in the developer portal, copy the
+# bot token, and set ``BERNSTEIN_DISCORD_TOKEN`` before invoking
+# ``bernstein chat serve --platform=discord``.
+discord = ["discord.py>=2.4"]
+# Microsoft Teams bidirectional driver over the Bot Framework. Enable with:
+#   pip install 'bernstein[teams]'
+# Register a bot in the Azure Bot Service, copy the app id and password, and
+# set ``BERNSTEIN_TEAMS_TOKEN`` (app id) plus ``BERNSTEIN_TEAMS_APP_PASSWORD``
+# (client secret) before invoking ``bernstein chat serve --platform=teams``.
+teams = ["botbuilder-core>=4.15", "aiohttp>=3.9"]
+# Contamination-resistant eval harness (SWE-bench Pro / Terminal-Bench 2.0 /
+# SWE-rebench). Kept optional so production installs don't pull HuggingFace
+# datasets unless the operator opts into the nightly leaderboard path.
+# Enable with: pip install 'bernstein[eval]'
+eval = ["datasets>=4.8.5", "huggingface-hub>=0.24"]
+# Web GUI (Vite + React SPA + FastAPI mount). Static assets ship with the
+# wheel under src/bernstein/gui/static/ (see artifacts). Python deps stay
+# minimal so TUI users keep zero overhead. Enable with:
+#   pip install 'bernstein[gui]'
+# then: bernstein gui serve
+gui = [
+    "sse-starlette>=2.1.0",
+    # Terminal QR rendering for ``bernstein gui qr`` and the
+    # ``--tunnel`` flag of ``bernstein gui serve`` (#1218). Pure Python,
+    # MIT-licensed, no native deps. The qr renderer ships a fallback
+    # placeholder when this extra is absent so minimal installs do not
+    # crash - they just print a "install qrcode" diagnostic.
+    "qrcode>=7.4",
+]
+# OpenTelemetry OTLP/gRPC exporter for GenAI semantic conventions
+# (src/bernstein/core/observability/otlp_exporter.py). The exporter is a
+# no-op when this extra is absent or BERNSTEIN_OTEL_ENDPOINT is unset, so
+# minimal installs do not pay the gRPC import cost. Enable with:
+#   pip install 'bernstein[otel]'
+otel = [
+    "opentelemetry-exporter-otlp-proto-grpc>=1.41.1",
+]
+# Error-telemetry SDK wired to an operator-managed Sentry-protocol-compatible
+# error sink (src/bernstein/cli/main.py:_init_error_telemetry). The SDK is
+# imported lazily and only initialises when BERNSTEIN_TELEMETRY_DSN is set, so
+# minimal installs pay zero overhead. Enable with:
+#   pip install 'bernstein[observability]'
+observability = [
+    "sentry-sdk[fastapi]>=2.20",
+]
+research-render = [
+    "playwright>=1.62.0",
+]
+# TRACE 0.2 Trust Record emitter (src/bernstein/core/observability/trust_record.py).
+# Optional so minimal installs stay dependency-free. Enable with:
+#   pip install 'bernstein[trace]'
+trace = ["agentrust-trace>=0.9,<0.10"]
+
+[project.scripts]
+bernstein = "bernstein.cli.main:cli"
+bernstein-worker = "bernstein.core.worker:main"
+bernstein-bench = "bernstein.eval.bench.bench_cli:bench_group"
+
+[project.entry-points."bernstein.plugins"]
+# Lifecycle/event plugins (hookimpl classes). Example:
+# my_plugin = "my_package:MyPlugin"
+
+[project.entry-points."bernstein.adapters"]
+# Third-party CLI agent adapters (CLIAdapter subclasses). Example:
+# myagent = "my_package.adapter:MyAgentAdapter"
+# Then use: bernstein run --cli myagent plan.yaml
+
+[project.entry-points."bernstein.gates"]
+# Custom quality gates (GatePlugin subclasses). Example:
+# my_gate = "my_package.gates:MyGate"
+
+[project.entry-points."bernstein.triggers"]
+# Custom trigger sources (normalize external events into tasks). Example:
+# jira = "my_package.triggers:JiraTriggerSource"
+
+[project.entry-points."bernstein.reporters"]
+# Custom reporters (hookimpl classes that emit run summaries). Example:
+# slack = "my_package.reporters:SlackReporter"
+
+[project.entry-points."bernstein.sandbox_backends"]
+# Sandbox backends (SandboxBackend protocol implementations).
+# First-party backends (worktree, docker) ship in core and are registered
+# by bernstein.core.sandbox.registry directly; plugin authors register
+# additional backends (e2b, modal, cloud providers ...) via this group.
+# Example:
+# e2b = "bernstein.core.sandbox.backends.e2b:E2BSandboxBackend"
+# modal = "bernstein.core.sandbox.backends.modal:ModalSandboxBackend"
+
+[project.entry-points."bernstein.skill_sources"]
+# Progressive-disclosure skill packs. Each entry resolves to a
+# zero-arg factory returning a ``bernstein.core.skills.SkillSource``.
+# Example:
+# my-data-pack = "my_pack.skills:source"
+
+[project.entry-points."bernstein.storage_sinks"]
+# Pluggable artifact storage sinks. First-party sinks
+# (local_fs, s3, gcs, azure_blob, r2) ship in core and are registered
+# eagerly by bernstein.core.storage.registry; plugin authors register
+# additional sinks (custom providers, domain-specific wrappers ...) via
+# this group. Example:
+# my_sink = "my_pkg.storage:MyArtifactSink"
+
+[project.entry-points."bernstein.spec_quality_rules"]
+# Spec-quality checklist rules (Rule factories). Each entry resolves to a
+# zero-arg callable returning a
+# ``bernstein.core.planning.spec_quality.Rule`` instance.
+# Example:
+# stakeholder = "my_pkg.spec_rules:stakeholder_factory"
+
+[project.entry-points."bernstein.notification_sinks"]
+# Outbound notification drivers (release 1.9). First-party drivers
+# (telegram, slack, discord, email_smtp, webhook, shell) ship in core
+# and are registered eagerly by bernstein.core.notifications.registry;
+# plugin authors register additional drivers (PagerDuty, Opsgenie,
+# Mattermost, ...) via this group. Each entry resolves to a callable
+# whose signature is ``factory(config: dict[str, Any]) -> NotificationSink``
+# and the entry name is the ``kind`` referenced from
+# ``bernstein.yaml::notifications.sinks[*].kind``. Example:
+# pagerduty = "my_pkg.notify:PagerDutySink"
+
+[tool.hatch.build]
+# NOTE: do NOT add src/bernstein/ entries here.  Every file under src/
+# ships production code that the runtime imports -- either directly or
+# via the _CoreRedirectFinder in core/__init__.py.  Previously 18 core/
+# sub-packages plus three cli/run_*.py helpers were excluded (v1.8.7..
+# v1.8.9 wheels on PyPI are all broken because of this); `pip install
+# bernstein && bernstein --version` failed with `ModuleNotFoundError:
+# No module named 'bernstein.core.config'` and similar because the
+# redirect map / import chain points to files stripped from the wheel.
+exclude = [
+    ".sdd/",
+    "tests/",
+    "scripts/",
+    "docs/",
+    ".github/",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/bernstein"]
+# Eval golden fixtures live INSIDE src/bernstein/eval/golden_data/ so they
+# ship by virtue of being inside the package tree.  ``artifacts`` is listed
+# explicitly to pin the *.md inclusion even if a future ``include`` /
+# ``exclude`` rewrite tries to whitelist only *.py.  Loader:
+# ``bernstein.eval.golden._packaged_tier_files`` (importlib.resources).
+# .sdd/ MUST stay out of the repo (Repo hygiene CI gate); the operator
+# override path .sdd/eval/golden/<tier>/*.md is still consulted first.
+artifacts = [
+    "src/bernstein/eval/golden_data/**/*.md",
+    # Recipe golden traces - YAML fixtures that pin the resolved
+    # workflow shape for each bundled recipe.  Loaded by the eval
+    # harness to catch drift after refactors.
+    "src/bernstein/eval/golden_data/**/*.yaml",
+    # Web GUI built assets - Vite output committed to the package tree so
+    # the wheel ships pre-built. Rebuild with: cd web && npm run build.
+    "src/bernstein/gui/static/**/*",
+    "src/bernstein/dashboard/static/**/*",
+    # microVM launcher source. The libkrun monitor spawns one process per VM
+    # and, on macOS, that process must carry the hypervisor entitlement, so the
+    # binary is compiled and signed on the operator's host from this source
+    # (`bernstein sandbox microvm-launcher`). Shipping the source rather than a
+    # binary keeps the wheel platform-independent and lets the link step resolve
+    # the local libkrun prefix. Loader:
+    # bernstein.core.sandbox.backends._libkrun.launcher_source_dir.
+    "src/bernstein/core/sandbox/backends/_libkrun_launcher/*.c",
+    "src/bernstein/core/sandbox/backends/_libkrun_launcher/*.plist",
+    # SDD ticket schemas. Shipped alongside the validator so downstream
+    # projects can lint their .sdd/backlog tickets via importlib.resources
+    # without a source checkout. Loader: bernstein.sdd.validator.load_schema.
+    "src/bernstein/sdd/schema/*.json",
+    # MCP per-tool input schemas (issue #1406). The orchestrator-side input
+    # firewall loads them at startup to validate every incoming MCP tool
+    # call. Loader: bernstein.mcp.input_validation.load_registry.
+    "src/bernstein/mcp/tool_schemas/*.json",
+    # Doctor doc-suggestion seed list. Curated list of common documentation
+    # gaps surfaced by `bernstein doctor --suggest-docs`. Operator refreshes
+    # it on each release. Loader:
+    # bernstein.cli.doctor.suggest_docs.load_unanswered_topics.
+    "src/bernstein/_default_templates/docs/*.json",
+]
+
+[tool.hatch.build.targets.wheel.force-include]
+"templates/prompts" = "bernstein/_default_templates/prompts"
+"templates/bernstein.yaml" = "bernstein/_default_templates/bernstein.yaml"
+# Progressive-disclosure skill packs - shipped alongside the wheel so
+# installed packages get the index without requiring a checkout of
+# templates/.
+"templates/skills" = "bernstein/_default_templates/skills"
+"templates/roles" = "bernstein/_default_templates/roles"
+# Review pipeline DSL - built-in stage templates and the default 3-phase
+# pipeline. Loaded by bernstein.core.quality.review_pipeline at runtime
+# when users omit a pipeline path.
+"templates/review" = "bernstein/_default_templates/review"
+# Lethal-trifecta capability matrix declarations.  Bundled so the
+# default-deny check can find tags right after pip install.
+"templates/capabilities" = "bernstein/_default_templates/capabilities"
+# Provenance trust-class source map (issue #2513). Bundled so tool-result
+# taint classification resolves right after pip install.
+"templates/provenance" = "bernstein/_default_templates/provenance"
+# Stock YAML workflow manifests (#1108) shipped with the wheel so
+# `bernstein workflow list` / `... run <name>` resolve immediately
+# without requiring a source checkout.
+"templates/workflows" = "bernstein/_default_templates/workflows"
+# First-class recipe library - parameterised workflows for common
+# operator tasks (refactor-glob, bump-dependency, add-tests-for-module,
+# license-audit, regenerate-docs).  Shipped in the wheel so
+# `bernstein recipes list|show|run` resolves immediately.
+"templates/recipes" = "bernstein/_default_templates/recipes"
+# Per-task criterion profile presets (issue #1346).  Shipped in the
+# wheel so `bernstein run --criterion-profile safety-first` resolves
+# without a source checkout, mirroring the mode_profile pattern.
+"templates/criterion_profiles" = "bernstein/_default_templates/criterion_profiles"
+# Blast-radius detector defaults (#1322) so the reversibility gate finds
+# its rule list without requiring a source checkout.
+"templates/blast-radius" = "bernstein/_default_templates/blast-radius"
+# Built-in team manifests (#2248) so `team_manifest: python` and the
+# `bernstein team` commands resolve right after pip install.
+"templates/teams" = "bernstein/_default_templates/teams"
+# Adapter admission evidence (#3547). The verdict `bernstein adapters
+# verify --seal` derives is a projection of the pinned contract's bytes and
+# the golden-transcript replay, so both have to be resolvable off a pip
+# install or every adapter falls back to a skip-shaped refusal
+# (`no_contract` / `no_transcript`) and the seal can never go green outside
+# a dev checkout. Both trees are shipped verbatim rather than filtered, so
+# an installed host derives the same replay fingerprint a checkout does.
+# Loaders: bernstein.adapters._contract.CONTRACTS_DIR and
+# bernstein.adapters.admission.golden_transcripts_dir.
+"tests/contract/contracts" = "bernstein/_default_templates/adapter_contracts"
+"tests/golden" = "bernstein/_default_templates/adapter_golden"
+# Cross-vendor agent-plugin assets (#2369): the bernstein-run skill plus
+# the plugin command/agent/rule files, so `bernstein skills package
+# install` resolves the bundled tree right after pip install. Loader:
+# bernstein.core.skills.packaging.packaged_asset_root.
+"skills" = "bernstein/_default_templates/agent_plugin/skills"
+"commands" = "bernstein/_default_templates/agent_plugin/commands"
+"agents" = "bernstein/_default_templates/agent_plugin/agents"
+"rules" = "bernstein/_default_templates/agent_plugin/rules"
+".mcp.json" = "bernstein/_default_templates/agent_plugin/.mcp.json"
+".plugin/plugin.json" = "bernstein/_default_templates/agent_plugin/.plugin/plugin.json"
+# ascii_logo.md now lives in-package at src/bernstein/_default_templates/ -
+# no force-include needed. The dev-repo copy at docs/assets/ascii_logo.md is
+# the display fallback read by cli/display/splash_v2.py when running from a
+# source checkout.
+
+[tool.hatch.build.targets.sdist.force-include]
+# Wheel force-include sources must also exist inside the sdist: `uv build`
+# (and any pip install from the sdist) builds the wheel FROM the sdist, and
+# hatchling hard-fails on a missing force-include source. Every other wheel
+# force-include source above (templates/, skills, ...) survives into the
+# sdist by default, but these two live under tests/, which the global
+# [tool.hatch.build] exclude drops - so they are re-included here verbatim,
+# at their checkout paths. Guard:
+# tests/unit/test_adapter_verification_data_in_wheel.py.
+"tests/contract/contracts" = "tests/contract/contracts"
+"tests/golden" = "tests/golden"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+src = ["src"]
+extend-exclude = [
+    "src/bernstein/core/grpc_gen",
+    "scripts/gen_tickets_*.py",
+    "scripts/gen_roadmap_*.py",
+    "scripts/convert_tickets_*.py",
+    # Intentionally vulnerable synthetic codebase used by the
+    # security-pentest eval scenario. Linting it makes no sense; the
+    # files exist so the security role can find seeded findings.
+    "tests/fixtures/eval/security_pentest/**",
+    # Cookiecutter source templates with Jinja-interpolated identifiers
+    # ({{cookiecutter.X}}) that ruff cannot parse as Python.
+    "templates/**",
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "lf"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "TCH", "RUF"]
+# TC006: We use module-level string constants for cast() type args (Sonar S1192).
+# Ruff cannot see through the indirection and flags them as "unquoted".
+ignore = ["TC006"]
+
+[tool.ruff.lint.per-file-ignores]
+# HTML/CSS template strings that cannot be wrapped without breaking structure
+"src/bernstein/evolution/report.py" = ["E501"]
+# Agent-generated modules with long inline strings and class-level lists
+"src/bernstein/adapters/mock.py" = ["E501"]
+"src/bernstein/compliance/eu_ai_act.py" = ["E501", "RUF012"]
+"src/bernstein/core/differential_privacy.py" = ["RUF002"]
+"src/bernstein/core/license_scanner.py" = ["E501"]
+"src/bernstein/core/memory_integrity.py" = ["E501", "RUF003"]
+"src/bernstein/core/seed_config.py" = ["TC001"]
+"src/bernstein/core/server_models.py" = ["TC001"]
+"src/bernstein/core/server_middleware.py" = ["TC002"]
+"src/bernstein/core/spawner_merge.py" = ["TC003"]
+"src/bernstein/core/spawner_worktree.py" = ["TC003"]
+"src/bernstein/core/spawner_warm_pool.py" = ["TC003"]
+"src/bernstein/core/server_supervisor.py" = ["TC003"]
+"src/bernstein/core/runtime_state.py" = ["TC003"]
+"src/bernstein/cli/frame_buffer.py" = ["TC003", "RUF002"]
+"src/bernstein/cli/gradients.py" = ["TC003", "RUF002", "RUF003"]
+"src/bernstein/cli/image_renderer.py" = ["TC003"]
+"benchmarks/run_benchmark.py" = ["E501", "RUF002"]
+"scripts/generate_roadmap_tickets.py" = ["E501", "RUF001"]
+# Ticket/roadmap generators have long inline strings and unicode symbols
+"scripts/gen_tickets_*.py" = ["E501", "RUF001"]
+"scripts/gen_roadmap_*.py" = ["E501", "RUF001"]
+"scripts/convert_tickets_*.py" = ["RUF001"]
+"tests/pentest/*.py" = ["SIM105"]
+"sdk/python/src/bernstein_sdk/adapters/github_actions.py" = ["E501"]
+"sdk/python/src/bernstein_sdk/adapters/jira.py" = ["E501"]
+"tests/**/*.py" = ["E402", "E501", "E741", "RUF002", "RUF003", "RUF012", "RUF043", "SIM108", "SIM117", "TC002", "TC003", "TC006"]
+# Bug-hunt suite uses ambiguous unicode (homoglyphs, ZWS) intentionally for bypass tests
+"tests/property/test_capability_matrix_bughunt.py" = ["RUF001", "RUF002", "RUF003"]
+# Example plugins are worked-example packages; runtime imports survive
+# ``TYPE_CHECKING`` blocks because tests rely on them at runtime (e.g.
+# ``pytest.fail``) and the adapter code uses ``Path`` in concrete
+# function signatures, not just hints.
+"examples/plugins/**/*.py" = ["TC001", "TC002", "TC003"]
+
+[tool.pyright]
+pythonVersion = "3.12"
+typeCheckingMode = "strict"
+include = ["src"]
+# Agent-created modules pending type annotation cleanup.
+# TODO: remove excludes as each module is cleaned up (#345h hygiene tickets)
+exclude = [
+    "src/bernstein/core/trigger_manager.py",
+    "src/bernstein/core/trigger_sources/",
+    "src/bernstein/core/circuit_breaker.py",
+    "src/bernstein/core/task_store.py",
+    "src/bernstein/core/task_store_core.py",
+    "src/bernstein/core/store_postgres.py",
+    "src/bernstein/core/server_launch.py",
+    "src/bernstein/core/semantic_graph.py",
+    "src/bernstein/core/repo_index.py",
+    "src/bernstein/core/cascade_router.py",
+    "src/bernstein/core/graduation.py",
+    "src/bernstein/core/auth.py",
+    "src/bernstein/core/plan_approval.py",
+    "src/bernstein/core/planner.py",
+    "src/bernstein/core/task_completion.py",
+    "src/bernstein/core/knowledge_base.py",
+    "src/bernstein/core/api_usage.py",
+    "src/bernstein/core/routes/auth.py",
+    "src/bernstein/core/routes/graduation.py",
+    "src/bernstein/core/routes/slack.py",
+    "src/bernstein/cli/checkpoint_cmd.py",
+    "src/bernstein/evolution/cycle_helpers.py",
+    "src/bernstein/evolution/report_generator.py",
+    "src/bernstein/core/batch_router.py",
+    "src/bernstein/core/bootstrap.py",
+    "src/bernstein/core/bulletin.py",
+    "src/bernstein/core/git_ops.py",
+    "src/bernstein/core/manager_parsing.py",
+    "src/bernstein/core/manager.py",
+    "src/bernstein/core/models.py",
+    "src/bernstein/core/routes/tasks.py",
+    "src/bernstein/core/routes/webhooks.py",
+    "src/bernstein/core/spawn_prompt.py",
+    "src/bernstein/core/spawner.py",
+    "src/bernstein/core/store.py",
+    "src/bernstein/compliance/",
+    "src/bernstein/benchmark/",
+    "src/bernstein/cli/audit_cmd.py",
+    "src/bernstein/cli/chaos_cmd.py",
+    "src/bernstein/cli/dashboard.py",
+    "src/bernstein/cli/dashboard_polling.py",
+    "src/bernstein/cli/dashboard_header.py",
+    "src/bernstein/cli/dashboard_actions.py",
+    "src/bernstein/cli/dashboard_app.py",
+    "src/bernstein/cli/gateway_cmd.py",
+    "src/bernstein/core/audit.py",
+    "src/bernstein/core/ci_monitor.py",
+    "src/bernstein/core/container.py",
+    "src/bernstein/core/duration_predictor.py",
+    "src/bernstein/core/incident.py",
+    "src/bernstein/core/manifest.py",
+    "src/bernstein/core/mcp_gateway.py",
+    "src/bernstein/core/memory_integrity.py",
+    "src/bernstein/core/merkle.py",
+    "src/bernstein/core/orchestrator.py",
+    "src/bernstein/core/router.py",
+    "src/bernstein/core/routes/acp.py",
+    "src/bernstein/core/routes/status.py",
+    "src/bernstein/core/runbooks.py",
+    "src/bernstein/core/slo.py",
+    "src/bernstein/core/voting.py",
+    "src/bernstein/core/workflow.py",
+    "src/bernstein/core/workflow_dsl.py",
+    "src/bernstein/cli/self_update_cmd.py",
+    "src/bernstein/tui/widgets.py",
+    "src/bernstein/cli/diff_cmd.py",
+    "src/bernstein/cli/voice_cmd.py",
+    "src/bernstein/cli/worker_cmd.py",
+    "src/bernstein/core/formal_verification.py",
+    "src/bernstein/core/seed.py",
+    "src/bernstein/core/seed_config.py",
+    "src/bernstein/core/seed_parser.py",
+    "src/bernstein/core/seed_validators.py",
+    "src/bernstein/cli/compare_screen.py",
+    "src/bernstein/cli/merge_cmd.py",
+    "src/bernstein/cli/prompts_cmd.py",
+    "src/bernstein/cli/status_cmd.py",
+    "src/bernstein/core/adaptive_parallelism.py",
+    "src/bernstein/core/cascade.py",
+    "src/bernstein/core/prompt_versioning.py",
+    "src/bernstein/core/secrets.py",
+    "src/bernstein/core/agent_lifecycle.py",
+    "src/bernstein/core/agent_reaping.py",
+    "src/bernstein/core/agent_recycling.py",
+    "src/bernstein/core/agent_state_refresh.py",
+    "src/bernstein/core/backlog_parser.py",
+    "src/bernstein/core/plan_loader.py",
+    "src/bernstein/core/runtime_state.py",
+    "src/bernstein/cli/maintenance_cmd.py",
+    "src/bernstein/cli/image_renderer.py",
+    "src/bernstein/core/agent_identity.py",
+    "src/bernstein/core/command_policy.py",
+    "src/bernstein/core/key_rotation.py",
+    "src/bernstein/core/mcp_server.py",
+    "src/bernstein/core/quality_gates.py",
+    "src/bernstein/core/server.py",
+    "src/bernstein/core/server_models.py",
+    "src/bernstein/core/server_middleware.py",
+    "src/bernstein/core/server_app.py",
+    "src/bernstein/adapters/conformance.py",
+    "src/bernstein/core/workflow_importer.py",
+    "src/bernstein/core/sbom.py",
+    "src/bernstein/core/sigstore_attestation.py",
+    "src/bernstein/core/review_rubric.py",
+    "src/bernstein/core/output_fingerprint.py",
+    "src/bernstein/core/hipaa.py",
+    "src/bernstein/core/output_normalizer.py",
+    "src/bernstein/core/integration_test_gen.py",
+    "src/bernstein/core/compliance.py",
+    "src/bernstein/core/adapter_health.py",
+    "src/bernstein/core/behavior_anomaly.py",
+    "src/bernstein/core/resource_limits.py",
+    "src/bernstein/cli/compliance_cmd.py",
+    "src/bernstein/core/vault_injector.py",
+    "src/bernstein/core/hook_protocol.py",
+    "src/bernstein/core/hook_templates.py",
+    "src/bernstein/core/frame_headers.py",
+    "src/bernstein/core/routes/batch_ops.py",
+    "src/bernstein/core/routes/embedding.py",
+    "src/bernstein/core/routes/graphql_api.py",
+    "src/bernstein/tui/layout_persistence.py",
+    "src/bernstein/tui/mouse_support.py",
+    "src/bernstein/tui/task_detail_overlay.py",
+    "src/bernstein/tui/session_recorder.py",
+    "src/bernstein/cli/conversation_inspector.py",
+    "src/bernstein/cli/leaderboard.py",
+    "src/bernstein/cli/plan_diff.py",
+    "src/bernstein/cli/plan_explain.py",
+    "src/bernstein/cli/voice_control.py",
+    "src/bernstein/core/plan_schema.py",
+    "src/bernstein/core/stack_detector.py",
+    "src/bernstein/core/vertical_packs.py",
+    "src/bernstein/core/web_graph.py",
+    "src/bernstein/core/security_correlation.py",
+    "src/bernstein/testing/parallel_runner.py",
+    "src/bernstein/tui/snapshot_testing.py",
+    "src/bernstein/core/log_search.py",
+    "src/bernstein/core/postmortem.py",
+    "src/bernstein/core/routes/team_dashboard.py",
+    "src/bernstein/core/agent_trust.py",
+    "src/bernstein/core/custom_metrics.py",
+    "src/bernstein/core/routes/custom_metrics.py",
+    # Agent-merged additions (2026-04-11) pending type-annotation cleanup.
+    # Pyright strict flagged 551 reportUnknown* errors across these modules
+    # after the latest PR wave; excluded to unblock the push. Remove as each
+    # module is cleaned up.
+    "src/bernstein/core/agent_session_token_breakdown.py",
+    "src/bernstein/core/apm_integration.py",
+    "src/bernstein/core/arch_conformance.py",
+    "src/bernstein/core/capability_router.py",
+    "src/bernstein/core/comment_quality.py",
+    "src/bernstein/core/compliance_policies.py",
+    "src/bernstein/core/config_schema.py",
+    "src/bernstein/core/context_compression.py",
+    "src/bernstein/core/dead_code_detector.py",
+    "src/bernstein/core/embedding_scorer.py",
+    "src/bernstein/core/gate_runner.py",
+    "src/bernstein/core/grpc_client.py",
+    "src/bernstein/core/grpc_server.py",
+    "src/bernstein/core/incremental_merge.py",
+    "src/bernstein/core/operator.py",
+    "src/bernstein/core/provider_latency.py",
+    "src/bernstein/core/routes/costs.py",
+    "src/bernstein/core/routes/provider_latency.py",
+    "src/bernstein/core/routes/quality.py",
+    "src/bernstein/core/run_changelog.py",
+    "src/bernstein/core/sandbox_eval.py",
+    "src/bernstein/core/test_data_gen.py",
+    "src/bernstein/core/test_expansion.py",
+    "src/bernstein/core/zombie_cleanup.py",
+    # Auto-heal v2 subpackage. The ``from_dict`` paths take unstructured
+    # JSON and defensively narrow at runtime, which pyright strict cannot
+    # follow without heavy casting. Pending follow-up hygiene ticket.
+    "src/bernstein/core/autoheal/bandit.py",
+    "src/bernstein/core/autoheal/bayesian.py",
+    "src/bernstein/core/autoheal/audit_log.py",
+    "src/bernstein/core/autoheal/shadow_mode.py",
+    "src/bernstein/core/autoheal/cordon.py",
+    "src/bernstein/core/autoheal/idempotency.py",
+]
+
+[tool.mypy]
+# Repo-wide mypy settings for the documented `uv run mypy src` command.
+# This run is advisory: mypy has a large pre-existing backlog because it
+# never actually parsed the tree (see the note on `python_version` below).
+# The subset that gates CI lives in mypy.gate.ini, the same way the
+# repo-wide pyright run is advisory and pyrightconfig.strict.json gates.
+#
+# `python_version` is pinned rather than inherited from whatever
+# interpreter happens to run mypy. It matches [tool.pyright] pythonVersion
+# and the `requires-python` floor. Note that this pins the *target*
+# version only - PEP 695 `type` aliases (11 of them in src/) still need
+# the interpreter running mypy to be >= 3.12, because mypy parses with the
+# host `ast` module. That is why mypy is a declared dev dependency: an
+# undeclared `uv run mypy` falls through to a PATH mypy that may be bound
+# to an older interpreter, and the run then aborts on the first alias with
+# `Invalid syntax` before checking anything.
+python_version = "3.12"
+files = ["src"]
+namespace_packages = true
+warn_unused_configs = true
+
+[[tool.mypy.overrides]]
+# Legacy `bernstein.core.*` / `bernstein.cli.*` import paths are served at
+# runtime by the `sys.meta_path` finders in src/bernstein/core/__init__.py
+# and src/bernstein/cli/__init__.py, not by files on disk. No static
+# checker can follow a meta-path redirect, so these resolve to nothing.
+module = ["bernstein.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# Installed dependencies that ship neither a `py.typed` marker nor a
+# published stub distribution. Checked against PyPI: there is no
+# `types-asn1crypto`, `types-kubernetes` or `types-e2b-code-interpreter`,
+# and the `google.cloud` namespace package carries no marker of its own
+# even though the individual `google-cloud-*` distributions do.
+#
+# Every other untyped import in the tree is resolved by a real stub
+# package in [dependency-groups].dev instead - see the block there. This
+# list is the residue, and it should shrink as upstream adds markers, not
+# grow. Adding an entry here means "no type information exists anywhere";
+# it is not a place to park a package we simply have not stubbed yet.
+module = [
+    "asn1crypto.*",  # RFC 3161 ASN.1 parsing, core/security/rfc3161_verifier.py
+    "e2b_code_interpreter.*",  # `e2b` extra, core/sandbox/backends/e2b.py
+    "google.cloud.*",  # `gcs` extra, core/security/secrets_broker.py
+    "kubernetes.*",  # `k8s` extra, core/orchestration/operator.py
+]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# Optional backends imported inside a function body behind a try/except
+# ImportError, with a typed fallback when absent. They are absent from the
+# environment `uv run mypy src` sees - the first group is not declared in
+# [project] at all, the second is behind an extra that a plain `uv sync`
+# does not install - so mypy reports `import-not-found`.
+#
+# `ignore_missing_imports` only applies to an import that fails to
+# resolve. Where the package is present and ships inline annotations
+# (`datasets`, `spiffe`, and most of the first group), mypy reads the real
+# types and this override does nothing - so it silences the "not
+# installed" noise without masking a typed surface.
+#
+# The first group is deliberately not installed rather than un-stubbed:
+# pulling it into the dev group to read those annotations would add native
+# toolchains (sounddevice/PortAudio, weasyprint/cairo+pango), multi-
+# gigabyte ML runtimes (faster-whisper), and import-time-patching APM
+# agents (ddtrace, newrelic) to every CI job.
+module = [
+    "asyncpg.*",  # core/persistence/store_postgres.py, cli/commands/status_cmd.py
+    "ddtrace.*",  # core/observability/apm_integration.py
+    "faster_whisper.*",  # cli/commands/voice_cmd.py
+    "newrelic.*",  # core/observability/apm_integration.py
+    "redis.*",  # core/persistence/store_redis.py
+    "sigstore.*",  # core/security/{sigstore_attestation,audit_receipt}.py
+    "sounddevice.*",  # cli/commands/voice_cmd.py
+    "tiktoken.*",  # tui/context_tokens.py
+    "weasyprint.*",  # core/observability/postmortem.py
+    "zstandard.*",  # core/observability/trace_store.py
+    # Declared extras, absent from a plain `uv sync`:
+    "datasets.*",  # `eval` extra, benchmark/{swe_bench,programbench}.py
+    "spiffe.*",  # `spiffe` extra, core/identity/spiffe/workload_api.py
+]
+ignore_missing_imports = true
+
+[tool.bernstein.readme-l10n]
+# Translated README variants gated by `bernstein readme-l10n verify`
+# (issue #3425). Adding a language is a data change: append its IETF tag
+# here and add docs/i18n/README.<tag>.md carrying l10n bindings.
+languages = ["zh-Hans", "zh-TW", "ja", "ko", "hi", "bn", "ru", "es", "pt", "de", "fr", "it", "nl", "pl", "sv", "fi", "uk", "tr", "ar", "he", "id", "vi", "th"]
+
+# Who keeps each translation current. `verify` names the owner when a
+# language drifts, so the report reaches someone who reads the language
+# rather than defaulting to whoever merged last. A language with no entry
+# here is reported as unowned and is a removal candidate rather than a
+# standing obligation. Handing a language over is a one-line change to
+# this table, made by the person taking it on.
+[tool.bernstein.readme-l10n.owners]
+"zh-Hans" = "@chernistry"
+"zh-TW" = "@chernistry"
+"ja" = "@chernistry"
+"ko" = "@chernistry"
+"hi" = "@chernistry"
+"bn" = "@chernistry"
+"ru" = "@chernistry"
+"es" = "@chernistry"
+"pt" = "@chernistry"
+"de" = "@chernistry"
+"fr" = "@chernistry"
+"it" = "@chernistry"
+"nl" = "@chernistry"
+"pl" = "@chernistry"
+"sv" = "@chernistry"
+"fi" = "@chernistry"
+"uk" = "@chernistry"
+"tr" = "@chernistry"
+"ar" = "@chernistry"
+"he" = "@chernistry"
+"id" = "@chernistry"
+"vi" = "@chernistry"
+"th" = "@chernistry"
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+pythonpath = ["src"]
+# Tests use explicit @pytest.mark.asyncio - keep strict mode to avoid
+# auto-collecting unmarked async tests and breaking existing suites.
+asyncio_mode = "strict"
+addopts = [
+    "--strict-markers",
+    "--strict-config",
+]
+markers = [
+    "ci: tests that run as part of CI for every release",
+    "auth_enabled: opt out of the autouse auth-disabled shim (tests that exercise auth defaults)",
+    "audit_key_real: opt out of the autouse audit-key path isolation (tests that exercise the real resolution logic)",
+    "cluster_e2e: real-process cluster harness tests; skipped by default, run via the cluster-e2e workflow",
+    "slow: long-running tests (> ~5s); skipped by default in fast feedback runs",
+    "integration: end-to-end / subprocess-driven integration tests; selectable via -m integration in CI",
+    "stress: resource-leak / memory-growth / deadlock stress tests (TC-C); gated off by default CI, run nightly via `-m stress`",
+    "allow_network: opt out of the autouse unit no-network guard (rare; a genuine integration test belongs in tests/integration/ instead)",
+    "protocol: protocol compatibility tests; applied to every item under tests/protocol/ by that directory's conftest, and run by the publish workflow's release gate",
+]
+# Visible warnings without converting to errors; individual tests or runs
+# can tighten via `pytest -W error::DeprecationWarning`.
+filterwarnings = [
+    "default",
+    "ignore::PendingDeprecationWarning",
+    "ignore::ResourceWarning",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["bernstein"]
+omit = [
+    "*/tests/*",
+    "*/test_*.py",
+    "*/_default_templates/*",
+    "*/__main__.py",
+]
+
+[tool.coverage.paths]
+source = [
+    "src/bernstein",
+    "*/site-packages/bernstein",
+]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
+    "raise NotImplementedError",
+    "raise AssertionError",
+    "@abstractmethod",
+    "@overload",
+    "\\.\\.\\.",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+    "pytest-asyncio>=1.3.0",
+    "pytest-cov>=7.1.0",
+    "pytest-benchmark>=4.0",
+    "pytest-timeout>=2.4.0",
+    "hypothesis>=6.100",
+    "respx>=0.22",
+    "ruff>=0.9",
+    "pyright>=1.1",
+    # Declared so `uv run mypy` resolves the project interpreter instead of
+    # falling through to whatever `mypy` sits on PATH. A PATH mypy bound to
+    # Python < 3.12 cannot parse PEP 695 `type` aliases and aborts the run.
+    # Mirror of [project.optional-dependencies].dev.
+    "mypy>=1.18.2",
+    "scikit-learn>=1.5",
+    # Pinned to the 3.x line - the focused harness in
+    # scripts/mutmut_critical.py / scripts/mutmut_lineage.py is validated
+    # against 3.5.0. mutmut's config surface and CLI moved between 2.x
+    # and 3.x; bump the upper bound deliberately when validating 4.x.
+    "mutmut>=3.5,<4",
+    "import-linter>=2.0",  # Architecture contracts (`uv run lint-imports`)
+    # CI hardening 2026 - keep this section in sync with [project.optional-dependencies].dev.
+    "schemathesis>=4.18.1",
+    "crosshair-tool>=0.0.95",
+    "bandit>=1.8",
+    "pip-audit>=2.7",
+    "beartype>=0.21",
+    "syrupy>=4.6",
+    "diff-cover>=9.0",
+    # PDF re-parse for Article 12 evidence tests (mirror of
+    # [project.optional-dependencies].dev).  Floor raised to the patched
+    # release for CVE-2026-59935 / CVE-2026-59936 (crafted-PDF DoS).
+    "pypdf>=6.14.2",
+    # Resource-leak probes for the TC-C stress suite (mirror of
+    # [project.optional-dependencies].dev).  Optional at runtime - the
+    # stress suite ``importorskip``s when missing.
+    "psutil>=5.9",
+    # Flake detection + auto-quarantine PR generator. Mirror of
+    # [project.optional-dependencies].dev. Driven by the nightly
+    # .github/workflows/flake-quarantine.yml workflow; pytest-json-report
+    # is a transitive requirement. pytest-randomly is intentionally NOT
+    # a dev dep - it auto-activates on import and would shuffle every
+    # other CI job's test order; the nightly workflow installs it
+    # ad-hoc. See docs/contributing/flake-handling.md.
+    "pytest-xflaky>=1.0.3",
+    "pytest-json-report>=1.5",
+    # Error-telemetry SDK for the operator-managed Sentry-protocol-compatible
+    # error sink. Mirror of [project.optional-dependencies].dev; the lazy
+    # init in src/bernstein/cli/main.py keeps no-op installs free.
+    "sentry-sdk[fastapi]>=2.20",
+    # Cron expression parser. Mirror of [project.optional-dependencies].dev;
+    # optional at runtime, required here so the cron-evaluation tests in
+    # tests/unit/test_trigger_manager.py run rather than importorskip out.
+    "croniter>=6.0",
+    # semgrep installed via `uv tool install semgrep` in CI - pins
+    # click<8.2 and opentelemetry-sdk<1.38, conflicts with our
+    # click>=8.3.3 / opentelemetry-sdk>=1.41.1 floors. Mirror of
+    # [project.optional-dependencies].dev.
+    #
+    # Type stubs for dependencies that ship no inline annotations. Mirror of
+    # [project.optional-dependencies].dev. Everything below is typeshed's
+    # own `types-*` distribution except lxml-stubs (published by the lxml
+    # developers) and boto3-stubs / botocore-stubs (mypy_boto3 project).
+    # Stub-only wheels: no runtime code, no import cost. They are dev-only
+    # because they are consumed by `uv run mypy src`.
+    "types-pyyaml>=6.0.12.20260724",  # pyyaml
+    "types-jsonschema>=4.26.0.20260518",  # jsonschema
+    "types-reportlab>=4.5.1.20260724",  # reportlab
+    "types-defusedxml>=0.7.0.20260504",  # defusedxml
+    "types-psutil>=7.2.2.20260518",  # psutil
+    "types-croniter>=6.2.4.20260711",  # croniter
+    "types-qrcode>=8.2.0.20260518",  # qrcode (gui extra)
+    "types-grpcio>=1.82.1.20260724",  # grpcio (grpc extra)
+    "types-grpcio-reflection>=1.0.0.20260508",  # grpcio-reflection (grpc extra)
+    "lxml-stubs>=0.5.1",  # lxml, via signxml (SAML assertion parsing)
+    "boto3-stubs>=1.43.56",  # boto3 (s3 / r2 extras), published by the mypy_boto3 project
+    "botocore-stubs>=1.43.14",  # botocore, same publisher
+    "playwright>=1.62.0",
+]
+
+[tool.uv]
+# The checked-in gRPC gencode under src/bernstein/core/grpc_gen/ carries
+# `Protobuf Python Version: 7.35.1` and calls ValidateProtobufRuntimeVersion()
+# at import time, which rejects any runtime from an older major. The modal SDK
+# caps protobuf below 7.0, so the `grpc` and `modal` extras cannot share one
+# environment. Declaring the conflict keeps the universal lock resolvable and
+# turns a former import-time VersionError into an install-time resolution
+# error, which is where a dependency conflict belongs.
+#
+# `otel` has the same shape as `grpc` here, not a different one:
+# opentelemetry-exporter-otlp-proto-grpc>=1.41.1 pins protobuf==7.35.1 (same
+# generated-code floor as the checked-in gRPC gencode above), which modal's
+# <7.0 cap rules out just as directly. Undeclared, this doesn't fail as a
+# known-incompatible pair - it fails as "your project's requirements are
+# unsatisfiable" from the *whole* lockfile, which is what aborted every `uv`
+# dependency-update run rather than just the two extras that actually clash
+# (#4088).
+conflicts = [[{ extra = "grpc" }, { extra = "modal" }], [{ extra = "otel" }, { extra = "modal" }]]
+
+[tool.mutmut]
+# Lineage v1 mutation testing - see scripts/mutmut_lineage.py for the
+# focused runner that exercises only the three lineage modules. The
+# project-wide conftest pulls heavyweight imports that mutmut 3's
+# `mutants/` shadow tree can't satisfy, so we ship a thin custom
+# harness alongside the standard config for ad-hoc deep runs.
+#
+# The wider fixed critical-path gate (claim_next, audit_log, audit
+# integrity, lineage v1, seed parser) is driven by
+# `scripts/mutmut_critical.py` and the .github/workflows/mutation-fixed.yml
+# workflow. The list below is kept *narrow* on purpose: anything bigger
+# breaks the mutmut-3 shadow tree because of our heavyweight conftest.
+# To add a module to the gate, extend `MODULES` in mutmut_critical.py
+# and the workflow matrix, NOT this list.
+paths_to_mutate = [
+    "src/bernstein/core/lineage/gate.py",
+    "src/bernstein/core/lineage/tips.py",
+    "src/bernstein/core/lineage/merge.py",
+]
+tests_dir = ["tests/unit/lineage/"]
+pytest_add_cli_args = ["--no-cov", "-p", "no:cacheprovider"]
+do_not_mutate = []

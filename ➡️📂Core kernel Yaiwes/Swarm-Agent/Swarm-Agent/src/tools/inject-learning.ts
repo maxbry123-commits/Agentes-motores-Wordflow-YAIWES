@@ -1,0 +1,90 @@
+import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import * as z from "zod";
+import { getAgentById } from "@/be/db";
+import { getEmbeddingProvider, getMemoryStore } from "@/be/memory";
+import { can } from "@/rbac";
+import { createToolRegistrar, swarmToolOutputSchema, toolErr, toolOk } from "@/tools/utils";
+
+const LearningCategoryEnum = z.enum([
+  "mistake-pattern",
+  "best-practice",
+  "codebase-knowledge",
+  "preference",
+]);
+
+export const registerInjectLearningTool = (server: McpServer) => {
+  createToolRegistrar(server)(
+    "inject-learning",
+    {
+      title: "Inject learning into worker memory",
+      annotations: { destructiveHint: false },
+      description:
+        "Allows the lead agent to push learnings into a worker's memory. The learning will be stored as a searchable memory entry that the worker can recall in future sessions.",
+      inputSchema: z.object({
+        agentId: z.string().describe("Target worker agent ID"),
+        learning: z.string().min(1).describe("The learning content to inject"),
+        category: LearningCategoryEnum.describe(
+          "Category of the learning: mistake-pattern, best-practice, codebase-knowledge, or preference",
+        ),
+      }),
+      outputSchema: swarmToolOutputSchema({
+        memoryId: z.string().optional(),
+      }),
+    },
+    async ({ agentId: targetAgentId, learning, category }, requestInfo, _meta) => {
+      if (!requestInfo.agentId) {
+        return toolErr('Agent ID not found. The MCP client should define the "X-Agent-ID" header.');
+      }
+
+      // Validate caller is the lead agent
+      const callerAgent = await getAgentById(requestInfo.agentId);
+      const decision = can({
+        principal: {
+          kind: "agent",
+          agentId: requestInfo.agentId,
+          isLead: callerAgent?.isLead ?? false,
+        },
+        verb: "memory.learning.inject",
+        resource: { kind: "agent", agentId: targetAgentId },
+        source: "mcp",
+      });
+      if (!decision.allow) {
+        return toolErr("Only the lead agent can inject learnings into worker memory.");
+      }
+
+      // Validate target agent exists
+      const targetAgent = await getAgentById(targetAgentId);
+      if (!targetAgent) {
+        return toolErr(`Agent with ID "${targetAgentId}" not found in the swarm.`);
+      }
+
+      // Create swarm-scoped memory — lead learnings are organizational knowledge visible to all workers
+      const content = `[Lead Feedback — ${category}]\n\n${learning}`;
+      const store = getMemoryStore();
+      const memory = await store.store({
+        agentId: targetAgentId,
+        scope: "swarm",
+        name: `Lead feedback: ${category} — ${learning.slice(0, 60)}`,
+        content,
+        source: "manual",
+        tags: [category],
+      });
+
+      // Generate and store embedding (async, best-effort)
+      try {
+        const provider = getEmbeddingProvider();
+        const embedding = await provider.embed(content);
+        if (embedding) {
+          await store.updateEmbedding(memory.id, embedding, provider.name);
+        }
+      } catch {
+        // Non-blocking — memory was created, embedding is optional
+      }
+
+      const targetName = targetAgent.name || targetAgentId.slice(0, 8);
+      return toolOk(`Learning injected into ${targetName}'s memory (category: ${category}).`, {
+        data: { memoryId: memory.id },
+      });
+    },
+  );
+};

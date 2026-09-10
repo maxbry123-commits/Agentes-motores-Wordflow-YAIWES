@@ -1,0 +1,588 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Reyn</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: system-ui, sans-serif; background: #0f0f11; color: #e8e8ec; min-height: 100vh; }
+
+    #shell-chrome {
+      position: fixed;
+      top: 0;
+      right: 0;
+      z-index: 9999;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 12px;
+      background: rgba(15, 15, 17, 0.85);
+      border-bottom-left-radius: 8px;
+      backdrop-filter: blur(8px);
+      font-size: 12px;
+    }
+
+    #shell-chrome label { color: #888; }
+    #design-picker {
+      background: #1c1c22;
+      color: #e8e8ec;
+      border: 1px solid #333;
+      border-radius: 4px;
+      padding: 3px 6px;
+      font-size: 12px;
+      cursor: pointer;
+    }
+
+    #schema-warning {
+      display: none;
+      position: fixed;
+      top: 48px;
+      right: 12px;
+      background: #3a1f00;
+      border: 1px solid #b34700;
+      border-radius: 6px;
+      padding: 10px 14px;
+      font-size: 12px;
+      color: #ffb86c;
+      z-index: 9998;
+      max-width: 320px;
+    }
+
+    #design-mount { width: 100%; min-height: 100vh; }
+
+    #shell-loading {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      height: 100vh;
+      color: #555;
+      font-size: 14px;
+    }
+  </style>
+</head>
+<body>
+
+<!-- Shell chrome: design picker (top-right) -->
+<div id="shell-chrome">
+  <label for="design-picker">Design</label>
+  <select id="design-picker" title="Switch design"></select>
+</div>
+
+<!-- Schema mismatch warning (shown if needed) -->
+<div id="schema-warning"></div>
+
+<!-- Design mount point -->
+<div id="design-mount">
+  <div id="shell-loading">Loading Reyn…</div>
+</div>
+
+<script>
+(async function shellMain() {
+  "use strict";
+
+  // ── 1. Fetch /api/web/config ─────────────────────────────────────────────
+  let config = { default_design: null, schemas_supported: ["reyn-ui/v1"], available_designs: [] };
+  try {
+    const r = await fetch("/api/web/config");
+    if (r.ok) config = await r.json();
+  } catch (e) {
+    console.warn("[shell] /api/web/config fetch failed:", e);
+  }
+
+  const { available_designs = [], schemas_supported = [], default_design: serverDefault = null } = config;
+
+  // ── 2. Design selection (priority: URL param → localStorage → server default → first alpha) ──
+  const urlParam = new URLSearchParams(location.search).get("design");
+  const lsDesign = localStorage.getItem("openui_design");
+  let chosenSlug = urlParam || lsDesign || serverDefault || null;
+
+  // Fallback: first alphabetically
+  if (!chosenSlug && available_designs.length > 0) {
+    chosenSlug = [...available_designs].sort((a, b) => a.slug.localeCompare(b.slug))[0].slug;
+  }
+
+  // Persist URL param to localStorage
+  if (urlParam) localStorage.setItem("openui_design", urlParam);
+
+  // ── 3. Populate design picker ─────────────────────────────────────────────
+  const picker = document.getElementById("design-picker");
+  const sortedDesigns = [...available_designs].sort((a, b) => a.slug.localeCompare(b.slug));
+
+  sortedDesigns.forEach(d => {
+    const opt = document.createElement("option");
+    opt.value = d.slug;
+    const sourceLabel = d.source === "stdlib" ? "⬡" : d.source === "project" ? "⬢" : "◈";
+    opt.textContent = `${d.slug} ${sourceLabel}`;
+    if (d.slug === chosenSlug) opt.selected = true;
+    picker.appendChild(opt);
+  });
+
+  if (sortedDesigns.length === 0) {
+    const opt = document.createElement("option");
+    opt.textContent = "(no designs)";
+    opt.disabled = true;
+    picker.appendChild(opt);
+  }
+
+  picker.addEventListener("change", () => {
+    localStorage.setItem("openui_design", picker.value);
+    location.reload();
+  });
+
+  // ── 4. Schema check ───────────────────────────────────────────────────────
+  const chosenDesign = available_designs.find(d => d.slug === chosenSlug);
+  if (chosenDesign) {
+    const designSchema = chosenDesign.schema || "reyn-ui/v1";
+    if (!schemas_supported.includes(designSchema)) {
+      const w = document.getElementById("schema-warning");
+      w.style.display = "block";
+      w.textContent = `Warning: design "${chosenSlug}" targets schema "${designSchema}" but this host supports ${schemas_supported.join(", ")}.`;
+    }
+  }
+
+  // ── 5. Set OPENUI_* globals ───────────────────────────────────────────────
+  window.OPENUI_SCHEMA = "reyn-ui/v1";
+  window.OPENUI_DESIGN_MODE = false;
+
+  // Fetch initial data
+  let initialData = {
+    AGENTS: [], RECAP: [], QUICKSTARTS: [], LIBRARY: [],
+    CONVO_ARIA: [], CONVO_ARIA_STUDIO: [],
+    RUN_EVENTS: [], RUNS_LIST: [], PERMISSIONS: [],
+    COPY: { en: _defaultCopy("en"), ja: _defaultCopy("ja") }
+  };
+  try {
+    const r = await fetch("/api/web/data");
+    if (r.ok) initialData = await r.json();
+  } catch (e) {
+    console.warn("[shell] /api/web/data fetch failed:", e);
+  }
+  window.OPENUI_DATA = initialData;
+
+  // ── 6. AG-UI SSE setup (ADR-0039 P6b) ─────────────────────────────────────
+  // The browser is a reyn-aware AG-UI client. Server→client is an EventSource
+  // over the P0-gated /agui/chat/{agent}/events SSE endpoint; each AG-UI event
+  // carries the exact reyn frame in its ``_reyn`` block, so we reconstruct the
+  // identical {kind,text,meta} the design's ``agent.message`` channel consumes
+  // (byte-preserved contract). Client→server is a POST to /agui/chat/{agent}
+  // (below in OPENUI_HOST.invoke).
+  let _es = null;               // EventSource (server→client display stream)
+  let _currentAgent = null;
+  const _connectionId = _newConnectionId();  // stable surface id (SSE + POSTs)
+  const _channelHandlers = {};  // channel → Set<handler>
+
+  // The AG-UI event types that can carry a ``_reyn.frame === "display"`` block
+  // (protocol.py ``_DISPLAY_KIND_EVENT`` + its CUSTOM fallback). Every display
+  // kind — known or future — encodes to one of these, so listening to the set is
+  // complete for the display stream. STATE_*/RUN_*/TOOL_CALL_*/MESSAGES_SNAPSHOT
+  // are NOT display frames and are ignored — live-only, display-kind-only
+  // forwarding (no backlog replay, no status side-channel), the same display
+  // shape the browser consumed before.
+  const _REYN_DISPLAY_EVENTS = [
+    "TEXT_MESSAGE_CONTENT", "REASONING_MESSAGE_CONTENT", "RUN_ERROR", "CUSTOM",
+  ];
+
+  function _newConnectionId() {
+    try {
+      if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
+    } catch (_) {}
+    return "c" + Math.random().toString(16).slice(2) + Date.now().toString(16);
+  }
+
+  // ADR-0039 P0/SR5: the gateway requires an auth token on the loopback/network
+  // (browser) surface. EventSource cannot set headers, so the token rides the
+  // query string (``?token=`` is the SR5-correct browser auth; the browser
+  // cannot use the UDS carve-out). ``connection_id`` correlates the SSE GET with
+  // its sibling POSTs so they share one surface identity.
+  function _authQuery(extra) {
+    const p = new URLSearchParams();
+    const t = new URLSearchParams(location.search).get("token");
+    if (t) p.set("token", t);
+    p.set("connection_id", _connectionId);
+    for (const k in (extra || {})) p.set(k, extra[k]);
+    const s = p.toString();
+    return s ? `?${s}` : "";
+  }
+
+  function _onReynDisplayEvent(ev) {
+    let data;
+    try { data = JSON.parse(ev.data); } catch (_) { return; }
+    const reyn = data && data._reyn;
+    // Only reyn DISPLAY frames become agent.message. A generic/foreign event or
+    // a non-display reyn frame (event/state/intervention_tool) is ignored — the
+    // ignore-unknown / graceful-degrade contract (D6).
+    if (!reyn || reyn.frame !== "display") return;
+    const kind = reyn.kind || "";
+    // Control sentinels (__copy_last_reply__ / __rewind_list__ / __attach_request__)
+    // ride the wire as CUSTOM display frames for the terminal thin client, but the
+    // browser message-shell does not consume them and never received them before.
+    // Drop the __-prefixed control namespace.
+    if (kind.startsWith("__")) return;
+    // Reconstruct the exact {kind,text,meta} contract — designs unchanged.
+    _dispatch("agent.message", { kind, text: reyn.text || "", meta: reyn.meta || {} });
+  }
+
+  function _connectSSE(agentName) {
+    if (_es) { try { _es.close(); } catch (_) {} }
+    _currentAgent = agentName;
+    _es = new EventSource(
+      `/agui/chat/${encodeURIComponent(agentName)}/events${_authQuery()}`
+    );
+    _REYN_DISPLAY_EVENTS.forEach(t => _es.addEventListener(t, _onReynDisplayEvent));
+    _es.addEventListener("error", (e) => console.warn("[shell] SSE error:", e));
+  }
+
+  async function _postToAgent(agentName, payload) {
+    // Client→server over the AG-UI POST. ``user_message`` maps server-side to
+    // submit_user_text → pending-intervention resolution (the same user_message
+    // semantics the browser had before). A 401/403 means the auth token is
+    // missing or unauthorized (SR5) — surfaced to the console; no send-ack UX.
+    try {
+      const r = await fetch(
+        `/agui/chat/${encodeURIComponent(agentName)}${_authQuery()}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        }
+      );
+      if (!r.ok) console.warn(`[shell] POST /agui/chat failed: ${r.status}`);
+      return r;
+    } catch (e) {
+      console.warn("[shell] POST /agui/chat error:", e);
+    }
+  }
+
+  function _dispatch(channel, event) {
+    const handlers = _channelHandlers[channel];
+    if (!handlers) return;
+    handlers.forEach(h => {
+      try { h(event); } catch (e) { console.error("[shell] channel handler threw:", e); }
+    });
+  }
+
+  // ── 7. OPENUI_HOST.invoke ─────────────────────────────────────────────────
+  async function invoke(action, payload) {
+    if (action === "data.refetch") {
+      const r = await fetch("/api/web/data");
+      if (!r.ok) throw new Error(`data.refetch failed: ${r.status}`);
+      const data = await r.json();
+      window.OPENUI_DATA = data;
+      return data;
+    }
+
+    if (action === "agent.submit") {
+      const { agentId, text } = payload || {};
+      if (!agentId) throw new Error("agent.submit requires agentId");
+      // Ensure the SSE stream is open for this agent (receive side), then POST
+      // the turn (send side). The POST is independent of the SSE connection, so
+      // no send-buffering / open-gate is needed.
+      if (!_es || _currentAgent !== agentId) {
+        _connectSSE(agentId);
+      }
+      await _postToAgent(agentId, { type: "user_message", text: String(text || "") });
+      return;
+    }
+
+    if (action === "agent.intervention.answer") {
+      const { choiceId, text } = payload || {};
+      // Intervention answer uses the SAME user_message fallback as a submit:
+      // submit_user_text resolves the pending intervention server-side. Routed
+      // to the currently-connected agent (an answer only follows a live submit).
+      const agentName = _currentAgent;
+      if (!agentName) throw new Error("agent.intervention.answer: no active agent");
+      await _postToAgent(agentName, {
+        type: "user_message", text: String(choiceId || text || ""),
+      });
+      return;
+    }
+
+    if (action === "agent.add") {
+      const r = await fetch("/api/agents", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: payload.name, role: payload.role_prompt || "" }),
+      });
+      if (!r.ok) throw new Error(`agent.add failed: ${r.status}`);
+      return await r.json();
+    }
+
+    if (action === "agent.remove") {
+      const r = await fetch(`/api/agents/${encodeURIComponent(payload.agentId)}`, { method: "DELETE" });
+      if (!r.ok) throw new Error(`agent.remove failed: ${r.status}`);
+      return;
+    }
+
+    if (action === "run.cancel") {
+      const r = await fetch(`/api/runs/${encodeURIComponent(payload.runId)}/cancel`, { method: "POST" });
+      if (!r.ok && r.status !== 404) throw new Error(`run.cancel failed: ${r.status}`);
+      return;
+    }
+
+    if (action === "permission.update") {
+      // Best-effort: permission store is approvals.yaml; full rule update not yet wired
+      console.warn("[shell] permission.update not yet fully wired:", payload);
+      return;
+    }
+
+    if (action === "permission.remove") {
+      const key = `${payload.op}:${payload.glob}`;
+      const r = await fetch(`/api/permissions/${encodeURIComponent(key)}`, { method: "DELETE" });
+      if (!r.ok && r.status !== 404) throw new Error(`permission.remove failed: ${r.status}`);
+      return;
+    }
+
+    throw new Error(`unknown action: ${action}`);
+  }
+
+  // ── 8. OPENUI_HOST.listen ─────────────────────────────────────────────────
+  function listen(channel, handler) {
+    if (!_channelHandlers[channel]) _channelHandlers[channel] = new Set();
+    _channelHandlers[channel].add(handler);
+
+    let removed = false;
+    return function unsubscribe() {
+      if (removed) return;
+      removed = true;
+      const s = _channelHandlers[channel];
+      if (s) s.delete(handler);
+    };
+  }
+
+  window.OPENUI_HOST = { invoke, listen };
+
+  // ── 9. Load design ────────────────────────────────────────────────────────
+  const mount = document.getElementById("design-mount");
+  mount.innerHTML = "";  // clear loading indicator
+
+  if (!chosenSlug) {
+    mount.innerHTML = `<div style="padding:40px;color:#888;text-align:center">
+      No design installed. Drop a design into <code>reyn/local/designs/&lt;slug&gt;/</code> and reload.
+    </div>`;
+    return;
+  }
+
+  // Strategy: fetch Reyn.html from the design directory, extract and inject its
+  // <body> content into the mount point, then inject its <script> tags so they
+  // execute in the shell's context (where OPENUI_* globals are already set).
+  // This is simpler than iframe + postMessage and keeps all globals shared.
+  try {
+    const designUrl = `/web/designs/${encodeURIComponent(chosenSlug)}/Reyn.html`;
+    // cache: no-store — designs change often during development; we'd rather
+    // pay the network cost than serve a stale Reyn.html on every refresh.
+    const r = await fetch(designUrl, { cache: "no-store" });
+    if (!r.ok) {
+      mount.innerHTML = `<div style="padding:40px;color:#888;text-align:center">
+        Design <strong>${_esc(chosenSlug)}</strong> not found at <code>${_esc(designUrl)}</code>.<br/>
+        <small>Status: ${r.status}</small>
+      </div>`;
+      return;
+    }
+    const html = await r.text();
+    _injectDesign(mount, html, chosenSlug);
+  } catch (e) {
+    console.error("[shell] failed to load design:", e);
+    mount.innerHTML = `<div style="padding:40px;color:#f55;text-align:center">
+      Failed to load design <strong>${_esc(chosenSlug)}</strong>: ${_esc(String(e))}
+    </div>`;
+  }
+
+  // ── Helpers ───────────────────────────────────────────────────────────────
+
+  function _esc(s) {
+    return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+  }
+
+  /**
+   * Inject a design's Reyn.html into the mount div.
+   *
+   * Approach:
+   * 1. Parse the HTML string with DOMParser.
+   * 2. Copy <body> children (except <script>) into #design-mount.
+   * 3. Re-create <script> tags and append them so they execute.
+   *    (cloneNode does not execute scripts; creating new elements does.)
+   */
+  function _injectDesign(mount, html, slug) {
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(html, "text/html");
+    const designBase = `/web/designs/${encodeURIComponent(slug)}/`;
+
+    // Walk BOTH head and body. The HTML5 parser routes `<link>` / `<style>`
+    // / `<script>` placed before the implicit body to head, so a Reyn.html
+    // that omits explicit <html>/<body> would otherwise lose its scripts.
+    const scripts = [];
+    [...doc.head.childNodes, ...doc.body.childNodes].forEach(node => {
+      if (node.nodeName === "SCRIPT") {
+        scripts.push(node);
+      } else if (node.nodeType === Node.ELEMENT_NODE) {
+        const imported = document.importNode(node, true);
+        _rewriteAssetUrls(imported, designBase);
+        mount.appendChild(imported);
+      } else if (node.nodeType === Node.TEXT_NODE && node.textContent.trim()) {
+        mount.appendChild(document.importNode(node, true));
+      }
+    });
+
+    // Cache-buster for design-local scripts. Designs iterate frequently in
+     // dev; a per-load timestamp keeps us from chasing stale assets without
+     // forcing the user to disable cache in DevTools.
+    const cacheBust = `?v=${Date.now()}`;
+    // Apply the same cache-buster to the link/img URLs we rewrote above.
+    mount.querySelectorAll("link[href], img[src]").forEach(el => {
+      const attr = el.tagName === "LINK" ? "href" : "src";
+      const v = el.getAttribute(attr);
+      if (v && v.startsWith("/web/designs/")) {
+        el.setAttribute(attr, v + cacheBust);
+      }
+    });
+
+    // Inject and execute scripts in order
+    let hasBabelScript = false;
+    scripts.forEach(orig => {
+      const s = document.createElement("script");
+      // Copy attributes (type, src, etc.)
+      Array.from(orig.attributes).forEach(a => s.setAttribute(a.name, a.value));
+      if (orig.src) {
+        // External script: rewrite relative URLs to design's base path
+        const base = `/web/designs/${encodeURIComponent(slug)}/`;
+        const src = orig.getAttribute("src");
+        let resolved = src.startsWith("http") || src.startsWith("/") ? src : base + src;
+        // Only cache-bust design-local URLs (skip CDN scripts).
+        if (resolved.startsWith("/web/designs/")) {
+          resolved += cacheBust;
+        }
+        s.src = resolved;
+        s.async = false;
+        if (/babel(\.min)?\.js/.test(resolved)) hasBabelScript = true;
+      } else {
+        s.textContent = orig.textContent;
+      }
+      document.head.appendChild(s);
+    });
+
+    // Babel-standalone normally auto-transforms type="text/babel" scripts on
+    // DOMContentLoaded. The shell injects designs AFTER DCL, so the auto-
+    // runner has already fired (and found nothing). We must invoke it
+    // ourselves once Babel is loaded. Poll for window.Babel because the
+    // CDN script load is async.
+    if (hasBabelScript) {
+      _runBabelWhenReady();
+    }
+  }
+
+  function _runBabelWhenReady() {
+    const start = Date.now();
+    const MAX = 30000;  // 30 s — slow networks / large CDN bundle
+    function tick() {
+      if (window.Babel && typeof window.Babel.transformScriptTags === "function") {
+        try {
+          window.Babel.transformScriptTags();
+        } catch (e) {
+          console.error("[shell] Babel.transformScriptTags() threw:", e);
+        }
+        return;
+      }
+      if (Date.now() - start > MAX) {
+        console.error(
+          "[shell] Babel never finished loading from the CDN. " +
+          "type=text/babel scripts will not execute; the design will not render."
+        );
+        return;
+      }
+      setTimeout(tick, 50);
+    }
+    tick();
+  }
+
+  /**
+   * Rewrite relative URLs on link/img elements to point at the design's
+   * served path (/web/designs/<slug>/). Without this, a design's
+   * <link href="styles.css"> resolves against the shell URL
+   * (/static/index.html) and 404s.
+   */
+  function _rewriteAssetUrls(el, designBase) {
+    const candidates = el.tagName === "LINK" || el.tagName === "IMG"
+      ? [el]
+      : el.querySelectorAll("link[href], img[src]");
+    candidates.forEach(node => {
+      const attr = node.tagName === "LINK" ? "href" : "src";
+      const v = node.getAttribute(attr);
+      if (!v) return;
+      if (v.startsWith("http") || v.startsWith("//") || v.startsWith("/")) {
+        return;  // already absolute
+      }
+      node.setAttribute(attr, designBase + v);
+    });
+  }
+
+  /**
+   * Default i18n copy so OPENUI_DATA.COPY is always populated.
+   */
+  function _defaultCopy(lang) {
+    const en = {
+      today_morning: "Good morning",
+      today_sub: "Here's what's happening",
+      recap_label: "Today",
+      your_agents: "Your agents",
+      quickstarts: "Quickstarts",
+      seeAll: "See all",
+      chat: "Chat",
+      profile: "Profile",
+      open_studio: "Open Studio",
+      back_app: "Back to App",
+      studio: "Studio",
+      app: "App",
+      today: "Today",
+      agents: "Agents",
+      library: "Library",
+      actions: "Tools",
+      runs: "Runs",
+      evals: "Evals",
+      topologies: "Topologies",
+      settings: "Settings",
+      send: "Send",
+      placeholder: "Message…",
+      permissions: "Permissions",
+      new_agent: "New agent",
+      add_agent: "Add agent",
+      library_lead: "Things your agents can do",
+      agents_lead: "Meet your team",
+    };
+    const ja = {
+      today_morning: "おはようございます",
+      today_sub: "今日の状況",
+      recap_label: "今日",
+      your_agents: "エージェント",
+      quickstarts: "クイックスタート",
+      seeAll: "すべて表示",
+      chat: "チャット",
+      profile: "プロフィール",
+      open_studio: "スタジオを開く",
+      back_app: "アプリに戻る",
+      studio: "スタジオ",
+      app: "アプリ",
+      today: "今日",
+      agents: "エージェント",
+      library: "ライブラリ",
+      actions: "ツール",
+      runs: "実行",
+      evals: "評価",
+      topologies: "トポロジー",
+      settings: "設定",
+      send: "送信",
+      placeholder: "メッセージ…",
+      permissions: "権限",
+      new_agent: "新しいエージェント",
+      add_agent: "エージェントを追加",
+      library_lead: "エージェントができること",
+      agents_lead: "チームの紹介",
+    };
+    return lang === "ja" ? ja : en;
+  }
+
+})();
+</script>
+
+</body>
+</html>

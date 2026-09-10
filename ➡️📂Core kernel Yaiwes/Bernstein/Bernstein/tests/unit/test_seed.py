@@ -1,0 +1,994 @@
+"""Tests for bernstein.core.seed."""
+
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+
+import pytest
+from bernstein.core.models import Complexity, Scope, TaskStatus
+from bernstein.core.seed import (
+    NotifyConfig,
+    SeedConfig,
+    SeedError,
+    _build_manager_description,
+    parse_seed,
+    seed_to_initial_task,
+)
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+MINIMAL_YAML = 'goal: "Build a REST API"\n'
+
+FULL_YAML = """\
+goal: "Build a REST API"
+budget: "$20"
+team: [backend, qa, devops]
+cli: codex
+max_agents: 4
+model: gpt-5.4-mini
+"""
+
+AUTO_TEAM_YAML = """\
+goal: "Deploy the thing"
+team: auto
+"""
+
+BARE_BUDGET_YAML = """\
+goal: "Test"
+budget: 35
+"""
+
+
+@pytest.fixture()
+def seed_file(tmp_path: Path) -> Path:
+    """Return path to a seed file (content written per-test)."""
+    return tmp_path / "bernstein.yaml"
+
+
+# ---------------------------------------------------------------------------
+# parse_seed - valid inputs
+# ---------------------------------------------------------------------------
+
+
+class TestParseSeedValid:
+    """Tests for valid seed file parsing."""
+
+    def test_minimal_yaml_defaults(self, seed_file: Path) -> None:
+        seed_file.write_text(MINIMAL_YAML)
+        cfg = parse_seed(seed_file)
+        assert cfg.goal == "Build a REST API"
+        assert cfg.budget_usd is None
+        assert cfg.team == "auto"
+        assert cfg.cli == "auto"
+        assert cfg.max_agents == 6
+        assert cfg.model is None
+
+    def test_full_yaml_all_fields(self, seed_file: Path) -> None:
+        seed_file.write_text(FULL_YAML)
+        cfg = parse_seed(seed_file)
+        assert cfg.goal == "Build a REST API"
+        assert cfg.budget_usd == pytest.approx(20.0)
+        assert cfg.team == ["backend", "qa", "devops"]
+        assert cfg.cli == "codex"
+        assert cfg.max_agents == 4
+        assert cfg.model == "gpt-5.4-mini"
+
+    def test_auto_team_explicit(self, seed_file: Path) -> None:
+        seed_file.write_text(AUTO_TEAM_YAML)
+        cfg = parse_seed(seed_file)
+        assert cfg.team == "auto"
+
+    def test_bare_numeric_budget(self, seed_file: Path) -> None:
+        seed_file.write_text(BARE_BUDGET_YAML)
+        cfg = parse_seed(seed_file)
+        assert cfg.budget_usd == pytest.approx(35.0)
+
+    def test_budget_as_float(self, seed_file: Path) -> None:
+        seed_file.write_text('goal: "T"\nbudget: 9.99\n')
+        cfg = parse_seed(seed_file)
+        assert cfg.budget_usd == pytest.approx(9.99)
+
+    def test_budget_as_dollar_string_with_decimals(self, seed_file: Path) -> None:
+        seed_file.write_text('goal: "T"\nbudget: "$12.50"\n')
+        cfg = parse_seed(seed_file)
+        assert cfg.budget_usd == pytest.approx(12.50)
+
+    def test_empty_team_list_becomes_auto(self, seed_file: Path) -> None:
+        seed_file.write_text('goal: "T"\nteam: []\n')
+        cfg = parse_seed(seed_file)
+        assert cfg.team == "auto"
+
+    def test_gemini_cli(self, seed_file: Path) -> None:
+        seed_file.write_text('goal: "T"\ncli: gemini\n')
+        cfg = parse_seed(seed_file)
+        assert cfg.cli == "gemini"
+
+    def test_role_model_policy_parsed(self, seed_file: Path) -> None:
+        seed_file.write_text(
+            'goal: "T"\n'
+            "role_model_policy:\n"
+            "  backend:\n"
+            "    provider: codex\n"
+            "    model: gpt-5.4-mini\n"
+            "    effort: high\n"
+        )
+        cfg = parse_seed(seed_file)
+        assert cfg.role_model_policy == {"backend": {"provider": "codex", "model": "gpt-5.4-mini", "effort": "high"}}
+
+    def test_role_model_policy_parses_base_url_and_api_key_env(self, seed_file: Path) -> None:
+        seed_file.write_text(
+            'goal: "T"\n'
+            "role_model_policy:\n"
+            "  backend:\n"
+            "    provider: openai_agents\n"
+            "    model: gpt-5\n"
+            "    base_url: http://localhost:8000/v1\n"
+            "    api_key_env: OPENROUTER_API_KEY\n"
+        )
+        cfg = parse_seed(seed_file)
+        assert cfg.role_model_policy is not None
+        entry = cfg.role_model_policy["backend"]
+        assert entry["base_url"] == "http://localhost:8000/v1"
+        assert entry["api_key_env"] == "OPENROUTER_API_KEY"
+
+    def test_role_model_policy_rejects_non_credential_api_key_env(self, seed_file: Path) -> None:
+        # Fail-closed: a credential-shaped but unrelated host secret name
+        # (e.g. GITHUB_TOKEN) must be rejected at parse time so a
+        # repo-carried config cannot forward it to an arbitrary endpoint.
+        # The rejection must come from the credential allowlist, not from an
+        # "unknown keys" path (which is why the message names the allowlist).
+        seed_file.write_text('goal: "T"\nrole_model_policy:\n  backend:\n    api_key_env: GITHUB_TOKEN\n')
+        with pytest.raises(SeedError, match="allowed credential variable name"):
+            parse_seed(seed_file)
+
+    def test_role_model_policy_parses_response_style(self, seed_file: Path) -> None:
+        seed_file.write_text('goal: "T"\nrole_model_policy:\n  backend:\n    model: gpt-5\n    response_style: terse\n')
+        cfg = parse_seed(seed_file)
+        assert cfg.role_model_policy is not None
+        assert cfg.role_model_policy["backend"]["response_style"] == "terse"
+
+    def test_role_model_policy_rejects_unknown_response_style(self, seed_file: Path) -> None:
+        seed_file.write_text(
+            'goal: "T"\nrole_model_policy:\n  backend:\n    model: gpt-5\n    response_style: shouty\n'
+        )
+        with pytest.raises(SeedError, match="response_style"):
+            parse_seed(seed_file)
+
+    def test_response_style_with_missing_template_fails_validation(self, seed_file: Path) -> None:
+        # AC4 (#2243): a style whose mapped mode-profile template file is
+        # missing from the workdir override directory fails config
+        # validation with the typed template error, not at spawn time.
+        from bernstein.core.agents.response_style import ResponseStyleTemplateError
+
+        profiles = seed_file.parent / "templates" / "mode_profiles"
+        profiles.mkdir(parents=True)
+        (profiles / "deep.yaml").write_text(
+            "name: deep\nsystem_prompt_preamble: |\n  Deep preamble.\n",
+            encoding="utf-8",
+        )
+        seed_file.write_text('goal: "T"\nrole_model_policy:\n  backend:\n    model: gpt-5\n    response_style: terse\n')
+        with pytest.raises(SeedError, match="fast.yaml") as excinfo:
+            parse_seed(seed_file)
+        assert isinstance(excinfo.value, ResponseStyleTemplateError) or isinstance(
+            excinfo.value.__cause__, ResponseStyleTemplateError
+        )
+
+    def test_response_style_with_bundled_templates_passes_validation(self, seed_file: Path) -> None:
+        # No workdir override dir -> bundled templates satisfy validation.
+        seed_file.write_text(
+            'goal: "T"\nrole_model_policy:\n  default:\n    model: gpt-5\n    response_style: verbose\n'
+        )
+        cfg = parse_seed(seed_file)
+        assert cfg.role_model_policy is not None
+        assert cfg.role_model_policy["default"]["response_style"] == "verbose"
+
+    def test_batch_config_parsed(self, seed_file: Path) -> None:
+        seed_file.write_text('goal: "T"\nbatch:\n  enabled: true\n  eligible: [docs, style, tests]\n')
+        cfg = parse_seed(seed_file)
+        assert cfg.batch.enabled is True
+        assert cfg.batch.eligible == ["docs", "style", "tests"]
+
+    def test_max_cost_per_agent_parsed(self, seed_file: Path) -> None:
+        seed_file.write_text('goal: "T"\nmax_cost_per_agent: "$1.25"\n')
+        cfg = parse_seed(seed_file)
+        assert cfg.max_cost_per_agent == pytest.approx(1.25)
+
+    def test_webhooks_parse_and_normalize_aliases(self, seed_file: Path) -> None:
+        seed_file.write_text(
+            'goal: "T"\nwebhooks:\n  - url: "https://example.com/hook"\n    events: [task.done, task.failed]\n'
+        )
+        cfg = parse_seed(seed_file)
+        assert len(cfg.webhooks) == 1
+        assert cfg.webhooks[0].url == "https://example.com/hook"
+        assert cfg.webhooks[0].events == ("task.completed", "task.failed")
+
+    def test_test_agent_config_parsed(self, seed_file: Path) -> None:
+        seed_file.write_text(
+            'goal: "T"\ntest_agent:\n  always_spawn: true\n  model: gpt-5.4-mini\n  trigger: on_task_complete\n'
+        )
+        cfg = parse_seed(seed_file)
+        assert cfg.test_agent.always_spawn is True
+        assert cfg.test_agent.model == "gpt-5.4-mini"
+        assert cfg.test_agent.trigger == "on_task_complete"
+
+    def test_network_config_parsed(self, seed_file: Path) -> None:
+        seed_file.write_text('goal: "T"\nnetwork:\n  allowed_ips: ["10.0.0.0/8", "192.168.1.0/24"]\n')
+        cfg = parse_seed(seed_file)
+        assert cfg.network is not None
+        assert cfg.network.allowed_ips == ("10.0.0.0/8", "192.168.1.0/24")
+
+    def test_rate_limit_config_parsed(self, seed_file: Path) -> None:
+        seed_file.write_text(
+            'goal: "T"\nrate_limit:\n  tasks: 100\n  auth:\n    requests_per_minute: 10\n    methods: [POST]\n'
+        )
+        cfg = parse_seed(seed_file)
+        assert cfg.rate_limit is not None
+        buckets = {bucket.name: bucket for bucket in cfg.rate_limit.buckets}
+        assert buckets["tasks"].requests == 100
+        assert buckets["tasks"].path_prefixes == ("/tasks",)
+        assert buckets["auth"].requests == 10
+        assert buckets["auth"].methods == ("POST",)
+
+
+# ---------------------------------------------------------------------------
+# parse_seed - local_endpoints profiles (issue #2356)
+# ---------------------------------------------------------------------------
+
+
+_LOCAL_ENDPOINTS_YAML = (
+    "local_endpoints:\n"
+    "  workhorse:\n"
+    "    base_url: http://127.0.0.1:11434/v1\n"
+    "    model: qwen2.5-coder\n"
+    "    engine: ollama\n"
+    "    timeout: 120\n"
+)
+
+
+class TestRoleModelPolicyLocalEndpoints:
+    """``role_model_policy.<role>.endpoint`` -> ``local_endpoints`` profile.
+
+    The seed parser must accept and resolve the same profile references the
+    pydantic ``BernsteinConfig`` schema already validates, so the shipped
+    ``examples/local-fleet/bernstein.yaml`` parses via ``parse_seed`` (the
+    runtime spawn path) and not only via ``load_and_validate``.
+    """
+
+    def test_endpoint_reference_resolves_profile_onto_entry(self, seed_file: Path) -> None:
+        seed_file.write_text(
+            'goal: "T"\n' + _LOCAL_ENDPOINTS_YAML + "role_model_policy:\n  linter:\n    endpoint: workhorse\n"
+        )
+        cfg = parse_seed(seed_file)
+        assert cfg.role_model_policy is not None
+        entry = cfg.role_model_policy["linter"]
+        # The profile is the single source of truth: base_url/model are
+        # materialised onto the entry (same shape the schema produces).
+        assert entry["endpoint"] == "workhorse"
+        assert entry["base_url"] == "http://127.0.0.1:11434/v1"
+        assert entry["model"] == "qwen2.5-coder"
+
+    def test_endpoint_reference_carries_profile_api_key_env(self, seed_file: Path) -> None:
+        seed_file.write_text(
+            'goal: "T"\n'
+            "local_endpoints:\n"
+            "  gateway:\n"
+            "    base_url: http://127.0.0.1:8000/v1\n"
+            "    model: gpt-5\n"
+            "    api_key_env: OPENROUTER_API_KEY\n"
+            "role_model_policy:\n  backend:\n    endpoint: gateway\n"
+        )
+        cfg = parse_seed(seed_file)
+        assert cfg.role_model_policy is not None
+        assert cfg.role_model_policy["backend"]["api_key_env"] == "OPENROUTER_API_KEY"
+
+    def test_endpoint_reference_to_unknown_profile_rejected(self, seed_file: Path) -> None:
+        seed_file.write_text(
+            'goal: "T"\n' + _LOCAL_ENDPOINTS_YAML + "role_model_policy:\n  linter:\n    endpoint: missing\n"
+        )
+        with pytest.raises(SeedError, match="unknown local_endpoints profile"):
+            parse_seed(seed_file)
+
+    def test_endpoint_with_inline_endpoint_fields_rejected(self, seed_file: Path) -> None:
+        # The profile pins the certified endpoint; setting base_url/model
+        # inline alongside it is rejected (mirrors the schema).
+        seed_file.write_text(
+            'goal: "T"\n'
+            + _LOCAL_ENDPOINTS_YAML
+            + "role_model_policy:\n  linter:\n    endpoint: workhorse\n    model: gpt-5\n"
+        )
+        with pytest.raises(SeedError, match="cannot be set inline"):
+            parse_seed(seed_file)
+
+    def test_endpoint_must_be_a_string(self, seed_file: Path) -> None:
+        seed_file.write_text(
+            'goal: "T"\n' + _LOCAL_ENDPOINTS_YAML + "role_model_policy:\n  linter:\n    endpoint: 123\n"
+        )
+        with pytest.raises(SeedError, match="endpoint.*non-empty string"):
+            parse_seed(seed_file)
+
+    def test_local_endpoints_profile_requires_base_url(self, seed_file: Path) -> None:
+        seed_file.write_text('goal: "T"\nlocal_endpoints:\n  workhorse:\n    model: qwen2.5-coder\n')
+        with pytest.raises(SeedError, match="base_url"):
+            parse_seed(seed_file)
+
+    def test_local_endpoints_profile_rejects_unknown_keys(self, seed_file: Path) -> None:
+        seed_file.write_text(
+            'goal: "T"\n'
+            "local_endpoints:\n"
+            "  workhorse:\n"
+            "    base_url: http://127.0.0.1:11434/v1\n"
+            "    model: qwen2.5-coder\n"
+            "    bogus: yes\n"
+        )
+        with pytest.raises(SeedError, match="unknown keys: bogus"):
+            parse_seed(seed_file)
+
+    def test_local_endpoints_profile_rejects_non_credential_api_key_env(self, seed_file: Path) -> None:
+        # Fail-closed: an unrelated host secret name must not slip through by
+        # hiding in a local_endpoints profile instead of an inline entry.
+        seed_file.write_text(
+            'goal: "T"\n'
+            "local_endpoints:\n"
+            "  gateway:\n"
+            "    base_url: http://127.0.0.1:8000/v1\n"
+            "    model: gpt-5\n"
+            "    api_key_env: GITHUB_TOKEN\n"
+        )
+        with pytest.raises(SeedError, match="allowed credential variable name"):
+            parse_seed(seed_file)
+
+
+# ---------------------------------------------------------------------------
+# parse_seed - invalid inputs
+# ---------------------------------------------------------------------------
+
+
+class TestParseSeedInvalid:
+    """Tests for seed file validation errors."""
+
+    def test_missing_file_raises_seed_error(self, seed_file: Path) -> None:
+        with pytest.raises(SeedError, match="Seed file not found"):
+            parse_seed(seed_file)
+
+    def test_missing_goal_raises_seed_error(self, seed_file: Path) -> None:
+        seed_file.write_text("budget: 10\n")
+        with pytest.raises(SeedError, match="goal"):
+            parse_seed(seed_file)
+
+    def test_empty_goal_raises_seed_error(self, seed_file: Path) -> None:
+        seed_file.write_text('goal: ""\n')
+        with pytest.raises(SeedError, match="goal"):
+            parse_seed(seed_file)
+
+    def test_invalid_yaml_raises_seed_error(self, seed_file: Path) -> None:
+        seed_file.write_text("goal: [\ninvalid yaml {{{\n")
+        with pytest.raises(SeedError, match="Invalid YAML"):
+            parse_seed(seed_file)
+
+    def test_invalid_cli_raises_seed_error(self, seed_file: Path) -> None:
+        seed_file.write_text('goal: "T"\ncli: chatgpt\n')
+        with pytest.raises(SeedError, match="cli must be one of"):
+            parse_seed(seed_file)
+
+    def test_invalid_budget_format_raises_seed_error(self, seed_file: Path) -> None:
+        seed_file.write_text('goal: "T"\nbudget: "free"\n')
+        with pytest.raises(SeedError, match="Invalid budget format"):
+            parse_seed(seed_file)
+
+    def test_max_agents_zero_raises_seed_error(self, seed_file: Path) -> None:
+        seed_file.write_text('goal: "T"\nmax_agents: 0\n')
+        with pytest.raises(SeedError, match="max_agents must be a positive integer"):
+            parse_seed(seed_file)
+
+    def test_non_mapping_yaml_raises_seed_error(self, seed_file: Path) -> None:
+        seed_file.write_text("- item1\n- item2\n")
+        with pytest.raises(SeedError, match="YAML mapping"):
+            parse_seed(seed_file)
+
+    def test_team_with_non_string_items_raises_seed_error(self, seed_file: Path) -> None:
+        seed_file.write_text('goal: "T"\nteam: [1, 2, 3]\n')
+        with pytest.raises(SeedError, match="team list must contain only strings"):
+            parse_seed(seed_file)
+
+    def test_invalid_role_model_policy_shape_raises(self, seed_file: Path) -> None:
+        seed_file.write_text('goal: "T"\nrole_model_policy: "bad"\n')
+        with pytest.raises(SeedError, match="role_model_policy must be a mapping"):
+            parse_seed(seed_file)
+
+    def test_invalid_batch_shape_raises(self, seed_file: Path) -> None:
+        seed_file.write_text('goal: "T"\nbatch: "bad"\n')
+        with pytest.raises(SeedError, match="batch must be a mapping"):
+            parse_seed(seed_file)
+
+    def test_invalid_webhook_event_raises(self, seed_file: Path) -> None:
+        seed_file.write_text('goal: "T"\nwebhooks:\n  - url: "https://example.com/hook"\n    events: [task.unknown]\n')
+        with pytest.raises(SeedError, match="unsupported event"):
+            parse_seed(seed_file)
+
+    def test_invalid_test_agent_trigger_raises(self, seed_file: Path) -> None:
+        seed_file.write_text('goal: "T"\ntest_agent:\n  trigger: on_start\n')
+        with pytest.raises(SeedError, match="on_task_complete"):
+            parse_seed(seed_file)
+
+    def test_invalid_network_shape_raises(self, seed_file: Path) -> None:
+        seed_file.write_text('goal: "T"\nnetwork: "10.0.0.0/8"\n')
+        with pytest.raises(SeedError, match="network must be a mapping"):
+            parse_seed(seed_file)
+
+    def test_invalid_network_cidr_raises(self, seed_file: Path) -> None:
+        seed_file.write_text('goal: "T"\nnetwork:\n  allowed_ips: ["not-a-cidr"]\n')
+        with pytest.raises(SeedError, match="invalid CIDR"):
+            parse_seed(seed_file)
+
+    def test_invalid_rate_limit_shape_raises(self, seed_file: Path) -> None:
+        seed_file.write_text('goal: "T"\nrate_limit: "fast"\n')
+        with pytest.raises(SeedError, match="rate_limit must be a mapping"):
+            parse_seed(seed_file)
+
+    def test_invalid_custom_rate_limit_without_paths_raises(self, seed_file: Path) -> None:
+        seed_file.write_text('goal: "T"\nrate_limit:\n  metrics: 5\n')
+        with pytest.raises(SeedError, match="paths is required"):
+            parse_seed(seed_file)
+
+
+# ---------------------------------------------------------------------------
+# parse_seed - worktree_setup
+# ---------------------------------------------------------------------------
+
+
+class TestParseSeedWorktreeSetup:
+    """Tests for worktree_setup section parsing."""
+
+    def test_no_worktree_setup_defaults_to_none(self, seed_file: Path) -> None:
+        seed_file.write_text(MINIMAL_YAML)
+        cfg = parse_seed(seed_file)
+        assert cfg.worktree_setup is None
+
+    def test_symlink_dirs_parsed(self, seed_file: Path) -> None:
+        seed_file.write_text('goal: "T"\nworktree_setup:\n  symlink_dirs: [node_modules, .venv]\n')
+        cfg = parse_seed(seed_file)
+        assert cfg.worktree_setup is not None
+        assert cfg.worktree_setup.symlink_dirs == ("node_modules", ".venv")
+
+    def test_copy_files_parsed(self, seed_file: Path) -> None:
+        seed_file.write_text('goal: "T"\nworktree_setup:\n  copy_files: [.env, .env.local]\n')
+        cfg = parse_seed(seed_file)
+        assert cfg.worktree_setup is not None
+        assert cfg.worktree_setup.copy_files == (".env", ".env.local")
+
+    def test_setup_command_parsed(self, seed_file: Path) -> None:
+        seed_file.write_text('goal: "T"\nworktree_setup:\n  setup_command: "uv sync"\n')
+        cfg = parse_seed(seed_file)
+        assert cfg.worktree_setup is not None
+        assert cfg.worktree_setup.setup_command == "uv sync"
+
+    def test_all_fields_together(self, seed_file: Path) -> None:
+        seed_file.write_text(
+            "goal: T\n"
+            "worktree_setup:\n"
+            "  symlink_dirs: [node_modules]\n"
+            "  copy_files: [.env]\n"
+            "  setup_command: npm install\n"
+        )
+        cfg = parse_seed(seed_file)
+        assert cfg.worktree_setup is not None
+        assert cfg.worktree_setup.symlink_dirs == ("node_modules",)
+        assert cfg.worktree_setup.copy_files == (".env",)
+        assert cfg.worktree_setup.setup_command == "npm install"
+
+    def test_empty_worktree_setup_block(self, seed_file: Path) -> None:
+        """An empty worktree_setup block creates a default config with no dirs/files."""
+        seed_file.write_text("goal: T\nworktree_setup: {}\n")
+        cfg = parse_seed(seed_file)
+        assert cfg.worktree_setup is not None
+        assert cfg.worktree_setup.symlink_dirs == ()
+        assert cfg.worktree_setup.copy_files == ()
+        assert cfg.worktree_setup.setup_command is None
+
+    def test_non_mapping_worktree_setup_raises(self, seed_file: Path) -> None:
+        seed_file.write_text('goal: "T"\nworktree_setup: "invalid"\n')
+        with pytest.raises(SeedError, match="worktree_setup must be a mapping"):
+            parse_seed(seed_file)
+
+    def test_non_list_symlink_dirs_raises(self, seed_file: Path) -> None:
+        seed_file.write_text('goal: "T"\nworktree_setup:\n  symlink_dirs: "node_modules"\n')
+        with pytest.raises(SeedError, match="worktree_setup.symlink_dirs"):
+            parse_seed(seed_file)
+
+    def test_non_string_setup_command_raises(self, seed_file: Path) -> None:
+        seed_file.write_text('goal: "T"\nworktree_setup:\n  setup_command: 42\n')
+        with pytest.raises(SeedError, match="worktree_setup.setup_command must be a string"):
+            parse_seed(seed_file)
+
+
+# ---------------------------------------------------------------------------
+# seed_to_initial_task
+# ---------------------------------------------------------------------------
+
+
+class TestSeedToInitialTask:
+    """Tests for initial task creation from seed config."""
+
+    def test_creates_manager_task(self) -> None:
+        cfg = SeedConfig(goal="Build a REST API")
+        task = seed_to_initial_task(cfg)
+        assert task.role == "manager"
+        assert "Build a REST API" in task.description
+        assert task.priority == 10
+        assert task.id == "task-000"
+        assert task.title == "Initial goal"
+
+    def test_task_status_is_open(self) -> None:
+        cfg = SeedConfig(goal="Deploy infra")
+        task = seed_to_initial_task(cfg)
+        assert task.status == TaskStatus.OPEN
+
+    def test_task_scope_and_complexity(self) -> None:
+        cfg = SeedConfig(goal="Refactor everything")
+        task = seed_to_initial_task(cfg)
+        assert task.scope == Scope.LARGE
+        assert task.complexity == Complexity.HIGH
+
+    def test_different_goals_produce_different_descriptions(self) -> None:
+        t1 = seed_to_initial_task(SeedConfig(goal="Goal A"))
+        t2 = seed_to_initial_task(SeedConfig(goal="Goal B"))
+        assert t1.description != t2.description
+
+
+# ---------------------------------------------------------------------------
+# SeedConfig dataclass
+# ---------------------------------------------------------------------------
+
+
+class TestSeedConfig:
+    """Tests for SeedConfig defaults and immutability."""
+
+    def test_defaults(self) -> None:
+        cfg = SeedConfig(goal="Test")
+        assert cfg.budget_usd is None
+        assert cfg.team == "auto"
+        assert cfg.cli == "auto"
+        assert cfg.max_agents == 6
+        assert cfg.model is None
+
+    def test_frozen(self) -> None:
+        cfg = SeedConfig(goal="Test")
+        with pytest.raises(AttributeError):
+            cfg.goal = "Changed"  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# NotifyConfig parsing
+# ---------------------------------------------------------------------------
+
+NOTIFY_YAML = """\
+goal: "Build a REST API"
+notify:
+  webhook: https://hooks.slack.com/services/T.../B.../xxx
+  on_complete: true
+  on_failure: false
+  desktop: true
+"""
+
+NOTIFY_WEBHOOK_ONLY_YAML = """\
+goal: "Build a REST API"
+notify:
+  webhook: https://hooks.example.com/notify
+"""
+
+
+class TestNotifyConfig:
+    """Tests for NotifyConfig parsing."""
+
+    def test_notify_parsed_with_all_fields(self, seed_file: Path) -> None:
+        seed_file.write_text(NOTIFY_YAML)
+        cfg = parse_seed(seed_file)
+        assert cfg.notify is not None
+        assert cfg.notify.webhook_url == "https://hooks.slack.com/services/T.../B.../xxx"
+        assert cfg.notify.on_complete is True
+        assert cfg.notify.on_failure is False
+        assert cfg.notify.desktop is True
+
+    def test_notify_webhook_only_defaults(self, seed_file: Path) -> None:
+        seed_file.write_text(NOTIFY_WEBHOOK_ONLY_YAML)
+        cfg = parse_seed(seed_file)
+        assert cfg.notify is not None
+        assert cfg.notify.webhook_url == "https://hooks.example.com/notify"
+        assert cfg.notify.on_complete is True
+        assert cfg.notify.on_failure is True
+
+    def test_notify_absent_is_none(self, seed_file: Path) -> None:
+        seed_file.write_text(MINIMAL_YAML)
+        cfg = parse_seed(seed_file)
+        assert cfg.notify is None
+
+    def test_notify_not_a_mapping_raises(self, seed_file: Path) -> None:
+        seed_file.write_text('goal: "T"\nnotify: "https://example.com"\n')
+        with pytest.raises(SeedError, match="notify must be a mapping"):
+            parse_seed(seed_file)
+
+    def test_notify_webhook_not_string_raises(self, seed_file: Path) -> None:
+        seed_file.write_text('goal: "T"\nnotify:\n  webhook: 123\n')
+        with pytest.raises(SeedError, match="notify.webhook must be a string"):
+            parse_seed(seed_file)
+
+    def test_notify_desktop_not_bool_raises(self, seed_file: Path) -> None:
+        seed_file.write_text('goal: "T"\nnotify:\n  desktop: "yes"\n')
+        with pytest.raises(SeedError, match="notify.desktop must be a bool"):
+            parse_seed(seed_file)
+
+    def test_notify_config_defaults(self) -> None:
+        nc = NotifyConfig(webhook_url="https://example.com")
+        assert nc.on_complete is True
+        assert nc.on_failure is True
+        assert nc.desktop is False
+
+    def test_notify_config_frozen(self) -> None:
+        nc = NotifyConfig(webhook_url="https://example.com")
+        with pytest.raises(AttributeError):
+            nc.webhook_url = "changed"  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# _build_manager_description
+# ---------------------------------------------------------------------------
+
+
+class TestBuildManagerDescription:
+    """Tests for _build_manager_description()."""
+
+    def test_goal_only(self) -> None:
+        cfg = SeedConfig(goal="Build a REST API")
+        result = _build_manager_description(cfg, workdir=None)
+        assert "## Goal" in result
+        assert "Build a REST API" in result
+        assert "## Team" not in result
+        assert "## Budget" not in result
+        assert "## Constraints" not in result
+        assert "## Context files" not in result
+
+    def test_with_team_list(self) -> None:
+        cfg = SeedConfig(goal="Deploy infra", team=["backend", "qa", "devops"])
+        result = _build_manager_description(cfg, workdir=None)
+        assert "## Team" in result
+        assert "backend" in result
+        assert "qa" in result
+        assert "devops" in result
+
+    def test_auto_team_omitted(self) -> None:
+        cfg = SeedConfig(goal="Deploy infra", team="auto")
+        result = _build_manager_description(cfg, workdir=None)
+        assert "## Team" not in result
+
+    def test_with_budget(self) -> None:
+        cfg = SeedConfig(goal="Build X", budget_usd=42.50)
+        result = _build_manager_description(cfg, workdir=None)
+        assert "## Budget" in result
+        assert "42.50" in result
+
+    def test_with_constraints(self) -> None:
+        cfg = SeedConfig(goal="Build X", constraints=("Python only", "No external APIs"))
+        result = _build_manager_description(cfg, workdir=None)
+        assert "## Constraints" in result
+        assert "- Python only" in result
+        assert "- No external APIs" in result
+
+    def test_with_context_files_real_files(self, tmp_path: Path) -> None:
+        (tmp_path / "spec.md").write_text("# My spec\nHello world")
+        cfg = SeedConfig(goal="Build X", context_files=("spec.md",))
+        result = _build_manager_description(cfg, workdir=tmp_path)
+        assert "## Context files" in result
+        assert "spec.md" in result
+        assert "# My spec" in result
+        assert "Hello world" in result
+        assert "```" in result
+
+    def test_with_context_files_missing_file(self, tmp_path: Path) -> None:
+        cfg = SeedConfig(goal="Build X", context_files=("missing.md",))
+        result = _build_manager_description(cfg, workdir=tmp_path)
+        assert "## Context files" in result
+        assert "missing.md" in result
+        assert "(file not found)" in result
+
+    def test_with_context_files_unreadable_file(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        target = tmp_path / "secret.txt"
+        target.write_text("contents")
+        original_read_text = Path.read_text
+
+        def mock_read_text(self: Path, *args: object, **kwargs: object) -> str:
+            if self == target:
+                raise OSError("Permission denied")
+            return original_read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", mock_read_text)
+        cfg = SeedConfig(goal="Build X", context_files=("secret.txt",))
+        result = _build_manager_description(cfg, workdir=tmp_path)
+        assert "## Context files" in result
+        assert "secret.txt" in result
+        assert "(could not read file)" in result
+
+    def test_context_files_ignored_when_no_workdir(self) -> None:
+        cfg = SeedConfig(goal="Build X", context_files=("spec.md",))
+        result = _build_manager_description(cfg, workdir=None)
+        assert "## Context files" not in result
+
+    def test_all_fields_combined(self, tmp_path: Path) -> None:
+        (tmp_path / "notes.txt").write_text("Important notes here")
+        cfg = SeedConfig(
+            goal="Build everything",
+            team=["backend", "frontend"],
+            budget_usd=100.00,
+            constraints=("No TypeScript",),
+            context_files=("notes.txt",),
+        )
+        result = _build_manager_description(cfg, workdir=tmp_path)
+        assert "## Goal" in result
+        assert "Build everything" in result
+        assert "## Team" in result
+        assert "backend" in result
+        assert "## Budget" in result
+        assert "100.00" in result
+        assert "## Constraints" in result
+        assert "No TypeScript" in result
+        assert "## Context files" in result
+        assert "Important notes here" in result
+
+
+# ---------------------------------------------------------------------------
+# quality_gates auto_format config parsing
+# ---------------------------------------------------------------------------
+
+
+class TestQualityGatesAutoFormatParsing:
+    """Tests that auto_format fields are correctly parsed from quality_gates config."""
+
+    def test_auto_format_enabled_and_default_commands(self, seed_file: Path) -> None:
+        seed_file.write_text('goal: "Test"\nquality_gates:\n  auto_format: true\n')
+        cfg = parse_seed(seed_file)
+        assert cfg.quality_gates is not None
+        assert cfg.quality_gates.auto_format is True
+        assert cfg.quality_gates.auto_format_python_command == "ruff format"
+        assert cfg.quality_gates.auto_format_js_command == "prettier --write"
+        assert cfg.quality_gates.auto_format_rust_command == "rustfmt"
+
+    def test_auto_format_disabled_by_default(self, seed_file: Path) -> None:
+        seed_file.write_text('goal: "Test"\nquality_gates:\n  lint: true\n')
+        cfg = parse_seed(seed_file)
+        assert cfg.quality_gates is not None
+        assert cfg.quality_gates.auto_format is False
+
+    def test_auto_format_custom_python_command(self, seed_file: Path) -> None:
+        seed_file.write_text(
+            'goal: "Test"\nquality_gates:\n  auto_format: true\n  auto_format_python_command: "uv run ruff format"\n'
+        )
+        cfg = parse_seed(seed_file)
+        assert cfg.quality_gates is not None
+        assert cfg.quality_gates.auto_format_python_command == "uv run ruff format"
+
+    def test_auto_format_custom_js_command(self, seed_file: Path) -> None:
+        seed_file.write_text(
+            'goal: "Test"\nquality_gates:\n  auto_format: true\n  auto_format_js_command: "npx prettier --write"\n'
+        )
+        cfg = parse_seed(seed_file)
+        assert cfg.quality_gates is not None
+        assert cfg.quality_gates.auto_format_js_command == "npx prettier --write"
+
+    def test_auto_format_custom_rust_command(self, seed_file: Path) -> None:
+        seed_file.write_text(
+            'goal: "Test"\nquality_gates:\n  auto_format: true\n  auto_format_rust_command: "cargo fmt"\n'
+        )
+        cfg = parse_seed(seed_file)
+        assert cfg.quality_gates is not None
+        assert cfg.quality_gates.auto_format_rust_command == "cargo fmt"
+
+
+class TestQualityGatesBenchmarkParsing:
+    """Tests that the benchmark regression gate config is parsed from quality_gates."""
+
+    def test_benchmark_disabled_by_default(self, seed_file: Path) -> None:
+        seed_file.write_text('goal: "Test"\nquality_gates:\n  lint: true\n')
+        cfg = parse_seed(seed_file)
+        assert cfg.quality_gates is not None
+        assert cfg.quality_gates.benchmark.enabled is False
+
+    def test_benchmark_enabled(self, seed_file: Path) -> None:
+        seed_file.write_text('goal: "Test"\nquality_gates:\n  benchmark:\n    enabled: true\n')
+        cfg = parse_seed(seed_file)
+        assert cfg.quality_gates is not None
+        assert cfg.quality_gates.benchmark.enabled is True
+        assert cfg.quality_gates.benchmark.threshold == pytest.approx(0.10)
+        assert "benchmark-json" in cfg.quality_gates.benchmark.command
+
+    def test_benchmark_custom_command_and_threshold(self, seed_file: Path) -> None:
+        seed_file.write_text(
+            'goal: "Test"\n'
+            "quality_gates:\n"
+            "  benchmark:\n"
+            "    enabled: true\n"
+            '    command: "pytest perf/ --benchmark-json=results.json"\n'
+            "    threshold: 0.05\n"
+        )
+        cfg = parse_seed(seed_file)
+        assert cfg.quality_gates is not None
+        bm = cfg.quality_gates.benchmark
+        assert bm.enabled is True
+        assert bm.command == "pytest perf/ --benchmark-json=results.json"
+        assert bm.threshold == pytest.approx(0.05)
+
+    def test_benchmark_invalid_enabled_type_raises(self, seed_file: Path) -> None:
+        seed_file.write_text('goal: "Test"\nquality_gates:\n  benchmark:\n    enabled: "yes"\n')
+        with pytest.raises(SeedError, match="benchmark.enabled"):
+            parse_seed(seed_file)
+
+    def test_benchmark_invalid_threshold_type_raises(self, seed_file: Path) -> None:
+        seed_file.write_text(
+            'goal: "Test"\nquality_gates:\n  benchmark:\n    enabled: true\n    threshold: "ten_percent"\n'
+        )
+        with pytest.raises(SeedError, match="benchmark.threshold"):
+            parse_seed(seed_file)
+
+    def test_benchmark_non_mapping_raises(self, seed_file: Path) -> None:
+        seed_file.write_text('goal: "Test"\nquality_gates:\n  benchmark: "enabled"\n')
+        with pytest.raises(SeedError, match="benchmark must be a mapping"):
+            parse_seed(seed_file)
+
+
+# ---------------------------------------------------------------------------
+# resolve_seed_path
+# ---------------------------------------------------------------------------
+
+
+class TestResolveSeedPathWorkdirFallback:
+    """The workdir fallback must honour the documented contract of returning
+    a resolved, absolute path -- matching the explicit-path and
+    BERNSTEIN_SEED_PATH branches."""
+
+    def test_fallback_returns_absolute_resolved_path(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from bernstein.core.config.seed import resolve_seed_path
+
+        monkeypatch.delenv("BERNSTEIN_SEED_PATH", raising=False)
+        monkeypatch.chdir(tmp_path)
+
+        resolved = resolve_seed_path(Path("."))
+
+        assert resolved.is_absolute()
+        assert resolved == (tmp_path / "bernstein.yaml").resolve()
+
+    def test_fallback_normalizes_dot_segments(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from bernstein.core.config.seed import resolve_seed_path
+
+        monkeypatch.delenv("BERNSTEIN_SEED_PATH", raising=False)
+        (tmp_path / "sub").mkdir()
+
+        resolved = resolve_seed_path(tmp_path / "sub" / "..")
+
+        assert resolved.is_absolute()
+        assert resolved == (tmp_path / "bernstein.yaml").resolve()
+
+
+# ---------------------------------------------------------------------------
+# parse_seed - unknown top-level keys
+# ---------------------------------------------------------------------------
+
+_SEED_PARSER_LOGGER = "bernstein.core.config.seed_parser"
+
+
+class TestParseSeedUnknownTopLevelKeys:
+    """Unknown top-level keys warn (never fail) and suggest the nearest known key."""
+
+    def test_unknown_key_warns_and_names_it(self, seed_file: Path, caplog: pytest.LogCaptureFixture) -> None:
+        seed_file.write_text('goal: "Test"\nmax_agnets: 3\n')
+
+        with caplog.at_level(logging.WARNING, logger=_SEED_PARSER_LOGGER):
+            cfg = parse_seed(seed_file)
+
+        assert cfg.goal == "Test"
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("max_agnets" in m for m in messages)
+
+    def test_unknown_key_suggests_nearest_match(self, seed_file: Path, caplog: pytest.LogCaptureFixture) -> None:
+        seed_file.write_text('goal: "Test"\nmax_agnets: 3\n')
+
+        with caplog.at_level(logging.WARNING, logger=_SEED_PARSER_LOGGER):
+            parse_seed(seed_file)
+
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("max_agnets" in m and "max_agents" in m for m in messages)
+
+    def test_tasks_key_suggests_cells(self, seed_file: Path, caplog: pytest.LogCaptureFixture) -> None:
+        seed_file.write_text('goal: "Test"\ntasks:\n  - id: t1\n    description: x\n')
+
+        with caplog.at_level(logging.WARNING, logger=_SEED_PARSER_LOGGER):
+            parse_seed(seed_file)
+
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("tasks" in m and "cells" in m for m in messages)
+
+    def test_valid_seed_warns_nothing(self, seed_file: Path, caplog: pytest.LogCaptureFixture) -> None:
+        seed_file.write_text(FULL_YAML)
+
+        with caplog.at_level(logging.WARNING, logger=_SEED_PARSER_LOGGER):
+            parse_seed(seed_file)
+
+        assert not caplog.records
+
+    def test_parse_result_unchanged_by_unknown_key(self, seed_file: Path, caplog: pytest.LogCaptureFixture) -> None:
+        seed_file.write_text(MINIMAL_YAML)
+        baseline = parse_seed(seed_file)
+
+        seed_file.write_text(MINIMAL_YAML + "tasks: [{id: t1, description: x}]\n")
+        with caplog.at_level(logging.WARNING, logger=_SEED_PARSER_LOGGER):
+            with_unknown = parse_seed(seed_file)
+
+        assert with_unknown == baseline
+
+    def test_unknown_key_without_close_match_still_warns(
+        self, seed_file: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        seed_file.write_text('goal: "Test"\nzzqqxx: 1\n')
+
+        with caplog.at_level(logging.WARNING, logger=_SEED_PARSER_LOGGER):
+            parse_seed(seed_file)
+
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("zzqqxx" in m for m in messages)
+
+    def test_container_image_key_hints_sandbox_image(self, seed_file: Path, caplog: pytest.LogCaptureFixture) -> None:
+        """``container_image:`` has no top-level equivalent; the warning must
+        point operators at ``sandbox.image`` instead of silently dropping the
+        value (bug #3023)."""
+        seed_file.write_text('goal: "Test"\ncontainer_image: bernstein-qwen:3.9.0\n')
+
+        with caplog.at_level(logging.WARNING, logger=_SEED_PARSER_LOGGER):
+            parse_seed(seed_file)
+
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("container_image" in m and "sandbox.image" in m for m in messages)
+
+
+class TestParseSeedEvolutionEnabled:
+    """``evolution_enabled`` must survive the YAML -> SeedConfig hop.
+
+    The key was schema-known through ``BernsteinConfig``, so it never tripped
+    the unknown-key warning above, yet no parser branch consumed it. The value
+    therefore never reached ``OrchestratorConfig``, which kept its ``True``
+    default no matter what the seed said. A key that is silently ignored is
+    harder to notice than one that is rejected: the only outward sign was
+    ``config_snapshot.json`` (dumped from the YAML) disagreeing with the run
+    manifest (serialised from the live config object).
+    """
+
+    def test_defaults_to_true_when_absent(self, seed_file: Path) -> None:
+        seed_file.write_text(MINIMAL_YAML)
+        assert parse_seed(seed_file).evolution_enabled is True
+
+    def test_explicit_false_is_preserved(self, seed_file: Path) -> None:
+        seed_file.write_text(MINIMAL_YAML + "evolution_enabled: false\n")
+        assert parse_seed(seed_file).evolution_enabled is False
+
+    def test_explicit_true_is_preserved(self, seed_file: Path) -> None:
+        seed_file.write_text(MINIMAL_YAML + "evolution_enabled: true\n")
+        assert parse_seed(seed_file).evolution_enabled is True
+
+    def test_non_boolean_is_rejected(self, seed_file: Path) -> None:
+        seed_file.write_text(MINIMAL_YAML + 'evolution_enabled: "sometimes"\n')
+        with pytest.raises(SeedError, match="evolution_enabled must be a boolean"):
+            parse_seed(seed_file)
+
+    def test_key_is_consumed_not_merely_tolerated(self, seed_file: Path, caplog: pytest.LogCaptureFixture) -> None:
+        """Warning-free *and* value-carrying.
+
+        Silently-ignored is exactly the state this guards against, and it also
+        produces no warning, so the absence of a warning proves nothing on its
+        own. The parsed value has to change too.
+        """
+        seed_file.write_text(MINIMAL_YAML + "evolution_enabled: false\n")
+
+        with caplog.at_level(logging.WARNING, logger=_SEED_PARSER_LOGGER):
+            cfg = parse_seed(seed_file)
+
+        assert not caplog.records
+        assert cfg.evolution_enabled is False

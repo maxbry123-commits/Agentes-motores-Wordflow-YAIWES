@@ -1,0 +1,132 @@
+---
+description: |
+  [Docling](https://github.com/docling-project/docling) is a layout-aware, structure-preserving
+  document parser for OGX. Unlike simple text extraction, Docling understands document
+  structure — headings, tables, lists, and sections — and produces Markdown-formatted output that
+  preserves semantic boundaries. It supports PDF, DOCX, PPTX, HTML, and images.
+
+  ## Features
+
+  - **Structure-aware chunking** — splits at semantic boundaries (headings, sections) using Docling's HybridChunker
+  - **Layout preservation** — tables, lists, and nested structures are converted to Markdown
+  - **Multi-format support** — PDF, DOCX, PPTX, HTML, and images
+  - **Better RAG quality** — structured chunks with heading metadata produce more relevant retrieval results
+  - **VLM configuration validation** — VLM processing requires worker-side inference routing, which is not yet
+    supported; configuring `vlm_model` currently produces a clear startup error
+
+  ## Usage
+
+  Start OGX with the Docling file processor using the `--providers` flag:
+
+  ```bash
+  OLLAMA_URL=http://localhost:11434/v1 ogx stack run \
+    --providers "file_processors=inline::docling,files=inline::localfs,vector_io=inline::faiss,inference=inline::sentence-transformers,inference=remote::ollama" \
+    --port 8321
+  ```
+
+  Or add it to a custom `run.yaml`:
+
+  ```yaml
+  file_processors:
+    - provider_id: docling
+      provider_type: inline::docling
+      config: {}
+  ```
+
+  ### VLM Processing
+
+  VLM-based document processing is not currently available while this provider runs in worker
+  mode because auto-routed inference cannot yet be reconstructed in the worker process. A
+  configuration with `vlm_model` fails startup rather than silently running a different pipeline.
+
+  Leave `vlm_model` unset to use the standard non-VLM pipeline.
+
+  ## Installation
+
+  ```bash
+  pip install docling
+  ```
+
+  ## Documentation
+
+  See [Docling's documentation](https://docling-project.github.io/docling/) for more details.
+sidebar_label: Docling
+title: inline::docling
+---
+
+# inline::docling
+
+## Description
+
+
+[Docling](https://github.com/docling-project/docling) is a layout-aware, structure-preserving
+document parser for OGX. Unlike simple text extraction, Docling understands document
+structure — headings, tables, lists, and sections — and produces Markdown-formatted output that
+preserves semantic boundaries. It supports PDF, DOCX, PPTX, HTML, and images.
+
+## Features
+
+- **Structure-aware chunking** — splits at semantic boundaries (headings, sections) using Docling's HybridChunker
+- **Layout preservation** — tables, lists, and nested structures are converted to Markdown
+- **Multi-format support** — PDF, DOCX, PPTX, HTML, and images
+- **Better RAG quality** — structured chunks with heading metadata produce more relevant retrieval results
+- **VLM configuration validation** — VLM processing requires worker-side inference routing, which is not yet
+  supported; configuring `vlm_model` currently produces a clear startup error
+
+## Usage
+
+Start OGX with the Docling file processor using the `--providers` flag:
+
+```bash
+OLLAMA_URL=http://localhost:11434/v1 ogx stack run \
+  --providers "file_processors=inline::docling,files=inline::localfs,vector_io=inline::faiss,inference=inline::sentence-transformers,inference=remote::ollama" \
+  --port 8321
+```
+
+Or add it to a custom `run.yaml`:
+
+```yaml
+file_processors:
+  - provider_id: docling
+    provider_type: inline::docling
+    config: {}
+```
+
+### VLM Processing
+
+VLM-based document processing is not currently available while this provider runs in worker
+mode because auto-routed inference cannot yet be reconstructed in the worker process. A
+configuration with `vlm_model` fails startup rather than silently running a different pipeline.
+
+Leave `vlm_model` unset to use the standard non-VLM pipeline.
+
+## Installation
+
+```bash
+pip install docling
+```
+
+## Documentation
+
+See [Docling's documentation](https://docling-project.github.io/docling/) for more details.
+
+
+## Configuration
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `default_chunk_size_tokens` | `int` | No | 800 | Default chunk size in tokens when chunking_strategy type is 'auto' |
+| `default_chunk_overlap_tokens` | `int` | No | 400 | Default chunk overlap in tokens when chunking_strategy type is 'auto' |
+| `do_ocr` | `bool` | No | True | Enable OCR for scanned documents. Set to False for digital PDFs (with embedded text) to improve processing speed by ~3x for non-scanned PDFs. Note: Setting to False on scanned PDFs will result in minimal text extraction. Ignored when vlm_model is set (VLM pipeline handles text extraction). |
+| `vlm_model` | `str \| None` | No |  | Model identifier for VLM-based document processing. When set and an inference provider is available, enables the VLM pipeline for richer document understanding (layout analysis, OCR via vision models). The model must be registered with the stack's inference API. When None (default), uses the standard non-VLM pipeline. |
+| `vlm_preset` | `str` | No | granite_docling | Docling VLM preset controlling prompt template and response format. Must be a valid preset name registered with VlmConvertOptions. The default 'granite_docling' is the recommended preset for production use. |
+
+## Sample Configuration
+
+```yaml
+default_chunk_size_tokens: 800
+default_chunk_overlap_tokens: 400
+do_ocr: true
+vlm_model: null
+vlm_preset: granite_docling
+```

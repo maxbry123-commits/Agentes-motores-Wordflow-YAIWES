@@ -1,0 +1,676 @@
+const COMMAND_GROUPS = {
+  agents: {
+    description: 'Manage agents',
+    commands: {
+      list: { description: 'List agents', method: 'GET', path: '/agents' },
+      get: { description: 'Get an agent by id (from list)', virtualGet: true, collectionPath: '/agents', params: ['id'] },
+      create: { description: 'Create an agent', method: 'POST', path: '/agents' },
+      update: { description: 'Update an agent', method: 'PUT', path: '/agents/:id', params: ['id'] },
+      delete: { description: 'Delete an agent', method: 'DELETE', path: '/agents/:id', params: ['id'] },
+      'bulk-update': { description: 'Bulk update agents', method: 'PATCH', path: '/agents/bulk' },
+      trash: { description: 'List trashed agents', method: 'GET', path: '/agents/trash' },
+      restore: { description: 'Restore a trashed agent', method: 'POST', path: '/agents/trash' },
+      purge: { description: 'Permanently delete a trashed agent', method: 'DELETE', path: '/agents/trash' },
+      status: { description: 'Get live status for an agent', method: 'GET', path: '/agents/:id/status', params: ['id'] },
+      dream: { description: 'Get agent dream config and recent cycles', method: 'GET', path: '/agents/:id/dream', params: ['id'] },
+      'dream-update': { description: 'Update agent dream config', method: 'PATCH', path: '/agents/:id/dream', params: ['id'] },
+    },
+  },
+  activity: {
+    description: 'Query activity feed events',
+    commands: {
+      list: { description: 'List activity events (supports --query limit=50,entityType=task,action=updated)', method: 'GET', path: '/activity' },
+    },
+  },
+  auth: {
+    description: 'Access-key auth checks',
+    commands: {
+      status: { description: 'Get auth setup status', method: 'GET', path: '/auth' },
+      login: { description: 'Validate an access key', method: 'POST', path: '/auth' },
+    },
+  },
+  autonomy: {
+    description: 'Autonomy supervisor inspection',
+    commands: {
+      incidents: { description: 'List supervisor incidents (supports --query sessionId=..., --query taskId=..., --query limit=50)', method: 'GET', path: '/autonomy/incidents' },
+      reflections: { description: 'List run reflections (supports --query sessionId=..., --query taskId=..., --query limit=50)', method: 'GET', path: '/autonomy/reflections' },
+      estop: { description: 'Get autonomy emergency-stop state', method: 'GET', path: '/autonomy/estop' },
+      'estop-set': { description: 'Engage or resume autonomy emergency-stop state', method: 'POST', path: '/autonomy/estop' },
+      'guardian-restore': { description: 'Restore the latest guardian checkpoint after approval', method: 'POST', path: '/autonomy/guardian/restore' },
+    },
+  },
+  approvals: {
+    description: 'List and resolve human-loop approvals',
+    commands: {
+      list: { description: 'List pending human-loop approvals', method: 'GET', path: '/approvals' },
+      resolve: { description: 'Resolve a human-loop approval', method: 'POST', path: '/approvals' },
+    },
+  },
+  chatrooms: {
+    description: 'Manage multi-agent chatrooms',
+    commands: {
+      list: { description: 'List chatrooms', method: 'GET', path: '/chatrooms' },
+      get: { description: 'Get chatroom by id', method: 'GET', path: '/chatrooms/:id', params: ['id'] },
+      create: { description: 'Create a chatroom', method: 'POST', path: '/chatrooms' },
+      update: { description: 'Update a chatroom', method: 'PUT', path: '/chatrooms/:id', params: ['id'] },
+      delete: { description: 'Delete a chatroom', method: 'DELETE', path: '/chatrooms/:id', params: ['id'] },
+      chat: { description: 'Post chatroom message and stream agent replies', method: 'POST', path: '/chatrooms/:id/chat', params: ['id'] },
+      'add-member': { description: 'Add an agent to a chatroom', method: 'POST', path: '/chatrooms/:id/members', params: ['id'] },
+      'remove-member': { description: 'Remove an agent from a chatroom', method: 'DELETE', path: '/chatrooms/:id/members', params: ['id'] },
+      react: { description: 'Toggle reaction on a chatroom message', method: 'POST', path: '/chatrooms/:id/reactions', params: ['id'] },
+      pin: { description: 'Toggle pin on a chatroom message', method: 'POST', path: '/chatrooms/:id/pins', params: ['id'] },
+    },
+  },
+  connectors: {
+    description: 'Manage chat connectors',
+    commands: {
+      list: { description: 'List connectors', method: 'GET', path: '/connectors' },
+      get: { description: 'Get connector details', method: 'GET', path: '/connectors/:id', params: ['id'] },
+      create: { description: 'Create a connector', method: 'POST', path: '/connectors' },
+      update: { description: 'Update connector config', method: 'PUT', path: '/connectors/:id', params: ['id'] },
+      delete: { description: 'Delete connector', method: 'DELETE', path: '/connectors/:id', params: ['id'] },
+      'access-get': { description: 'Get connector access and ownership state', method: 'GET', path: '/connectors/:id/access', params: ['id'] },
+      'access-set': { description: 'Update connector access and ownership state', method: 'PUT', path: '/connectors/:id/access', params: ['id'] },
+      start: {
+        description: 'Start connector runtime',
+        method: 'PUT',
+        path: '/connectors/:id',
+        params: ['id'],
+        staticBody: { action: 'start' },
+      },
+      stop: {
+        description: 'Stop connector runtime',
+        method: 'PUT',
+        path: '/connectors/:id',
+        params: ['id'],
+        staticBody: { action: 'stop' },
+      },
+      repair: {
+        description: 'Repair connector runtime',
+        method: 'PUT',
+        path: '/connectors/:id',
+        params: ['id'],
+        staticBody: { action: 'repair' },
+      },
+    },
+  },
+  clawhub: {
+    description: 'Browse and install ClawHub skills',
+    commands: {
+      search: { description: 'Search ClawHub skills catalog', method: 'GET', path: '/clawhub/search' },
+      preview: { description: 'Preview a ClawHub skill install without writing files', method: 'POST', path: '/clawhub/preview' },
+      install: { description: 'Install a skill from ClawHub', method: 'POST', path: '/clawhub/install' },
+    },
+  },
+  credentials: {
+    description: 'Manage encrypted provider credentials',
+    commands: {
+      list: { description: 'List credentials', method: 'GET', path: '/credentials' },
+      get: { description: 'Get credential metadata by id (from list)', virtualGet: true, collectionPath: '/credentials', params: ['id'] },
+      create: { description: 'Create credential', method: 'POST', path: '/credentials' },
+      delete: { description: 'Delete credential', method: 'DELETE', path: '/credentials/:id', params: ['id'] },
+    },
+  },
+  daemon: {
+    description: 'Daemon lifecycle controls',
+    commands: {
+      status: { description: 'Get daemon status', method: 'GET', path: '/daemon' },
+      start: { description: 'Start daemon', method: 'POST', path: '/daemon', staticBody: { action: 'start' } },
+      stop: { description: 'Stop daemon', method: 'POST', path: '/daemon', staticBody: { action: 'stop' } },
+      'health-check': { description: 'Run daemon health checks immediately', method: 'POST', path: '/daemon/health-check' },
+    },
+  },
+  'delegation-jobs': {
+    description: 'Delegation job status',
+    commands: {
+      list: { description: 'List active and recent delegation jobs', method: 'GET', path: '/delegation-jobs' },
+    },
+  },
+  dirs: {
+    description: 'Directory browsing helpers',
+    commands: {
+      list: { description: 'List directories (supports --query path=/some/dir)', method: 'GET', path: '/dirs' },
+      pick: { description: 'Open native picker (body: {"mode":"file|folder"})', method: 'POST', path: '/dirs/pick' },
+    },
+  },
+  perf: {
+    description: 'Inspect or control runtime perf tracing',
+    commands: {
+      status: { description: 'Get current perf tracing status and recent entries', method: 'GET', path: '/perf' },
+      enable: { description: 'Enable perf tracing and clear existing entries', method: 'POST', path: '/perf', staticBody: { action: 'enable' } },
+      disable: { description: 'Disable perf tracing', method: 'POST', path: '/perf', staticBody: { action: 'disable' } },
+      clear: { description: 'Clear recent perf entries', method: 'POST', path: '/perf', staticBody: { action: 'clear' } },
+    },
+  },
+  documents: {
+    description: 'File uploads/downloads and TTS audio',
+    commands: {
+      upload: {
+        description: 'Upload a file (requires --file)',
+        method: 'POST',
+        path: '/upload',
+        upload: true,
+      },
+      fetch: {
+        description: 'Download an uploaded file by filename',
+        method: 'GET',
+        path: '/uploads/:filename',
+        params: ['filename'],
+        binary: true,
+      },
+      tts: {
+        description: 'Generate TTS audio (body: {"text":"..."})',
+        method: 'POST',
+        path: '/tts',
+        binary: true,
+      },
+    },
+  },
+  'external-agents': {
+    description: 'Manage external agent runtimes',
+    commands: {
+      list: { description: 'List external agent runtimes', method: 'GET', path: '/external-agents' },
+      create: { description: 'Register an external agent runtime', method: 'POST', path: '/external-agents' },
+      update: { description: 'Update an external agent runtime', method: 'PUT', path: '/external-agents/:id', params: ['id'] },
+      delete: { description: 'Delete an external agent runtime', method: 'DELETE', path: '/external-agents/:id', params: ['id'] },
+      heartbeat: { description: 'Record an external agent heartbeat', method: 'POST', path: '/external-agents/:id/heartbeat', params: ['id'] },
+    },
+  },
+  a2a: {
+    description: 'A2A Protocol gateway',
+    commands: {
+      send: { description: 'Send a JSON-RPC request to the A2A endpoint', method: 'POST', path: '/a2a' },
+      'agent-card': { description: 'Get agent card for a SwarmClaw agent', method: 'GET', path: '/.well-known/agent-card' },
+      'task-status': { description: 'Check A2A task status', method: 'GET', path: '/a2a/tasks/:taskId/status', params: ['taskId'] },
+    },
+  },
+  artifacts: {
+    description: 'Resolve evidence artifacts for runs, missions, and tasks',
+    commands: {
+      list: { description: 'List evidence artifacts (supports --query runId=,missionId=,taskId=)', method: 'GET', path: '/artifacts' },
+    },
+  },
+  uploads: {
+    description: 'Manage uploaded artifacts',
+    commands: {
+      list: { description: 'List uploaded artifacts', method: 'GET', path: '/uploads' },
+      get: { description: 'Download uploaded artifact by filename', method: 'GET', path: '/uploads/:filename', params: ['filename'], binary: true },
+      delete: { description: 'Delete uploaded artifact by filename', method: 'DELETE', path: '/uploads/:filename', params: ['filename'] },
+      'delete-many': { description: 'Delete uploads by filter/body (filenames, olderThanDays, category, or all)', method: 'DELETE', path: '/uploads' },
+    },
+  },
+  operations: {
+    description: 'Operator triage and readiness summaries',
+    commands: {
+      pulse: { description: 'Get Operations Pulse summary (supports --query range=24h|7d)', method: 'GET', path: '/operations/pulse' },
+    },
+  },
+  files: {
+    description: 'Serve/open local files',
+    commands: {
+      serve: { description: 'Serve a local file (supports --query path=/some/file)', method: 'GET', path: '/files/serve' },
+      open: { description: 'Open a local file path via host default app/browser', method: 'POST', path: '/files/open' },
+    },
+  },
+  gateways: {
+    description: 'Manage named OpenClaw gateway profiles',
+    commands: {
+      list: { description: 'List configured gateway profiles', method: 'GET', path: '/gateways' },
+      create: { description: 'Create a gateway profile', method: 'POST', path: '/gateways' },
+      update: { description: 'Update a gateway profile', method: 'PUT', path: '/gateways/:id', params: ['id'] },
+      delete: { description: 'Delete a gateway profile', method: 'DELETE', path: '/gateways/:id', params: ['id'] },
+      control: { description: 'Run a gateway lifecycle control action', method: 'POST', path: '/gateways/:id/control', params: ['id'] },
+      activate: { description: 'Return a gateway to active routing', method: 'POST', path: '/gateways/:id/control', params: ['id'] },
+      drain: { description: 'Drain a gateway from new automatic work', method: 'POST', path: '/gateways/:id/control', params: ['id'] },
+      cordon: { description: 'Cordon a gateway from automatic work', method: 'POST', path: '/gateways/:id/control', params: ['id'] },
+      restart: { description: 'Request a gateway restart', method: 'POST', path: '/gateways/:id/control', params: ['id'] },
+      health: { description: 'Run a gateway health check', method: 'GET', path: '/gateways/:id/health', params: ['id'] },
+      topology: { description: 'Refresh and return one gateway topology snapshot', method: 'GET', path: '/gateways/:id/topology', params: ['id'] },
+      environments: { description: 'List OpenClaw gateway execution environments', method: 'GET', path: '/gateways/:id/environments', params: ['id'] },
+      'environment-status': { description: 'Get one OpenClaw gateway execution environment status', method: 'GET', path: '/gateways/:id/environments/:environmentId', params: ['id', 'environmentId'] },
+      fleet: { description: 'Refresh and return fleet-wide gateway topology', method: 'GET', path: '/gateways/fleet' },
+    },
+  },
+  logs: {
+    description: 'Application logs',
+    commands: {
+      list: { description: 'Fetch logs (supports --query lines=200,level=INFO)', method: 'GET', path: '/logs' },
+      clear: { description: 'Clear log file', method: 'DELETE', path: '/logs' },
+      report: { description: 'Write a client/browser error entry to the application log', method: 'POST', path: '/logs' },
+    },
+  },
+
+  memory: {
+    description: 'Agent memory entries',
+    commands: {
+      list: { description: 'List memory entries (supports --query q=term,agentId=id)', method: 'GET', path: '/memory' },
+      get: { description: 'Get memory entry by id', method: 'GET', path: '/memory/:id', params: ['id'] },
+      create: { description: 'Create memory entry', method: 'POST', path: '/memory' },
+      update: { description: 'Update memory entry', method: 'PUT', path: '/memory/:id', params: ['id'] },
+      delete: { description: 'Delete memory entry', method: 'DELETE', path: '/memory/:id', params: ['id'] },
+      maintenance: { description: 'Analyze memory dedupe/prune candidates', method: 'GET', path: '/memory/maintenance' },
+      'maintenance-run': { description: 'Run memory dedupe/prune maintenance', method: 'POST', path: '/memory/maintenance' },
+      dream: { description: 'List dream cycles', method: 'GET', path: '/memory/dream' },
+      'dream-trigger': { description: 'Trigger a dream cycle', method: 'POST', path: '/memory/dream' },
+      'dream-get': { description: 'Get dream cycle by id', method: 'GET', path: '/memory/dream/:id', params: ['id'] },
+    },
+  },
+  'memory-images': {
+    description: 'Stored memory image assets',
+    commands: {
+      get: { description: 'Download memory image by filename', method: 'GET', path: '/memory-images/:filename', params: ['filename'], binary: true },
+    },
+  },
+  notifications: {
+    description: 'In-app notification center',
+    commands: {
+      list: { description: 'List notifications (supports --query unreadOnly=true,limit=100)', method: 'GET', path: '/notifications' },
+      create: { description: 'Create notification', method: 'POST', path: '/notifications' },
+      clear: { description: 'Clear read notifications', method: 'DELETE', path: '/notifications' },
+      'mark-read': { description: 'Mark notification as read', method: 'PUT', path: '/notifications/:id', params: ['id'] },
+      delete: { description: 'Delete notification by id', method: 'DELETE', path: '/notifications/:id', params: ['id'] },
+    },
+  },
+  openclaw: {
+    description: 'OpenClaw discovery, gateway control, and runtime APIs',
+    commands: {
+      discover: { description: 'Discover OpenClaw gateways', method: 'GET', path: '/openclaw/discover' },
+      'deploy-status': { description: 'Get managed OpenClaw deploy status', method: 'GET', path: '/openclaw/deploy' },
+      'deploy-local-start': {
+        description: 'Start a managed local OpenClaw deployment (use --data JSON for port/token overrides)',
+        method: 'POST',
+        path: '/openclaw/deploy',
+        staticBody: { action: 'start-local' },
+      },
+      'deploy-local-stop': {
+        description: 'Stop the managed local OpenClaw deployment',
+        method: 'POST',
+        path: '/openclaw/deploy',
+        staticBody: { action: 'stop-local' },
+      },
+      'deploy-local-restart': {
+        description: 'Restart the managed local OpenClaw deployment (use --data JSON for port/token overrides)',
+        method: 'POST',
+        path: '/openclaw/deploy',
+        staticBody: { action: 'restart-local' },
+      },
+      'deploy-bundle': {
+        description: 'Generate an OpenClaw remote deployment bundle (use --data JSON for template/target/token)',
+        method: 'POST',
+        path: '/openclaw/deploy',
+        staticBody: { action: 'bundle' },
+      },
+      'deploy-ssh': {
+        description: 'Push the official-image OpenClaw bundle to a remote host over SSH (use --data JSON for target/ssh/provider)',
+        method: 'POST',
+        path: '/openclaw/deploy',
+        staticBody: { action: 'ssh-deploy' },
+      },
+      'deploy-verify': {
+        description: 'Verify an OpenClaw endpoint/token pair (use --data JSON for endpoint/token)',
+        method: 'POST',
+        path: '/openclaw/deploy',
+        staticBody: { action: 'verify' },
+      },
+      'remote-start': {
+        description: 'Start a remote SSH-managed OpenClaw stack',
+        method: 'POST',
+        path: '/openclaw/deploy',
+        staticBody: { action: 'remote-start' },
+      },
+      'remote-stop': {
+        description: 'Stop a remote SSH-managed OpenClaw stack',
+        method: 'POST',
+        path: '/openclaw/deploy',
+        staticBody: { action: 'remote-stop' },
+      },
+      'remote-restart': {
+        description: 'Restart a remote SSH-managed OpenClaw stack',
+        method: 'POST',
+        path: '/openclaw/deploy',
+        staticBody: { action: 'remote-restart' },
+      },
+      'remote-upgrade': {
+        description: 'Upgrade a remote SSH-managed OpenClaw stack',
+        method: 'POST',
+        path: '/openclaw/deploy',
+        staticBody: { action: 'remote-upgrade' },
+      },
+      'remote-backup': {
+        description: 'Create a remote backup on an SSH-managed OpenClaw host',
+        method: 'POST',
+        path: '/openclaw/deploy',
+        staticBody: { action: 'remote-backup' },
+      },
+      'remote-restore': {
+        description: 'Restore a remote backup on an SSH-managed OpenClaw host',
+        method: 'POST',
+        path: '/openclaw/deploy',
+        staticBody: { action: 'remote-restore' },
+      },
+      'remote-rotate-token': {
+        description: 'Rotate the gateway token on an SSH-managed OpenClaw host',
+        method: 'POST',
+        path: '/openclaw/deploy',
+        staticBody: { action: 'remote-rotate-token' },
+      },
+      directory: { description: 'List directory entries from running OpenClaw connectors', method: 'GET', path: '/openclaw/directory' },
+      'gateway-status': { description: 'Check OpenClaw gateway connection status', method: 'GET', path: '/openclaw/gateway' },
+      gateway: { description: 'Call OpenClaw gateway RPC/control action', method: 'POST', path: '/openclaw/gateway' },
+      'config-sync': { description: 'Detect OpenClaw gateway config issues', method: 'GET', path: '/openclaw/config-sync' },
+      'config-sync-repair': { description: 'Repair a detected OpenClaw config issue', method: 'POST', path: '/openclaw/config-sync' },
+      approvals: { description: 'List pending OpenClaw execution approvals', method: 'GET', path: '/openclaw/approvals' },
+      'approvals-resolve': { description: 'Resolve an OpenClaw execution approval', method: 'POST', path: '/openclaw/approvals' },
+      cron: { description: 'List OpenClaw cron jobs', method: 'GET', path: '/openclaw/cron' },
+      'cron-action': { description: 'Create/run/remove OpenClaw cron jobs', method: 'POST', path: '/openclaw/cron' },
+      'agent-files': { description: 'Fetch OpenClaw agent files', method: 'GET', path: '/openclaw/agent-files' },
+      'agent-files-set': { description: 'Save an OpenClaw agent file', method: 'PUT', path: '/openclaw/agent-files' },
+      'dotenv-keys': { description: 'List gateway .env keys', method: 'GET', path: '/openclaw/dotenv-keys' },
+      'exec-config': { description: 'Fetch OpenClaw exec approval config', method: 'GET', path: '/openclaw/exec-config' },
+      'exec-config-set': { description: 'Save OpenClaw exec approval config', method: 'PUT', path: '/openclaw/exec-config' },
+      'history-preview': { description: 'Preview OpenClaw session history', method: 'GET', path: '/openclaw/history' },
+      'history-merge': { description: 'Merge OpenClaw session history into local session', method: 'POST', path: '/openclaw/history' },
+      media: { description: 'Proxy OpenClaw media/file content', method: 'GET', path: '/openclaw/media' },
+      models: { description: 'List allowed OpenClaw models', method: 'GET', path: '/openclaw/models' },
+      permissions: { description: 'Get OpenClaw permission preset/config', method: 'GET', path: '/openclaw/permissions' },
+      'permissions-set': { description: 'Apply OpenClaw permission preset', method: 'PUT', path: '/openclaw/permissions' },
+      'sandbox-env': { description: 'List OpenClaw sandbox env allowlist', method: 'GET', path: '/openclaw/sandbox-env' },
+      'sandbox-env-set': { description: 'Update OpenClaw sandbox env allowlist', method: 'PUT', path: '/openclaw/sandbox-env' },
+      skills: { description: 'List OpenClaw skills and eligibility', method: 'GET', path: '/openclaw/skills' },
+      'skills-update': { description: 'Update OpenClaw skill state/config', method: 'PATCH', path: '/openclaw/skills' },
+      'skills-save': { description: 'Save OpenClaw skill allowlist mode/config', method: 'PUT', path: '/openclaw/skills' },
+      'skills-install': { description: 'Install OpenClaw skill dependencies', method: 'POST', path: '/openclaw/skills/install' },
+      'skills-remove': { description: 'Remove OpenClaw skill', method: 'POST', path: '/openclaw/skills/remove' },
+      sync: { description: 'Run OpenClaw sync action', method: 'POST', path: '/openclaw/sync' },
+    },
+  },
+  extensions: {
+    description: 'Extension listing/config/install',
+    commands: {
+      list: { description: 'List installed extensions', method: 'GET', path: '/extensions' },
+      update: { description: 'Enable or disable an extension (body: {"filename":"x.js","enabled":true})', method: 'POST', path: '/extensions' },
+      marketplace: { description: 'Get extension marketplace registry', method: 'GET', path: '/extensions/marketplace' },
+      install: { description: 'Install extension by URL', method: 'POST', path: '/extensions/install' },
+      'settings-get': { description: 'Read extension settings (supports --query extensionId=...)', method: 'GET', path: '/extensions/settings' },
+      'settings-set': { description: 'Write extension settings (supports --query extensionId=... and --data JSON)', method: 'PUT', path: '/extensions/settings' },
+      'managed-resources': { description: 'Preview extension-managed agents, routines, folders, gateways, and setup checks', method: 'GET', path: '/extensions/managed-resources' },
+      'managed-resources-action': { description: 'Reconcile or inspect extension-managed resources', method: 'POST', path: '/extensions/managed-resources' },
+    },
+  },
+  providers: {
+    description: 'Provider configs and model overrides',
+    commands: {
+      list: { description: 'List providers', method: 'GET', path: '/providers' },
+      create: { description: 'Create custom provider', method: 'POST', path: '/providers' },
+      get: { description: 'Get provider by id', method: 'GET', path: '/providers/:id', params: ['id'] },
+      update: { description: 'Update provider config', method: 'PUT', path: '/providers/:id', params: ['id'] },
+      delete: { description: 'Delete custom provider', method: 'DELETE', path: '/providers/:id', params: ['id'] },
+      configs: { description: 'List provider configs only', method: 'GET', path: '/providers/configs' },
+      ollama: { description: 'List local Ollama models', method: 'GET', path: '/providers/ollama' },
+      'openclaw-health': { description: 'Probe OpenClaw endpoint and auth status', method: 'GET', path: '/providers/openclaw/health' },
+      'models-get': { description: 'Get provider model overrides', method: 'GET', path: '/providers/:id/models', params: ['id'] },
+      'models-set': { description: 'Set provider model overrides', method: 'PUT', path: '/providers/:id/models', params: ['id'] },
+      'models-reset': { description: 'Delete provider model overrides', method: 'DELETE', path: '/providers/:id/models', params: ['id'] },
+    },
+  },
+  search: {
+    description: 'Global search across app resources',
+    commands: {
+      query: { description: 'Search agents/tasks/chats/schedules/webhooks/skills (supports --query q=term)', method: 'GET', path: '/search' },
+    },
+  },
+  schedules: {
+    description: 'Scheduled task automation',
+    commands: {
+      list: { description: 'List schedules', method: 'GET', path: '/schedules' },
+      preview: { description: 'Preview schedule timing and validation', method: 'POST', path: '/schedules/preview' },
+      create: { description: 'Create schedule', method: 'POST', path: '/schedules' },
+      get: { description: 'Get schedule by id (from list)', virtualGet: true, collectionPath: '/schedules', params: ['id'] },
+      history: { description: 'Get schedule revision history', method: 'GET', path: '/schedules/:id/history', params: ['id'] },
+      update: { description: 'Update schedule', method: 'PUT', path: '/schedules/:id', params: ['id'] },
+      delete: { description: 'Delete schedule', method: 'DELETE', path: '/schedules/:id', params: ['id'] },
+      run: { description: 'Trigger schedule immediately', method: 'POST', path: '/schedules/:id/run', params: ['id'] },
+    },
+  },
+  secrets: {
+    description: 'Encrypted secret vault',
+    commands: {
+      list: { description: 'List secret metadata', method: 'GET', path: '/secrets' },
+      get: { description: 'Get secret metadata by id (from list)', virtualGet: true, collectionPath: '/secrets', params: ['id'] },
+      create: { description: 'Create secret', method: 'POST', path: '/secrets' },
+      update: { description: 'Update secret metadata', method: 'PUT', path: '/secrets/:id', params: ['id'] },
+      delete: { description: 'Delete secret', method: 'DELETE', path: '/secrets/:id', params: ['id'] },
+    },
+  },
+  chats: {
+    description: 'Agent chats',
+    commands: {
+      list: { description: 'List chats', method: 'GET', path: '/chats' },
+      create: { description: 'Create chat', method: 'POST', path: '/chats' },
+      get: { description: 'Get chat by id', method: 'GET', path: '/chats/:id', params: ['id'] },
+      update: { description: 'Update chat fields', method: 'PUT', path: '/chats/:id', params: ['id'] },
+      delete: { description: 'Delete one chat', method: 'DELETE', path: '/chats/:id', params: ['id'] },
+      'delete-many': { description: 'Delete multiple chats (body: {"ids":[...]})', method: 'DELETE', path: '/chats' },
+      'heartbeat-disable-all': { description: 'Disable all chat heartbeats and cancel queued heartbeat runs', method: 'POST', path: '/chats/heartbeat' },
+      'migrate-messages': { description: 'Migrate messages from session blobs to relational table', method: 'POST', path: '/chats/migrate-messages' },
+      messages: { description: 'Get chat message history', method: 'GET', path: '/chats/:id/messages', params: ['id'] },
+      'messages-update': { description: 'Update chat message metadata (e.g. bookmark)', method: 'PUT', path: '/chats/:id/messages', params: ['id'] },
+      'messages-send': { description: 'Append a user/system message to a chat', method: 'POST', path: '/chats/:id/messages', params: ['id'] },
+      'messages-delete': { description: 'Delete a message from a chat', method: 'DELETE', path: '/chats/:id/messages', params: ['id'] },
+      'edit-resend': { description: 'Edit and resend from a specific message index', method: 'POST', path: '/chats/:id/edit-resend', params: ['id'] },
+      chat: { description: 'Send chat message (SSE stream)', method: 'POST', path: '/chats/:id/chat', params: ['id'], stream: true, waitable: true },
+      stop: { description: 'Cancel active/running chat work', method: 'POST', path: '/chats/:id/stop', params: ['id'] },
+      clear: { description: 'Clear chat history (returns undoToken with 30s TTL)', method: 'POST', path: '/chats/:id/clear', params: ['id'] },
+      'clear-undo': { description: 'Restore a cleared chat via its undoToken', method: 'POST', path: '/chats/:id/clear/undo', params: ['id'] },
+      compact: { description: 'Summarize and compact chat history', method: 'POST', path: '/chats/:id/compact', params: ['id'] },
+      'context-status': { description: 'Report token usage and context-window status', method: 'GET', path: '/chats/:id/context-status', params: ['id'] },
+      'context-pack': { description: 'Get a copyable session context pack for handoff', method: 'GET', path: '/chats/:id/context-pack', params: ['id'] },
+      mailbox: { description: 'List mailbox envelopes for a chat', method: 'GET', path: '/chats/:id/mailbox', params: ['id'] },
+      'mailbox-action': { description: 'Send/ack/clear mailbox envelopes', method: 'POST', path: '/chats/:id/mailbox', params: ['id'] },
+      queue: { description: 'List queued follow-up turns for a chat', method: 'GET', path: '/chats/:id/queue', params: ['id'] },
+      'queue-add': { description: 'Enqueue a follow-up turn for a busy chat', method: 'POST', path: '/chats/:id/queue', params: ['id'] },
+      'queue-clear': { description: 'Remove queued follow-up turns from a chat', method: 'DELETE', path: '/chats/:id/queue', params: ['id'] },
+      deploy: { description: 'Deploy chat workspace git changes', method: 'POST', path: '/chats/:id/deploy', params: ['id'] },
+      devserver: { description: 'Start/stop/status dev server (body: {"action":"start|stop|status"})', method: 'POST', path: '/chats/:id/devserver', params: ['id'] },
+      browser: { description: 'Check browser runtime for chat', method: 'GET', path: '/chats/:id/browser', params: ['id'] },
+      'browser-clear': { description: 'Close browser runtime for chat', method: 'DELETE', path: '/chats/:id/browser', params: ['id'] },
+    },
+  },
+  settings: {
+    description: 'Global app settings',
+    commands: {
+      get: { description: 'Get settings', method: 'GET', path: '/settings' },
+      update: { description: 'Update settings', method: 'PUT', path: '/settings' },
+    },
+  },
+  setup: {
+    description: 'Setup and provider validation helpers',
+    commands: {
+      'check-provider': { description: 'Validate provider credentials/endpoint', method: 'POST', path: '/setup/check-provider' },
+      doctor: { description: 'Run local setup diagnostics', method: 'GET', path: '/setup/doctor' },
+    },
+  },
+  'learned-skills': {
+    description: 'Inspect agent-scoped learned skills',
+    commands: {
+      list: { description: 'List learned skills', method: 'GET', path: '/learned-skills' },
+      promote: { description: 'Promote a review-ready skill to active', method: 'POST', path: '/learned-skills/:id?action=promote', params: ['id'] },
+      dismiss: { description: 'Dismiss a learned skill', method: 'POST', path: '/learned-skills/:id?action=dismiss', params: ['id'] },
+      delete: { description: 'Delete a learned skill', method: 'DELETE', path: '/learned-skills/:id', params: ['id'] },
+      'review-counts': { description: 'Show pending review counts', method: 'GET', path: '/skill-review-counts' },
+    },
+  },
+  skills: {
+    description: 'SwarmClaw and Claude skills',
+    commands: {
+      list: { description: 'List SwarmClaw skills', method: 'GET', path: '/skills' },
+      get: { description: 'Get SwarmClaw skill by id', method: 'GET', path: '/skills/:id', params: ['id'] },
+      create: { description: 'Create SwarmClaw skill', method: 'POST', path: '/skills' },
+      update: { description: 'Update SwarmClaw skill', method: 'PUT', path: '/skills/:id', params: ['id'] },
+      delete: { description: 'Delete SwarmClaw skill', method: 'DELETE', path: '/skills/:id', params: ['id'] },
+      import: { description: 'Import skill from URL', method: 'POST', path: '/skills/import' },
+      claude: { description: 'List local ~/.claude/skills', method: 'GET', path: '/claude-skills' },
+    },
+  },
+  'skill-suggestions': {
+    description: 'Conversation-derived skill draft review',
+    commands: {
+      list: { description: 'List generated skill suggestions', method: 'GET', path: '/skill-suggestions' },
+      draft: { description: 'Generate or refresh a skill suggestion from a session', method: 'POST', path: '/skill-suggestions' },
+      approve: { description: 'Approve a skill suggestion and materialize it', method: 'POST', path: '/skill-suggestions/:id/approve', params: ['id'] },
+      reject: { description: 'Reject a skill suggestion draft', method: 'POST', path: '/skill-suggestions/:id/reject', params: ['id'] },
+    },
+  },
+  system: {
+    description: 'System and version endpoints',
+    commands: {
+      ip: { description: 'Get local bind IP/port', method: 'GET', path: '/ip' },
+      status: { description: 'Get lightweight system health summary (safe for external monitors)', method: 'GET', path: '/system/status' },
+      usage: { description: 'Get usage summary', method: 'GET', path: '/usage' },
+      version: { description: 'Get local/remote git version info', method: 'GET', path: '/version' },
+      update: { description: 'Update to latest stable release tag (fallback: main)', method: 'POST', path: '/version/update' },
+    },
+  },
+  tasks: {
+    description: 'Task board operations',
+    commands: {
+      list: { description: 'List tasks', method: 'GET', path: '/tasks' },
+      get: { description: 'Get task by id', method: 'GET', path: '/tasks/:id', params: ['id'] },
+      handoff: { description: 'Get task handoff packet', method: 'GET', path: '/tasks/:id/handoff', params: ['id'] },
+      'handoff-save': { description: 'Save task handoff packet into the task workspace', method: 'POST', path: '/tasks/:id/handoff', params: ['id'] },
+      handoffs: { description: 'List task handoff readiness packets', method: 'GET', path: '/tasks/handoffs' },
+      'execution-policy': { description: 'Get task execution policy state', method: 'GET', path: '/tasks/:id/execution-policy', params: ['id'] },
+      'execution-policy-decision': { description: 'Approve, request changes, or reset a task policy stage', method: 'POST', path: '/tasks/:id/execution-policy', params: ['id'] },
+      retry: { description: 'Retry a failed task and requeue it', method: 'POST', path: '/tasks/:id/retry', params: ['id'] },
+      create: { description: 'Create task', method: 'POST', path: '/tasks' },
+      bulk: { description: 'Bulk update tasks (status/agent/project)', method: 'POST', path: '/tasks/bulk' },
+      update: { description: 'Update task', method: 'PUT', path: '/tasks/:id', params: ['id'] },
+      delete: { description: 'Archive task', method: 'DELETE', path: '/tasks/:id', params: ['id'] },
+      archive: { description: 'Archive task', method: 'DELETE', path: '/tasks/:id', params: ['id'] },
+      approve: { description: 'Approve or reject a pending tool execution', method: 'POST', path: '/tasks/:id/approve', params: ['id'] },
+      'import-github': { description: 'Import GitHub issues into tasks', method: 'POST', path: '/tasks/import/github' },
+      metrics: { description: 'Get task board metrics (supports --query range=24h|7d|30d)', method: 'GET', path: '/tasks/metrics' },
+    },
+  },
+  runs: {
+    description: 'Session run queue/history',
+    commands: {
+      list: { description: 'List runs (supports --query sessionId=,status=,limit=)', method: 'GET', path: '/runs' },
+      get: { description: 'Get run by id', method: 'GET', path: '/runs/:id', params: ['id'] },
+      events: { description: 'Get run event history by run id', method: 'GET', path: '/runs/:id/events', params: ['id'] },
+      brief: { description: 'Get deterministic run brief by run id', method: 'GET', path: '/runs/:id/brief', params: ['id'] },
+      handoff: { description: 'Get run handoff packet by run id', method: 'GET', path: '/runs/:id/handoff', params: ['id'] },
+    },
+  },
+  webhooks: {
+    description: 'Inbound webhook triggers',
+    commands: {
+      trigger: { description: 'Trigger webhook by id', method: 'POST', path: '/webhooks/:id', params: ['id'], waitable: true },
+    },
+  },
+  portability: {
+    description: 'Export and import agent configurations',
+    commands: {
+      export: { description: 'Export agents, skills, and schedules as a portable JSON manifest', method: 'GET', path: '/portability/export' },
+      import: { description: 'Import a portable JSON manifest', method: 'POST', path: '/portability/import', body: true },
+    },
+  },
+  wallets: {
+    description: 'Manage agent wallets',
+    commands: {
+      list: { description: 'List wallets', method: 'GET', path: '/wallets' },
+      get: { description: 'Get wallet by id', method: 'GET', path: '/wallets/:id', params: ['id'] },
+      create: { description: 'Create a wallet', method: 'POST', path: '/wallets' },
+      generate: { description: 'Generate a new wallet for an agent', method: 'POST', path: '/wallets/generate', body: true },
+      update: { description: 'Update wallet settings', method: 'PATCH', path: '/wallets/:id', params: ['id'], body: true },
+      delete: { description: 'Delete a wallet', method: 'DELETE', path: '/wallets/:id', params: ['id'] },
+    },
+  },
+  goals: {
+    description: 'Manage goal hierarchy',
+    commands: {
+      list: { description: 'List goals', method: 'GET', path: '/goals' },
+      get: { description: 'Get goal by id', method: 'GET', path: '/goals/:id', params: ['id'] },
+      create: { description: 'Create a goal', method: 'POST', path: '/goals' },
+      update: { description: 'Update a goal', method: 'PATCH', path: '/goals/:id', params: ['id'], body: true },
+      delete: { description: 'Delete a goal', method: 'DELETE', path: '/goals/:id', params: ['id'] },
+    },
+  },
+  workspaces: {
+    description: 'Manage logical workspaces (multi-workspace scaffolding)',
+    commands: {
+      list: { description: 'List workspaces', method: 'GET', path: '/workspaces' },
+      create: { description: 'Create a workspace', method: 'POST', path: '/workspaces' },
+      update: { description: 'Update a workspace', method: 'PATCH', path: '/workspaces' },
+      delete: { description: 'Delete a workspace', method: 'DELETE', path: '/workspaces' },
+      active: { description: 'Get the active workspace', method: 'GET', path: '/workspaces/active' },
+      'set-active': { description: 'Set the active workspace', method: 'POST', path: '/workspaces/active' },
+    },
+  },
+  'workflow-states': {
+    description: 'Manage customizable task workflow states',
+    commands: {
+      list: { description: 'List workflow states', method: 'GET', path: '/task-workflow-states' },
+      create: { description: 'Create or update a workflow state', method: 'POST', path: '/task-workflow-states' },
+      delete: { description: 'Delete a workflow state (or pass --query reset=true to restore defaults)', method: 'DELETE', path: '/task-workflow-states' },
+    },
+  },
+  'config-versions': {
+    description: 'Inspect and restore configuration version history',
+    commands: {
+      list: { description: 'List versions for an entity (--query entityKind=agent,entityId=...)', method: 'GET', path: '/config-versions' },
+      restore: { description: 'Restore an entity to a prior version', method: 'POST', path: '/config-versions/restore' },
+    },
+  },
+  'cost-attribution': {
+    description: 'Aggregate cost by billing-code tags',
+    commands: {
+      'by-code': { description: 'Roll up cost by billing code (--query codes=foo,bar,range=7d)', method: 'GET', path: '/usage/by-code' },
+    },
+  },
+  'chatroom-policy': {
+    description: 'Configure chatroom delegation refusal policies',
+    commands: {
+      set: { description: 'Set onRefusal policy for a chatroom', method: 'POST', path: '/chatrooms/refusal-policy' },
+      simulate: { description: 'Simulate a refusal-handling decision', method: 'PUT', path: '/chatrooms/refusal-policy' },
+    },
+  },
+  missions: {
+    description: 'Manage autonomous missions',
+    commands: {
+      list: { description: 'List autonomous missions', method: 'GET', path: '/missions' },
+      get: { description: 'Get a mission by id', method: 'GET', path: '/missions/:id', params: ['id'] },
+      create: { description: 'Create an autonomous mission', method: 'POST', path: '/missions' },
+      update: { description: 'Update a mission', method: 'PUT', path: '/missions/:id', params: ['id'], body: true },
+      delete: { description: 'Delete a mission', method: 'DELETE', path: '/missions/:id', params: ['id'] },
+      control: { description: 'Start, pause, resume, cancel, complete, or fail a mission', method: 'POST', path: '/missions/:id/control', params: ['id'] },
+      reports: { description: 'List mission reports', method: 'GET', path: '/missions/:id/reports', params: ['id'] },
+      'report-now': { description: 'Force-generate a mission report now', method: 'POST', path: '/missions/:id/reports', params: ['id'] },
+      events: { description: 'List mission events', method: 'GET', path: '/missions/:id/events', params: ['id'] },
+      templates: { description: 'List built-in mission templates', method: 'GET', path: '/missions/templates' },
+      instantiate: { description: 'Create a mission from a template', method: 'POST', path: '/missions/templates/:id/instantiate', params: ['id'], body: true },
+    },
+  },
+}
+
+const GROUP_NAMES = Object.keys(COMMAND_GROUPS)
+
+function listCoveredRoutes() {
+  const routes = []
+  for (const group of GROUP_NAMES) {
+    const commands = COMMAND_GROUPS[group].commands
+    for (const action of Object.keys(commands)) {
+      const cmd = commands[action]
+      if (cmd.method && cmd.path) {
+        routes.push(`${cmd.method.toUpperCase()} ${cmd.path.split('?')[0]}`)
+      }
+    }
+  }
+  return routes
+}
+
+module.exports = {
+  COMMAND_GROUPS,
+  GROUP_NAMES,
+  listCoveredRoutes,
+}

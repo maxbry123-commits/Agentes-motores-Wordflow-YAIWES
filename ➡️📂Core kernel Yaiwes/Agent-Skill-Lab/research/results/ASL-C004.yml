@@ -1,0 +1,362 @@
+schema_version: "0.2"
+
+sample:
+  corpus_id: ASL-C004
+  name: handoff
+  repository: openclaw/agent-skills
+  commit: fe588b1a6267eb47f785d0c748db9f6f3e9a3b4f
+  skill_root: skills/handoff
+  skill_md_blob_sha: 50054b4079bcc25492e27cae7b72ea748a853cc9
+  git_tree_sha: 1c8427f164487c197b37a87dc76a0b5be63c3735
+  inventory_sha256: b443e7666aa7bb89936545fedd290ba560c0b173c9b50ac9d998a8a2839acf5b
+  license:
+    identifier: MIT
+    scope: repository
+    evidence: LICENSE
+
+review:
+  review_id: ASL-C004-manual-001
+  mode: static_manual
+  reviewer: codex-assisted-manual-review
+  reviewed_at: "2026-07-29"
+  source_access: github-connector-at-pinned-commit
+  source_network_accessed: true
+  content_installed: false
+  content_executed: false
+  skill_referenced_urls_contacted: false
+  third_party_content_vendored: false
+  secret_values_accessed: false
+
+manual_baseline:
+  frontmatter_fields: [name, description]
+  files:
+    total: 1
+    scripts: []
+    references: []
+    assets: []
+    package_manifests: []
+    symlinks: []
+  declared_capabilities: []
+  inferred_capabilities:
+    - clipboard-write
+    - filesystem-context-read
+    - repository-context-read
+    - optional-github-and-ci-state-read
+    - shell-command-use
+  external_urls: []
+  environment_variable_names: []
+  command_references:
+    - pbcopy
+    - wl-copy
+    - xclip
+    - clip.exe
+  observations:
+    - The package is a single instruction file with no bundled supporting resources.
+    - The workflow requires a clipboard mechanism but documents cross-platform fallbacks.
+    - Repository, issue, pull-request, and CI context are requested only when relevant.
+
+evidence:
+  - id: ASL-C004-E001
+    location:
+      path: corpus.yml
+      start_line: null
+      end_line: null
+    fact: The admitted record pins the repository commit, skill root, blob, tree, inventory hash, and MIT license evidence.
+    supports_rules: [AS-PKG-001, AS-RES-001, OC-DISC-001, HA-DISC-001]
+
+  - id: ASL-C004-E002
+    location:
+      path: SKILL.md
+      start_line: 1
+      end_line: 4
+    fact: YAML frontmatter contains name "handoff" and a non-empty task-specific description.
+    supports_rules:
+      - AS-DOC-001
+      - AS-DOC-002
+      - AS-NAME-001
+      - AS-NAME-002
+      - AS-NAME-003
+      - AS-NAME-004
+      - AS-DESC-001
+      - AS-DESC-002
+      - AS-DESC-003
+      - OC-DOC-001
+      - OC-DOC-002
+      - HA-DOC-001
+      - HA-DOC-005
+
+  - id: ASL-C004-E003
+    location:
+      path: SKILL.md
+      start_line: 6
+      end_line: 110
+    fact: The Markdown body defines trigger conditions, a workflow, constraints, a prompt template, clipboard handling, and a quality bar.
+    supports_rules: [AS-DOC-003, AS-PD-001, HA-DOC-003, HA-DOC-004]
+
+  - id: ASL-C004-E004
+    location:
+      path: SKILL.md
+      start_line: 17
+      end_line: 24
+    fact: The workflow may inspect repository and discussion context and then writes the generated prompt to a clipboard.
+    supports_rules: []
+
+  - id: ASL-C004-E005
+    location:
+      path: SKILL.md
+      start_line: 39
+      end_line: 52
+    fact: Instructions mention filesystem orientation and optional live repository, GitHub, and CI state while restricting external write actions unless explicitly requested.
+    supports_rules: []
+
+  - id: ASL-C004-E006
+    location:
+      path: SKILL.md
+      start_line: 91
+      end_line: 103
+    fact: Clipboard handling references pbcopy and fallbacks wl-copy, xclip, and clip.exe; no command was executed.
+    supports_rules: []
+
+  - id: ASL-C004-E007
+    location:
+      path: inventories.yml
+      start_line: null
+      end_line: null
+    fact: The pinned recursive inventory contains only SKILL.md and no scripts, references, assets, manifests, binaries, or symlinks.
+    supports_rules: [AS-RES-001, AS-REF-002, HA-RES-001, HA-RES-002]
+
+compatibility:
+  - profile: agent-skills
+    profile_version: research-0.1
+    target_version: specification-blob-20cf9f6
+    surface: core
+    layers:
+      package_structure: compatible
+      platform_packaging: not_applicable
+      capability_availability: unknown
+      behavioral_conformance: not_tested
+      operational_suitability: unknown
+    rules:
+      AS-PKG-001: {result: pass, confidence: high, evidence_refs: [ASL-C004-E001], remediation: null}
+      AS-DOC-001: {result: pass, confidence: high, evidence_refs: [ASL-C004-E002], remediation: null}
+      AS-DOC-002: {result: pass, confidence: high, evidence_refs: [ASL-C004-E002], remediation: null}
+      AS-DOC-003: {result: pass, confidence: high, evidence_refs: [ASL-C004-E003], remediation: null}
+      AS-NAME-001: {result: pass, confidence: high, evidence_refs: [ASL-C004-E002], remediation: null}
+      AS-NAME-002: {result: pass, confidence: high, evidence_refs: [ASL-C004-E002], remediation: null}
+      AS-NAME-003: {result: pass, confidence: high, evidence_refs: [ASL-C004-E002], remediation: null}
+      AS-NAME-004: {result: pass, confidence: high, evidence_refs: [ASL-C004-E001, ASL-C004-E002], remediation: null}
+      AS-DESC-001: {result: pass, confidence: high, evidence_refs: [ASL-C004-E002], remediation: null}
+      AS-DESC-002: {result: pass, confidence: high, evidence_refs: [ASL-C004-E002], remediation: null}
+      AS-DESC-003: {result: pass, confidence: high, evidence_refs: [ASL-C004-E002], remediation: null}
+      AS-RES-001: {result: pass, confidence: high, evidence_refs: [ASL-C004-E001, ASL-C004-E007], remediation: null}
+      AS-PD-001: {result: pass, confidence: high, evidence_refs: [ASL-C004-E003], remediation: null}
+      AS-PD-002:
+        result: unknown
+        confidence: high
+        evidence_refs: [ASL-C004-E003]
+        remediation: Record a named tokenizer before reporting a token estimate.
+      AS-PD-003: {result: not_applicable, confidence: high, evidence_refs: [ASL-C004-E007], remediation: null}
+    not_applicable_rules:
+      - AS-LICENSE-001
+      - AS-LICENSE-002
+      - AS-COMPAT-001
+      - AS-COMPAT-002
+      - AS-META-001
+      - AS-META-002
+      - AS-TOOLS-001
+      - AS-TOOLS-002
+      - AS-REF-001
+      - AS-REF-002
+      - AS-REF-003
+      - AS-SCRIPT-001
+      - AS-SCRIPT-002
+    skipped_rules: []
+    observations:
+      - Core format passes; runtime capability remains outside this profile.
+
+  - profile: openclaw
+    profile_version: research-0.1
+    target_version: runtime-blob-ebbfcc0
+    surface: runtime
+    layers:
+      package_structure: compatible
+      platform_packaging: compatible_with_conditions
+      capability_availability: compatible_with_conditions
+      behavioral_conformance: not_tested
+      operational_suitability: unknown
+    rules:
+      OC-DISC-001: {result: pass, confidence: high, evidence_refs: [ASL-C004-E001], remediation: null}
+      OC-DISC-002: {result: unknown, confidence: high, evidence_refs: [], remediation: Evaluate the final OpenClaw installation path.}
+      OC-DISC-003: {result: unknown, confidence: high, evidence_refs: [], remediation: Record the final source root and precedence.}
+      OC-DISC-004: {result: unknown, confidence: high, evidence_refs: [], remediation: Check name collisions in the target installation.}
+      OC-DISC-006: {result: unknown, confidence: high, evidence_refs: [], remediation: Resolve the installed real path in the target context.}
+      OC-DOC-001: {result: pass, confidence: high, evidence_refs: [ASL-C004-E002], remediation: null}
+      OC-DOC-002: {result: pass, confidence: high, evidence_refs: [ASL-C004-E002], remediation: null}
+      OC-DOC-003: {result: pass, confidence: high, evidence_refs: [ASL-C004-E002], remediation: null}
+    not_applicable_rules:
+      - OC-DISC-005
+      - OC-INV-001
+      - OC-INV-002
+      - OC-INV-003
+      - OC-INV-004
+      - OC-INV-005
+      - OC-INV-006
+      - OC-META-001
+      - OC-META-002
+      - OC-META-003
+      - OC-META-004
+      - OC-META-005
+      - OC-META-006
+      - OC-META-007
+      - OC-META-008
+      - OC-GATE-001
+      - OC-GATE-002
+      - OC-GATE-003
+      - OC-GATE-004
+      - OC-GATE-005
+      - OC-GATE-006
+      - OC-GATE-007
+      - OC-GATE-008
+      - OC-INSTALL-001
+      - OC-INSTALL-002
+      - OC-INSTALL-003
+      - OC-INSTALL-004
+      - CH-PKG-001
+      - CH-PKG-002
+      - CH-PKG-003
+      - CH-PKG-004
+      - CH-PKG-005
+      - CH-PKG-006
+      - CH-PKG-007
+      - CH-PKG-008
+      - CH-GH-001
+      - CH-GH-002
+      - CH-GH-003
+      - CH-GH-004
+      - CH-GH-005
+    skipped_rules: []
+    observations:
+      - ClawHub publication and GitHub import were not requested and are not applicable.
+
+  - profile: hermes-agent
+    profile_version: research-0.1
+    target_version: skills-system-blob-1857648
+    surface: runtime
+    layers:
+      package_structure: compatible
+      platform_packaging: compatible_with_conditions
+      capability_availability: compatible_with_conditions
+      behavioral_conformance: not_tested
+      operational_suitability: unknown
+    rules:
+      HA-DISC-001: {result: pass, confidence: high, evidence_refs: [ASL-C004-E001], remediation: null}
+      HA-DISC-002: {result: unknown, confidence: high, evidence_refs: [], remediation: Evaluate the final Hermes installation path.}
+      HA-DISC-003: {result: unknown, confidence: high, evidence_refs: [], remediation: Record the local or external source root.}
+      HA-DISC-004: {result: unknown, confidence: high, evidence_refs: [], remediation: Check target name collisions and shadowing.}
+      HA-DISC-005: {result: unknown, confidence: high, evidence_refs: [], remediation: Resolve configured external directories when applicable.}
+      HA-DISC-006: {result: unknown, confidence: high, evidence_refs: [], remediation: Record write permissions for external directories.}
+      HA-DOC-001: {result: pass, confidence: high, evidence_refs: [ASL-C004-E002], remediation: null}
+      HA-DOC-002: {result: pass, confidence: high, evidence_refs: [ASL-C004-E002], remediation: null}
+      HA-DOC-003: {result: pass, confidence: medium, evidence_refs: [ASL-C004-E003], remediation: null}
+      HA-DOC-004: {result: pass, confidence: medium, evidence_refs: [ASL-C004-E003, ASL-C004-E007], remediation: null}
+      HA-DOC-005: {result: pass, confidence: medium, evidence_refs: [ASL-C004-E002], remediation: null}
+      HA-PLAT-003: {result: pass, confidence: high, evidence_refs: [ASL-C004-E002], remediation: null}
+      HA-RES-001: {result: pass, confidence: high, evidence_refs: [ASL-C004-E007], remediation: null}
+      HA-RES-002: {result: not_applicable, confidence: high, evidence_refs: [ASL-C004-E007], remediation: null}
+    not_applicable_rules:
+      - HA-PLAT-001
+      - HA-PLAT-002
+      - HA-ACT-001
+      - HA-ACT-002
+      - HA-ACT-003
+      - HA-ACT-004
+      - HA-ACT-005
+      - HA-ACT-006
+      - HA-ENV-001
+      - HA-ENV-002
+      - HA-ENV-003
+      - HA-ENV-004
+      - HA-ENV-005
+      - HA-ENV-006
+      - HA-CONFIG-001
+      - HA-CONFIG-002
+      - HA-CONFIG-003
+      - HA-CONFIG-004
+      - HA-CRED-001
+      - HA-CRED-002
+      - HA-CRED-003
+      - HA-CRED-004
+      - HA-CRED-005
+      - HA-RES-003
+      - HA-RES-004
+      - HA-RES-005
+      - HA-BP-001
+      - HA-BP-002
+      - HA-BP-003
+      - HA-BP-004
+      - HH-PKG-001
+      - HH-PKG-002
+      - HH-PKG-003
+      - HH-PROV-001
+      - HH-PROV-002
+      - HH-SCAN-001
+      - HH-SCAN-002
+      - HH-SCAN-003
+      - HT-REPO-001
+      - HT-REPO-002
+      - HT-REPO-003
+      - HT-REPO-004
+      - HT-REPO-005
+      - HT-REPO-006
+    skipped_rules: []
+    observations:
+      - Hub installation and GitHub-tap distribution were not requested and are not applicable.
+
+analyzer_runs: []
+
+normalized_findings:
+  - id: ASL-C004-F001
+    source:
+      type: manual
+      engine: null
+      original_id: null
+    category: capability.clipboard
+    severity: low
+    confidence: high
+    compatibility_layers: [capability-availability]
+    targets: [openclaw, hermes-agent]
+    location:
+      path: SKILL.md
+      start_line: 91
+      end_line: 103
+    evidence_refs: [ASL-C004-E006]
+    explanation: Clipboard writing depends on a platform command, although the skill documents multiple commands and a print fallback.
+    remediation: Confirm one clipboard command is available or use the documented print fallback.
+    disposition: confirmed
+
+  - id: ASL-C004-F002
+    source:
+      type: manual
+      engine: null
+      original_id: null
+    category: capability.external-context
+    severity: low
+    confidence: medium
+    compatibility_layers: [capability-availability, operational-suitability]
+    targets: [openclaw, hermes-agent]
+    location:
+      path: SKILL.md
+      start_line: 17
+      end_line: 52
+    evidence_refs: [ASL-C004-E004, ASL-C004-E005]
+    explanation: A complete handoff may require filesystem, repository, GitHub, or CI context that is not guaranteed in every runtime.
+    remediation: Record available tools and permissions and preserve unknowns when live state cannot be checked.
+    disposition: confirmed
+
+disagreements: []
+
+limitations:
+  - No OpenClaw or Hermes installation context, operating system, tool inventory, allowlist, or credentials were supplied.
+  - No behavior was executed; clipboard output and handoff quality remain not tested.
+  - Token count was not estimated because no tokenizer was selected.
+  - The result does not assess ClawHub, Hermes Hub, or GitHub-tap distribution suitability.

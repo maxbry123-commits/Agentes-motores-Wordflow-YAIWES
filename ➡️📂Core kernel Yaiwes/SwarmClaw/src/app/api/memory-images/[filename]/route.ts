@@ -1,0 +1,36 @@
+import { NextResponse } from 'next/server'
+import { notFound } from '@/lib/server/collection-helpers'
+import { MEMORY_IMAGES_DIR } from '@/lib/server/data-dir'
+import fs from 'fs'
+import path from 'path'
+
+const MIME_TYPES: Record<string, string> = {
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+  '.bmp': 'image/bmp',
+  '.tiff': 'image/tiff',
+}
+
+export async function GET(_req: Request, { params }: { params: Promise<{ filename: string }> }) {
+  const { filename } = await params
+  const safeName = filename.replace(/[^a-zA-Z0-9._-]/g, '')
+  const filePath = path.join(MEMORY_IMAGES_DIR, safeName)
+
+  if (!fs.existsSync(filePath)) {
+    return notFound()
+  }
+
+  const ext = path.extname(safeName).toLowerCase()
+  const contentType = MIME_TYPES[ext] || 'application/octet-stream'
+  const data = fs.readFileSync(filePath)
+
+  return new NextResponse(data, {
+    headers: {
+      'Content-Type': contentType,
+      'Cache-Control': 'public, max-age=86400',
+    },
+  })
+}

@@ -1,0 +1,66 @@
+@layer resets, grid, application;
+
+/* Import AG Grid Quartz theme at the grid layer */
+@import "ag-grid-community/styles/ag-theme-quartz.css" layer(grid);
+
+/* Neutral theme overrides — maps to shadcn/ui CSS vars */
+.ag-theme-quartz {
+  --ag-background-color: var(--color-background);
+  --ag-foreground-color: var(--color-foreground);
+  /* Header chrome: no fill — the header is typography (small uppercase
+     tracked labels, see .ag-header-cell-text below) over the page surface,
+     separated from rows by a single subtle rule. */
+  --ag-header-background-color: transparent;
+  --ag-header-foreground-color: var(--color-muted-foreground);
+  --ag-odd-row-background-color: transparent;
+  --ag-row-hover-color: var(--color-accent);
+  --ag-selected-row-background-color: var(--color-accent);
+  --ag-border-color: var(--color-border);
+  --ag-secondary-border-color: var(--color-border);
+  --ag-row-border-color: var(--color-border-subtle);
+  --ag-header-column-separator-color: var(--color-border-subtle);
+  --ag-font-family: "Space Grotesk", system-ui, sans-serif;
+  --ag-font-size: 13px;
+  --ag-header-column-resize-handle-color: var(--color-border);
+  --ag-range-selection-border-color: var(--color-primary);
+  --ag-input-focus-border-color: var(--color-primary);
+}
+
+/* Header labels: 11px uppercase with wide tracking — data-console typography
+   instead of a filled toolbar band. */
+.ag-theme-quartz .ag-header-cell-text {
+  font-size: 11px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.ag-theme-quartz .ag-header {
+  border-bottom: 1px solid var(--color-border-subtle);
+}
+
+/* Vertically center cell content in all AG Grid cells */
+.ag-theme-quartz .ag-cell {
+  display: flex;
+  align-items: center;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ag-theme-quartz .ag-cell-value {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/*
+ * Quartz reserves `min-height: 150px` on the auto-height viewport, which leaves
+ * a slab of dead space under a table narrowed to one or two rows. Applied only
+ * when the grid actually has rows — the no-rows overlay still needs its box.
+ */
+.ag-theme-quartz.ag-grid-hug .ag-layout-auto-height .ag-center-cols-viewport {
+  min-height: 0;
+}

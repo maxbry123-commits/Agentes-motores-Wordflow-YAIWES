@@ -1,0 +1,207 @@
+"""AC6: validate_contract() validates .loop/repair/*.json and .loop/*.jsonl (and
+.loop/receipts/*.jsonl) against their schemas WHEN PRESENT — absence is never an
+error, and the shipped example / repo contract still validate clean."""
+
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from loop.contract import _validate_optional_records, validate_contract  # noqa: E402
+from loop.paths import resolve_loop_paths  # noqa: E402
+
+
+def _valid_repair() -> dict:
+    return {
+        "schema": "loop-engineer/repair@1",
+        "iteration_id": "iter-001",
+        "attempt": 1,
+        "failure_mode": "deterministic-fail",
+        "hypothesis": "h",
+        "repair_action": "a",
+        "verification_before": {"score": 0.5},
+        "verification_after": {"score": 0.9},
+        "remaining_delta": "none",
+        "productive": True,
+    }
+
+
+def _optional_issues(loop_dir: Path) -> list[dict]:
+    paths = resolve_loop_paths(loop_dir)
+    issues: list[dict] = []
+    _validate_optional_records(paths, "structural-fallback", issues)
+    return issues
+
+
+def test_absent_record_files_are_not_an_error(tmp_path):
+    (tmp_path / ".loop").mkdir()
+    assert _optional_issues(tmp_path) == []
+
+
+def test_present_valid_repair_record_passes(tmp_path):
+    repair_dir = tmp_path / ".loop" / "repair"
+    repair_dir.mkdir(parents=True)
+    (repair_dir / "iter-001.json").write_text(json.dumps(_valid_repair()), encoding="utf-8")
+    assert _optional_issues(tmp_path) == []
+
+
+def test_present_repair_record_missing_field_is_flagged(tmp_path):
+    repair_dir = tmp_path / ".loop" / "repair"
+    repair_dir.mkdir(parents=True)
+    bad = _valid_repair()
+    del bad["hypothesis"]
+    (repair_dir / "iter-001.json").write_text(json.dumps(bad), encoding="utf-8")
+    issues = _optional_issues(tmp_path)
+    assert any("hypothesis" in i["message"] for i in issues)
+
+
+def test_present_repair_record_non_numeric_score_is_flagged(tmp_path):
+    repair_dir = tmp_path / ".loop" / "repair"
+    repair_dir.mkdir(parents=True)
+    bad = _valid_repair()
+    del bad["verification_after"]["score"]
+    (repair_dir / "iter-001.json").write_text(json.dumps(bad), encoding="utf-8")
+    issues = _optional_issues(tmp_path)
+    assert any("verification_after.score" in i["message"] for i in issues)
+
+
+def test_present_rollout_jsonl_bad_line_is_flagged(tmp_path):
+    loop_dir = tmp_path / ".loop"
+    loop_dir.mkdir()
+    good = {"id": "c1", "parent": None, "verdict": "ok", "score": 0.9,
+            "score_delta": 0.1, "coherent_with_prior_winner": True, "productive": True}
+    bad = {"id": "c2"}  # missing the rest of the required rollout fields
+    (loop_dir / "rollout.jsonl").write_text(
+        json.dumps(good) + "\n" + json.dumps(bad) + "\n", encoding="utf-8"
+    )
+    issues = _optional_issues(tmp_path)
+    assert any("rollout.jsonl" in i["message"] for i in issues)
+
+
+def test_foreign_jsonl_is_not_validated_as_rollout(tmp_path):
+    # F5a: doctor must validate only the canonical rollout ledger (rollout.jsonl),
+    # not every .loop/*.jsonl. A foreign notes.jsonl must not false-FAIL a healthy
+    # contract by being force-validated against the rollout schema.
+    loop_dir = tmp_path / ".loop"
+    loop_dir.mkdir()
+    (loop_dir / "notes.jsonl").write_text(json.dumps({"note": "hi"}) + "\n", encoding="utf-8")
+    assert _optional_issues(tmp_path) == []
+
+
+def test_foreign_jsonl_does_not_mark_rollout_checked(tmp_path):
+    # F5a: "rollout" belongs in schemas_checked only when a canonical ledger was
+    # actually validated — an unknown jsonl must not inflate coverage.
+    loop_dir = tmp_path / ".loop"
+    loop_dir.mkdir()
+    (loop_dir / "notes.jsonl").write_text(json.dumps({"note": "hi"}) + "\n", encoding="utf-8")
+    checked = _validate_optional_records(resolve_loop_paths(tmp_path), "structural-fallback", [])
+    assert "rollout" not in checked
+
+
+def test_canonical_rollout_ledger_is_still_validated_and_marked(tmp_path):
+    # F5a: the canonical rollout.jsonl must still be validated and reported.
+    loop_dir = tmp_path / ".loop"
+    loop_dir.mkdir()
+    good = {"id": "c1", "parent": None, "verdict": "ok", "score": 0.9,
+            "score_delta": 0.1, "coherent_with_prior_winner": True, "productive": True}
+    (loop_dir / "rollout.jsonl").write_text(json.dumps(good) + "\n", encoding="utf-8")
+    issues: list[dict] = []
+    checked = _validate_optional_records(resolve_loop_paths(tmp_path), "structural-fallback", issues)
+    assert issues == []
+    assert "rollout" in checked
+
+
+def test_rollout_ledger_with_invalid_utf8_is_flagged(tmp_path):
+    # F5b: a rollout ledger line carrying a raw 0xff byte inside an otherwise-valid
+    # JSON record must not silently validate clean under errors="ignore" (a false
+    # PASS). Strict decode fails the file closed with an invalid_encoding issue.
+    loop_dir = tmp_path / ".loop"
+    loop_dir.mkdir()
+    prefix = b'{"id": "c1", "parent": null, "verdict": "o'
+    suffix = (
+        b'k", "score": 0.9, "score_delta": 0.1, '
+        b'"coherent_with_prior_winner": true, "productive": true}'
+    )
+    (loop_dir / "rollout.jsonl").write_bytes(prefix + b"\xff" + suffix + b"\n")
+    issues = _optional_issues(tmp_path)
+    assert any(i["code"] == "invalid_encoding" for i in issues), issues
+
+
+def test_present_valid_receipt_jsonl_passes(tmp_path):
+    receipts = tmp_path / ".loop" / "receipts"
+    receipts.mkdir(parents=True)
+    rec = {"schema": "loop-engineer/receipt@1", "iteration_id": 1,
+           "role": "write", "model": "opus", "outcome": "ok"}
+    (receipts / "run.jsonl").write_text(json.dumps(rec) + "\n", encoding="utf-8")
+    assert _optional_issues(tmp_path) == []
+
+
+def test_schemas_checked_reports_repair_when_a_repair_record_is_validated():
+    # P3: schemas_checked must not under-report — a loop with repair records shows
+    # the repair schema id, not just the 4 core contract schemas.
+    report = validate_contract(ROOT / "examples" / "coverage-repair")
+    assert "loop-engineer/repair@1" in report["schemas_checked"]
+    assert report["schemas_checked"][:4] == [
+        "loop-engineer/manifest@1",
+        "loop-engineer/state@1",
+        "loop-engineer/tasks@1",
+        "loop-engineer/terminal@1",
+    ]
+
+
+def test_schemas_checked_omits_record_schemas_when_no_record_files(tmp_path):
+    (tmp_path / ".loop").mkdir()
+    (tmp_path / "RUNLOG.md").write_text("# RUNLOG\n", encoding="utf-8")
+    report = validate_contract(tmp_path)
+    assert report["schemas_checked"] == [
+        "loop-engineer/manifest@1",
+        "loop-engineer/state@1",
+        "loop-engineer/tasks@1",
+        "loop-engineer/terminal@1",
+    ]
+
+
+def test_flagship_example_contract_validates_clean_with_repair_record():
+    report = validate_contract(ROOT / "examples" / "coverage-repair")
+    assert report["ok"] is True, report["issues"]
+
+
+def test_repo_own_contract_still_validates_clean():
+    # The repo's live .loop run-state is gitignored, so a fresh checkout (CI)
+    # has none; the live-contract gate is a local/operator check.
+    if not (ROOT / ".loop" / "state.json").exists():
+        pytest.skip("no live .loop contract in this checkout (gitignored run-state)")
+    report = validate_contract(ROOT / ".loop")
+    assert report["ok"] is True, report["issues"]
+
+
+def test_doctor_reports_invalid_encoding_for_an_undecodable_contract_object(tmp_path):
+    # #107: a terminal_state.json holding invalid UTF-8 bytes is a typed doctor
+    # finding, never a raw UnicodeDecodeError traceback out of doctor_report.
+    from loop.contract import doctor_report
+    from loop.scaffold import scaffold
+
+    workspace = tmp_path / "ws"
+    scaffold(workspace)
+    (workspace / ".loop" / "terminal_state.json").write_bytes(b"\xff\xfe{}")
+
+    report = doctor_report(workspace)
+    assert report["ok"] is False
+    assert any(i["code"] == "invalid_encoding" for i in report["issues"]), report["issues"]
+
+
+def test_read_manifest_fails_safe_on_undecodable_bytes(tmp_path):
+    # Mirrors the malformed-YAML rule stated inline in read_manifest: a manifest
+    # that cannot be decoded fails safe to {} rather than propagating a traceback.
+    from loop.contract import read_manifest
+
+    path = tmp_path / "manifest.yaml"
+    path.write_bytes(b"\xff\xfename: x")
+    assert read_manifest(path) == {}

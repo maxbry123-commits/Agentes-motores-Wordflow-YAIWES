@@ -1,0 +1,98 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "bernstein_scenario",
+  "description": "List, run, or poll Bernstein scenarios. action=list reads packaged scenario definitions; action=run queues file-writing agent work and returns the same pollable handle shape as bernstein_run; action=status queries the task server and needs orchestration_id. Host effects: reads files; writes files; spawns agent processes; makes network requests.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "action": {
+      "type": "string",
+      "enum": [
+        "list",
+        "run",
+        "status"
+      ]
+    },
+    "scenario_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^[A-Za-z0-9_.:-]+$"
+    },
+    "context": {
+      "type": "string",
+      "maxLength": 16384
+    },
+    "pr_number": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0,
+      "maximum": 1000000000
+    },
+    "branch": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 256
+    },
+    "orchestration_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^[A-Za-z0-9_.:-]+$"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "run"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "required": [
+          "scenario_id"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "status"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "required": [
+          "orchestration_id"
+        ]
+      }
+    },
+    {
+      "if": {
+        "not": {
+          "required": [
+            "action"
+          ]
+        }
+      },
+      "then": {
+        "required": [
+          "scenario_id"
+        ]
+      }
+    }
+  ]
+}

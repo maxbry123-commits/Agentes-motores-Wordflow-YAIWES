@@ -1,0 +1,9 @@
+[
+  {
+    "repo": "Yunjue-Agent",
+    "path": "docs/assets/demo.mp4",
+    "chunks_dir": "Yunjue-Agent/docs/assets/demo.mp4.chunks",
+    "bytes": 11733440,
+    "chunk_bytes": 8388608
+  }
+]

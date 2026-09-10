@@ -1,0 +1,252 @@
+"""Tier 2: #4470 — a security hole #4468's own landing opened,
+found by lead-coder before it shipped further: ``CompactionController``
+builds candidates from ``self._history_access()`` (``lambda: self.history``,
+#4387/#4468 RESIDENT-only), then sets ``covers_through_seq =
+candidates[-1].seq`` — advancing the compaction watermark to the highest
+seq it examined. If #4387's byte-driven eviction has already dropped an
+entry whose ``prev_cover < seq <= candidates[-1].seq`` from residency
+BEFORE this compaction pass ever ran, that entry is silently marked
+"covered" (summarized) even though it was never seen by the summarizer at
+all — the entries eviction removes are always a contiguous PREFIX
+(eviction only ever removes from the front), so this is always a genuine
+gap between ``prev_cover`` and the earliest resident seq, never a
+false-positive on ordinary head/tail exclusion.
+
+The security angle (lead-coder, severity:high): #4468's own untrusted-
+content narrowing latch (``Session._max_evicted_untrusted_seq``) is
+DELIBERATELY keyed to the compaction watermark, not to residency — correct
+per #4468's own design (a resource-role eviction must not itself decide a
+semantic-role question; only compaction, a semantic operation, may clear
+the latch). This bug reopens exactly that hole from the OTHER side: a
+compaction pass that never actually summarized the tainted entry still
+advances the watermark past it, so the latch clears anyway — narrowing
+lifts over content that was genuinely never folded away.
+
+Fixed at the time (#4471): when the entry immediately after ``prev_cover``
+was missing from residency (a gap), SKIP this compaction pass entirely
+rather than let ``covers_through_seq`` advance at all — a stricter fix
+than an earlier draft (clamp ``prev_cover`` forward past the gap and keep
+going), which still let the watermark become numerically larger than the
+evicted-untrusted seq (the only thing #4468's latch check compares
+against), reopening the hole even though that pass's own candidates
+excluded the gap. Known, deliberate limitation AT THE TIME: compaction
+could not make ANY progress while a gap persisted (a functionality/
+performance cost, never a security cost).
+
+**Superseded by #4472** (structural fix, same night): compaction's
+candidate input moved from ``self.history`` (resident, byte-cap-evictable)
+to reading ``history.jsonl`` DIRECTLY (durable, branch-visibility
+filtered) — see ``Session._durable_active_history_after``. Residency now
+has NO influence on what compaction considers at all, so the "gap" #4470/
+#4471 had to detect and skip around cannot occur anymore — there is
+nothing left for a gap to be a gap IN. The first test below, originally
+asserting the #4471 skip-branch fired, is REWRITTEN (not merely patched)
+to assert the correct #4472-era behavior instead: eviction no longer
+prevents coverage at all, and narrowing correctly clears because the
+content genuinely WAS retired this time — the deny-side property this
+whole file exists to protect ("narrowing must never silently lift over
+content that was never truly summarized") now holds for a DIFFERENT
+reason (there's no unexamined content left to silently claim), not
+because compaction refuses to run. See
+``tests/runtime/test_4472_compaction_reads_durable_store.py`` for the
+NEW deny-side case #4472 itself introduces (branch-visibility: an
+abandoned-branch tainted entry must still never be summarized, even
+though it's readable from disk).
+
+Real ``Session`` + real ``CompactionController``/engine (only
+``litellm.acompletion`` monkeypatched to a scripted summary, same
+discipline ``tests/runtime/test_slash_compact_191.py`` already
+established) + real narrowing config + real #4387 eviction (a small
+``history_resident_config``, not manual ``self.history`` slicing).
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+from datetime import datetime, timezone
+from types import SimpleNamespace
+
+import litellm
+
+from reyn.config import CompactionConfig
+from reyn.config.chat import HistoryResidentConfig
+from reyn.core.events.state_log import StateLog
+from reyn.runtime.budget.budget import BudgetTracker, CostConfig
+from reyn.runtime.chat_message import ChatMessage
+from reyn.runtime.session import Session
+from tests._support.agent_session import make_session
+from tests._support.untrusted_narrowing import narrowing_on
+
+
+# #4951-B: new_turn_seqs is NOT part of CompactionEngine.compact()'s
+# schema/validation at all anymore (the key was removed — see engine.py's
+# _CHAT_SUMMARY_JSON_SCHEMA and _validate_chat_summary_fields, which only
+# ever validated topic_arc, never this field). This helper still includes
+# it in the scripted response body purely as harmless inert fixture data
+# (parsed.get() ignores unrecognized keys) — covers_through_seq is derived
+# dynamically from the REAL candidate turns each call was actually asked to
+# summarize (parsed out of the engine's own user-prompt content, via
+# compute_covers_through_seq on compact()'s own input), never read back
+# from this response at all, rather than a hardcoded list — a hardcoded
+# value would let the summary's own claim diverge from the real
+# candidates, which is exactly the property #4470 exists to protect
+# (covers_through_seq must reflect only what was genuinely examined).
+def _summary_json_for_messages(messages: list) -> str:
+    user_content = json.loads(messages[1]["content"])
+    seqs = [t["seq"] for t in user_content.get("new_turns", []) if "seq" in t]
+    return json.dumps({
+        "new_turn_seqs": seqs,
+        "topic_arc": "compacted summary of older turns",
+        "decisions": [], "pending": [],
+        "session_user_facts": [], "artifacts_referenced": [],
+    })
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _make_session(tmp_path, monkeypatch, *, max_bytes: int) -> Session:
+    """Same token-budget shape as test_slash_compact_191.py's own
+    _make_session (head_budget≈74, tail_budget≈112 with t_max=2800,
+    use_chars4_estimate=True, section_caps_spec_tokens=0), plus narrowing
+    on and a #4387 resident-byte cap small enough to genuinely evict the
+    earliest turns as padding accumulates."""
+    import reyn.llm.model_budget as _mb
+
+    monkeypatch.setattr(_mb, "get_max_input_tokens", lambda model, **kw: 2800)
+    return make_session(
+        agent_name="default",
+        budget_tracker=BudgetTracker(CostConfig()),
+        state_log=StateLog(tmp_path / ".reyn" / "state" / "wal.jsonl"),
+        compaction_config=CompactionConfig(
+            use_chars4_estimate=True,
+            section_caps_spec_tokens=0,
+        ),
+        snapshot_path=tmp_path / ".reyn" / "agents" / "default" / "state" / "snapshot.json",
+        safety=narrowing_on(),
+        history_resident_config=HistoryResidentConfig(max_bytes=max_bytes),
+    )
+
+
+def _script_compaction_llm(monkeypatch) -> None:
+    async def _fake_acompletion(model, messages, **kw):  # noqa: ANN001, ANN003
+        return SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(content=_summary_json_for_messages(messages))
+            )]
+        )
+    monkeypatch.setattr(litellm, "acompletion", _fake_acompletion)
+
+
+def _narrowed(s: Session) -> bool:
+    return s._ephemeral_contextual_for_turn() is not None
+
+
+def test_eviction_no_longer_prevents_compaction_from_covering_the_tainted_entry(
+    tmp_path, monkeypatch,
+):
+    """Tier 2: REWRITTEN for #4472 (was: the #4470/#4471 gap-skip case —
+    see this module's own docstring for why that scenario is now
+    unreachable). The tainted entry is evicted from RESIDENCY before
+    compaction ever runs, exactly as #4470 originally exercised — but
+    #4472 moved compaction's candidate input to the durable store
+    (``history.jsonl``), so residency no longer has any influence: this
+    pass genuinely reads the tainted entry from disk, genuinely folds it
+    into a summary, and narrowing correctly clears because it WAS truly
+    retired this time. The deny-side property this file protects
+    ("narrowing must never silently lift over content that was never
+    truly summarized") now holds for a different, stronger reason — there
+    is no unexamined content left for the watermark to silently claim."""
+    monkeypatch.chdir(tmp_path)
+    # Small enough that the tainted entry + several padding turns are
+    # genuinely evicted from residency once enough padding accumulates —
+    # the exact #4470 setup, now proving RESIDENCY no longer matters.
+    s = _make_session(tmp_path, monkeypatch, max_bytes=20_000)
+    _script_compaction_llm(monkeypatch)
+
+    s._append_history(
+        ChatMessage(
+            role="user", content="<<<EXTERNAL>>> untrusted payload", ts=_now(),
+            meta={"external_source": True},
+        )
+    )
+    tainted_seq = s.history[-1].seq
+    assert _narrowed(s), "control arm: the taint must engage narrowing before eviction"
+
+    # Padding turns, same shape test_slash_compact_191.py uses to produce
+    # real, non-empty candidates (head=2/tail=2 boundaries over 4000-char
+    # turns) -- large enough that #4387's byte cap genuinely evicts the
+    # tainted entry (and some early padding) from residency well before
+    # compaction runs.
+    for _ in range(8):
+        s._append_history(ChatMessage(role="user", content="x" * 4000, ts=_now()))
+
+    resident_seqs = [m.seq for m in s.history]
+    assert tainted_seq not in resident_seqs, (
+        "sanity: the tainted entry must have been genuinely EVICTED (not "
+        "manually removed) before compaction runs -- if this fails, "
+        "shrink max_bytes or add more padding"
+    )
+    assert _narrowed(s), (
+        "sanity: eviction alone (#4468's own latch) must still keep "
+        "narrowing engaged at this point -- if this fails, #4468 itself "
+        "regressed, not this test's own setup"
+    )
+
+    result = asyncio.run(s._compact_now_for_op())
+
+    assert result["summarized_turns"] > 0, (
+        "#4472: compaction must genuinely cover the evicted tainted entry "
+        "via the durable read -- residency must have NO influence on "
+        "what compaction considers"
+    )
+    assert not _narrowed(s), (
+        "narrowing must clear once compaction genuinely folds the tainted "
+        "entry into a summary (it WAS truly retired, unlike the pre-#4472 "
+        "gap scenario) -- eviction from residency alone must never block "
+        "genuine coverage"
+    )
+    assert any(m.role == "summary" for m in s.history), (
+        "sanity: a real summary must have been produced"
+    )
+
+
+def test_compaction_still_clears_narrowing_once_it_genuinely_covers_the_tainted_seq(
+    tmp_path, monkeypatch,
+):
+    """Tier 2: accept-side — #4470's clamp must not make narrowing
+    permanently un-clearable. When the tainted entry IS still resident
+    (no eviction has happened) and compaction genuinely folds it into a
+    summary, narrowing must clear exactly as before."""
+    monkeypatch.chdir(tmp_path)
+    # A generous cap -- nothing gets evicted in this test at all, isolating
+    # the "compaction genuinely covers it" case from #4470's own clamp.
+    s = _make_session(tmp_path, monkeypatch, max_bytes=10_000_000)
+    _script_compaction_llm(monkeypatch)
+
+    s._append_history(
+        ChatMessage(
+            role="user", content="<<<EXTERNAL>>> untrusted payload", ts=_now(),
+            meta={"external_source": True},
+        )
+    )
+    tainted_seq = s.history[-1].seq
+
+    for _ in range(8):
+        s._append_history(ChatMessage(role="user", content="x" * 4000, ts=_now()))
+
+    assert tainted_seq in [m.seq for m in s.history], (
+        "sanity: nothing evicted in this test -- isolates the genuine-"
+        "coverage case from #4470's own gap-clamp"
+    )
+    assert _narrowed(s), "sanity: still narrowed before compaction"
+
+    result = asyncio.run(s._compact_now_for_op())
+    assert result["summarized_turns"] > 0, "sanity: compaction must have run"
+
+    assert not _narrowed(s), (
+        "compaction that genuinely folds the tainted entry into a summary "
+        "must still clear narrowing -- #4470's clamp must not make the "
+        "latch permanently un-clearable"
+    )

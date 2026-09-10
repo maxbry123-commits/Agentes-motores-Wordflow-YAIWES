@@ -1,0 +1,44 @@
+{
+  "name": "zuora-coding-agent",
+  "version": "1.5.4",
+  "description": "Zuora development assistant for API integrations, Workflow, Meter, migrations, CPQ customizations, Quote Studio hooks/events, and best-practice validation. Powered by zuora-mcp.",
+  "author": {
+    "name": "Zuora Engineering",
+    "email": "developer@zuora.com"
+  },
+  "license": "MIT",
+  "keywords": [
+    "zuora",
+    "billing",
+    "subscription",
+    "migration",
+    "api",
+    "workflow",
+    "cpq",
+    "salesforce",
+    "apex",
+    "lwc",
+    "quote-studio"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Zuora Coding Agent",
+    "shortDescription": "Build Zuora Solutions",
+    "longDescription": "Optimized for Codex. Reusable Zuora skills for API integrations, workflow automation, Invoice Settlement and Order API migrations, CPQ Apex/Visualforce customizations, Quote Studio hooks/events, and\n  best-practice validation.",
+    "developerName": "Zuora Engineering",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Use Zuora Coding Agent to design a Zuora API integration.",
+      "Use Zuora Coding Agent to review Zuora workflow.",
+      "Use Zuora Coding Agent to review Zuora meter."
+    ],
+    "brandColor": "#0B8F8A",
+    "logo": "./assets/logo-512.png",
+    "composerIcon": "./assets/logo-96.png"
+  }
+}

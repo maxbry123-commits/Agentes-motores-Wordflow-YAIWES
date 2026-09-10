@@ -1,0 +1,43 @@
+name: OVK External Consumer Example
+
+# Phase 2: strict enforcement with emit-check for production adoption.
+# See also: pilot_fork_adopter.yml (phase 0), pilot_advisory_with_comment.yml (phase 1).
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write
+  checks: write
+
+env:
+  # Target pin for v1.3.0-rc.1 (use only after the attributable tag exists).
+  OVK_PACKAGE_VERSION: "1.3.0-rc.1"
+
+jobs:
+  ovk-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Open Verification Kernel check path
+        uses: fraware/open-verification-kernel@v1.3.0-rc.1
+        with:
+          mode: strict
+          use-check: "true"
+          emit-check: "true"
+          changed-files: examples/ci_secrets/workflow_secrets_on_pr.diff
+          post-comment: "false"
+
+  ovk-full-mvp:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Open Verification Kernel (all five lanes)
+        uses: fraware/open-verification-kernel@v1.3.0-rc.1
+        with:
+          mode: advisory
+          verification-manifest: examples/verification_manifests/full_mvp.json
+          bundle-output-dir: ovk-full-mvp-bundle
+          post-comment: "false"

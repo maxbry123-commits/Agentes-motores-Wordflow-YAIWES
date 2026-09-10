@@ -1,0 +1,94 @@
+import { NextResponse } from 'next/server'
+import { ensureGatewayConnected } from '@/lib/server/openclaw/gateway'
+import { resolveOpenClawGatewayAgentId } from '@/lib/server/openclaw/agent-resolver'
+import { normalizeOpenClawSkillsPayload } from '@/lib/server/openclaw/skills-normalize'
+import { loadAgents, saveAgents } from '@/lib/server/storage'
+import { notify } from '@/lib/server/ws-hub'
+import type { SkillAllowlistMode } from '@/types'
+import { errorMessage } from '@/lib/shared-utils'
+import { safeParseBody } from '@/lib/server/safe-parse-body'
+
+/** GET ?agentId=X — fetch skills from gateway with eligibility */
+export async function GET(req: Request) {
+  const { searchParams } = new URL(req.url)
+  const agentId = searchParams.get('agentId')
+  if (!agentId) {
+    return NextResponse.json({ error: 'Missing agentId' }, { status: 400 })
+  }
+
+  const gw = await ensureGatewayConnected()
+  if (!gw) {
+    return NextResponse.json({ error: 'OpenClaw gateway not connected' }, { status: 503 })
+  }
+
+  try {
+    const gatewayAgentId = await resolveOpenClawGatewayAgentId(agentId, gw)
+    const result = await gw.rpc('skills.status', { agentId: gatewayAgentId }) as unknown
+    return NextResponse.json(normalizeOpenClawSkillsPayload(result))
+  } catch (err: unknown) {
+    const message = errorMessage(err)
+    const status = message.includes('not an OpenClaw agent')
+      ? 400
+      : message.includes('not found')
+        ? 404
+        : 502
+    return NextResponse.json({ error: message }, { status })
+  }
+}
+
+/** PATCH { skillKey, enabled?, apiKey? } — update a skill's config on gateway */
+export async function PATCH(req: Request) {
+  const { data: body, error } = await safeParseBody<Record<string, unknown>>(req)
+  if (error) return error
+  const { skillKey, enabled, apiKey } = body as {
+    skillKey?: string
+    enabled?: boolean
+    apiKey?: string
+  }
+  if (!skillKey) {
+    return NextResponse.json({ error: 'Missing skillKey' }, { status: 400 })
+  }
+
+  const gw = await ensureGatewayConnected()
+  if (!gw) {
+    return NextResponse.json({ error: 'Gateway not connected' }, { status: 503 })
+  }
+
+  try {
+    await gw.rpc('skills.update', { skillKey, enabled, apiKey })
+    return NextResponse.json({ ok: true })
+  } catch (err: unknown) {
+    const message = errorMessage(err)
+    return NextResponse.json({ error: message }, { status: 502 })
+  }
+}
+
+/** PUT { agentId, mode, allowedSkills } — save skill allowlist config to agent */
+export async function PUT(req: Request) {
+  const { data: body, error: parseError } = await safeParseBody<Record<string, unknown>>(req)
+  if (parseError) return parseError
+  const { agentId, mode, allowedSkills } = body as {
+    agentId?: string
+    mode?: SkillAllowlistMode
+    allowedSkills?: string[]
+  }
+
+  if (!agentId || !mode) {
+    return NextResponse.json({ error: 'Missing agentId or mode' }, { status: 400 })
+  }
+
+  const agents = loadAgents({ includeTrashed: true })
+  const agent = agents[agentId]
+  if (!agent) {
+    return NextResponse.json({ error: 'Agent not found' }, { status: 404 })
+  }
+
+  agent.openclawSkillMode = mode
+  agent.openclawAllowedSkills = mode === 'selected' ? (allowedSkills ?? []) : undefined
+  agent.updatedAt = Date.now()
+  agents[agentId] = agent
+  saveAgents(agents)
+  notify('agents')
+
+  return NextResponse.json({ ok: true })
+}

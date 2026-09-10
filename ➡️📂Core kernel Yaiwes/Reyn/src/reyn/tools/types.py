@@ -1,0 +1,577 @@
+"""Type definitions for the unified tool registry (ADR-0026 M1/M4).
+
+ToolDefinition is the single source of truth for a capability's
+identity, metadata, gates, and handler. ToolGates encodes the
+per-protocol allow/deny declaration. ToolContext is the
+protocol-agnostic execution context handed to handlers; the router
+dispatcher builds it before invocation. ToolHandler is the async
+callable signature.
+
+RouterCallerState is a typed sub-object replacing the loose Any type on
+ToolContext.router_state.
+"""
+from __future__ import annotations
+
+from copy import deepcopy
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Literal, Mapping, Protocol
+
+from reyn.core.offload.canonical import UNDECLARED
+
+if TYPE_CHECKING:
+    from reyn.core.offload.canonical import (
+        CanonicalMapper,
+        _CanonicalTodo,
+        _StructuredPassthrough,
+    )
+    from reyn.data.skills.registry import SkillEntry
+
+
+# ToolGates: per-protocol allow/deny gate at the registry level.
+# This is Layer 1 of the gate model (= ADR-0026 §3):
+#   Layer 1: role gate (this dataclass)
+#   Layer 2: permission resolver (per-call runtime)
+# ADR-0026's Layer-2 "phase narrowing" arm is gone with the phase engine
+# (#2434 / #2438) — ``router`` is the only surface a tool can be gated for.
+@dataclass(frozen=True)
+class ToolGates:
+    router: Literal["allow", "deny"] = "allow"
+
+
+# ToolResult: canonical result shape returned by handlers. The router
+# dispatcher serializes this shape to a JSON string for tool_result
+# content. Handler returns whatever Mapping[str, Any] makes semantic
+# sense for the capability; the dispatcher does the shape adaptation.
+ToolResult = Mapping[str, Any]
+
+
+@dataclass
+class RouterCallerState:
+    """Per-protocol state that router-style invocations need access to.
+
+    Populated by RouterLoop / dispatch_tool when invoking a
+    ToolDefinition handler in router context. Handlers that need
+    session-scoped resources (agent registry, MCP servers, etc.)
+    or async-dispatch callbacks
+    consume them via this object.
+
+    All fields are Optional so test contexts can populate only the
+    subset a given handler consumes.
+    """
+    # Catalog discovery (= for catalog tools list_agents / describe_agent handlers)
+    agent_registry: Any = None
+    # #5291: available_agents removed — 0 real consumers (its only one,
+    # delegate_to_agent's per-call `to` enum injection, retired #3978 P6);
+    # every populate site was a real disk read (list_available_agents())
+    # for a value nothing downstream read. If a future capability needs
+    # this again, give it a real reader (mcp_servers-shaped, a live field
+    # some enricher actually reads) — not an eager list nobody consumes.
+
+    # IS-1 (docs/proposals/reyn-pipeline-v0.9-design-resolutions.md R6): the
+    # PipelineRegistry the run_pipeline tool looks up a registered Pipeline by
+    # name in. Threaded explicitly (mirrors agent_registry above) rather than a
+    # hidden global, since IS-1 registration is programmatic per-owner. IS-5:
+    # populated in production by RouterLoop._build_router_caller_state from
+    # Session's real PipelineRegistry (host.get_pipeline_registry()) — no
+    # longer None on the live path. None only for narrow test hosts that
+    # don't support run_pipeline.
+    pipeline_registry: Any = None
+
+    # proposal 0067 P4 (#3978): the ChainManager describe_task/list_tasks/
+    # cancel_task read/act against — THIS session's own pending_chains, not
+    # a global. Threaded the same way as pipeline_registry above (populated
+    # by build_resource_caller_state from host.get_chains()).
+    chains: Any = None
+
+    # Proposal 0067 P9 (#3978), architect ruling 2026-08-10: THIS session's
+    # current inbox queue depth (a plain int — an INSTANTANEOUS read, taken
+    # when this caller-state was built; by the time describe_task/list_tasks
+    # returns it to the LLM the real value may already differ, hence why the
+    # field's own LLM-visible description says so explicitly rather than
+    # implying a live value). None when the host can't resolve it (e.g. no
+    # live session backing this call). Observation only — see
+    # AgentRegistry.is_session_running's docstring for the same "does not
+    # imply a valve" caveat class; check_pre_llm bounds spend regardless of
+    # this number.
+    session_inbox_depth: "int | None" = None
+
+    # #2103 S1bc: session-spawn dispatch. The spawn_session handler spawns a
+    # fresh-context session under the agent (rewind-tracked via session_spawned),
+    # applies the per-session capability narrowing (S1a), and submits the task.
+    # Bound by RouterLoop with chain_id pre-bound; None when the host doesn't
+    # support session-spawn (= duck-typed / hasattr-guarded at caller-state build).
+    spawn_session_fn: Callable[..., Awaitable[Any]] | None = None
+
+    # #2103 B-tool: agent-spawn dispatch. The spawn_agent handler creates a new agent
+    # under the spawner (rewind-tracked via agent_created carrying the OS-set parent
+    # lineage), capped at ⊆ the spawner by construction (B-core), with an optional
+    # restrict-only narrowing. None when the host doesn't support agent-spawn.
+    spawn_agent_fn: Callable[..., Awaitable[Any]] | None = None
+
+    # #2103 C1: topology-create dispatch. The create_topology handler wires the spawner's
+    # spawn-subtree agents into a topology (routed through registry.create_topology — the
+    # logged emit seam, WAL-tracked for rewind), restricting members to the creator's
+    # subtree so profile bindings stay ⊆-creator by construction. None when the host
+    # doesn't support topology-create.
+    topology_create_fn: Callable[..., Awaitable[Any]] | None = None
+
+    # Proposal 0067 P5 (#3978): send_to_session dispatch — fire-and-forget
+    # delivery to a peer (agent, session) via TurnOrigin.PEER_SESSION.
+    # Bound by RouterLoop with no pre-bound identity — the target agent/
+    # session are per-call args; None when the host doesn't support
+    # multi-session delivery (= duck-typed / hasattr-guarded at
+    # caller-state build, same pattern as spawn_session_fn above).
+    send_to_session_fn: Callable[..., Awaitable[Any]] | None = None
+
+    # Proposal 0067 P4d (#3978): run_prompt(collect="attached") dispatch — sends
+    # a prompt to a LIVE peer (agent, session) and collects the reply in-band,
+    # synchronously (session_api.run_prompt_result). Bound by RouterLoop with
+    # the caller's own (agent, sid) pre-bound (needed for the PEER_SESSION
+    # payload's from_agent/from_session/sender attribution — send_to_session's
+    # own send_to_session_fn does the same). None when the host doesn't
+    # support multi-session delivery.
+    run_prompt_result_fn: Callable[..., Awaitable[Any]] | None = None
+
+    # Proposal 0067 P4e (#3978): run_prompt(collect="async") dispatch — sends
+    # a prompt to a LIVE peer (agent, session) as an agent_request and
+    # returns a task_id IMMEDIATELY (session_api.run_prompt_async); the reply
+    # arrives later via task_settled, not this call. Bound the same way as
+    # run_prompt_result_fn above (caller's own (agent, sid) pre-bound). None
+    # when the host doesn't support multi-session delivery.
+    run_prompt_async_fn: Callable[..., Awaitable[Any]] | None = None
+
+    # Session-scoped chain identity (= for plan tool, delegate
+    # tool, etc.)
+    chain_id: str | None = None
+
+    # Cost / model context (= for plan tool cost-aware decomposition)
+    budget: Any = None                    # BudgetGateway instance
+    router_model: str | None = None
+    available_tool_names: list[str] | None = None
+
+    # #1667: catalog categories to skip at the SOURCE (``_enumerate_category``),
+    # so an excluded category vanishes UNIFORMLY from ``catalog_entries`` (every
+    # scheme's flat list) + ``list_actions`` + dispatch — orthogonal to
+    # ``exclude_tools`` (which filters top-level ``tools=`` by name and cannot
+    # reach the universal catalog source). The task-agent / external-repo eval path
+    # sets e.g. ``{"reyn_repo"}``; the general/interactive agent leaves it empty.
+    excluded_categories: frozenset[str] = frozenset()
+
+    # The memory-store capability (``MemoryService``) the memory-cluster
+    # handlers delegate to when invoked router-side. #3607: this field already
+    # existed and was wired by nobody — the router instead bound three
+    # ``*_fn`` callables to RouterLoop privates that re-implemented
+    # remember / forget / read_body over file primitives. The privates are
+    # gone; this field is now the live one. When None (= non-router callers,
+    # test sites) the handlers take their workspace-level fallback path.
+    memory_service: Any = None
+
+    # Catalog access callbacks (= for catalog stub handlers
+    # list_agents / describe_agent; RouterLoop populates with bound methods,
+    # the stubs delegate to keep router/registry decoupled from RouterLoopHost type)
+    list_agents_fn: Callable[[str], list[Mapping[str, Any]]] | None = None
+    describe_agent_fn: Callable[[str], Mapping[str, Any]] | None = None
+
+    # OpContext factory (= for file / mcp / web handlers that delegate
+    # to op_runtime).  Bound by RouterLoop to ``host.make_router_op_context``
+    # so handlers can build a permission-aware OpContext (= populated
+    # PermissionDecl + Workspace + actor="chat_router") matching the
+    # legacy router branch behavior.  When None, handlers fall back to
+    # minimal OpContext synthesis (= test sites).
+    op_context_factory: Callable[[], Any] | None = None
+
+    # RouterLoopHost reference for handlers that need duck-typed access
+    # to host methods not covered by individual callable fields (=
+    # MCP tools that already shipped with ``ctx.router_state`` treated as
+    # host duck-type before Phase 3 step 2 introduced the typed sub-object).
+    # When set, handlers may access ``rs.host.mcp_list_servers()`` etc.
+    # directly.  Test sites leave it None.
+    host: Any = None
+
+    # Memory LISTING callback (= for the list_memory handler). Bound by
+    # RouterLoop to its private ``_list_memory`` helper so registry handlers
+    # consume the SAME parsed-index path the legacy router branches used (=
+    # host.get_memory_index() routed through the agent-aware session layer).
+    # Without this, registry handlers would read MEMORY.md from a path not
+    # aware of per-agent dirs. The three sibling ``*_fn`` fields that used to
+    # sit here (read_memory_body_fn / remember_fn / forget_fn) are gone —
+    # those are memory-store operations and ride ``memory_service`` (#3607).
+    list_memory_fn: Callable[[str], list[Mapping[str, Any]]] | None = None
+
+    # FP-0032: MCP server list for enum injection into call_mcp_tool /
+    # describe_mcp_tool. Shape: [{name, description, tools?: [{name, ...}]}, ...]
+    # Matches the ``mcp_servers`` arg passed to build_tools() and
+    # build_system_prompt().  Populated by RouterLoop when building the
+    # RouterCallerState for MCP tool dispatch.  When None, enum injection
+    # is skipped and the schema falls back to plain string (graceful empty case).
+    mcp_servers: list[Mapping[str, Any]] | None = None
+
+    # FP-0034 Phase 2 prep: indexed RAG corpora snapshot for the universal
+    # catalog ``rag_corpus`` category enumeration. Shape:
+    # ``[{name, description, backend?, chunk_count?}, ...]``.
+    # Populated by RouterLoop from ``SourceManifest.get_all()`` so
+    # ``list_actions(category=["rag_corpus"])`` returns the configured
+    # corpora as ``rag_corpus__<name>`` qualified names without round-
+    # tripping the manifest file per invocation. ``None`` = router did
+    # not provide a manifest snapshot (= test sites / plan-step hosts);
+    # the catalog handler treats this identically to an empty list.
+    available_rag_sources: list[Mapping[str, Any]] | None = None
+
+    # FP-0034 Phase 2 step 1: ActionEmbeddingIndex for the
+    # ``search_actions`` semantic search wrapper.  RouterLoop owns the
+    # session-scoped instance and triggers a background build when
+    # ``embedding.enabled: true`` (FP-0066 §7).  The
+    # search_actions handler calls ``query()`` via this reference when
+    # ``is_ready()`` returns True; otherwise it returns an empty result
+    # so the LLM gracefully sees "no semantic results" rather than a
+    # crash.  ``None`` = no index (= embedding not configured / fake
+    # caller path); search_actions returns an empty result.
+    action_embedding_index: Any = None
+
+    # FP-0034 Phase 2 step 1: embedding provider + model class for
+    # the search_actions query path.  RouterLoop binds these from the
+    # session's EmbeddingProvider + the configured
+    # ``embedding.default_class`` (used only when ``embedding.enabled:
+    # true`` — FP-0066 §7) so search_actions can embed
+    # the user's query and rank against the index.  ``None`` = not
+    # configured; handler returns an empty result.
+    embedding_provider: Any = None
+    embedding_model_class: str | None = None
+
+    # FP-0034 Phase 2: sandbox backend name, threaded from
+    # ``session._sandbox_config.backend``. #4932 (owner ruling,
+    # 2026-08-19): no longer a VISIBILITY gate — the exec category is
+    # always in ``list_actions(category=["exec"])`` regardless of this
+    # value (#3226 Phase 3 qualified name). ``None``/``"noop"`` now only
+    # decides whether exec's own description discloses "no sandbox
+    # isolation is applied" (``universal_catalog.is_exec_isolated``).
+    sandbox_backend: str | None = None
+
+    # #2548 PR-A: skill registry snapshot — enabled skills available at
+    # router construction time. Filtered to enabled=True by the
+    # builder (build_skill_registry); #2971: only visibility="menu"
+    # entries are rendered into the L1 system-prompt ## Skills block,
+    # while the skill_list tool reads this same snapshot and returns
+    # every entry whose visibility is not "hidden".
+    # None = not populated (test sites / contexts without a project
+    # root). Construction-time only — per-turn hot-reload is a later PR.
+    available_skills: "list[SkillEntry] | None" = None
+
+
+# #2567: the host-derived subset of RouterCallerState — every field a
+# RouterHostAdapter (or compatible host) alone can populate, with NO
+# loop-local state (chain_id / budget / router_model / available_tool_names /
+# excluded_categories / spawn_*_fn / topology_create_fn /
+# catalog-callback / memory-callback fields — those belong to a live
+# RouterLoop turn and stay None here by construction).
+#
+# Extracted from ``RouterLoop._build_router_caller_state`` (which now calls
+# this factory with ``self.host`` and overlays its own loop-local fields) so
+# a caller with only a host reference — no RouterLoop turn in flight, e.g. the
+# async pipeline driver-session's tool-step dispatch (#2567) — gets the SAME
+# mcp/rag/skills/sandbox/agent-registry/pipeline-registry resource wiring a
+# normal chat router turn gets, instead of a hardcoded ``router_state=None``
+# landmine. Every accessor expression below is copied verbatim from
+# ``_build_router_caller_state`` (same getattr-guard / same default) so a
+# narrow test host degrades identically in both callers.
+async def build_resource_caller_state(host: Any) -> "RouterCallerState":
+    """Build the host-derived (resource) subset of a RouterCallerState.
+
+    ``host`` is a ``RouterLoopHost``-compatible object (typically a
+    ``RouterHostAdapter``). Loop-local fields (chain_id, budget, dispatch
+    callbacks, ...) are NOT populated — callers without a RouterLoop turn
+    (e.g. a pipeline driver-session) have none to give.
+    """
+    from pathlib import Path
+
+    from reyn.data.index.source_manifest import get_source_manifest
+
+    # FP-0034 Phase 2 prep: snapshot indexed RAG corpora for the universal
+    # catalog's rag_corpus enumeration (same try/except degrade as the
+    # RouterLoop original — manifest unavailable → None, not a crash).
+    rag_sources: "list[Mapping[str, Any]] | None" = None
+    try:
+        manifest = get_source_manifest(Path.cwd())
+        entries = await manifest.get_all()
+        rag_sources = [
+            {
+                "name": e.name,
+                "description": e.description,
+                "backend": e.backend,
+                "chunk_count": e.chunk_count,
+            }
+            for e in entries.values()
+        ]
+    except Exception:
+        rag_sources = None
+
+    return RouterCallerState(
+        # #5291: no longer reads .reyn/agents/ here — RouterCallerState.
+        # available_agents was removed (0 real consumers); this was a
+        # real disk read (list_available_agents()) on every call.
+        op_context_factory=getattr(host, "make_router_op_context", None),
+        host=host,
+        available_rag_sources=rag_sources,
+        action_embedding_index=(
+            getattr(host, "get_action_embedding_index", lambda: None)()
+        ),
+        embedding_provider=(
+            getattr(host, "get_embedding_provider", lambda: None)()
+        ),
+        embedding_model_class=(
+            getattr(host, "get_embedding_model_class", lambda: None)()
+        ),
+        sandbox_backend=(
+            getattr(host, "get_sandbox_backend", lambda: None)()
+        ),
+        mcp_servers=host.get_mcp_servers() if hasattr(host, "get_mcp_servers") else None,
+        available_skills=(
+            getattr(host, "get_available_skills", lambda: None)()
+        ),
+        agent_registry=(
+            getattr(host, "get_agent_registry", lambda: None)()
+        ),
+        pipeline_registry=(
+            getattr(host, "get_pipeline_registry", lambda: None)()
+        ),
+        chains=(
+            getattr(host, "get_chains", lambda: None)()
+        ),
+        session_inbox_depth=(
+            getattr(host, "get_inbox_depth", lambda: None)()
+        ),
+    )
+
+
+# ToolContext: protocol-agnostic execution context. Built by the
+# router dispatcher before invoking the handler.
+# Universal fields: events / permission_resolver / workspace.
+# Router-specific state is carried on the router_state sub-object.
+@dataclass
+class ToolContext:
+    """Protocol-agnostic execution context (= ADR-0026 §2).
+
+    Universal fields (events, permission_resolver, workspace) are
+    populated regardless of caller. router_state carries the
+    router-specific state sub-object.
+    """
+    events: Any                                      # EventLog
+    permission_resolver: Any | None                  # PermissionResolver
+    workspace: Any                                   # Workspace
+    caller_kind: Literal["router"]                   # audit field emitted into tool_* events
+    # Router-specific state sub-object.
+    router_state: RouterCallerState | None = None    # populated for caller_kind="router"
+    # #1673: the config-aware ModelResolver, threaded so tool handlers that spawn a
+    # sub-run hand the spawned OpContext a REAL resolver + a config-following model
+    # class instead of resolver=None + the literal "standard" (which litellm rejects
+    # with BadRequestError — the latent bug).
+    # Also completes #1672 CAT-3 (tool sub-runs follow model_class_by_purpose).
+    resolver: Any | None = None                      # ModelResolver | None
+    # #2073 S3: the CALLING session's HotReloader, so a self-reload tool
+    # (hooks_add) requests a reload on THIS session's reloader (per-session
+    # correctness in multi-agent — a process-wide global would reload the wrong
+    # session). None in non-session/test contexts → the tool falls back to the
+    # process-wide get_active_hot_reloader().
+    hot_reloader: Any | None = None
+    # #2259 PR-1: the process-shared WAL (StateLog), threaded from the calling
+    # session so a recovery-core config tool handler (cron / hooks) — and the
+    # OpContext it builds for an op handler (mcp_install / index_drop) — can record a
+    # config GENERATION (keyed by the WAL head) after persisting its `.yaml`. None in
+    # non-session / test contexts → the handler skips it (the opt-in contract).
+    state_log: Any | None = None                     # StateLog | None
+    # #2088: the CALLING session's agent name (Session.agent_name / the Agent identity
+    # SSoT), threaded so a scope-aware self-write tool (hooks_add) can target that
+    # agent's OWN per-agent layer (.reyn/agents/<name>/hooks.yaml) instead of always
+    # the global runtime layer. Same threading pattern as hot_reloader/state_log above
+    # (added for the SAME tool's needs). None in non-session/test contexts → the
+    # handler falls back to the pre-#2088 global-only write (backward-compatible).
+    agent_name: Any | None = None                    # str | None
+    # #4215①: the CALLING session's OWN per-(agent, sid) state dir (the parent
+    # of ``Session._snapshot_path`` — #2285's "4th, most-specific" hook layer),
+    # threaded so a session-scoped self-write tool (hooks_add) targets THIS
+    # session's isolated layer instead of a layer shared with every other
+    # session (the global runtime layer, or #2088's shared per-agent layer —
+    # both replaced by this field). Same threading pattern as
+    # hot_reloader/state_log/agent_name above (added for the SAME tool's
+    # needs). None in non-session/test contexts → the handler falls back to
+    # the pre-#4215 global-only write (backward-compatible).
+    session_state_dir: Any | None = None              # Path | None
+
+
+def parameters_for_export(parameters: Mapping[str, Any]) -> dict[str, Any]:
+    """The ONE way a canonical tool schema is handed outside its definition.
+
+    Every seam that projects a ``ToolDefinition.parameters`` into something a
+    caller keeps — the router ``tools=`` payload, a ``describe_action`` result
+    — MUST route through here. The obligation this owns is the DEEP copy.
+
+    A shallow ``dict(parameters)`` is wrong, and wrong in a way that is invisible
+    at the call site: it copies only the top level, leaving every nested
+    sub-schema (``properties``, each ``oneOf`` variant, each variant's own
+    property schemas) ALIASED to the module-level constant the ToolDefinition was
+    built from. litellm's provider transforms then rewrite the payload they are
+    handed IN PLACE — ``_build_vertex_schema`` documents itself as returning
+    "the input parameters, modified in place"; within it ``add_object_type``
+    injects ``type: object`` into any node that has none and
+    ``_remove_additional_properties`` deletes ``additionalProperties: false``.
+    So one Gemini/Vertex turn used to permanently rewrite reyn's canonical
+    schema, and every later render — for ANY provider — served the corrupted
+    shape (#3383). The schema the LLM receives must never be a function of
+    process history.
+
+    Centralised deliberately: the four known seams were four copies of the same
+    ``dict(x.parameters)`` expression, so seam five would have been written the
+    same way. Owning the responsibility on the projection, not at each source,
+    is what makes the next seam correct by default. The behavioural gates in
+    ``tests/tools/test_tool_schema_3383_process_history_independence.py`` still assert
+    it PER SEAM — "a helper with the right contract exists" and "every escape
+    point goes through the helper" are different claims, and only the second is
+    the invariant.
+    """
+    return deepcopy(dict(parameters))
+
+
+# ToolHandler: async callable signature.
+# Returns canonical ToolResult; raises on error (dispatcher wraps).
+class ToolHandler(Protocol):
+    async def __call__(
+        self,
+        args: Mapping[str, Any],
+        ctx: ToolContext,
+    ) -> ToolResult: ...
+
+
+@dataclass(frozen=True)
+class ToolDefinition:
+    """Single source of truth for a capability exposed to router-style
+    LLM invocations.
+
+    Per ADR-0026 §2. Held in a ToolRegistry; rendered to OpenAI tools[]
+    via render_for_router().
+    """
+    # Identity
+    name: str                                        # canonical name (= ADR-0026 Open Question #6)
+    description: str                                 # LLM-facing description
+    parameters: Mapping[str, Any]                    # JSON schema (object root)
+
+    # Gating
+    gates: ToolGates
+
+    # Implementation
+    handler: ToolHandler
+
+    # Metadata
+    category: str                                    # = "io" / "discovery" / "memory" / etc.
+    purity: Literal["pure", "side_effect", "read_only", "world_pure"] = "side_effect"
+    dispatch_kind: Literal["sync", "async"] = "sync"  # async = result via deferred channel
+                                                     # (= delegate_to_agent / plan;
+                                                     # router-side only consideration)
+    # FP-0050 / #1822: tool self-declares that its result carries content from
+    # OUTSIDE the trust boundary (external server / internet / user-written disk).
+    # The content-threat guard fences (structurally marks as data) such results
+    # at the tool-result chokepoint; trusted-internal results are scan-only.
+    # P7: a generic OS-level bool the tool sets — not a hardcoded tool-name list.
+    #
+    # #4701: this default can be overridden PER-CALL — an op's own result dict
+    # may set ``result["_external_source"] = True`` directly (router_loop.py's
+    # ``_execute_all`` only ever sets the tag TRUE from this flag, never resets
+    # it False, so an op-level True always wins). ``read_file`` is the first
+    # user: most reads of ordinary project files are trusted-internal (this
+    # flag stays False), but a read that lands under a REGISTERED skill's own
+    # directory (a `references/*.md`-shaped file, #4701) is the SAME content
+    # class as a SKILL.md body — external, per-call, without making every
+    # read_file call external. Externality is a property of the CONTENT'S
+    # OWN provenance, not of which tool happened to fetch it.
+    returns_external_content: bool = False
+
+    # #2123: the tool declares it routes through the unified registry dispatch path
+    # (RouterLoop._invoke_via_registry) — i.e. it belongs in REGISTRY_DISPATCH_TOOLS,
+    # which is DERIVED from this flag (single SoT), not a hand-maintained frozenset.
+    # The drift class this kills: a router-only tool advertised at build_tools but
+    # missing from the dispatch set (→ "unhandled tool"), wired at one seam but not
+    # the others (#2120 / #2122 / read_tool_result). The cross-seam guard asserts
+    # every ADVERTISED bare router tool has this flag. P7: a generic OS-level bool the
+    # tool sets — not a hardcoded tool-name list. False = dispatched elsewhere
+    # (op-runtime / other path) or not router-dispatched.
+    router_dispatched: bool = False
+
+    # Per-call schema enrichment hook (= ADR-0026 M4 Phase 3).
+    # When set, callers (= build_tools) invoke this hook AFTER
+    # render_for_router to inject per-session dynamic data into the
+    # schema (live example, #5291: tools/mcp.py's _enrich_router_schema
+    # reads state.mcp_servers to enumerate call_mcp_tool's server names;
+    # the original canonical example, delegate_to_agent.to from
+    # available_agents, is gone — that consumer retired #3978 P6, and
+    # available_agents itself was removed, #5291, 0 remaining readers).
+    #
+    # Signature: (rendered_tool_dict, RouterCallerState) -> rendered_tool_dict
+    #   - rendered_tool_dict: the dict produced by render_for_router
+    #     (= function/parameters/etc shape)
+    #   - RouterCallerState: per-session data the enricher may consult
+    #     (e.g. mcp_servers)
+    #   - returns: a NEW dict with dynamic enrichment applied (do NOT
+    #     mutate the input; static schema is the canonical render)
+    #
+    # None (default) = static render is used as-is. This is the path
+    # for the 24/26 capabilities whose schemas don't depend on per-session
+    # data.
+    schema_enricher: Any = None  # Callable[[dict, RouterCallerState], dict] | None
+
+    # FP-0056 PR-F1: the tool's canonical declaration — how its result is normalized to the
+    # LLM-visible {text, attachments, meta} shape at the offload chokepoint. REQUIRED in spirit
+    # (kw_only, and the coverage gate rejects the UNDECLARED default): either a mapper
+    # (``result -> CanonicalToolResult``) or the explicit ``CANONICAL_TODO`` opt-in (the whole
+    # dict IS the right LLM view — admin/install tools). Born WITH the tool, like its schema — so a
+    # router tool can never reach the chokepoint without a declared shape (the file/reyn_repo incident
+    # class). ``ToolRegistry.register`` records it into the canonical registry keyed by tool name;
+    # ``to_canonical(result, source=<tool name>)`` resolves it by invoked identity, not result sniffing.
+    # A not-yet-mapped tool declares ``CANONICAL_TODO`` (provisional whole-dict fallback, greppable
+    # debt) — distinct from ``CANONICAL_TODO`` (the reviewed admin/install whole-dict view).
+    canonical: "CanonicalMapper | _StructuredPassthrough | _CanonicalTodo" = field(
+        kw_only=True, default=UNDECLARED,
+    )
+
+    # Proposal 0060 Addendum D, D5d: a structured pointer at the reference doc
+    # that fully specifies this tool's format (the reachability audit found
+    # "Control-IR ops (class)" BROKEN — no op names a doc at all, unlike
+    # hooks_add's hand-written pointer). None = not yet declared (most tools;
+    # not every tool needs one — this is populated for the reachability-audit
+    # spec-bearing set, see tests/core/test_0060_d5d_doc_ref_registry_gate.py).
+    # Surfaced at describe_action (universal_dispatch.py) and consumed by the
+    # D5c error-rail (reyn.core.doc_ref_rail) to teach a parse/validation
+    # failure where the full spec lives.
+    doc_ref: str | None = field(kw_only=True, default=None)
+
+    # Future metadata anchors (commented out; surface as needed):
+    # cost_weight: float = 1.0
+    # rate_limit_class: str | None = None
+    # log_redaction: tuple[str, ...] = ()
+
+    # Protocol-specific renders
+    def render_for_router(self, *, state: RouterCallerState | None = None) -> dict:
+        """Render to OpenAI tools[] entry shape used by call_llm_tools.
+
+        Identical structure to the existing ToolSpec.to_openai_dict().
+
+        M4 Phase 3: when ``schema_enricher`` is set on the ToolDefinition AND
+        ``state`` is provided, the static render is post-processed by the
+        enricher to inject per-call dynamic data (e.g. ``call_mcp_tool``'s
+        server-name enum from ``RouterCallerState.mcp_servers``, #5291).
+        When either is None (= 24/26 capabilities, plus all callers that
+        don't supply state), the static render is returned as-is.
+        """
+        rendered = {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                # #3383: the ONE projection that owns the deep-copy obligation.
+                # Never inline a shallow ``dict(self.parameters)`` here — see
+                # parameters_for_export.
+                "parameters": parameters_for_export(self.parameters),
+            },
+        }
+        if self.schema_enricher is not None and state is not None:
+            rendered = self.schema_enricher(rendered, state)
+        return rendered
+

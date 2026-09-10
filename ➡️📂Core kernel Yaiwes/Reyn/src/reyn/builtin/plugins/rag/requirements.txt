@@ -1,0 +1,32 @@
+# Install these into your OWN venv -- `plugin_install` is register-only
+# (ADR 0064 §3.11b, #3209) and never reads or installs this file itself.
+# See the `build-and-query-rag-corpus` skill's SETUP section (or
+# docs/guide/for-users/build-a-rag-corpus.md) for the exact
+# `python -m venv` + `pip install -r requirements.txt` steps, then point
+# the registered `reyn_chunker`/`reyn_vector_store` MCP `command` at that
+# venv's own interpreter (absolute path) so the servers start
+# network-free at spawn.
+#
+#   - sqlite-vec (dual MIT/Apache-2.0): pure-C SQLite extension, no bundled
+#     embedding model -> no HuggingFace-fetch hazard (FP-0057 line 55).
+#   - apsw (zlib-like "any-OSI"): sqlite-vec loads via
+#     `sqlite3.Connection.load_extension`, which the stdlib `sqlite3` module
+#     is not guaranteed to support (extension loading disabled in some
+#     interpreter builds). apsw statically bundles its own SQLite with
+#     extension loading always enabled, so loading is portable.
+#   - chonkie (MIT): recursive/semantic/etc. chunking, ~15 MiB vs LangChain's
+#     ~80 MiB; no bundled model in the default character-tokenizer path used
+#     here -> no network fetch at import or call time.
+#   - fastmcp: the stdio MCP server framework both scripts build on. #4388:
+#     was `>=2.0` (a lower bound only) -- reyn's old CORE pin, before #4302
+#     dropped fastmcp from core entirely, was the exact `==3.4.5`; nobody
+#     had counted what `>=2.0` alone actually permits (2.x through any
+#     future major, untested here) until a #4371 CI investigation asked
+#     "did the resolved version actually change" and found it hadn't
+#     (3.4.7, same 3.4.x line) -- this time. `>=3.4,<4` keeps patch/minor
+#     updates flowing while blocking the next untested major bump from
+#     resolving silently in CI/dev installs.
+sqlite-vec>=0.1.9
+apsw>=3.51
+chonkie>=1.7
+fastmcp>=3.4,<4

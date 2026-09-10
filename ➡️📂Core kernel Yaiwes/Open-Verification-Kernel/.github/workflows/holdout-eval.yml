@@ -1,0 +1,241 @@
+name: FormalPR-Holdout eval
+
+# Label-separated eval (WP-13). Verifies prediction digest/identity, then scores
+# against immutable labeled holdout. Tokens are stripped after download.
+# Ordinary holdout reports candidate_source_sha only — never verified_source_sha.
+
+on:
+  workflow_dispatch:
+    inputs:
+      holdout_tag:
+        description: Frozen FormalPR-Holdout release tag
+        required: true
+        default: v0.1.0-synthetic
+        type: string
+      asset_sha256:
+        description: Immutable SHA-256 of the release asset (overrides repo variable)
+        required: false
+        default: ""
+        type: string
+      predictions_artifact:
+        description: Optional name of a workflow artifact containing predictions
+        required: false
+        default: ""
+        type: string
+      predictions_run_id:
+        description: Exact FormalPR-Holdout predict workflow run ID for predictions_artifact
+        required: false
+        default: ""
+        type: string
+      candidate_source_sha:
+        description: Candidate SHA that produced predictions (defaults to GITHUB_SHA)
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  holdout-aggregates:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check secret configured
+        id: gate
+        env:
+          HOLDOUT_DOWNLOAD_TOKEN: ${{ secrets.HOLDOUT_DOWNLOAD_TOKEN }}
+          HOLDOUT_ASSET_SHA256: ${{ inputs.asset_sha256 || vars.HOLDOUT_ASSET_SHA256 }}
+        run: |
+          if [ -z "$HOLDOUT_DOWNLOAD_TOKEN" ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "FormalPR-Holdout eval skipped: HOLDOUT_DOWNLOAD_TOKEN not configured."
+            echo "See docs/FORMALPR_HOLDOUT_GOVERNANCE.md"
+          elif [ -z "$HOLDOUT_ASSET_SHA256" ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "FormalPR-Holdout eval skipped: HOLDOUT_ASSET_SHA256 not configured."
+            echo "Provide workflow input asset_sha256 or repository variable HOLDOUT_ASSET_SHA256."
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+            echo "asset_sha256=$HOLDOUT_ASSET_SHA256" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        if: steps.gate.outputs.configured == 'true'
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        if: steps.gate.outputs.configured == 'true'
+        with:
+          python-version: "3.11"
+
+      - name: Require predictions file or exact source run
+        if: steps.gate.outputs.configured == 'true'
+        id: preds
+        env:
+          PREDICTIONS_ARTIFACT: ${{ inputs.predictions_artifact }}
+          PREDICTIONS_RUN_ID: ${{ inputs.predictions_run_id }}
+        run: |
+          set -euo pipefail
+          if [ -n "$PREDICTIONS_ARTIFACT" ]; then
+            if [ -z "$PREDICTIONS_RUN_ID" ]; then
+              echo "predictions_run_id is required when predictions_artifact is set" >&2
+              exit 1
+            fi
+            python - <<'PY'
+          import os, re
+          value = os.environ["PREDICTIONS_RUN_ID"].strip()
+          if not re.fullmatch(r"[1-9][0-9]*", value):
+              raise SystemExit(f"predictions_run_id must be a positive integer, got {value!r}")
+          PY
+            echo "mode=artifact" >> "$GITHUB_OUTPUT"
+          elif [ -f .verification/holdout-predictions.json ]; then
+            echo "mode=workspace" >> "$GITHUB_OUTPUT"
+          else
+            echo "No predictions provided."
+            echo "Provide predictions_artifact + predictions_run_id or .verification/holdout-predictions.json."
+            echo "Refusing to invent labels or print expected outcomes."
+            exit 1
+          fi
+
+      - name: Download predictions from exact workflow run
+        if: steps.gate.outputs.configured == 'true' && steps.preds.outputs.mode == 'artifact'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ${{ inputs.predictions_artifact }}
+          path: .verification/holdout-pred-in
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.predictions_run_id }}
+
+      - name: Normalize predictions and verify candidate plus digest binding
+        if: steps.gate.outputs.configured == 'true'
+        id: identity
+        env:
+          CANDIDATE: ${{ inputs.candidate_source_sha || github.sha }}
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.preds.outputs.mode }}" = "artifact" ]; then
+            test -f .verification/holdout-pred-in/predictions.json || test -f .verification/holdout-pred-in/holdout-predictions.json
+            if [ -f .verification/holdout-pred-in/predictions.json ]; then
+              cp .verification/holdout-pred-in/predictions.json .verification/holdout-predictions.json
+            else
+              cp .verification/holdout-pred-in/holdout-predictions.json .verification/holdout-predictions.json
+            fi
+            test -f .verification/holdout-pred-in/holdout-prediction-manifest.json
+            cp .verification/holdout-pred-in/holdout-prediction-manifest.json .verification/holdout-prediction-manifest.json
+          fi
+          test -f .verification/holdout-predictions.json
+          test -f .verification/holdout-prediction-manifest.json
+          echo "candidate_source_sha=$CANDIDATE" >> "$GITHUB_OUTPUT"
+          python - <<'PY'
+          import hashlib, json, os, re
+          from pathlib import Path
+          from scripts.digest_holdout_predictions import assert_predictions_label_free
+
+          expected = os.environ["CANDIDATE"].strip().lower()
+          if not re.fullmatch(r"[0-9a-f]{40}", expected):
+              raise SystemExit(f"candidate_source_sha must be exact lowercase 40-hex, got {expected!r}")
+
+          pred_path = Path(".verification/holdout-predictions.json")
+          manifest_path = Path(".verification/holdout-prediction-manifest.json")
+          preds = json.loads(pred_path.read_text(encoding="utf-8"))
+          manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+          assert_predictions_label_free(preds)
+
+          if "verified_source_sha" in json.dumps(preds) or "verified_source_sha" in json.dumps(manifest):
+              raise SystemExit("ordinary holdout prediction artifacts must not contain verified_source_sha")
+
+          pred_candidate = str(preds.get("candidate_source_sha") or "").lower()
+          manifest_candidate = str(manifest.get("candidate_source_sha") or "").lower()
+          if pred_candidate != expected:
+              raise SystemExit(
+                  f"candidate_source_sha mismatch: predictions={pred_candidate!r} expected={expected!r}"
+              )
+          if manifest_candidate != expected:
+              raise SystemExit(
+                  f"candidate_source_sha mismatch: manifest={manifest_candidate!r} expected={expected!r}"
+              )
+
+          actual_digest = hashlib.sha256(pred_path.read_bytes()).hexdigest()
+          manifest_digest = str(manifest.get("predictions_sha256") or "").lower()
+          if manifest_digest != actual_digest:
+              raise SystemExit(
+                  f"prediction digest mismatch: manifest={manifest_digest!r} actual={actual_digest!r}"
+              )
+          print(f"predictions label-free and byte-bound to candidate {expected}: {actual_digest}")
+          PY
+
+      - name: Download holdout asset (token only here)
+        if: steps.gate.outputs.configured == 'true'
+        id: download
+        env:
+          HOLDOUT_DOWNLOAD_TOKEN: ${{ secrets.HOLDOUT_DOWNLOAD_TOKEN }}
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          from scripts.run_formalpr_holdout import download_release_asset, verify_asset_sha256
+
+          tag = "${{ inputs.holdout_tag }}"
+          asset_name = f"FormalPR-Holdout-{tag}.tar.gz"
+          dest = Path(".verification") / asset_name
+          dest.parent.mkdir(parents=True, exist_ok=True)
+          download_release_asset(
+              repo="fraware/FormalPR-Holdout",
+              tag=tag,
+              asset_name=asset_name,
+              dest=dest,
+              token=os.environ["HOLDOUT_DOWNLOAD_TOKEN"],
+          )
+          verify_asset_sha256(dest, "${{ steps.gate.outputs.asset_sha256 }}")
+          print(f"downloaded and verified {dest}")
+          PY
+          echo "artifact=.verification/FormalPR-Holdout-${{ inputs.holdout_tag }}.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Strip tokens after download
+        if: steps.gate.outputs.configured == 'true'
+        run: |
+          unset HOLDOUT_DOWNLOAD_TOKEN GITHUB_TOKEN GH_TOKEN || true
+          echo "HOLDOUT_DOWNLOAD_TOKEN=" >> "$GITHUB_ENV"
+          echo "GITHUB_TOKEN=" >> "$GITHUB_ENV"
+          echo "GH_TOKEN=" >> "$GITHUB_ENV"
+
+      - name: Run holdout aggregate eval (fail closed, candidate SHA only)
+        if: steps.gate.outputs.configured == 'true'
+        env:
+          HOLDOUT_DOWNLOAD_TOKEN: ""
+          GITHUB_TOKEN: ""
+          GH_TOKEN: ""
+        run: |
+          unset HOLDOUT_DOWNLOAD_TOKEN GITHUB_TOKEN GH_TOKEN || true
+          python scripts/run_formalpr_holdout.py \
+            --artifact "${{ steps.download.outputs.artifact }}" \
+            --asset-sha256 "${{ steps.gate.outputs.asset_sha256 }}" \
+            --tag "${{ inputs.holdout_tag }}" \
+            --predictions .verification/holdout-predictions.json \
+            --ovk-commit-sha "${{ steps.identity.outputs.candidate_source_sha }}" \
+            --candidate-source-sha "${{ steps.identity.outputs.candidate_source_sha }}" \
+            --output .verification/holdout-aggregate-metrics.json
+
+      - name: Validate aggregate schema shape
+        if: steps.gate.outputs.configured == 'true'
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          from scripts.run_formalpr_holdout import validate_aggregate_schema
+          payload = json.loads(Path(".verification/holdout-aggregate-metrics.json").read_text())
+          validate_aggregate_schema(payload)
+          text = json.dumps(payload)
+          assert "verified_source_sha" not in text, "ordinary holdout must not mint verified_source_sha"
+          assert payload.get("candidate_source_sha") or payload.get("ovk_commit_sha")
+          print("aggregate schema checks passed; labels not present; candidate_source_sha only")
+          PY
+
+      - name: Upload aggregates only
+        if: steps.gate.outputs.configured == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: formalpr-holdout-aggregates
+          path: .verification/holdout-aggregate-metrics.json
+          if-no-files-found: error

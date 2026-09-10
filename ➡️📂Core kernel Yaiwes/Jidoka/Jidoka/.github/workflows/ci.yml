@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  pull_request:
+  merge_group:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  ci:
+    name: CI
+    uses: agentjido/github-actions/.github/workflows/jido-ci.yml@v5
+    secrets: inherit
+    with:
+      docs_command: mix docs --warnings-as-errors && mix run scripts/check_docs.exs && mix doctor --raise
+      test_command: mix test --cover && mix test.coverage
+      credo_command: mix credo
+
+  examples:
+    name: Example Livebooks and showcase
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.19"
+          otp-version: "28"
+      - run: mix deps.get
+      - run: mix run scripts/check_livebooks.exs -- --project examples/*/*.livemd guides/livebooks/*.livemd
+      - run: mix deps.get
+        working-directory: showcase
+      - run: mix test --warnings-as-errors
+        working-directory: showcase

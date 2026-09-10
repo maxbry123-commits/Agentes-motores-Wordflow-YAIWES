@@ -1,0 +1,27 @@
+apiVersion: v2
+name: bernstein
+description: Deterministic orchestrator for CLI coding agents - no model in the coordination loop, so parallel runs in per-task git worktrees replay byte-identically
+type: application
+version: 0.2.0
+appVersion: "3.9.0"
+icon: https://via.placeholder.com/256?text=Bernstein
+
+keywords:
+  - ai
+  - agents
+  - orchestration
+  - llm
+
+maintainers:
+  - name: Bernstein Contributors
+
+dependencies:
+  - name: postgresql
+    version: "18.x"
+    repository: https://charts.bitnami.com/bitnami
+    condition: postgresql.enabled
+
+  - name: redis
+    version: "28.x"
+    repository: https://charts.bitnami.com/bitnami
+    condition: redis.enabled

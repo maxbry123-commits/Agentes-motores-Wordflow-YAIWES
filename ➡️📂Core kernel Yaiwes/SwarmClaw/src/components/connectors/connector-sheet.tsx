@@ -1,0 +1,1577 @@
+'use client'
+
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
+import { useAppStore } from '@/stores/use-app-store'
+import { BottomSheet } from '@/components/shared/bottom-sheet'
+import { toast } from 'sonner'
+import type {
+  Connector,
+  ConnectorAccessMutationAction,
+  ConnectorAccessSnapshot,
+  ConnectorPlatform,
+} from '@/types'
+import { ConnectorPlatformBadge } from '@/components/shared/connector-platform-icon'
+import { AgentPickerList } from '@/components/shared/agent-picker-list'
+import { ChatroomPickerList } from '@/components/shared/chatroom-picker-list'
+import { SheetFooter } from '@/components/shared/sheet-footer'
+import { SectionLabel } from '@/components/shared/section-label'
+import { HintTip } from '@/components/shared/hint-tip'
+import { ConfirmDialog } from '@/components/shared/confirm-dialog'
+import { ConnectorHealth } from '@/components/connectors/connector-health'
+import { ConnectorAccessPanel } from '@/components/connectors/connector-access-panel'
+import { AdvancedSettingsSection } from '@/components/shared/advanced-settings-section'
+import { errorMessage } from '@/lib/shared-utils'
+import {
+  useConnectorsQuery,
+  useConnectorAccessMutation,
+  useConnectorAccessQuery,
+  useConnectorActionMutation,
+  useConnectorDoctorMutation,
+  useConnectorQuery,
+  useDeleteConnectorMutation,
+  useSaveConnectorMutation,
+} from '@/features/connectors/queries'
+import { useAgentsQuery } from '@/features/agents/queries'
+import { useCredentialsQuery, useCreateCredentialMutation } from '@/features/credentials/queries'
+import { useChatroomsQuery } from '@/features/chatrooms/queries'
+import { useAppSettingsQuery } from '@/features/settings/queries'
+import { useConnectorExtensionOptionsQuery } from '@/features/extensions/queries'
+
+/** Auto-detect URLs in text and make them clickable links that open in a new tab */
+function linkify(text: string) {
+  const urlRegex = /(https?:\/\/[^\s,)]+)/gi
+  const parts = text.split(urlRegex)
+  if (parts.length === 1) return text
+  return parts.map((part, i) => {
+    if (urlRegex.test(part)) {
+      urlRegex.lastIndex = 0
+      return <a key={i} href={part} target="_blank" rel="noopener noreferrer" className="text-accent-bright hover:underline">{part}</a>
+    }
+    return part
+  })
+}
+
+interface ConnectorDoctorPolicyPreview {
+  scope?: string
+  replyMode?: string
+  threadBinding?: string
+  groupPolicy?: string
+  resetMode?: string
+  idleTimeoutSec?: number | null
+  maxAgeSec?: number | null
+  dailyResetAt?: string | null
+  resetTimezone?: string | null
+  thinkingLevel?: string | null
+  providerOverride?: string | null
+  modelOverride?: string | null
+  inboundDebounceMs?: number
+  statusReactions?: boolean
+  typingIndicators?: boolean
+}
+
+interface ConnectorConfigOption {
+  value: string
+  label: string
+}
+
+interface ConnectorConfigField {
+  key: string
+  label: string
+  placeholder: string
+  help?: string
+  type?: 'text' | 'select' | 'tags'
+  options?: ConnectorConfigOption[]
+  emptyLabel?: string
+  section?: 'basic' | 'advanced'
+}
+
+const FIELD_HINTS: Record<string, string> = {
+  rootDir: 'Root folder for the queue. Defaults to a managed folder under SwarmClaw data.',
+  inboxDir: 'Folder where external tools drop inbound JSON commands. Relative paths are resolved under Root Directory.',
+  outboxDir: 'Folder where SwarmClaw writes outbound JSON replies. Relative paths are resolved under Root Directory.',
+  archiveDir: 'Processed inbound JSON commands are moved here after routing.',
+  errorDir: 'Malformed or failed inbound JSON commands are moved here with an error sidecar.',
+  pollIntervalMs: 'How often SwarmClaw checks the inbox folder. Minimum 250 ms.',
+  channelIds: "Find these in your platform's developer settings. Leave empty to allow all channels",
+  chatIds: "Find these in your platform's developer settings. Leave empty to allow all chats",
+  roomIds: 'Leave empty to allow all rooms visible to the bot',
+  spaceIds: 'Leave empty to allow all configured spaces',
+  allowedJids: 'Phone numbers in international format, or WhatsApp JIDs. Leave empty to allow all',
+  allowFrom: 'Only needed for allowlist or pairing DM policy modes',
+  denyFrom: 'Blocked sender IDs are rejected before pairing or reply generation',
+  dmAddressingMode: 'Control whether DMs need to address the agent by name before it replies',
+  ownerSenderId: 'Optional sender ID that should route to the main owner thread for direct agent connectors',
+  scopes: 'Press Enter after each scope to add it',
+  walletAddress: 'Base L2 Ethereum address for receiving USDC payments from completed tasks',
+  maxBudget: 'USDC with 6 decimal places. $1.00 = 1000000, $5.00 = 5000000',
+}
+
+const BOOLEAN_SELECT_OPTIONS: ConnectorConfigOption[] = [
+  { value: 'true', label: 'Enabled' },
+  { value: 'false', label: 'Disabled' },
+]
+
+const THINKING_LEVEL_OPTIONS: ConnectorConfigOption[] = [
+  { value: 'minimal', label: 'Minimal' },
+  { value: 'low', label: 'Low' },
+  { value: 'medium', label: 'Medium' },
+  { value: 'high', label: 'High' },
+]
+
+const DM_POLICY_OPTIONS: ConnectorConfigOption[] = [
+  { value: 'open', label: 'Open' },
+  { value: 'allowlist', label: 'Allowlist' },
+  { value: 'pairing', label: 'Pairing approval' },
+  { value: 'disabled', label: 'Disabled' },
+]
+
+const DM_ADDRESSING_OPTIONS: ConnectorConfigOption[] = [
+  { value: 'open', label: 'Reply to any DM' },
+  { value: 'addressed', label: 'Require agent name' },
+]
+
+const SESSION_SCOPE_OPTIONS: ConnectorConfigOption[] = [
+  { value: 'main', label: 'Main thread' },
+  { value: 'channel', label: 'Per channel' },
+  { value: 'peer', label: 'Per sender' },
+  { value: 'channel-peer', label: 'Per channel + sender' },
+  { value: 'thread', label: 'Per thread/topic' },
+]
+
+const REPLY_MODE_OPTIONS: ConnectorConfigOption[] = [
+  { value: 'off', label: 'Off' },
+  { value: 'first', label: 'Reply to first inbound' },
+  { value: 'all', label: 'Reply to every inbound' },
+]
+
+const THREAD_BINDING_OPTIONS: ConnectorConfigOption[] = [
+  { value: 'off', label: 'Off' },
+  { value: 'prefer', label: 'Prefer thread context' },
+  { value: 'strict', label: 'Require thread context' },
+]
+
+const GROUP_POLICY_OPTIONS: ConnectorConfigOption[] = [
+  { value: 'open', label: 'Open' },
+  { value: 'mention', label: 'Mention only' },
+  { value: 'reply-or-mention', label: 'Reply or mention' },
+  { value: 'disabled', label: 'Disabled' },
+]
+
+const RESET_MODE_OPTIONS: ConnectorConfigOption[] = [
+  { value: 'idle', label: 'Idle reset' },
+  { value: 'daily', label: 'Daily reset' },
+]
+
+const PLATFORMS: {
+  id: ConnectorPlatform
+  label: string
+  color: string
+  setupSteps: string[]
+  tokenLabel: string
+  tokenHelp: string
+  configFields: ConnectorConfigField[]
+}[] = [
+  {
+    id: 'discord',
+    label: 'Discord',
+    color: '#5865F2',
+    setupSteps: [
+      'Go to https://discord.com/developers/applications and create a new app',
+      'Under "Bot", click "Reset Token" and copy it',
+      'Enable MESSAGE CONTENT intent under "Privileged Gateway Intents"',
+      'Under "OAuth2 > URL Generator", check the "bot" scope — a Bot Permissions panel will appear below',
+      'In Bot Permissions, check "Send Messages" and "Read Message History"',
+      'Copy the generated URL at the bottom and open it to invite the bot to your server',
+    ],
+    tokenLabel: 'Bot Token',
+    tokenHelp: 'From Discord Developer Portal > Your App > Bot > Token',
+    configFields: [
+      { key: 'channelIds', label: 'Channel IDs', placeholder: '123456789,987654321', help: 'Leave empty to listen in all channels the bot can see', type: 'tags', section: 'advanced' },
+    ],
+  },
+  {
+    id: 'telegram',
+    label: 'Telegram',
+    color: '#229ED9',
+    setupSteps: [
+      'Message @BotFather on Telegram',
+      'Send /newbot and follow the prompts to create a bot',
+      'Copy the bot token BotFather gives you',
+    ],
+    tokenLabel: 'Bot Token',
+    tokenHelp: 'From @BotFather after creating your bot',
+    configFields: [
+      { key: 'chatIds', label: 'Chat IDs', placeholder: '-100123456789', help: 'Leave empty to respond in all chats. Use negative IDs for groups.', type: 'tags', section: 'advanced' },
+    ],
+  },
+  {
+    id: 'slack',
+    label: 'Slack',
+    color: '#4A154B',
+    setupSteps: [
+      'Go to https://api.slack.com/apps and create a new app "From scratch"',
+      'Under "Socket Mode", enable it. Then go to "Basic Information > App-Level Tokens", generate a token with connections:write scope, and copy the xapp-... token',
+      'Under "OAuth & Permissions", add bot scopes: chat:write, channels:history, channels:read, im:history, im:read, users:read, app_mentions:read',
+      'Under "Event Subscriptions", enable events and subscribe to: message.channels, message.im, app_mention',
+      'Under "App Home", enable the Messages Tab and check "Allow users to send Slash commands and messages from the messages tab"',
+      'Install the app to your workspace and copy the Bot Token (xoxb-...) from OAuth & Permissions',
+    ],
+    tokenLabel: 'Bot Token (xoxb-...)',
+    tokenHelp: 'From Slack App > OAuth & Permissions > Bot User OAuth Token',
+    configFields: [
+      { key: 'appToken', label: 'App-Level Token (xapp-...)', placeholder: 'xapp-1-...', help: 'Required for Socket Mode. From Slack App > Basic Information > App-Level Tokens', section: 'basic' },
+      { key: 'channelIds', label: 'Channel IDs', placeholder: 'C0123456789', help: 'Leave empty to listen in all channels the bot is in', type: 'tags', section: 'advanced' },
+    ],
+  },
+  {
+    id: 'whatsapp',
+    label: 'WhatsApp',
+    color: '#25D366',
+    setupSteps: [
+      'No token needed — WhatsApp uses QR code pairing',
+      'When you start this connector, a QR code will appear in the server terminal',
+      'Open WhatsApp > Settings > Linked Devices > Link a Device',
+      'Scan the QR code to connect',
+    ],
+    tokenLabel: '',
+    tokenHelp: '',
+    configFields: [
+      { key: 'allowedJids', label: 'Allowed Numbers/Groups', placeholder: '1234567890,MyGroup', help: 'Leave empty to respond to all messages', type: 'tags', section: 'advanced' },
+      { key: 'outboundJid', label: 'Default Outbound Recipient', placeholder: '15551234567 or 15551234567@s.whatsapp.net', help: 'Used by connector_message_tool when the agent sends proactive WhatsApp updates without an explicit "to" value', section: 'advanced' },
+    ],
+  },
+  {
+    id: 'openclaw',
+    label: 'OpenClaw',
+    color: '#F97316',
+    setupSteps: [
+      'Ensure your OpenClaw instance is running (default: localhost:18789)',
+      'If authentication is enabled, create a credential with your OpenClaw gateway token',
+      'The connector will connect via OpenClaw Gateway RPC and handle chat events',
+    ],
+    tokenLabel: 'Gateway Token',
+    tokenHelp: 'Required when your OpenClaw gateway is auth-protected',
+    configFields: [
+      { key: 'wsUrl', label: 'WebSocket URL', placeholder: 'ws://localhost:18789', help: 'OpenClaw gateway WebSocket endpoint (root URL, not /ws)', section: 'basic' },
+      { key: 'sessionKey', label: 'Chat Key Filter', placeholder: 'main', help: 'Optional. If set, only inbound events for this OpenClaw chat are processed.', section: 'advanced' },
+      { key: 'nodeId', label: 'Client Label', placeholder: 'swarmclaw', help: 'Optional display label shown in OpenClaw presence metadata.', section: 'advanced' },
+      { key: 'role', label: 'Gateway Role', placeholder: 'operator', help: 'Optional role claim for connect handshake. Default is operator.', section: 'advanced' },
+      { key: 'scopes', label: 'Scopes (CSV)', placeholder: 'operator.read,operator.write', help: 'Optional comma-separated scopes for OpenClaw connect.', type: 'tags', section: 'advanced' },
+      { key: 'tickWatchdog', label: 'Tick Watchdog', placeholder: 'true', help: 'Enable or disable stale-tick reconnect watchdog.', type: 'select', options: BOOLEAN_SELECT_OPTIONS, emptyLabel: 'Not set (default: enabled)', section: 'advanced' },
+      { key: 'tickIntervalMs', label: 'Tick Interval Override (ms)', placeholder: '30000', help: 'Optional watchdog interval override when policy tick is unavailable.', section: 'advanced' },
+    ],
+  },
+  {
+    id: 'bluebubbles',
+    label: 'BlueBubbles',
+    color: '#2E89FF',
+    setupSteps: [
+      'Run BlueBubbles server on your macOS host and enable the REST API',
+      'Copy the BlueBubbles server password',
+      'After saving the connector, point BlueBubbles webhook to /api/connectors/<connector-id>/webhook',
+      'Optionally set dmPolicy=pairing to require explicit sender approval for new DMs',
+    ],
+    tokenLabel: 'BlueBubbles Password',
+    tokenHelp: 'Server password used for /api/v1/ping and /api/v1/message/text',
+    configFields: [
+      { key: 'serverUrl', label: 'Server URL', placeholder: 'http://127.0.0.1:1234', help: 'BlueBubbles server URL (no trailing /api path needed)', section: 'basic' },
+      { key: 'chatIds', label: 'Allowed Chat IDs', placeholder: 'iMessage;-;+15551234567', help: 'Optional comma-separated chat IDs/guid fragments. Leave empty for all chats.', type: 'tags', section: 'advanced' },
+      { key: 'outboundTarget', label: 'Default Outbound Target', placeholder: 'iMessage;-;+15551234567', help: 'Used when proactive sends omit "to".', section: 'advanced' },
+      { key: 'webhookSecret', label: 'Webhook Secret', placeholder: 'optional-shared-secret', help: 'Optional secret required by /api/connectors/{id}/webhook (header: x-connector-secret or ?secret=...)', section: 'advanced' },
+      { key: 'timeoutMs', label: 'Request Timeout (ms)', placeholder: '10000', help: 'Optional BlueBubbles API timeout in milliseconds.', section: 'advanced' },
+    ],
+  },
+  {
+    id: 'matrix',
+    label: 'Matrix',
+    color: '#0DBD8B',
+    setupSteps: [
+      'Create a bot user on your Matrix homeserver',
+      'Generate an access token for the bot user',
+      'Set the homeserver URL (e.g. https://matrix.org)',
+      'Optionally restrict to specific room IDs',
+    ],
+    tokenLabel: 'Access Token',
+    tokenHelp: 'Matrix access token for the bot user',
+    configFields: [
+      { key: 'homeserverUrl', label: 'Homeserver URL', placeholder: 'https://matrix.org', help: 'The Matrix homeserver URL', section: 'basic' },
+      { key: 'roomIds', label: 'Room IDs', placeholder: '!abc123:matrix.org', help: 'Comma-separated room IDs. Leave empty for all rooms.', type: 'tags', section: 'advanced' },
+    ],
+  },
+  {
+    id: 'googlechat',
+    label: 'Google Chat',
+    color: '#00AC47',
+    setupSteps: [
+      'Create a Google Cloud project and enable the Google Chat API',
+      'Create a service account and download the JSON key file',
+      'In Google Chat Admin, configure event delivery to /api/connectors/<connector-id>/webhook',
+      'Paste the full service account JSON as the bot token',
+    ],
+    tokenLabel: 'Service Account JSON',
+    tokenHelp: 'Paste the full service account JSON key file contents',
+    configFields: [
+      { key: 'spaceIds', label: 'Space IDs', placeholder: 'spaces/AAAA123', help: 'Comma-separated Google Chat space IDs', type: 'tags', section: 'advanced' },
+      { key: 'webhookSecret', label: 'Webhook Secret', placeholder: 'optional-shared-secret', help: 'Optional secret required by /api/connectors/{id}/webhook (header: x-connector-secret or ?secret=...)', section: 'advanced' },
+    ],
+  },
+  {
+    id: 'teams',
+    label: 'Microsoft Teams',
+    color: '#6264A7',
+    setupSteps: [
+      'Register a bot in the Azure Bot Framework portal',
+      'Note the Microsoft App ID and generate an App Secret',
+      'Set up a public HTTPS endpoint for webhook delivery',
+      'After saving the connector, point Azure to /api/connectors/<connector-id>/webhook',
+    ],
+    tokenLabel: 'App Secret',
+    tokenHelp: 'Microsoft App Secret from Azure Bot registration',
+    configFields: [
+      { key: 'appId', label: 'Microsoft App ID', placeholder: 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx', help: 'Azure Bot Framework App ID', section: 'basic' },
+      { key: 'notifyUrl', label: 'Notify URL', placeholder: 'https://your-server.com/api/connectors/<id>/webhook', help: 'Public HTTPS endpoint for receiving messages (informational)', section: 'advanced' },
+      { key: 'webhookSecret', label: 'Webhook Secret', placeholder: 'optional-shared-secret', help: 'Optional secret required by /api/connectors/{id}/webhook (header: x-connector-secret or ?secret=...)', section: 'advanced' },
+    ],
+  },
+  {
+    id: 'signal',
+    label: 'Signal',
+    color: '#3A76F0',
+    setupSteps: [
+      'Install signal-cli (https://github.com/AsamK/signal-cli)',
+      'Register a phone number: signal-cli -u +1234567890 register',
+      'Verify the number: signal-cli -u +1234567890 verify CODE',
+      'The connector spawns signal-cli daemon to listen for messages',
+    ],
+    tokenLabel: '',
+    tokenHelp: '',
+    configFields: [
+      { key: 'phoneNumber', label: 'Phone Number', placeholder: '+1234567890', help: 'Pre-registered Signal phone number', section: 'basic' },
+      { key: 'signalCliPath', label: 'signal-cli Path', placeholder: 'signal-cli', help: 'Path to signal-cli binary (defaults to signal-cli)', section: 'advanced' },
+      { key: 'signalCliMode', label: 'Mode', placeholder: 'stdio', help: 'How SwarmClaw talks to signal-cli.', type: 'select', options: [{ value: 'stdio', label: 'stdio' }, { value: 'http', label: 'HTTP API' }], emptyLabel: 'Not set (default: stdio)', section: 'advanced' },
+      { key: 'signalCliHttpUrl', label: 'HTTP API URL', placeholder: 'http://localhost:8080', help: 'Only needed for http mode', section: 'advanced' },
+    ],
+  },
+  {
+    id: 'swarmdock',
+    label: 'SwarmDock',
+    color: '#F59E0B',
+    setupSteps: [
+      'Generate an Ed25519 keypair for agent identity',
+      'Set your Base L2 wallet address for receiving USDC payments',
+      'Configure skills and auto-discovery preferences',
+    ],
+    tokenLabel: 'SwarmDock Identity Key',
+    tokenHelp: 'Encrypted Ed25519 private key used to authenticate this agent on SwarmDock.',
+    configFields: [
+      { key: 'apiUrl', label: 'API URL', placeholder: 'https://swarmdock-api.onrender.com', help: 'SwarmDock marketplace API endpoint' },
+      { key: 'walletAddress', label: 'Base L2 Wallet Address', placeholder: '0x...', help: 'USDC wallet on Base L2 for payments' },
+      { key: 'agentDescription', label: 'Marketplace Description', placeholder: 'Specialized in...', help: 'Description on your SwarmDock profile' },
+      { key: 'skills', label: 'Skills (comma-separated)', placeholder: 'data-analysis,web-design', help: 'Skill IDs for task matching' },
+      { key: 'autoDiscover', label: 'Auto-Discover Tasks', placeholder: 'false', help: 'Automatically bid on matching tasks' },
+      { key: 'maxBudget', label: 'Max Budget (USDC micro-units)', placeholder: '5000000', help: '$1 = 1000000, $5 = 5000000' },
+    ],
+  },
+  {
+    id: 'filequeue',
+    label: 'File Queue',
+    color: '#22C55E',
+    setupSteps: [
+      'Choose a root directory or let SwarmClaw create a managed one',
+      'External tools write JSON commands into the inbox folder',
+      'SwarmClaw archives processed commands and writes JSON replies into the outbox folder',
+      'Use an agent or chatroom route to decide who handles inbound commands',
+    ],
+    tokenLabel: '',
+    tokenHelp: '',
+    configFields: [
+      { key: 'rootDir', label: 'Root Directory', placeholder: '~/swarmclaw-command-queue', help: 'Optional. Defaults to data/connectors/<id>/filequeue.', section: 'basic' },
+      { key: 'inboxDir', label: 'Inbox Directory', placeholder: 'inbox', help: 'Inbound JSON command directory. Relative paths resolve under Root Directory.', section: 'basic' },
+      { key: 'outboxDir', label: 'Outbox Directory', placeholder: 'outbox', help: 'Outbound JSON reply directory. Relative paths resolve under Root Directory.', section: 'basic' },
+      { key: 'archiveDir', label: 'Archive Directory', placeholder: 'archive', help: 'Processed command archive directory.', section: 'advanced' },
+      { key: 'errorDir', label: 'Error Directory', placeholder: 'errors', help: 'Malformed command quarantine directory.', section: 'advanced' },
+      { key: 'pollIntervalMs', label: 'Poll Interval (ms)', placeholder: '1000', help: 'How often to scan the inbox. Minimum 250 ms.', section: 'advanced' },
+      { key: 'defaultChannelId', label: 'Default Channel ID', placeholder: 'ops', help: 'Used when an inbound command omits channelId.', section: 'advanced' },
+      { key: 'defaultSenderId', label: 'Default Sender ID', placeholder: 'queue', help: 'Used when an inbound command omits senderId.', section: 'advanced' },
+      { key: 'defaultSenderName', label: 'Default Sender Name', placeholder: 'Queue', help: 'Used when an inbound command omits senderName.', section: 'advanced' },
+    ],
+  },
+]
+
+const COMMON_CONFIG_FIELDS: ConnectorConfigField[] = [
+  {
+    key: 'thinkingLevel',
+    label: 'Thinking Level',
+    placeholder: 'minimal | low | medium | high',
+    help: 'Default reasoning depth for new/reset direct connector sessions.',
+    type: 'select',
+    options: THINKING_LEVEL_OPTIONS,
+    emptyLabel: 'Not set (agent default)',
+    section: 'advanced',
+  },
+  {
+    key: 'providerOverride',
+    label: 'Provider Override',
+    placeholder: 'openai | anthropic | openclaw | ...',
+    help: 'Optional direct-session provider override. Useful for connector-specific routing or cheaper autonomy lanes.',
+    section: 'advanced',
+  },
+  {
+    key: 'modelOverride',
+    label: 'Model Override',
+    placeholder: 'gpt-4.1-mini',
+    help: 'Optional direct-session model override. Defaults to the assigned agent model when empty.',
+    section: 'advanced',
+  },
+  {
+    key: 'sessionScope',
+    label: 'Session Scope',
+    placeholder: 'main | channel | peer | channel-peer | thread',
+    help: 'Conversation identity policy. Defaults to channel-peer for DMs and channel for groups.',
+    type: 'select',
+    options: SESSION_SCOPE_OPTIONS,
+    emptyLabel: 'Not set (platform default)',
+    section: 'advanced',
+  },
+  {
+    key: 'replyMode',
+    label: 'Reply Mode',
+    placeholder: 'off | first | all',
+    help: 'Whether outbound replies should attach to the triggering inbound message.',
+    type: 'select',
+    options: REPLY_MODE_OPTIONS,
+    emptyLabel: 'Not set (platform default)',
+    section: 'advanced',
+  },
+  {
+    key: 'threadBinding',
+    label: 'Thread Binding',
+    placeholder: 'off | prefer | strict',
+    help: 'Prefer or require thread/topic-specific sessions when the platform exposes thread IDs.',
+    type: 'select',
+    options: THREAD_BINDING_OPTIONS,
+    emptyLabel: 'Not set (platform default)',
+    section: 'advanced',
+  },
+  {
+    key: 'groupPolicy',
+    label: 'Group Policy',
+    placeholder: 'open | mention | reply-or-mention | disabled',
+    help: 'Controls whether the agent speaks in group chats without being mentioned or replied to.',
+    type: 'select',
+    options: GROUP_POLICY_OPTIONS,
+    emptyLabel: 'Not set (platform default)',
+    section: 'advanced',
+  },
+  {
+    key: 'idleTimeoutSec',
+    label: 'Idle Timeout (sec)',
+    placeholder: '43200',
+    help: 'If exceeded, the connector session is reset before the next inbound turn.',
+    section: 'advanced',
+  },
+  {
+    key: 'maxAgeSec',
+    label: 'Max Age (sec)',
+    placeholder: '604800',
+    help: 'Absolute maximum age of a connector session before it is reset.',
+    section: 'advanced',
+  },
+  {
+    key: 'sessionResetMode',
+    label: 'Reset Mode',
+    placeholder: 'idle | daily',
+    help: 'Freshness policy for connector sessions. Daily resets use the fields below.',
+    type: 'select',
+    options: RESET_MODE_OPTIONS,
+    emptyLabel: 'Not set (default: idle)',
+    section: 'advanced',
+  },
+  {
+    key: 'sessionDailyResetAt',
+    label: 'Daily Reset Time',
+    placeholder: '04:00',
+    help: 'Used only when Reset Mode is daily. Format: HH:MM.',
+    section: 'advanced',
+  },
+  {
+    key: 'sessionResetTimezone',
+    label: 'Reset Timezone',
+    placeholder: 'UTC or Europe/Isle_of_Man',
+    help: 'Optional timezone for daily reset boundaries. Defaults to the server timezone.',
+    section: 'advanced',
+  },
+  {
+    key: 'inboundDebounceMs',
+    label: 'Inbound Debounce (ms)',
+    placeholder: '700',
+    help: 'Coalesces rapid inbound bursts from the same sender before starting a run.',
+    section: 'advanced',
+  },
+  {
+    key: 'statusReactions',
+    label: 'Status Reactions',
+    placeholder: 'true | false',
+    help: 'When supported, add lightweight platform-native reactions for processing/sent/silent states.',
+    type: 'select',
+    options: BOOLEAN_SELECT_OPTIONS,
+    emptyLabel: 'Not set (default: enabled)',
+    section: 'advanced',
+  },
+  {
+    key: 'typingIndicators',
+    label: 'Typing Indicators',
+    placeholder: 'true | false',
+    help: 'When supported, keep a native typing/working indicator alive while the agent is running.',
+    type: 'select',
+    options: BOOLEAN_SELECT_OPTIONS,
+    emptyLabel: 'Not set (default: enabled)',
+    section: 'advanced',
+  },
+  {
+    key: 'taskFollowups',
+    label: 'Task Follow-ups',
+    placeholder: 'true | false',
+    help: 'Enable automatic connector follow-up messages when this agent completes or fails a task.',
+    type: 'select',
+    options: BOOLEAN_SELECT_OPTIONS,
+    emptyLabel: 'Not set (default: enabled)',
+    section: 'advanced',
+  },
+  {
+    key: 'taskFollowupTemplate',
+    label: 'Task Follow-up Template',
+    placeholder: 'Task {status}: {title}\\n\\n{summary}',
+    help: 'Optional placeholders: {status}, {title}, {summary}, {taskId}.',
+    section: 'advanced',
+  },
+]
+
+const ACCESS_CONTROL_FIELDS: ConnectorConfigField[] = [
+  {
+    key: 'dmPolicy',
+    label: 'DM Policy',
+    placeholder: 'open',
+    help: 'How new direct-message senders are handled for this connector.',
+    type: 'select',
+    options: DM_POLICY_OPTIONS,
+    emptyLabel: 'Not set (default: open)',
+    section: 'basic',
+  },
+  {
+    key: 'dmAddressingMode',
+    label: 'DM Addressing Default',
+    placeholder: 'open',
+    help: 'Whether direct messages should only trigger when the sender addresses the agent by name or replies to it.',
+    type: 'select',
+    options: DM_ADDRESSING_OPTIONS,
+    emptyLabel: 'Not set (default: reply to any DM)',
+    section: 'basic',
+  },
+  {
+    key: 'allowFrom',
+    label: 'Configured Allowlist',
+    placeholder: '15551234567,447700900123',
+    help: 'Connector-specific sender IDs that are always approved.',
+    type: 'tags',
+    section: 'advanced',
+  },
+  {
+    key: 'denyFrom',
+    label: 'Deny List',
+    placeholder: '15551234567,447700900123',
+    help: 'Blocked sender IDs. These are rejected before pairing or reply generation.',
+    type: 'tags',
+    section: 'advanced',
+  },
+  {
+    key: 'ownerSenderId',
+    label: 'Owner Sender ID',
+    placeholder: '15551234567@s.whatsapp.net',
+    help: 'Optional direct-message sender ID that should route into the main owner thread.',
+    section: 'basic',
+  },
+]
+
+export function ConnectorSheet() {
+  const open = useAppStore((s) => s.connectorSheetOpen)
+  const setOpen = useAppStore((s) => s.setConnectorSheetOpen)
+  const editingId = useAppStore((s) => s.editingConnectorId)
+  const setEditingId = useAppStore((s) => s.setEditingConnectorId)
+  const connectorsQuery = useConnectorsQuery({ enabled: open })
+  const connectorDetailQuery = useConnectorQuery(editingId, {
+    enabled: open && !!editingId,
+    refetchInterval: open && editingId ? 2_000 : false,
+  })
+  const agentsQuery = useAgentsQuery({ enabled: open })
+  const credentialsQuery = useCredentialsQuery({ enabled: open })
+  const chatroomsQuery = useChatroomsQuery({ enabled: open })
+  const appSettingsQuery = useAppSettingsQuery({ enabled: open })
+  const connectorExtensionOptionsQuery = useConnectorExtensionOptionsQuery({ enabled: open })
+  const connectorDoctorMutation = useConnectorDoctorMutation()
+  const connectorAccessMutation = useConnectorAccessMutation(editingId)
+  const connectorAccessQuery = useConnectorAccessQuery(editingId, { enabled: open && !!editingId })
+  const saveConnectorMutation = useSaveConnectorMutation()
+  const connectorActionMutation = useConnectorActionMutation()
+  const deleteConnectorMutation = useDeleteConnectorMutation()
+  const createCredentialMutation = useCreateCredentialMutation()
+  const initializedKeyRef = useRef<string | null>(null)
+
+  const dynamicPlatforms = useMemo(() => connectorExtensionOptionsQuery.data ?? [], [connectorExtensionOptionsQuery.data])
+  const connectors = connectorsQuery.data ?? {}
+  const agents = agentsQuery.data ?? {}
+  const appSettings = appSettingsQuery.data ?? {}
+  const credentials = credentialsQuery.data ?? {}
+  const chatrooms = chatroomsQuery.data ?? {}
+
+  const ALL_PLATFORMS = useMemo(() => {
+    const extensionPlatforms = dynamicPlatforms.map(p => ({
+      id: p.id,
+      label: p.name,
+      color: '#10B981',
+      setupSteps: [p.description || 'Follow the extension instructions for setup.'],
+      tokenLabel: 'Extension Token',
+      tokenHelp: 'Secret key required by this extension connector.',
+      configFields: [],
+    }))
+    return [...PLATFORMS, ...extensionPlatforms]
+  }, [dynamicPlatforms])
+
+  const [name, setName] = useState('')
+  const [platform, setPlatform] = useState<ConnectorPlatform>('discord')
+  const [agentId, setAgentId] = useState('')
+  const [routeMode, setRouteMode] = useState<'agent' | 'chatroom'>('agent')
+  const [chatroomId, setChatroomId] = useState('')
+  const [credentialId, setCredentialId] = useState('')
+  const [config, setConfig] = useState<Record<string, string>>({})
+  const [saving, setSaving] = useState(false)
+  const [actionLoading, setActionLoading] = useState(false)
+  const [showSetup, setShowSetup] = useState(false)
+  const [waConnecting, setWaConnecting] = useState(false)
+  const [showNewCred, setShowNewCred] = useState(false)
+  const [newCredName, setNewCredName] = useState('')
+  const [newCredValue, setNewCredValue] = useState('')
+  const [savingCred, setSavingCred] = useState(false)
+  const [doctorWarnings, setDoctorWarnings] = useState<string[]>([])
+  const [doctorPolicy, setDoctorPolicy] = useState<ConnectorDoctorPolicyPreview | null>(null)
+  const [doctorLoading, setDoctorLoading] = useState(false)
+  const [accessError, setAccessError] = useState<string | null>(null)
+  const [accessPending, setAccessPending] = useState(false)
+  const [confirmDelete, setConfirmDelete] = useState(false)
+  const [confirmWhatsAppAction, setConfirmWhatsAppAction] = useState<'unlink' | 'repair' | null>(null)
+  const [deleting, setDeleting] = useState(false)
+  const [showAdvancedSettings, setShowAdvancedSettings] = useState(false)
+  const localAllowlistCount = config.allowFrom ? config.allowFrom.split(',').map((entry) => entry.trim()).filter(Boolean).length : 0
+  const localBlocklistCount = config.denyFrom ? config.denyFrom.split(',').map((entry) => entry.trim()).filter(Boolean).length : 0
+  const globalWhatsAppAllowlistCount = platform === 'whatsapp' && Array.isArray(appSettings.whatsappApprovedContacts)
+    ? appSettings.whatsappApprovedContacts.length
+    : 0
+  const supportsAccessControls = platform === 'whatsapp' || platform === 'bluebubbles'
+
+  const editing = editingId ? connectors[editingId] as Connector | undefined : null
+  const runtimeConnector = connectorDetailQuery.data ?? editing ?? null
+  const accessSnapshot = connectorAccessQuery.data ?? null
+  const accessLoading = connectorAccessQuery.isPending
+
+  // Sync form fields when editing connector changes (by ID, not reference)
+  const editingIdRef = editing?.id ?? null
+  useEffect(() => {
+    if (!open) {
+      initializedKeyRef.current = null
+      return
+    }
+    if (editingId && !editing) return
+    const initKey = editing?.id || '__new__'
+    if (initializedKeyRef.current === initKey) return
+    setShowSetup(false)
+    setShowAdvancedSettings(false)
+    if (editing) {
+      setName(editing.name)
+      setPlatform(editing.platform)
+      setAgentId(editing.agentId || '')
+      setRouteMode(editing.chatroomId ? 'chatroom' : 'agent')
+      setChatroomId(editing.chatroomId || '')
+      setCredentialId(editing.credentialId || '')
+      setConfig(editing.config || {})
+    } else {
+      setName('')
+      setPlatform('discord')
+      setAgentId('')
+      setRouteMode('agent')
+      setChatroomId('')
+      setCredentialId('')
+      setConfig({})
+      setShowNewCred(false)
+      setNewCredName('')
+      setNewCredValue('')
+    }
+    setWaConnecting(false)
+    initializedKeyRef.current = initKey
+  }, [editing, editingId, editingIdRef, open])
+
+  // Poll for QR code when WhatsApp connector is running or connecting
+  const qrDataUrl = runtimeConnector?.qrDataUrl ?? null
+  const waAuthenticated = runtimeConnector?.authenticated === true
+  const waHasCreds = runtimeConnector?.hasCredentials === true
+  const loadDoctorPreview = useCallback(async () => {
+    setDoctorLoading(true)
+    try {
+      const data = await connectorDoctorMutation.mutateAsync({
+        id: editing?.id || null,
+        name,
+        platform,
+        agentId: routeMode === 'agent' ? (agentId || null) : null,
+        chatroomId: routeMode === 'chatroom' ? (chatroomId || null) : null,
+        credentialId: credentialId || null,
+        config,
+      })
+      setDoctorWarnings(Array.isArray(data.warnings) ? data.warnings : [])
+      setDoctorPolicy(data.policy || null)
+    } catch {
+      setDoctorWarnings([])
+      setDoctorPolicy(null)
+    } finally {
+      setDoctorLoading(false)
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- connectorDoctorMutation omitted: mutateAsync is stable at runtime but the wrapper isn't reference-stable, causing an infinite render loop
+  }, [editing?.id, name, platform, routeMode, agentId, chatroomId, credentialId, config])
+
+  useEffect(() => {
+    if (!open) {
+      setDoctorWarnings([])
+      setDoctorPolicy(null)
+      setDoctorLoading(false)
+      setAccessError(null)
+      setAccessPending(false)
+      setConfirmDelete(false)
+      setConfirmWhatsAppAction(null)
+      setDeleting(false)
+      return
+    }
+    const timer = window.setTimeout(() => {
+      void loadDoctorPreview()
+    }, 250)
+    return () => window.clearTimeout(timer)
+  }, [open, loadDoctorPreview])
+
+  const applySnapshotToConfig = useCallback((snapshot: ConnectorAccessSnapshot) => {
+    setConfig((prev) => {
+      const next = { ...prev }
+      if (snapshot.dmAddressingMode === 'addressed') next.dmAddressingMode = 'addressed'
+      else delete next.dmAddressingMode
+      if (snapshot.allowFrom.length > 0) next.allowFrom = snapshot.allowFrom.join(',')
+      else delete next.allowFrom
+      if (snapshot.denyFrom.length > 0) next.denyFrom = snapshot.denyFrom.join(',')
+      else delete next.denyFrom
+      if (snapshot.ownerSenderId) next.ownerSenderId = snapshot.ownerSenderId
+      else delete next.ownerSenderId
+      return next
+    })
+  }, [])
+
+  const handleAccessAction = useCallback(async (
+    action: ConnectorAccessMutationAction,
+    payload?: {
+      senderId?: string | null
+      senderIdAlt?: string | null
+      code?: string | null
+      dmAddressingMode?: 'open' | 'addressed' | null
+    },
+  ) => {
+    if (!editing?.id) return
+    setAccessPending(true)
+    setAccessError(null)
+    try {
+      const result = await connectorAccessMutation.mutateAsync({
+        action,
+        senderId: payload?.senderId || null,
+        senderIdAlt: payload?.senderIdAlt || null,
+        code: payload?.code || null,
+        dmAddressingMode: payload?.dmAddressingMode || null,
+      })
+      applySnapshotToConfig(result.snapshot)
+    } catch (err: unknown) {
+      const message = errorMessage(err)
+      setAccessError(message)
+      toast.error(message)
+    } finally {
+      setAccessPending(false)
+    }
+  }, [applySnapshotToConfig, connectorAccessMutation, editing?.id])
+
+  const handleSave = async () => {
+    const hasTarget = routeMode === 'agent' ? !!agentId : !!chatroomId
+    if (!hasTarget) return
+    setSaving(true)
+    const routePayload = routeMode === 'agent'
+      ? { agentId, chatroomId: null }
+      : { agentId: null, chatroomId }
+    try {
+      await saveConnectorMutation.mutateAsync({
+        id: editing?.id,
+        payload: {
+          name: name || (platform === 'filequeue' ? `${platformConfig?.label} Connector` : `${platformConfig?.label} Bot`),
+          platform,
+          ...routePayload,
+          credentialId: showCredentialSection ? (credentialId || null) : null,
+          config,
+        },
+      })
+      setOpen(false)
+      setEditingId(null)
+    } catch (err: unknown) {
+      toast.error(errorMessage(err))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const handleStartStop = async (action: 'start' | 'stop') => {
+    if (!editing) return
+    setActionLoading(true)
+    try {
+      await connectorActionMutation.mutateAsync({ id: editing.id, action })
+      if (action === 'start' && editing.platform === 'whatsapp') {
+        setWaConnecting(true)
+      } else if (action === 'stop') {
+        setWaConnecting(false)
+      }
+    } catch (err: unknown) {
+      setWaConnecting(false)
+      toast.error(`Failed to ${action}: ${errorMessage(err)}`)
+    } finally {
+      setActionLoading(false)
+    }
+  }
+
+  const handleDelete = async () => {
+    if (!editing) return
+    setDeleting(true)
+    try {
+      await deleteConnectorMutation.mutateAsync(editing.id)
+      setConfirmDelete(false)
+      setOpen(false)
+      setEditingId(null)
+    } catch (err: unknown) {
+      toast.error(`Failed to delete connector: ${errorMessage(err)}`)
+    } finally {
+      setDeleting(false)
+    }
+  }
+
+  const handleWhatsAppRepair = async (mode: 'unlink' | 'repair') => {
+    if (!editing) return
+    setActionLoading(true)
+    try {
+      await connectorActionMutation.mutateAsync({ id: editing.id, action: 'repair' })
+      setWaConnecting(true)
+      setConfirmWhatsAppAction(null)
+    } catch (err: unknown) {
+      toast.error(`Failed to ${mode === 'unlink' ? 'unlink' : 're-pair'}: ${errorMessage(err)}`)
+    } finally {
+      setActionLoading(false)
+    }
+  }
+
+  const platformConfig = ALL_PLATFORMS.find((p) => p.id === platform) || ALL_PLATFORMS[0]
+  const agentList = Object.values(agents).sort((a, b) => a.name.localeCompare(b.name))
+  const credList = Object.values(credentials)
+  const basicPlatformFields = platformConfig.configFields.filter((field) => field.section !== 'advanced')
+  const advancedPlatformFields = platformConfig.configFields.filter((field) => field.section === 'advanced')
+  const showCredentialSection = Boolean(platformConfig.tokenLabel.trim())
+  const basicAccessFields = ACCESS_CONTROL_FIELDS.filter((field) => field.section !== 'advanced')
+  const advancedAccessFields = ACCESS_CONTROL_FIELDS.filter((field) => field.section === 'advanced')
+  const hasConfiguredValue = useCallback((key: string) => Boolean(config[key]?.trim()), [config])
+  const connectorAdvancedBadges = useMemo(() => {
+    const badges: string[] = []
+    if (advancedPlatformFields.some((field) => hasConfiguredValue(field.key))) badges.push('Platform overrides')
+    if (advancedAccessFields.some((field) => hasConfiguredValue(field.key)) || accessSnapshot?.pendingPairingRequests.length || accessSnapshot?.storedAllowedSenderIds.length) badges.push('Access lists')
+    if (COMMON_CONFIG_FIELDS.some((field) => hasConfiguredValue(field.key))) badges.push('Runtime policy')
+    if (doctorWarnings.length > 0 || runtimeConnector?.lastError) badges.push('Diagnostics')
+    return Array.from(new Set(badges))
+  }, [accessSnapshot?.pendingPairingRequests.length, accessSnapshot?.storedAllowedSenderIds.length, advancedAccessFields, advancedPlatformFields, doctorWarnings.length, hasConfiguredValue, runtimeConnector?.lastError])
+  const configuredAdvancedCount = useMemo(() => {
+    const advancedKeys = new Set([
+      ...advancedPlatformFields.map((field) => field.key),
+      ...advancedAccessFields.map((field) => field.key),
+      ...COMMON_CONFIG_FIELDS.map((field) => field.key),
+    ])
+    const populated = Object.entries(config).filter(([key, value]) => advancedKeys.has(key) && value.trim()).length
+    return populated + (doctorWarnings.length > 0 ? 1 : 0)
+  }, [advancedAccessFields, advancedPlatformFields, config, doctorWarnings.length])
+  const advancedSummary = configuredAdvancedCount > 0 ? `${configuredAdvancedCount} configured` : 'Defaults only'
+
+  const inputClass = "w-full px-4 py-3 rounded-[12px] border border-white/[0.08] bg-surface text-text text-[14px] outline-none transition-all placeholder:text-text-3/50 focus:border-white/[0.15]"
+
+  const updateConfigValue = useCallback((key: string, value: string) => {
+    setConfig((prev) => {
+      const next = { ...prev }
+      if (value.trim() === '') delete next[key]
+      else next[key] = value
+      return next
+    })
+  }, [])
+
+  const renderConfigField = useCallback((field: ConnectorConfigField) => {
+    const isTagField = field.type === 'tags'
+    if (isTagField) {
+      const tags = (config[field.key] || '').split(',').map((s) => s.trim()).filter(Boolean)
+      return (
+        <div key={field.key} className="mb-6">
+          <label className="flex items-center gap-2 font-display text-[12px] font-600 text-text-2 uppercase tracking-[0.08em] mb-2">
+            {field.label} <span className="normal-case tracking-normal font-normal text-text-3">(optional)</span>
+            {FIELD_HINTS[field.key] && <HintTip text={FIELD_HINTS[field.key]} />}
+          </label>
+          {field.help && <p className="text-[12px] text-text-3/60 mb-2">{field.help}</p>}
+          <div className="flex flex-wrap gap-2 mb-2">
+            {tags.map((tag, i) => (
+              <span key={i} className="flex items-center gap-1.5 px-3 py-1.5 rounded-[8px] bg-accent-soft/50 border border-accent-bright/20 text-[12px] font-mono text-accent-bright">
+                {tag}
+                <button
+                  aria-label={`Remove ${tag}`}
+                  onClick={() => updateConfigValue(field.key, tags.filter((_, j) => j !== i).join(','))}
+                  className="ml-0.5 w-4 h-4 flex items-center justify-center rounded-full hover:bg-white/10 transition-colors cursor-pointer text-accent-bright/50 hover:text-accent-bright"
+                >
+                  <svg width="8" height="8" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round">
+                    <line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />
+                  </svg>
+                </button>
+              </span>
+            ))}
+          </div>
+          <div className="flex gap-2">
+            <input
+              id={`tag-input-${field.key}`}
+              placeholder={field.placeholder}
+              className={`${inputClass} font-mono text-[13px] flex-1`}
+              style={{ fontFamily: undefined }}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' || e.key === ',') {
+                  e.preventDefault()
+                  const input = e.currentTarget
+                  const val = input.value.trim().replace(/,/g, '')
+                  if (val) {
+                    const next = tags.length > 0 ? `${tags.join(',')},${val}` : val
+                    updateConfigValue(field.key, next)
+                    input.value = ''
+                  }
+                }
+              }}
+            />
+            <button
+              type="button"
+              onClick={() => {
+                const input = document.getElementById(`tag-input-${field.key}`) as HTMLInputElement | null
+                const val = input?.value.trim().replace(/,/g, '')
+                if (val) {
+                  const next = tags.length > 0 ? `${tags.join(',')},${val}` : val
+                  updateConfigValue(field.key, next)
+                  if (input) input.value = ''
+                }
+              }}
+              className="px-4 py-2.5 rounded-[10px] bg-accent-soft/50 text-accent-bright text-[12px] font-600 hover:bg-accent-soft transition-colors cursor-pointer border border-accent-bright/20"
+            >
+              Add
+            </button>
+          </div>
+        </div>
+      )
+    }
+
+    if (field.type === 'select' && field.options?.length) {
+      return (
+        <div key={field.key} className="mb-6">
+          <label className="block font-display text-[12px] font-600 text-text-2 uppercase tracking-[0.08em] mb-2">
+            {field.label} <span className="normal-case tracking-normal font-normal text-text-3">(optional)</span>
+          </label>
+          {field.help && <p className="text-[12px] text-text-3/60 mb-2">{field.help}</p>}
+          <select
+            value={config[field.key] || ''}
+            onChange={(e) => updateConfigValue(field.key, e.target.value)}
+            className={`${inputClass} appearance-none cursor-pointer`}
+            style={{ fontFamily: 'inherit' }}
+          >
+            <option value="">{field.emptyLabel || 'Not set'}</option>
+            {field.options.map((option) => (
+              <option key={option.value} value={option.value}>{option.label}</option>
+            ))}
+          </select>
+        </div>
+      )
+    }
+
+    return (
+      <div key={field.key} className="mb-6">
+        <label className="block font-display text-[12px] font-600 text-text-2 uppercase tracking-[0.08em] mb-2">
+          {field.label} <span className="normal-case tracking-normal font-normal text-text-3">(optional)</span>
+        </label>
+        {field.help && <p className="text-[12px] text-text-3/60 mb-2">{field.help}</p>}
+        <input
+          value={config[field.key] || ''}
+          onChange={(e) => updateConfigValue(field.key, e.target.value)}
+          placeholder={field.placeholder}
+          className={`${inputClass} ${field.key.toLowerCase().includes('token') || field.key.toLowerCase().includes('secret') ? 'font-mono text-[13px]' : ''}`}
+          style={{ fontFamily: field.key.toLowerCase().includes('token') || field.key.toLowerCase().includes('secret') ? undefined : 'inherit' }}
+        />
+      </div>
+    )
+  }, [config, inputClass, updateConfigValue])
+
+  return (
+    <BottomSheet open={open} onClose={() => { setOpen(false); setEditingId(null) }} wide>
+      <div className="mb-8">
+        <h2 className="font-display text-[28px] font-700 tracking-[-0.03em] mb-2">
+          {editing ? 'Edit Connector' : 'New Connector'}
+        </h2>
+        <p className="text-[14px] text-text-3">Start with the connection basics, then expand advanced settings for routing and policy overrides.</p>
+      </div>
+
+      {/* Platform selector (only for new) */}
+      {!editing && (
+        <div className="mb-8">
+          <SectionLabel>Platform</SectionLabel>
+          <div className="grid grid-cols-2 gap-3">
+            {ALL_PLATFORMS.map((p) => (
+              <button
+                key={p.id}
+                onClick={() => { setPlatform(p.id as ConnectorPlatform); setShowSetup(false) }}
+                className={`flex items-center gap-3 p-4 rounded-[14px] cursor-pointer transition-all duration-200 border text-left
+                  ${platform === p.id
+                    ? 'bg-white/[0.04] border-white/[0.15] shadow-[0_0_20px_rgba(255,255,255,0.02)]'
+                    : 'bg-transparent border-white/[0.04] hover:border-white/[0.08] hover:bg-white/[0.01]'}`}
+                style={{ fontFamily: 'inherit' }}
+              >
+                <ConnectorPlatformBadge platform={p.id as ConnectorPlatform} size={40} iconSize={18} />
+                <div>
+                  <div className={`text-[14px] font-600 ${platform === p.id ? 'text-text' : 'text-text-2'}`}>{p.label}</div>
+                  <div className="text-[11px] text-text-3 mt-0.5">
+                    {p.id === 'whatsapp' ? 'QR code pairing' : p.id === 'openclaw' ? 'WebSocket gateway' : p.id === 'bluebubbles' ? 'iMessage bridge' : p.id === 'signal' ? 'signal-cli binary' : p.id === 'matrix' ? 'Access token' : p.id === 'googlechat' ? 'Service account' : p.id === 'teams' ? 'Bot Framework' : p.id === 'filequeue' ? 'Local queue' : 'Bot token'}
+                  </div>
+                </div>
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Editing: show platform badge */}
+      {editing && (
+        <div className="mb-6 flex items-center gap-3">
+          <ConnectorPlatformBadge platform={platformConfig.id as ConnectorPlatform} size={40} iconSize={18} />
+          <div>
+            <div className="text-[14px] font-600 text-text">{platformConfig.label}</div>
+            <div className="flex items-center gap-2 mt-0.5">
+              <span className={`w-2 h-2 rounded-full ${
+                runtimeConnector?.status === 'running' ? 'bg-green-400 shadow-[0_0_6px_rgba(74,222,128,0.5)]' :
+                runtimeConnector?.status === 'error' ? 'bg-red-400' : 'bg-white/20'
+              }`} />
+              <span className="text-[12px] text-text-3 capitalize">{runtimeConnector?.status || editing.status}</span>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Setup guide (collapsible) */}
+      <div className="mb-6">
+        <button
+          onClick={() => setShowSetup(!showSetup)}
+          className="flex items-center gap-2 text-[13px] font-600 text-accent-bright hover:text-accent-bright/80 transition-colors cursor-pointer bg-transparent border-none"
+          style={{ fontFamily: 'inherit' }}
+        >
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"
+            className={`transition-transform ${showSetup ? 'rotate-90' : ''}`}>
+            <polyline points="9 18 15 12 9 6" />
+          </svg>
+          {platformConfig.label} Setup Guide
+        </button>
+        {showSetup && (
+          <div className="mt-3 p-4 rounded-[12px] border border-white/[0.06] bg-white/[0.01] space-y-2.5"
+            style={{ animation: 'fade-in 0.2s ease-out' }}>
+            {platformConfig.setupSteps.map((step, i) => (
+              <div key={i} className="flex items-start gap-3">
+                <span className="w-5 h-5 rounded-full bg-white/[0.06] flex items-center justify-center text-[10px] font-700 text-text-3 shrink-0 mt-0.5">
+                  {i + 1}
+                </span>
+                <span className="text-[13px] text-text-2/80 leading-[1.5]">{linkify(step)}</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* Name */}
+      <div className="mb-6">
+        <label className="block font-display text-[12px] font-600 text-text-2 uppercase tracking-[0.08em] mb-2">Name</label>
+        <input
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          placeholder={`My ${platformConfig.label} ${platform === 'filequeue' ? 'Connector' : 'Bot'}`}
+          className={inputClass}
+          style={{ fontFamily: 'inherit' }}
+        />
+      </div>
+
+      {/* Route mode toggle + target selector */}
+      <div className="mb-6">
+        <label className="block font-display text-[12px] font-600 text-text-2 uppercase tracking-[0.08em] mb-2">Route Messages To</label>
+        <div className="flex gap-1 mb-3 p-1 rounded-[10px] bg-white/[0.04] border border-white/[0.06]">
+          <button
+            type="button"
+            onClick={() => setRouteMode('agent')}
+            className={`flex-1 py-2 px-3 rounded-[8px] text-[13px] font-600 transition-all cursor-pointer border-none ${
+              routeMode === 'agent' ? 'bg-accent-soft text-accent-bright' : 'bg-transparent text-text-3 hover:text-text-2'
+            }`}
+            style={{ fontFamily: 'inherit' }}
+          >
+            Single Agent
+          </button>
+          <button
+            type="button"
+            onClick={() => setRouteMode('chatroom')}
+            className={`flex-1 py-2 px-3 rounded-[8px] text-[13px] font-600 transition-all cursor-pointer border-none ${
+              routeMode === 'chatroom' ? 'bg-accent-soft text-accent-bright' : 'bg-transparent text-text-3 hover:text-text-2'
+            }`}
+            style={{ fontFamily: 'inherit' }}
+          >
+            Chat Room
+          </button>
+        </div>
+        {routeMode === 'agent' ? (
+          <>
+            <p className="text-[12px] text-text-3/60 mb-2">Incoming messages will be handled by this agent</p>
+            <AgentPickerList
+              agents={agentList}
+              selected={agentId}
+              onSelect={(id) => setAgentId(id)}
+              showDelegationBadge={true}
+            />
+          </>
+        ) : (
+          <>
+            <p className="text-[12px] text-text-3/60 mb-2">Incoming messages will be routed to a chat room with multiple agents</p>
+            <ChatroomPickerList
+              chatrooms={Object.values(chatrooms)}
+              selected={chatroomId}
+              onSelect={(id) => setChatroomId(id)}
+            />
+          </>
+        )}
+      </div>
+
+      {/* Bot token credential */}
+      {showCredentialSection && (
+        <div className="mb-6">
+          <label className="block font-display text-[12px] font-600 text-text-2 uppercase tracking-[0.08em] mb-2">{platformConfig.tokenLabel}</label>
+          <p className="text-[12px] text-text-3/60 mb-2">{platformConfig.tokenHelp}</p>
+          <div className="flex gap-2">
+            <select
+              value={credentialId}
+              onChange={(e) => {
+                if (e.target.value === '__new__') {
+                  setShowNewCred(true)
+                  setNewCredName(`${platformConfig.label} Bot Token`)
+                  setNewCredValue('')
+                } else {
+                  setCredentialId(e.target.value)
+                  setShowNewCred(false)
+                }
+              }}
+              className={`${inputClass} appearance-none cursor-pointer flex-1`}
+              style={{ fontFamily: 'inherit' }}
+            >
+              <option value="">Select credential...</option>
+              {credList.map((c) => (
+                <option key={c.id} value={c.id}>{c.name} ({c.provider})</option>
+              ))}
+              <option value="__new__">+ Add new key...</option>
+            </select>
+            {!showNewCred && (
+              <button
+                type="button"
+                onClick={() => {
+                  setShowNewCred(true)
+                  setNewCredName(`${platformConfig.label} Bot Token`)
+                  setNewCredValue('')
+                }}
+                className="shrink-0 px-3 py-2.5 rounded-[10px] bg-accent-soft/50 text-accent-bright text-[12px] font-600 hover:bg-accent-soft transition-colors cursor-pointer border border-accent-bright/20"
+              >
+                + New
+              </button>
+            )}
+          </div>
+          {showNewCred && (
+            <div className="mt-3 p-4 rounded-[12px] border border-accent-bright/15 bg-accent-soft/20 space-y-3"
+              style={{ animation: 'fade-in 0.2s ease-out' }}>
+              <input
+                value={newCredName}
+                onChange={(e) => setNewCredName(e.target.value)}
+                placeholder="Key name (e.g. My Discord Bot)"
+                className={`${inputClass} !bg-surface text-[13px]`}
+                style={{ fontFamily: 'inherit' }}
+              />
+              <input
+                type="password"
+                value={newCredValue}
+                onChange={(e) => setNewCredValue(e.target.value)}
+                placeholder="Paste your token here..."
+                className={`${inputClass} !bg-surface font-mono text-[13px]`}
+                style={{ fontFamily: undefined }}
+              />
+              <div className="flex gap-2 justify-end">
+                <button
+                  type="button"
+                  onClick={() => setShowNewCred(false)}
+                  className="px-3 py-1.5 text-[12px] text-text-3 hover:text-text-2 transition-colors cursor-pointer bg-transparent border-none"
+                  style={{ fontFamily: 'inherit' }}
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  disabled={savingCred || !newCredValue.trim()}
+                  onClick={async () => {
+                    setSavingCred(true)
+                    try {
+                      const cred = await createCredentialMutation.mutateAsync({
+                        provider: platform,
+                        name: newCredName.trim() || (platform === 'swarmdock'
+                          ? `${platformConfig.label} Identity Key`
+                          : `${platformConfig.label} Bot Token`),
+                        apiKey: newCredValue.trim(),
+                      })
+                      await credentialsQuery.refetch()
+                      setCredentialId(cred.id)
+                      setShowNewCred(false)
+                      setNewCredName('')
+                      setNewCredValue('')
+                    } catch (err: unknown) {
+                      toast.error(`Failed to save: ${errorMessage(err)}`)
+                    } finally {
+                      setSavingCred(false)
+                    }
+                  }}
+                  className="px-4 py-1.5 rounded-[8px] bg-accent-bright text-white text-[12px] font-600 cursor-pointer border-none hover:brightness-110 transition-all disabled:opacity-40"
+                  style={{ fontFamily: 'inherit' }}
+                >
+                  {savingCred ? 'Saving...' : 'Save Key'}
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Platform-specific config */}
+      {basicPlatformFields.length > 0 && (
+        <div className="mb-2">
+          <SectionLabel>Platform Settings</SectionLabel>
+          <p className="text-[12px] text-text-3/60 mb-4">
+            Settings specific to {platformConfig.label}. Leave optional values unset unless you need to override the defaults.
+          </p>
+          {basicPlatformFields.map((field) => renderConfigField(field))}
+        </div>
+      )}
+
+      {supportsAccessControls && (
+        <div className="mb-2">
+          <SectionLabel>Behavior</SectionLabel>
+          <p className="text-[12px] text-text-3/60 mb-4">
+            Keep the everyday DM policy and owner routing visible. Detailed lists and live access actions stay in advanced settings.
+          </p>
+          {basicAccessFields.map((field) => renderConfigField(field))}
+          {platform === 'whatsapp' && (
+            <div className="mb-6 rounded-[12px] border border-white/[0.06] bg-white/[0.02] px-4 py-3 text-[12px] text-text-3">
+              Global WhatsApp approved contacts still live in Settings. Use advanced settings for per-connector allow and block lists.
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Start/Stop controls for editing */}
+      {editing && (() => {
+        const effectiveRunning = runtimeConnector?.status === 'running' || waConnecting
+        return (
+        <div className="mb-6 p-4 rounded-[14px] border border-white/[0.06] bg-white/[0.01]">
+          <div className="flex items-center justify-between">
+            <div>
+              <div className="text-[13px] font-600 text-text-2">Connection</div>
+              <div className="text-[12px] text-text-3 mt-0.5 flex items-center gap-1.5">
+                <span className={`w-2 h-2 rounded-full inline-block ${
+                  effectiveRunning ? 'bg-green-400 shadow-[0_0_6px_rgba(74,222,128,0.5)]' :
+                  runtimeConnector?.status === 'error' ? 'bg-red-400' : 'bg-white/20'
+                }`} />
+                {effectiveRunning ? (waAuthenticated ? 'Connected and listening' : 'Connecting...') :
+                 runtimeConnector?.status === 'error' ? 'Error — see below' : runtimeConnector?.status === 'starting' ? 'Starting...' : 'Not connected'}
+              </div>
+            </div>
+            {effectiveRunning ? (
+              <button
+                onClick={() => handleStartStop('stop')}
+                disabled={actionLoading}
+                className="px-5 py-2 rounded-[10px] bg-red-500/15 text-red-400 text-[13px] font-600 cursor-pointer border border-red-500/20 hover:bg-red-500/25 transition-all disabled:opacity-50"
+                style={{ fontFamily: 'inherit' }}
+              >
+                {actionLoading ? 'Stopping...' : 'Disconnect'}
+              </button>
+            ) : (
+              <button
+                onClick={() => handleStartStop('start')}
+                disabled={actionLoading}
+                className="px-5 py-2 rounded-[10px] bg-green-500/15 text-green-400 text-[13px] font-600 cursor-pointer border border-green-500/20 hover:bg-green-500/25 transition-all disabled:opacity-50"
+                style={{ fontFamily: 'inherit' }}
+              >
+                {actionLoading ? 'Connecting...' : 'Connect'}
+              </button>
+            )}
+          </div>
+        </div>
+        )
+      })()}
+
+      {/* WhatsApp QR code */}
+      {editing && platform === 'whatsapp' && (runtimeConnector?.status === 'running' || waConnecting) && qrDataUrl && (
+        <div className="mb-6 p-5 rounded-[14px] border border-white/[0.06] bg-white/[0.01] text-center"
+          style={{ animation: 'fade-in 0.3s ease-out' }}>
+          <div className="text-[13px] font-600 text-text-2 mb-1">Scan with WhatsApp</div>
+          <p className="text-[11px] text-text-3 mb-4">
+            Open WhatsApp &gt; Settings &gt; Linked Devices &gt; Link a Device
+          </p>
+          <div className="inline-block p-2 bg-white rounded-[12px]">
+            {/* eslint-disable-next-line @next/next/no-img-element -- WhatsApp QR data URL is generated at runtime */}
+            <img src={qrDataUrl} alt="WhatsApp QR Code" className="w-[240px] h-[240px]" />
+          </div>
+          <p className="text-[11px] text-text-3 mt-3">QR code refreshes automatically</p>
+        </div>
+      )}
+
+      {/* WhatsApp connected (authenticated, no QR) */}
+      {editing && platform === 'whatsapp' && (runtimeConnector?.status === 'running' || waConnecting) && !qrDataUrl && waAuthenticated && (
+        <div className="mb-6 p-5 rounded-[14px] border border-white/[0.06] bg-white/[0.01] text-center">
+          <div className="text-[13px] font-600 text-green-400 mb-1">Connected</div>
+          <p className="text-[11px] text-text-3 mb-3">WhatsApp is paired and listening for messages</p>
+          <button
+            onClick={() => setConfirmWhatsAppAction('unlink')}
+            disabled={actionLoading}
+            className="text-[12px] text-text-3 hover:text-red-400 transition-colors cursor-pointer bg-transparent border-none underline underline-offset-2"
+            style={{ fontFamily: 'inherit' }}
+          >
+            Unlink device
+          </button>
+        </div>
+      )}
+
+      {/* WhatsApp waiting for QR / reconnecting (not yet authenticated, no QR yet) */}
+      {editing && platform === 'whatsapp' && (runtimeConnector?.status === 'running' || waConnecting) && !qrDataUrl && !waAuthenticated && (
+        <div className="mb-6 p-5 rounded-[14px] border border-white/[0.06] bg-white/[0.01] text-center">
+          <div className="flex items-center justify-center gap-2 mb-1">
+            <span className="w-3 h-3 rounded-full border-2 border-blue-500 border-t-transparent animate-spin" />
+            <span className="text-[13px] font-600 text-blue-500">
+              {waHasCreds ? 'Reconnecting...' : 'Waiting for QR code...'}
+            </span>
+          </div>
+          <p className="text-[11px] text-text-3">
+            {waHasCreds
+              ? 'Reconnecting with saved credentials, this should only take a moment'
+              : 'Connecting to WhatsApp, QR code will appear shortly'}
+          </p>
+          {waHasCreds && (
+            <button
+              onClick={() => setConfirmWhatsAppAction('repair')}
+              disabled={actionLoading}
+              className="mt-3 text-[12px] text-text-3 hover:text-amber-400 transition-colors cursor-pointer bg-transparent border-none underline underline-offset-2"
+              style={{ fontFamily: 'inherit' }}
+            >
+              Force re-pair with new QR code
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* Error display */}
+      {runtimeConnector?.lastError && (
+        <div className="mb-6 p-4 rounded-[14px] bg-red-500/[0.06] border border-red-500/15">
+          <div className="text-[12px] font-600 text-red-400 mb-1">Error</div>
+          <div className="text-[12px] text-red-400/70 leading-[1.5] font-mono">{runtimeConnector.lastError}</div>
+        </div>
+      )}
+
+      <AdvancedSettingsSection
+        open={showAdvancedSettings}
+        onToggle={() => setShowAdvancedSettings((current) => !current)}
+        summary={advancedSummary}
+        badges={connectorAdvancedBadges}
+      >
+        {advancedPlatformFields.length > 0 && (
+          <div className="mb-8">
+            <SectionLabel>Platform Overrides</SectionLabel>
+            <p className="text-[12px] text-text-3/60 mb-4">
+              Optional targeting and platform-specific overrides for {platformConfig.label}.
+            </p>
+            {advancedPlatformFields.map((field) => renderConfigField(field))}
+          </div>
+        )}
+
+        {supportsAccessControls && (
+          <div className="mb-8">
+            <SectionLabel>Access Lists</SectionLabel>
+            <p className="text-[12px] text-text-3/60 mb-4">
+              Manage connector-specific allow and deny lists, plus any live pairing state for this connector.
+            </p>
+            {advancedAccessFields.map((field) => renderConfigField(field))}
+            {platform === 'whatsapp' && (
+              <div className="mb-6 rounded-[12px] border border-white/[0.06] bg-white/[0.02] px-4 py-3 text-[12px] text-text-3">
+                Global WhatsApp approved contacts: {globalWhatsAppAllowlistCount}. They remain managed in Settings.
+              </div>
+            )}
+            {editing && (
+              <div className="mb-2">
+                <ConnectorAccessPanel
+                  connector={editing}
+                  snapshot={accessSnapshot}
+                  loading={accessLoading}
+                  error={accessError}
+                  pending={accessPending}
+                  onAction={handleAccessAction}
+                  description="Live pairing store and owner controls for this connector. Form fields above edit saved config; actions here manage paired senders and pending requests immediately."
+                />
+              </div>
+            )}
+          </div>
+        )}
+
+        <div className="mb-8">
+          <SectionLabel>Runtime Policy</SectionLabel>
+          <p className="text-[12px] text-text-3/60 mb-4">
+            Conversation identity, reply behavior, reset policy, and other connector runtime overrides.
+          </p>
+          {COMMON_CONFIG_FIELDS.map((field) => renderConfigField(field))}
+        </div>
+
+        <div className="mb-8 p-4 rounded-[14px] border border-white/[0.06] bg-white/[0.01]">
+          <div className="flex items-center justify-between gap-3 mb-2">
+            <div>
+              <div className="text-[13px] font-600 text-text-2">Connector Doctor</div>
+              <div className="text-[12px] text-text-3/70">
+                Live autonomy and safety preview for the current connector settings.
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => void loadDoctorPreview()}
+              disabled={doctorLoading}
+              className="px-3 py-1.5 rounded-[9px] border border-white/[0.08] bg-transparent text-[12px] font-600 text-text-3 hover:text-text-2 hover:bg-white/[0.04] transition-all cursor-pointer disabled:opacity-50"
+              style={{ fontFamily: 'inherit' }}
+            >
+              {doctorLoading ? 'Checking...' : 'Refresh'}
+            </button>
+          </div>
+          {doctorPolicy && (
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-2 mb-3">
+              <div className="rounded-[10px] border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-[12px] text-text-3/80">
+                Scope: <span className="text-text-2">{doctorPolicy.scope || 'channel-peer'}</span>{' '}
+                · Reply: <span className="text-text-2">{doctorPolicy.replyMode || 'first'}</span>{' '}
+                · Thread: <span className="text-text-2">{doctorPolicy.threadBinding || 'prefer'}</span>
+              </div>
+              <div className="rounded-[10px] border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-[12px] text-text-3/80">
+                DMs: <span className="text-text-2">{config.dmPolicy || 'open'}</span>{' '}
+                · Group: <span className="text-text-2">{doctorPolicy.groupPolicy || 'reply-or-mention'}</span>{' '}
+                · Debounce: <span className="text-text-2">{doctorPolicy.inboundDebounceMs ?? 700}ms</span>
+              </div>
+              <div className="rounded-[10px] border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-[12px] text-text-3/80">
+                Allowlist: <span className="text-text-2">{localAllowlistCount + globalWhatsAppAllowlistCount}</span>{' '}
+                · Blocked: <span className="text-text-2">{localBlocklistCount}</span>{' '}
+                · Reactions: <span className="text-text-2">{doctorPolicy.statusReactions === false ? 'off' : 'on'}</span>{' '}
+                · Typing: <span className="text-text-2">{doctorPolicy.typingIndicators === false ? 'off' : 'on'}</span>
+              </div>
+              <div className="rounded-[10px] border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-[12px] text-text-3/80">
+                Reset: <span className="text-text-2">{doctorPolicy.resetMode || 'idle'}</span>{' '}
+                {doctorPolicy.resetMode === 'daily'
+                  ? `at ${doctorPolicy.dailyResetAt || 'unset'} (${doctorPolicy.resetTimezone || 'server timezone'})`
+                  : `idle ${doctorPolicy.idleTimeoutSec ?? 0}s / max ${doctorPolicy.maxAgeSec ?? 0}s`}
+              </div>
+              <div className="rounded-[10px] border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-[12px] text-text-3/80">
+                Runtime: <span className="text-text-2">{doctorPolicy.thinkingLevel || 'inherit'}</span>{' '}
+                · Provider: <span className="text-text-2">{doctorPolicy.providerOverride || 'agent default'}</span>{' '}
+                · Model: <span className="text-text-2">{doctorPolicy.modelOverride || 'agent default'}</span>
+              </div>
+            </div>
+          )}
+          {doctorWarnings.length > 0 ? (
+            <div className="space-y-2">
+              {doctorWarnings.map((warning, index) => (
+                <div key={`${index}:${warning}`} className="rounded-[10px] border border-amber-400/15 bg-amber-500/8 px-3 py-2 text-[12px] text-amber-200/85 leading-[1.5]">
+                  {warning}
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="text-[12px] text-emerald-300/85">
+              {doctorLoading ? 'Running checks…' : 'No autonomy or safety warnings detected for the current form values.'}
+            </div>
+          )}
+          <p className="text-[11px] text-text-3/55 mt-2">
+            This preview updates from the form directly, so you can catch risky connector policy changes before saving.
+          </p>
+        </div>
+
+        {editing && (
+          <div className="mb-0">
+            <ConnectorHealth connectorId={editing.id} />
+          </div>
+        )}
+      </AdvancedSettingsSection>
+
+      {/* Actions */}
+      <SheetFooter
+        onCancel={() => { setOpen(false); setEditingId(null) }}
+        onSave={handleSave}
+        saveLabel={saving ? 'Saving...' : editing ? 'Save' : 'Create Connector'}
+        saveDisabled={saving || (routeMode === 'agent' ? !agentId : !chatroomId)}
+        left={editing && (
+          <button
+            onClick={() => setConfirmDelete(true)}
+            disabled={deleting}
+            className="py-3.5 px-6 rounded-[14px] border border-red-500/20 bg-transparent text-red-400 text-[15px] font-600 cursor-pointer hover:bg-red-500/10 transition-all disabled:cursor-not-allowed disabled:opacity-60"
+            style={{ fontFamily: 'inherit' }}
+          >
+            Delete
+          </button>
+        )}
+      />
+      <ConfirmDialog
+        open={confirmDelete}
+        title="Delete Connector?"
+        message={editing ? `Delete "${editing.name}"? This will stop the connector and remove its configuration from the app.` : 'Delete this connector?'}
+        confirmLabel={deleting ? 'Deleting...' : 'Delete'}
+        confirmDisabled={deleting}
+        cancelDisabled={deleting}
+        danger
+        onConfirm={() => { void handleDelete() }}
+        onCancel={() => { if (!deleting) setConfirmDelete(false) }}
+      />
+      <ConfirmDialog
+        open={!!confirmWhatsAppAction}
+        title={confirmWhatsAppAction === 'unlink' ? 'Unlink Device?' : 'Force Re-pair?'}
+        message={
+          confirmWhatsAppAction === 'unlink'
+            ? 'Unlink this device? You will need to scan a new QR code.'
+            : 'Force re-pair? This will clear saved credentials and show a new QR code.'
+        }
+        confirmLabel={
+          actionLoading
+            ? confirmWhatsAppAction === 'unlink'
+              ? 'Unlinking...'
+              : 'Re-pairing...'
+            : confirmWhatsAppAction === 'unlink'
+              ? 'Unlink'
+              : 'Re-pair'
+        }
+        confirmDisabled={actionLoading}
+        cancelDisabled={actionLoading}
+        danger
+        onConfirm={() => { if (confirmWhatsAppAction) void handleWhatsAppRepair(confirmWhatsAppAction) }}
+        onCancel={() => { if (!actionLoading) setConfirmWhatsAppAction(null) }}
+      />
+    </BottomSheet>
+  )
+}

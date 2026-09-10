@@ -1,0 +1,441 @@
+defmodule Jidoka.Operation.Source.Subagent do
+  @moduledoc """
+  Operation source for bounded subagent delegation.
+
+  A subagent call runs one child agent turn and returns the child result to the
+  parent. It does not change conversation ownership; handoffs own that separate
+  routing concern.
+  """
+
+  @behaviour Jidoka.Operation.Source
+
+  alias Jidoka.Agent.Spec.Operation
+  alias Jidoka.Context
+  alias Jidoka.Effect
+  alias Jidoka.Operation.Continuation
+  alias Jidoka.Operation.Source
+  alias Jidoka.Review.Response
+  alias Jidoka.Runtime.Review, as: RuntimeReview
+  alias Jidoka.Schema
+
+  @result_modes [:text, :structured]
+
+  @type forward_context ::
+          :public | :none | {:only, [atom() | String.t()]} | {:except, [atom() | String.t()]}
+  @type result_mode :: :text | :structured
+
+  @context_key_schema Zoi.union([Zoi.atom(), Zoi.string()])
+  @forward_context_schema Zoi.union(
+                            [
+                              Zoi.enum([:public, :none]),
+                              Zoi.tuple({Zoi.enum([:only, :except]), Zoi.array(@context_key_schema)})
+                            ],
+                            typespec: quote(do: forward_context())
+                          )
+
+  @schema Zoi.struct(
+            __MODULE__,
+            %{
+              agent: Zoi.module(),
+              name: Zoi.string(),
+              description: Zoi.string() |> Zoi.nullable(),
+              timeout:
+                Zoi.integer(typespec: quote(do: pos_integer()))
+                |> Zoi.positive()
+                |> Zoi.default(30_000),
+              forward_context: @forward_context_schema |> Zoi.default(:public),
+              result: Schema.atom_enum(@result_modes) |> Zoi.default(:structured),
+              metadata: Zoi.map() |> Zoi.default(%{})
+            },
+            coerce: true,
+            unrecognized_keys: :error
+          )
+
+  @type t :: unquote(Zoi.type_spec(@schema))
+  @enforce_keys Zoi.Struct.enforce_keys(@schema)
+  defstruct Zoi.Struct.struct_fields(@schema)
+
+  @doc false
+  @spec schema() :: Zoi.schema()
+  def schema, do: @schema
+
+  @doc "Builds a bounded subagent operation source."
+  @spec new(keyword() | map()) :: {:ok, t()} | {:error, term()}
+  def new(attrs) do
+    attrs = Schema.normalize_attrs(attrs)
+
+    with {:ok, agent} <- normalize_agent(Schema.get_key(attrs, :agent)),
+         {:ok, name} <-
+           normalize_name(Schema.get_key(attrs, :name) || Schema.get_key(attrs, :as), agent),
+         {:ok, timeout} <- normalize_timeout(Schema.get_key(attrs, :timeout, 30_000)),
+         {:ok, forward_context} <-
+           normalize_forward_context(Schema.get_key(attrs, :forward_context, :public)),
+         {:ok, result} <- normalize_result(Schema.get_key(attrs, :result, :structured)),
+         {:ok, metadata} <- normalize_metadata(Schema.get_key(attrs, :metadata, %{})) do
+      Schema.parse(@schema, %{
+        agent: agent,
+        name: name,
+        description: Schema.get_key(attrs, :description),
+        timeout: timeout,
+        forward_context: forward_context,
+        result: result,
+        metadata: metadata
+      })
+    end
+  end
+
+  @doc "Builds a subagent source and raises if the settings are invalid."
+  @spec new!(keyword() | map()) :: t()
+  def new!(attrs) do
+    case new(attrs) do
+      {:ok, source} -> source
+      {:error, reason} -> raise ArgumentError, "invalid subagent source: #{inspect(reason)}"
+    end
+  end
+
+  @impl true
+  def compile(%__MODULE__{} = source, opts) do
+    with {:ok, operations} <- operations(source, opts),
+         {:ok, capability} <- capability(source, opts) do
+      Source.compiled(operations, capability)
+    end
+  end
+
+  @impl true
+  def operations(%__MODULE__{} = source, _opts) do
+    {:ok,
+     [
+       Operation.new!(
+         name: source.name,
+         description:
+           source.description ||
+             "Delegate one bounded task to #{inspect(source.agent)} and return the result.",
+         idempotency: :idempotent,
+         metadata:
+           source.metadata
+           |> Map.merge(%{
+             "source" => "subagent",
+             "kind" => "subagent",
+             "agent" => inspect(source.agent),
+             "timeout" => source.timeout,
+             "forward_context" => inspect(source.forward_context),
+             "result" => Atom.to_string(source.result),
+             "parameters_schema" => task_schema()
+           })
+       )
+     ]}
+  end
+
+  @impl true
+  def capability(%__MODULE__{} = source, _opts) do
+    {:ok,
+     fn
+       %Effect.Intent{kind: :operation, payload: payload} = intent, %Effect.Journal{}, %Context{} = context ->
+         with {:ok, request} <- Effect.OperationRequest.from_input(payload),
+              :ok <- ensure_operation_name(source, request.name),
+              {:ok, task} <- task_from_arguments(request.arguments) do
+           run_child(source, intent, task, request.arguments, context)
+         end
+
+       %Effect.Intent{kind: kind}, _journal, %Context{} ->
+         {:error, {:unsupported_effect_kind, kind}}
+     end}
+  end
+
+  defp task_schema do
+    %{
+      "type" => "object",
+      "properties" => %{
+        "task" => %{"type" => "string", "description" => "Bounded task for the child agent."},
+        "context" => %{"type" => "object", "description" => "Optional task-local context."}
+      },
+      "required" => ["task"]
+    }
+  end
+
+  defp run_child(%__MODULE__{} = source, %Effect.Intent{} = intent, task, arguments, context) do
+    request = [
+      input: task,
+      context: child_context(source, context, arguments)
+    ]
+
+    opts =
+      [
+        timeout: source.timeout,
+        operation_context: Context.get_runtime(context, :subagent_operation_context, %{})
+      ]
+      |> maybe_put(:llm, Context.get_runtime(context, :subagent_llm))
+      |> maybe_put(:memory_store, Context.get_runtime(context, :memory_store))
+      |> maybe_put(:stream_to, Context.get_runtime(context, :stream_to))
+      |> Keyword.merge(subagent_opts(context))
+
+    with {:ok, continuations} <- operation_continuations(context) do
+      result =
+        case Continuation.find(continuations, intent, :subagent, source.name) do
+          {:ok, continuation} ->
+            resume_continuation(source, continuation, opts, context)
+
+          :none ->
+            source.agent.run_turn(request, opts)
+
+          {:error, _reason} = error ->
+            error
+        end
+
+      normalize_child_result(result, source, intent)
+    end
+  end
+
+  defp resume_continuation(source, continuation, opts, context) do
+    with :ok <- validate_continuation(source, continuation) do
+      resume_child(
+        continuation,
+        Keyword.merge(opts, nested_resume_opts(context)),
+        context
+      )
+    end
+  end
+
+  defp normalize_child_result(result, source, intent) do
+    case result do
+      {:ok, result} ->
+        {:ok, child_result(source, result)}
+
+      {:hibernate, snapshot} ->
+        with {:ok, continuation} <-
+               Continuation.new(
+                 intent_id: intent.id,
+                 operation: source.name,
+                 kind: :subagent,
+                 source: source.name,
+                 snapshot: snapshot,
+                 metadata: %{"agent" => inspect(source.agent)}
+               ) do
+          {:hibernate, continuation}
+        end
+
+      {:error, reason} ->
+        {:error, {:subagent_failed, source.name, reason}}
+    end
+  end
+
+  defp operation_continuations(context) do
+    context
+    |> Context.get_runtime(:operation_continuations, [])
+    |> Continuation.list_from_input()
+  end
+
+  defp subagent_opts(context) do
+    case Context.get_runtime(context, :subagent_opts, []) do
+      opts when is_list(opts) -> opts
+      _opts -> []
+    end
+  end
+
+  defp nested_resume_opts(context) do
+    case Context.get_runtime(context, :nested_resume_opts, []) do
+      opts when is_list(opts) -> opts
+      _opts -> []
+    end
+  end
+
+  defp resume_child(%Continuation{snapshot: snapshot}, opts, context) do
+    case {snapshot.turn_state.pending_interrupt, RuntimeReview.approval_response(opts)} do
+      {%Jidoka.Review.Interrupt{id: expected}, {:ok, %Response{interrupt_id: actual}}}
+      when expected != actual ->
+        {:hibernate, snapshot}
+
+      _pending_or_response ->
+        resume_nested_turn(context, snapshot, opts)
+    end
+  end
+
+  defp resume_nested_turn(context, snapshot, opts) do
+    case Context.get_runtime(context, :subagent_resume) do
+      resume when is_function(resume, 2) -> resume.(snapshot, opts)
+      _resume -> {:error, :missing_subagent_resume}
+    end
+  end
+
+  defp validate_continuation(
+         %__MODULE__{agent: agent},
+         %Continuation{snapshot: %Jidoka.Snapshot{} = snapshot}
+       ) do
+    dsl_module = Map.get(snapshot.turn_state.plan.spec.metadata, "dsl_module")
+
+    with {:ok, expected_agent_id} <- expected_agent_id(agent) do
+      if snapshot.agent_id == expected_agent_id and
+           (is_nil(dsl_module) or dsl_module == inspect(agent)) do
+        :ok
+      else
+        {:error, {:subagent_continuation_mismatch, agent, expected_agent_id, snapshot.agent_id, dsl_module}}
+      end
+    end
+  end
+
+  defp expected_agent_id(agent) do
+    if function_exported?(agent, :__jidoka_agent_id__, 0) do
+      {:ok, agent.__jidoka_agent_id__()}
+    else
+      case agent.spec() do
+        %Jidoka.Agent.Spec{id: id} -> {:ok, id}
+        spec -> {:error, {:invalid_subagent_spec, agent, spec}}
+      end
+    end
+  rescue
+    exception -> {:error, {:invalid_subagent_spec, agent, exception}}
+  end
+
+  defp child_result(%__MODULE__{result: :text} = source, result) do
+    %{subagent: source.name, agent: inspect(source.agent), content: result.content}
+  end
+
+  defp child_result(%__MODULE__{} = source, result) do
+    %{
+      subagent: source.name,
+      agent: inspect(source.agent),
+      content: result.content,
+      value: result.value,
+      operation_results: Enum.map(result.agent_state.operation_results, &project_operation_result/1)
+    }
+  end
+
+  defp project_operation_result(result) do
+    result
+    |> Map.from_struct()
+    |> Map.reject(fn {_key, value} -> is_nil(value) end)
+  end
+
+  defp child_context(%__MODULE__{} = source, parent_context, arguments) do
+    runtime = runtime_context(source, parent_context)
+
+    forwarded_data =
+      parent_context
+      |> public_context_data()
+      |> forward_context(source.forward_context)
+
+    case Schema.get_key(arguments, :context, %{}) do
+      task_context when is_map(task_context) ->
+        Context.from_data!(Map.merge(forwarded_data, task_context), runtime: runtime)
+
+      _other ->
+        Context.from_data!(forwarded_data, runtime: runtime)
+    end
+  end
+
+  defp public_context_data(%Context{} = context), do: Context.data(context)
+
+  defp runtime_context(%__MODULE__{forward_context: :public}, %Context{} = context),
+    do: Context.runtime(context)
+
+  defp runtime_context(%__MODULE__{}, _context), do: %{}
+
+  defp forward_context(context, :public) when is_map(context), do: context
+  defp forward_context(_context, :none), do: %{}
+
+  defp forward_context(context, {:only, keys}) when is_map(context) and is_list(keys) do
+    keys
+    |> Enum.reduce(%{}, fn key, acc ->
+      case fetch_context(context, key) do
+        {:ok, value} -> Map.put(acc, key, value)
+        :error -> acc
+      end
+    end)
+  end
+
+  defp forward_context(context, {:except, keys}) when is_map(context) and is_list(keys) do
+    blocked = MapSet.new(Enum.flat_map(keys, &[&1, to_string(&1)]))
+    Map.reject(context, fn {key, _value} -> MapSet.member?(blocked, key) end)
+  end
+
+  defp forward_context(_context, _policy), do: %{}
+
+  defp fetch_context(context, key) when is_atom(key) do
+    case Map.fetch(context, key) do
+      {:ok, value} -> {:ok, value}
+      :error -> Map.fetch(context, Atom.to_string(key))
+    end
+  end
+
+  defp fetch_context(context, key), do: Map.fetch(context, key)
+
+  defp ensure_operation_name(%__MODULE__{name: expected}, name) do
+    if name == expected, do: :ok, else: {:error, {:missing_operation_handler, name}}
+  end
+
+  defp task_from_arguments(arguments) do
+    case Schema.get_key(arguments, :task) do
+      task when is_binary(task) and task != "" -> {:ok, task}
+      task -> {:error, {:invalid_subagent_task, task}}
+    end
+  end
+
+  defp normalize_agent(agent) when is_atom(agent) do
+    with {:module, _module} <- Code.ensure_compiled(agent),
+         true <- function_exported?(agent, :spec, 0) do
+      {:ok, agent}
+    else
+      {:error, reason} -> {:error, {:invalid_subagent_module, agent, reason}}
+      false -> {:error, {:invalid_subagent_module, agent, :missing_spec}}
+    end
+  end
+
+  defp normalize_agent(agent), do: {:error, {:invalid_subagent_module, agent}}
+
+  defp normalize_name(nil, agent) do
+    agent
+    |> Module.split()
+    |> List.last()
+    |> Macro.underscore()
+    |> normalize_name(agent)
+  end
+
+  defp normalize_name(name, _agent) when is_atom(name) and not is_nil(name) do
+    name |> Atom.to_string() |> normalize_name(nil)
+  end
+
+  defp normalize_name(name, _agent) when is_binary(name) do
+    name = String.trim(name)
+
+    if Regex.match?(~r/^[a-z][a-z0-9_]*$/, name) do
+      {:ok, name}
+    else
+      {:error, {:invalid_subagent_name, name}}
+    end
+  end
+
+  defp normalize_name(name, _agent), do: {:error, {:invalid_subagent_name, name}}
+
+  defp normalize_timeout(timeout) when is_integer(timeout) and timeout > 0, do: {:ok, timeout}
+  defp normalize_timeout(timeout), do: {:error, {:invalid_subagent_timeout, timeout}}
+
+  defp normalize_forward_context(policy) when policy in [:public, :none], do: {:ok, policy}
+
+  defp normalize_forward_context({mode, keys} = policy)
+       when mode in [:only, :except] and is_list(keys) do
+    {:ok, policy}
+  end
+
+  defp normalize_forward_context(policy),
+    do: {:error, {:invalid_subagent_forward_context, policy}}
+
+  defp normalize_result(result) when result in @result_modes, do: {:ok, result}
+
+  defp normalize_result(result) when is_binary(result) do
+    @result_modes
+    |> Enum.find(&(Atom.to_string(&1) == String.trim(result)))
+    |> case do
+      nil -> {:error, {:invalid_subagent_result, result}}
+      result -> {:ok, result}
+    end
+  end
+
+  defp normalize_result(result), do: {:error, {:invalid_subagent_result, result}}
+
+  defp normalize_metadata(nil), do: {:ok, %{}}
+  defp normalize_metadata(metadata) when is_map(metadata), do: {:ok, metadata}
+  defp normalize_metadata(metadata), do: {:error, {:invalid_subagent_metadata, metadata}}
+
+  defp maybe_put(opts, _key, nil), do: opts
+  defp maybe_put(opts, key, value), do: Keyword.put(opts, key, value)
+end

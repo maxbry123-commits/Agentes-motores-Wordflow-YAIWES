@@ -1,0 +1,31 @@
+# RUNLOG.md — {{PROJECT_NAME}}
+
+> Human-readable iteration history. Append-only — one entry per loop iteration.
+> Machine state lives in `.loop/state.json`; this is the audit trail.
+>
+> This file starts with no iterations. `loop metrics` reads only `## Iteration`
+> blocks, so a fresh RUNLOG scores clean by construction. The entry format below
+> is a reference, not an iteration — `loop.emit.append_iteration()` writes real
+> blocks for you (or copy the shape by hand) beneath the marker at the bottom.
+
+---
+
+## Entry format (reference — not an iteration, not scored)
+
+Each iteration is a section headed `## Iteration <id> — <date>` carrying:
+
+- **State entered / Active task / Plan version** — the loop state, the task
+  worked, and the plan version in force.
+- **Actions taken** — a bullet list of what the agent did.
+- **Verification result** — the gate (`scripts/verify-*`), its outcome, and the
+  score before/after.
+- **Outcome** — exactly one backticked token, one of: `task_passed`,
+  `task_failed`, `repair_triggered`, `approval_requested`, `replanned`,
+  `terminal`.
+- **Repair record** — failure mode, repair action, attempt N of the cap, and the
+  measurable-improvement flag (only when a repair was triggered).
+- **Notes** — free-form context.
+
+---
+
+<!-- Append new `## Iteration <id>` blocks below this line. Do not edit past entries. -->

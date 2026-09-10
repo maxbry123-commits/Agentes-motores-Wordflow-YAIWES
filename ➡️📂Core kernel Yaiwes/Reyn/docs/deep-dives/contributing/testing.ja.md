@@ -1,0 +1,560 @@
+# テストポリシー
+
+Reyn は**自律性よりも予測可能性**を重視します（プロジェクトビジョン (principles doc removed)参照）。テストスイートもその方針を反映しています。**テストは OS を守る不変条件を保護するものであり、将来の進化に対するコストになってはなりません。**
+
+このドキュメントがポリシーです。新しいテストを書く前に[判断フロー](#判断フロー)を確認し、ポリシーに合致しない既存テストは次に触れたタイミングでリファクタリングまたは削除します。
+
+---
+
+## 基本原則
+
+> 良いテストは「壊れたときに何を示すか」で評価されます。「壊れにくい」ことは美徳ではありません。その性質はテストではなく、設計（P1–P8）と OS が担うものです。
+
+テストが守るべきコントラクトや不変条件を明確に言語化できない場合、それは実装の固定（implementation pinning）を装った偽物です。実装の固定はテスト腐敗の最も一般的な原因です。実装が進化するたびにテストが壊れ、目的を再評価せずに修正され、スイートはフィードバック層ではなく摩擦層になっていきます。
+
+---
+
+## Tier モデル
+
+`tests/` 内のテストはちょうど 1 つの Tier に属します。Tier は、テストが何を固定するか、誰が対象か、いつ変更すべきかを決定します。
+
+### Tier 1 — Contract
+
+**固定対象**: ユーザー／OSS コントリビューター／インテグレーションスクリプトが依存する外部境界。
+
+- `reyn.yaml` スキーマ（必須フィールド、型、エラーケース）
+- Events JSONL ペイロードスキーマ（監査・リプレイツールが依存）
+- DSL コントラクト: `skill.md`・`phase.md`・`artifact.yaml` の必須セクション
+- 各クラスタの `__init__.py` から再エクスポートされる公開 Python API
+
+**粒度**: スキーマレベル。ユーザーが grep で検索するエラーメッセージトークン（例外クラス名、設定キー名など）を除き、特定の文言は固定しません。
+
+**保留**: CLI 出力フォーマットは現リビジョンでは Tier 1 対象**外**です。CLI UX を見直し中であり、再設計後にコントラクトを追加する予定です。
+
+### Tier 2 — OS invariant
+
+**固定対象**: OS アーキテクチャとそのサブシステムの不変条件。
+
+3 つのサブカテゴリ:
+
+- **Tier 2a — 中核原則の不変条件** (P1-P8 直接):
+  - LLM 出力コントラクト（`type=transition` ⇒ `next_phase` が非 null；`type=finish` ⇒ `next_phase` が null）
+  - **P1**: 自身の出力スキーマを含む Phase は OS に拒否される
+  - **P5**: Workspace チャネル外でフェーズ間に渡されたデータは次フェーズの入力として扱われない
+  - **P6**: Events ログをバイパスした状態変更が検出される（= すべての状態変更がイベントを生成する）
+
+- **Tier 2b — サブシステム不変条件**: 主要サブシステム
+  (resume / persistence / dispatch / scheduling) の派生コントラクト。例:
+  - 「WAL `step_completed` event により resume が再実行なしで memoize できる」
+  - 「復元 intervention の answer が resuming skill に届く」
+  - 「BudgetTracker が `save_state` / `load_state` で crash を跨ぐ」
+  - 「schema version mismatch が `--reset` 案内付きで refuse する」
+
+  P1-P8 直接導出ではないが、 real なコントラクトであり pin する価値がある。
+
+- **Tier 2c — マルチコンポーネント統合 (e2e)**: 1 つのテストが複数モジュー
+  ルを exercise して end-to-end 不変条件を verify する。 全工程 real 実装、
+  LLM のみ stub callable で fake — `@pytest.mark.llm_stub`（[LLMStub — 2 本目の Fake](#llmstub--2-本目の-fake)参照）、
+  `LLMReplay` 経路は使わない（そちらは Tier 3）。 例:
+  - 「crash mid-skill → restart → resume → completes」 (`test_resume_e2e.py`)
+  - 「schema mismatch → CLI が `--reset` 案内付きで clean exit」
+  - 「BudgetTracker cap が crash + restart を跨いで enforce される」
+
+**粒度**: 不変条件。違反の方法を問わず、不変条件が破れたときにテストが失敗しなければなりません。
+
+**目標件数**: 不変条件 1 つあたり 1〜2 ケース。 サブシステムや統合点が
+増えれば total も自然に増える。 これを「実装テストの dump 場」 として誤
+用しないこと — フィルタは [判断フロー](#判断フロー) が担う。
+
+### Tier 3 — LLM-replay テスト（決定論的、Fake LLM）
+
+**固定対象**: `litellm.acompletion` 境界で `LLMReplay` Fake を通じて実行される、LLM 依存の OS パスの振る舞い。**Mock は禁止 — [Mock vs Fake](#mock-vs-fake)参照。**
+
+用語の note: Tier 3 テストは特に `LLMReplay` (録画 fixture を real `litellm` API surface に対して replay) を使う test を指す。 stub callable で LLM を fake する end-to-end 統合テスト（`@pytest.mark.llm_stub` — [LLMStub — 2 本目の Fake](#llmstub--2-本目の-fake)参照）は **Tier 2c** に属する (Tier 3 ではない)。
+
+#### Tier 3a — シングルコール・リプレイ（現在のスコープ）
+
+1 テストあたり 1 回の LLM 呼び出し、1 フェーズ。代表例: 「この `ContextFrame` が与えられたとき、ルーターはインテントを X と分類する」。ドリフト検出は必須: 各エリアには意図的にズレたフレームで `MissingFixture` が発生することを確認するテストも含めます。
+
+現在対象のエリア:
+- `skill_router` — インテント分類（typical 1〜2、drift 1）
+- `multi_hop` — chain_id 伝播、遅延返信（typical 1、drift 1）
+- `skill_improver` — temp-copy ワークフロー + force_decide（typical 1、drift 1）
+- `eval_builder` — ケースごとの criteria、ロールバックループ（typical 1、drift 1）
+
+**目標件数**: 全エリア合計 6〜8 ケース（上限: 4 エリア × 2 ケース）。12 件以上はTier 4 に属すべき冗長なコーナーケース網羅の兆候です。
+
+#### Tier 3b — エンドツーエンド・シナリオリプレイ（延期）
+
+マルチフェーズセッション。Workspace と Events ストアの最終状態を assert します。現在は**スコープ外**（CLI／`ChatSession` ドライバの見直し中）。CLI 再設計後に追加予定です。
+
+### Tier 4 — 書かない
+
+以下に該当するテストはスイートに**追加しません**（技術的には pass するとしても）:
+
+- **private state への直接 assert**（`tracker._daily_tokens == 100`）。`snapshot()` や公開 API を使う。
+- **テストが query する cache を bypass で pre-populate する setup** (例:
+  `session._buffered[key] = value` で内部 cache を直接書き、 後でその値
+  を query する)。 望む状態に公開 API で到達するのが高コストなら、 必要
+  な surface を public 化すべき — テストで bypass しない。 setup-via-private
+  は assert-on-private と同種の anti-pattern (壊れやすさが setup phase
+  に移るだけ)。
+- **内部 coordination flag** (`_state_loaded`, `_initialized`,
+  `_cache_dirty` 等)。 結果の振る舞いを test し、 flag は test しない。
+  実装内部 flag の固定は設計を凍結する。
+- **アルゴリズムの固定**（ソート順、dict のイテレーション順、内部キャッシュ構造）
+- **コミットごとのリグレッション複製**。修正はコミットが担い、記録は PR の説明に残す。「この特定のバグ」のテストは、永久に成立すべき本物の不変条件でない限り追加しない。
+- **LLM 出力の品質／意味的正確さ**（「この回答は役に立つか？」）。これは `eval` スキル（LLM-as-judge）の仕事であり、テストスイートの範囲外。[ポリシー外](#ポリシー外)を参照。
+- **見た目のフォーマット固定**（空白、句読点、行数、カラーコード）
+- **スナップショット／ゴールデンファイルテスト** — [スナップショットテストを採用しない理由](#スナップショットテストを採用しない理由)参照。限定的な例外は[Annex](#annex-スキャフォールディングテスト)にあります。
+- **`litellm` への `unittest.mock` パッチ** — 代わりに[Fake](#mock-vs-fake)（`LLMReplay`）を使う。
+- **カバレッジ目標**（例: 「行カバレッジ ≥ 80%」）。カバレッジは副作用であり、目標ではありません。PR のゲートにはしません。
+- **デフォルトの TDD**。テストファーストは Tier 2 不変条件（コントラクトが実装前から明確な場合）に適しています。機能開発では「まず動かし、それから守る」を推奨します。未検証の設計を早期に凍結するテストは避けてください。
+
+---
+
+## 判断フロー
+
+テストを書く前に、以下の設問に答えてください:
+
+```
+Q1. これが壊れたとき、誰が気づくか？
+  A. 外部ユーザー／インテグレーター              → Tier 1（CLI 出力は現在延期）
+  B. OS 自体（不変条件が崩れる）                → Tier 2
+  C. 単一の LLM 呼び出しがドリフトする          → Tier 3a
+  D. セッション全体がドリフトする               → Tier 3b（延期 — CLI 再設計を待つ）
+  E. このコミットの著者だけが気づく             → 書かない — PR の説明で十分
+
+Q2. これは将来の作業で摩擦になるか？
+  - Skill の変更が触れる形状を固定している              → 書かない
+  - リファクタリングでリネームされる private 名を固定     → 書かない
+  - DSL が拡張予定の振る舞いを固定している              → 書かない
+
+Q3. どのレベルで固定しているか？
+  - 公開コントラクト／OS 不変条件レベル          → 書く
+  - 実装レベル                                  → 書かない
+
+Q4. LLM の意味的品質を測定しているか？
+  → テストスイートのスコープ外。eval スキル（LLM-as-judge）を使う。
+    参考: Anthropic の「regression eval」と「capability eval」の区別。
+```
+
+Tier 1〜3 に明確に位置づけられないテストは、ほぼ例外なく Tier 4 に属します。
+
+---
+
+## 検証アプローチ: static replay vs real-env run
+
+検証方法は、対象の振る舞いが決定論的か分散依存かによって決まります:
+
+- **決定論的なメカニズム** — pure function、パース規則、固定入力に対して固定出力を返す OS 不変条件: **static replay** を使う（キャプチャした入力とゴールド期待値を直接渡す）。テストは完全に再現可能です。LLM 依存パスには `LLMReplay` が static replay 機構です（[Tier 3](#tier-3--llm-replay-テスト決定論的fake-llm) 参照）。
+- **分散依存の振る舞い** — LLM ルーティング、確率依存のトリガー、特定条件下でのみ発火する機能: **N≥3 の real-env run で実際に対象の振る舞いが発火することを確認する**。単一の smoke run では「動作している」か「たまたま通った」かを区別できません。計測対象は「パイプラインがエラーなく完了したか」ではなく「各 run で対象の振る舞いが実際に発火したか」です。
+
+ゼロフロア基準なしにパイプライン再実行の失敗数を数えるのは、分散依存パスにとってノイズです。構造的な原因（コンテキスト不足、スキーマ不一致、結線ミス）を修正して振る舞いが安定して発火するようにする。その後に残る失敗がモデル能力限界を示します。
+
+---
+
+## Mock vs Fake
+
+LLM 依存テストは必ず Fake を使う必要があります。Mock は決して使いません。
+**この禁止は litellm 固有ではありません — テストが構築するあらゆる collaborator（callable
+と plain な data/state object の両方）に適用されます**（下記「[data/state object の fake](#datastate-object-の-fake-同じ禁止より鋭い失敗モード)」参照）。litellm/`LLMReplay` は単に、このリポジトリの規範的な実例が存在する場所です。
+
+どちらの Fake を使うかは、テストがどの問いを立てるかで決まります。どの
+Tier に落ちるかでは決まりません（Tier は選択の結果であって、選択の基準
+ではありません）: model 自身の出力がテスト対象なら `LLMReplay` を使う。
+主題が turn 周りの loop/wiring の振る舞いで、completion 自身の内容に
+assert しないなら `LLMStub` を使う（[LLMStub — 2 本目の Fake](#llmstub--2-本目の-fake)
+参照）。**completion 自身の内容に assert する test は `LLMStub` を使っては
+いけません** — `llm_stub.py` 自身の module docstring が主張する内容
+（"must not assert on the completion's own content … not Tier 3"）と同じ
+です。
+
+### LLMStub — 2 本目の Fake
+
+LLM 境界には Fake が 2 本あります。`LLMReplay`（`@pytest.mark.replay(path)`）
+は「model が実際に何を言ったか（byte for byte）」を録画済み fixture から
+答えます — 上記 Tier 3 の機構です。`LLMStub`（`@pytest.mark.llm_stub`、
+#5103）はもっと狭い問いに答えます — fixture を要らなかった問い「real な
+turn machinery が実際に走ったか」です — 上記 Tier 2c の stub-callable 機構
+です。
+
+**最も重要な違い**: `LLMStub` は fixture ファイルを一切読み書きしません
+— fixture key を作る必要が無く、構造上 #3662 の `MissingFixture` 安全網
+にも #5283 の未消費検査にも見えません（ディスク上にどちらも見るものが
+無いため）。`LLMReplay` はその両方を行いますが、`LLMStub` はどちらも
+行いません。
+
+**いつ使うか**: 主題が turn 周りの loop/valve/lifecycle/wiring の振る舞い
+であって、model 自身の出力ではないとき。model が何を言ったかを assert
+する必要があるなら `LLMReplay`（Tier 3）を使ってください。
+
+**Tier のルール**: `@pytest.mark.llm_stub` を使う test は Tier 3 を宣言し
+てはいけません — `test_tier_audit.py` がこの対応を強制します。この Fake
+の要点はまさに、completion 自身の内容がテスト対象ではないという点です。
+
+`LLMStub` 自身の module docstring（`reyn.dev.testing.llm_stub`）が現在の
+mode の正典です（本稿執筆時点: cause-injection mode と gating mode）—
+ここには複製しません。mode が増えたときにこのページが古くならないため
+です。
+
+### 理由
+
+Mock は関数を手書きのスタブに置き換えます:
+
+```python
+# 禁止
+from unittest.mock import patch
+with patch("litellm.acompletion", return_value=hand_built_dict):
+    ...
+```
+
+これは実際の API コントラクトをバイパスします。`litellm` のシグネチャやレスポンス形状が変わったとき（例: LangChain が `__call__` を `invoke()` にリネームしたとき、エコシステム全体の Mock テストは pass し続けながら本番が壊れていました — Lincoln Loop, "Avoiding Mocks: Testing LLM Applications with LangChain in Django" 参照）、Mock テストはそれを検出できません。
+
+Fake は実際の API サーフェスを通じてルーティングします。`LLMReplay` は `litellm.acompletion` をパッチしますが、記録済みデータから本物の `litellm.ModelResponse` を再構築します。シグネチャのドリフトは呼び出しサイト（TypeError、AttributeError）またはルックアップ時（`MissingFixture`）で検出されます。
+
+**2つの異なる失敗モードがあり、1つではありません。** fake された **callable**（関数 / `__call__`）はシグネチャドリフト検出をバイパスします — 本物の呼び出しならコントラクトが変わった時に大きく（`TypeError` で）失敗するはずが、mock は指示された値を黙って返すだけです。fake された **data/state object**（呼び出されるのではなく collaborator として渡される、手書きの代替物）はより悪い失敗モードを持ちます: 本物の型には存在しないフィールドを黙って持たせることができ、`getattr(obj, "field", default)` で存在しないフィールドを読むと**何も発生しません** — 単にデフォルト値を永遠に返すだけで、ドリフトすべきシグネチャも、失敗すべき呼び出しもありません。本物の collaborator が安価に構築できる（plain な dataclass で I/O なし）なら、本物を構築してください — fake する理由になるコストトレードオフは存在しません。
+
+#### `data/state object` の fake: 同じ禁止・より鋭い失敗モード
+
+```python
+# 禁止
+class FakeRouterCallerState:
+    def __init__(self):
+        self.permission_resolver = _AllowAllResolver()  # 発明された — 本物の
+                                                          # RouterCallerState にこのフィールドは無い
+```
+
+**#3037**: `RouterCallerState` 用の手書き fake が、本物の dataclass には存在しない
+`permission_resolver` フィールドを発明していました。検査対象の gate は
+`getattr(state, "permission_resolver", None)` でそのフィールドを読み、fake が発明した
+値を見つけて CLEAR と報告しました — その gate は本物の `RouterCallerState` に対して一度も
+実行されたことがなく、本物の型にそのフィールドが無い以上、実行できるはずもありませんでした。
+本番では、これにより LLM が permission gate 無しで `.reyn/config/mcp.yaml` を書けて
+いました。これが上述の「より鋭い失敗モード」です: 違反すべきシグネチャも、失敗すべき呼び出しも
+なく、ただ黙って永遠に間違ったデフォルト値があるだけです。**本物の collaborator が plain な
+dataclass なら、本物を構築してください — 構築コストがゼロのものを手書きで代替する
+test-isolation 上の理由はありません。**
+
+#### test seam は construction-wiring gate を弱めてはならない
+
+構造的 / AST 不変条件 gate で守られた class — たとえば `node.func.id == "RouterLoop"`
+を AST 走査して全 construction site が必須 keyword を wire していることを証明する
+gate — に Tier-2 test seam を足す時、その construction を**置換してはいけません**。
+*factory* seam（`RouterLoop(...)` を注入された `_loop_factory(...)` へ迂回させる）は
+避けてください: literal な constructor 呼び出しが AST から消え、gate が 0 site を見て
+fail し、さらに gate が守っている穴そのものを開けます（注入された callable が guarded
+kwargs を省略できてしまう）。代わりに **post-construction observer** — 構築済み
+instance を渡される spy callback — を使います:
+
+```python
+# class は実際の方法で自身を構築する; observer は inspect するだけ
+loop = RouterLoop(..., resume_always_on=...)   # literal call は AST に残る
+if self._loop_observer is not None:
+    self._loop_observer(loop)                  # 解決済み instance を spy
+```
+
+observer は literal な construction を AST に残し（gate は引き続き検出できる）、実際の
+constructor が guarded kwargs を無条件に wire させます; テストは生の constructor kwargs
+でなく解決済み instance（`loop.router_model` 等）を assert します。これは上のルールの
+seam 版です: コントラクトを bypass せず adapt する。
+
+### 使い方
+
+```python
+@pytest.mark.replay("fixtures/llm/my_area/my_scenario.jsonl")
+def test_my_phase():
+    from reyn.testing.replay import REPLAY_DATETIME
+    frame = ContextFrame(
+        # ...
+        current_datetime=REPLAY_DATETIME,  # 安定したキーに必須
+    )
+    response = await call_llm(model, frame, ...)
+    assert response.data["type"] == "decide"
+```
+
+完全なセットアップ手順は[リプレイテストの書き方](#リプレイテストの書き方)を参照してください。
+
+---
+
+## スナップショットテストを採用しない理由
+
+スナップショットテストは Phase／artifact／最終結果の構造的な出力を固定し、将来の実行との差分を確認します。これは**採用しません**。理由は以下の通りです:
+
+1. **P1 に反する。** Phase は `input_schema` と instructions のみを宣言し、出力形状は次フェーズの `input_schema` や `final_output_schema` によって外部で決まります。スナップショットはその出力形状をテスト内に凍結し、P1 と相反します。
+2. **Skill の進化で壊れる。** Skill の変更はすべて artifact に影響するため、スナップショットは定常的に更新されます。定常的な更新は「よさそうだから承認」という慣行に堕落し、スナップショットはガードとして機能しなくなります。
+3. **差分レビューが雰囲気チェックになる。** 明確な不変条件がなければ、「スナップショット更新」のレビューは目視確認に劣化します。「期待される変更」と「リグレッション」を区別する原理的な方法がありません。
+4. **Tier 2（OS 不変条件）がより適切なツール。** スナップショットが守ろうとするものは、多くの場合 LLM 出力構造や Workspace 状態に関する不変条件です。その不変条件を直接エンコードしてください。
+
+業界文献もこれに沿っています: Coulman, *Snapshot Testing: Use With Care* (2016)；Hughes, *Why Snapshot Testing Sucks*；メタ分析 *Snapshot Testing in Practice: Benefits and Drawbacks* (Science of Computer Programming, 2024)。
+
+限定的な例外が[Annex](#annex-スキャフォールディングテスト)に存在します（レガシーリファクタのキャラクタリゼーション用）。Coulman の元の枠組みに従います。
+
+---
+
+## 否定例（negative example）の選び方
+
+多くの gate は、システムが**拒否すべき**値を必要とします（未登録のセル、未知の名前、非対応の kind など）。この値の選び方を誤ると、テストは**主張しているものを黙って検査しなくなります**。
+
+> ★ **否定例は、システムが *拡張していく空間の外* から取る。集合に *今いない* ものではなく、集合に *入りえない* ものを使う。**
+
+両者は呼び出し側では見分けがつかず、時間が経つと全く違う振る舞いをします。`(retrieval, content_fence)` は禁止されていたのではなく、**合法な組み合わせがまだ実装されていなかった**だけです — しかもそれを実装することが目的のアーク（#3376）の最中に。`"no-such-presentation"` は presentation 軸の値ですらないので、将来のどの作業でも登録されえません。
+
+**推測ではなく実測（#3376）**: 3 つのテストが `(category, content_fence)` を「*その*未登録セル」としてハードコードしていました。P2 がそれを登録して 3 件とも RED になり、`(retrieval, content_fence)` へ retarget されました。P3 がそちらを登録したので、同じ 3 件がまた RED になるはずでした。**各 retarget は小さな修正に見えて、実際は同じ欠陥の再発**です。
+
+**期限つき witness が避けられない場合**は、期限を inline で falsifiable な形で宣言してください（`comments.md` §4）— 何がそれを登録するのか、そのとき何が壊れるのかを名指す。恒久 witness が常に優先です。
+
+**印を付けること。** 否定例は肯定例と全く同じ形で書かれるため、検査だけでは区別できません — これが純粋な構文 gate を作れない理由です。共有された名前付きモジュールから値を import することが印になります。`tests/_support/tool_use_negative_examples.py` がその実例で、印を付けた名前が本当に軸の外にあることを assert するアームと対になっています。**印のある witness は gate 化できますが、印のないものはできず、その場合この節だけが後ろ盾になります。**
+
+**関連する失敗**: ある 1 箇所を registry からの導出に変えても、**その値がどこにもハードコードされていないことは意味しません**。#3376 P1 が未登録集合をライブ registry から導出したあとも、他の 3 ファイルはリテラルを持ったままでした。導出に変えたら、**値の側**から grep してください — 概念ではなくリテラルで `tests/` を横断し、**何を直すか決める前に件数を数える**こと。
+
+---
+
+## Annex: スキャフォールディングテスト
+
+これが bounded-life のテストを許可する唯一の場所です。**スキャフォールディングは Tier ではありません** — `tests/` スイート全体の原則を保つため、意図的に特殊ケースの例外として位置づけています。
+
+### いつ使うか
+
+既存エリアの大規模なリファクタリングやマイグレーションを行う際、作業中に意図しない振る舞いの変化を検出したい場合。スキャフォールディングテストは現在の振る舞いを固定し、リファクタリングが完了するまで存在し、完了時に削除されます。
+
+### 必須メタデータ
+
+```python
+# scaffold: triggered_by="BudgetLedger を別のバッキングストアに置き換えたとき"
+# scaffold: removed_by="新しいバッキングストアをランディングした PR"
+def test_ledger_jsonl_format_during_migration():
+    ...
+```
+
+トリガーは**観測可能**でなければなりません。「このコードパスが書き直されたとき」は可。「時間ができたら」や「Q4 以降」は不可。
+
+### 削除の規律
+
+トリガーイベントが発生した PR は、**同じ PR でスキャフォールディングテストも削除しなければなりません**。PR レビューでこれを確認します。
+
+### 物理的な分離
+
+スキャフォールディングテストは `tests/scaffold/` に配置します。このディレクトリ配下のファイルは、PR レビュー時にトリガーが古くなっていないか（トリガーイベントがすでに発生済みでないか）スキャンされます。
+
+### スナップショットテストの例外
+
+スナップショットテストは**レガシーリファクタのスキャフォールディング**（Coulman の「キャラクタリゼーションテスト」のユースケース）としてのみ許可されます。条件:
+- `tests/scaffold/` に配置すること
+- 具体的な `triggered_by`（リファクタ PR またはリリース）を持つこと
+- リファクタがランディングされたタイミングで削除されること
+
+これがコードベースにおけるスナップショットテストの唯一の認定用途です。
+
+---
+
+## ファイルシステム隔離 (= real `~/.reyn/` への汚染禁止)
+
+テストは開発者の real `~/.reyn/` ファイルを **変更してはいけません**。 リポジトリの `tests/conftest.py` は secret store について autouse fixture で既にこれを強制しています。 全テストで `REYN_SECRETS_PATH` が `tmp_path / "secrets.env"` に設定されます。 結果として:
+
+- `secrets.store.save_secret()` / `clear_secret()` / `load_secrets()` は自動的に `tmp_path` 配下に行きます。 個別テストで `monkeypatch.setattr` は不要。
+- `reyn secret {set,list,clear,rotate}` CLI のテストも同じ isolation を継承します。
+
+User home (`~/.reyn/registry-cache/`、 `~/.reyn/approvals.jsonl` 等) に触れる新 infra を追加する時は、 同 pattern に従ってください:
+
+1. パス resolver が呼出時に env var (`REYN_*_PATH`) を参照、 default は `Path.home() / ".reyn" / ...` で fallback。
+2. `conftest.py` に autouse fixture を追加、 env var を `tmp_path` に向ける。
+3. md5 で verify: `~/.reyn/<file>` のハッシュがテスト前後で byte-identical であること。
+
+モジュール level の constant (`_SECRETS_FILE = Path.home() / ".reyn" / "secrets.env"`) は import 時に evaluate されます。 import 後の `monkeypatch.setenv("HOME", ...)` は効きません。 「呼出時に env var 参照」 の pattern がこの footgun を回避します。
+
+---
+
+## ポリシー外
+
+以下はテストスイートの外に属します:
+
+- **LLM 出力の意味的品質。** 「このレスポンスは本当に役に立つか？」は `eval` スキル（LLM-as-judge）の仕事です。テストスイートは「構造は正しいままか」を問います — Anthropic はこれを *regression eval* と呼んでいます。品質は *capability eval* であり、別の場所に属します。
+- **モデル比較ベンチマーク**（gemini vs claude vs gpt）。`eval` スキルや専用のベンチマークツールを使ってください。
+- **本番トラフィックの監視／アラート。** `events.jsonl` と外部監視を使ってください。これはオペレーショナルインフラであり、テストではありません。
+
+---
+
+## リプレイテストの書き方
+
+> Tier 3a テストの参考資料。最も一般的なコントリビューションの形式です。
+
+### ボイラープレート
+
+```python
+import pytest
+import asyncio
+from reyn.llm.llm import call_llm
+from reyn.schemas.models import ContextFrame
+from reyn.testing.replay import REPLAY_DATETIME
+
+
+@pytest.mark.replay("fixtures/llm/my_area/my_scenario.jsonl")
+def test_my_phase_classifies_as_x():
+    """Tier 3a: skill_router が chitchat 入力を finish と分類する。"""
+    frame = ContextFrame(
+        current_phase="classify",
+        # ... その他のフィールド ...
+        current_datetime=REPLAY_DATETIME,   # 必須
+    )
+
+    result = asyncio.get_event_loop().run_until_complete(
+        call_llm(
+            model="gemini-2.5-flash-lite",
+            frame=frame,
+            prompt_cache_enabled=False,
+            skill_name="skill_router",
+            phase_role="chat_router",
+        )
+    )
+
+    assert result.data["type"] == "decide"
+    assert result.data["control"]["decision"] == "finish"
+```
+
+### フィクスチャパス
+
+パスは `tests/` からの相対パスです。例: `"fixtures/llm/skill_router/chitchat.jsonl"`。
+
+### フィクスチャの記録
+
+**初回**（フィクスチャファイルが存在しない）: conftest がこれを検出し、自動的に記録モードに切り替えます。稼働中の LLM が必要です（ローカル開発では `localhost:4000` の LiteLLM プロキシ — メモリの `project_local_env.md` 参照）。
+
+```bash
+python -m pytest tests/test_replay_my_area.py -v
+# フィクスチャが tests/fixtures/llm/my_area/my_scenario.jsonl に書き込まれます
+```
+
+**意図的なプロンプトのドリフト後**: `REYN_LLM_RECORD=1` で再記録します —
+事前の削除はもう不要です（#3634 で `LLMReplay.flush()` が「追記」でなく
+「再記録/置き換え済みエントリを置換」するようになったため、その場での
+再生成が schema 世代を積み重ねることはなくなりました）:
+
+```bash
+REYN_LLM_RECORD=1 python -m pytest tests/test_replay_my_area.py -v
+```
+
+事前削除（`rm tests/fixtures/llm/my_area/my_scenario.jsonl`）も引き続き
+動作しますが、それは好みの問題であり正しさの要件ではありません — 詳細は
+`write-replay-tests.md` の Step 4 と `LLMReplay.flush` 自身の docstring、
+積層したフィクスチャが再度混入した場合に検出する CI ゲートである
+`tests/dev/test_replay_fixture_no_stacking_3634.py` を参照してください。
+
+### ドリフト検出 — 各エリアで必須
+
+Tier 3a の各エリアには、フィクスチャがカバーしていないフレームを意図的に構築し、`MissingFixture` が発生することを assert するテストが 1 つ必要です。これが偶発的なプロンプトのドリフトを検出する仕組みです。
+
+```python
+@pytest.mark.replay("fixtures/llm/my_area/my_scenario.jsonl")
+def test_wrong_input_raises_missing_fixture():
+    """Tier 3a: drift detection — instructions / candidate_outputs の変更は
+    フィクスチャの再記録が必要。さもなければテストが大きな音で失敗する。"""
+    frame = ContextFrame(
+        current_phase="classify",
+        instructions="これは意図的にフィクスチャに含まれていない",
+        current_datetime=REPLAY_DATETIME,
+    )
+    from reyn.testing.replay import MissingFixture
+    with pytest.raises(MissingFixture):
+        asyncio.get_event_loop().run_until_complete(call_llm(...))
+```
+
+### フィクスチャフォーマット
+
+JSONL、1 行 1 レコード:
+
+```json
+{"key": "<sha256>", "model": "gemini-2.5-flash-lite", "prompt_preview": "...", "response": {...}}
+```
+
+- `key` — `SHA256(model + canonical_json(messages))`
+- `prompt_preview` — 最後のメッセージの先頭 200 文字（grep 用）
+- `response` — `litellm.ModelResponse.model_dump()`、リプレイ時に再構築
+
+### モンキーパッチのライフサイクル
+
+`tests/conftest.py` は `@pytest.mark.replay` を持つテストに対して `LLMReplay` をインストールし、`try/finally` で復元します。マーカーを持たないテストは本物の `litellm.acompletion` を参照します。
+
+#4081: この節は以前 `tests/test_replay_skill_router.py` の `test_no_monkeypatch_leak` を「検証済み」の根拠として引用していましたが、そのファイルは #2435 の skill/phase decouple で削除され（サブシステム丸ごとの削除で、リネームではありません）、後継のテストもありません。上記の機構自体は今も生きています（`tests/conftest.py` の `_llm_replay` fixture で確認できます）が、no-leak 保証を専門に固定するテストは現在存在しません。
+
+---
+
+## テストの実行
+
+```bash
+# すべてのテスト
+python -m pytest tests/ -v
+
+# 強制記録モード（稼働中の LLM が必要）
+REYN_LLM_RECORD=1 python -m pytest tests/ -v
+```
+
+#4081: このブロックは以前 `python -m pytest tests/test_replay_*.py -v` と `python -m pytest tests/test_os_invariants.py -v` も示していましたが、glob もリテラルパスも今は何にも一致しません（`tests/test_replay_skill_router.py` 系と `tests/test_os_invariants.py` は #2435/#2438 の skill/phase engine 一括削除で消え、後継はありません）。未検証の新しい例に差し替えるのではなく削除しました——自分の変更が実際に触るファイル/キーワードにスコープを絞って実行してください（下の「プッシュ前」参照）。
+
+---
+
+## プッシュ前 — 3 つの CI ゲート
+
+`pytest` が green でも CI が green とは限りません。`.github/workflows/test.yml`
+は **3 つの独立したゲート**を回します。PR を ready とする前に、diff に対して 3 つ
+ともローカルで実行してください:
+
+1. **pytest** — リポジトリルートから（サブセットパスでなく）。collection が CI と一致します:
+   ```bash
+   python -m pytest tests/ -q
+   ```
+2. **ruff** — lint + import-sort（`I001`）:
+   ```bash
+   ruff check .        # autofix 可能な I001 / format は --fix
+   ```
+   末尾の `.` は略記ではなく意味を持ちます: CI（`test.yml`）と同じ範囲を実行してください、狭い `src tests` サブセットではありません —
+   #4630 がこの狭いコマンドの穴を測定しました: `scripts/` を含む他のトップレベル
+   ディレクトリ全てが未チェックのままで、`src/` 以外の genuinely-dead import 17 件が
+   このチェックリスト全体から不可視でした。狭いローカルゲートは、その名が意味する
+   ものを意味しない green です。
+3. **test-tier audit** — 新規・変更したテストファイルごとに
+   `scripts/test_tier_audit.py --strict`（後述の Tier コンプライアンス監査ツールと
+   同じ linter）。Tier-4 の format-pin（`len(...) == N`、exact whitespace、行数）は
+   pytest が green でもここで fail します — behavioral assertion に置き換えてください
+   （長さでなく抽出した値そのものを assert）:
+   ```bash
+   python scripts/test_tier_audit.py --strict <変更したテストファイル>
+   ```
+
+`pytest` だけが green の PR が、CI で ruff（`I001`）や tier audit（`len(...) == 1`
+の format-pin）で bounce した実例があります。report scope は正直に: 走らせたのが
+pytest だけなら「pytest passed」と言い、「suite passed」（lint・audit ゲートも含意する）
+とは言わないこと。
+
+---
+
+## 新しい OS 機能のカバレッジチェックリスト
+
+LLM 依存の OS パスを新たに追加する場合:
+
+- [ ] 代表的なハッピーパスに対する Tier 3a テスト 1 件
+- [ ] コーナーケース（force_decide、エラーパス、境界値）に対する Tier 3a テスト 1 件
+- [ ] ドリフト検出テスト（`MissingFixture` の assert）1 件
+- [ ] P1–P8 の不変条件から導出される機能であれば、Tier 2 テスト 1 件を追加
+- [ ] 公開コントラクト（yaml スキーマ、Events ペイロード、DSL セクション）を変更する場合は Tier 1 テストを更新／追加
+- [ ] `current_datetime=datetime.now()` を使っていないことを確認 — 常に `REPLAY_DATETIME` を使う
+- [ ] 各テストの docstring 一行目に Tier の明記（例: `"""Tier 3a: ..."""`）
+
+---
+
+## Tier コンプライアンス監査ツール
+
+`testing.ja.md` のポリシーに基づく **自動リンター**: `scripts/test_tier_audit.py`。
+
+新しいテスト追加時の pre-commit チェック、既存スイートの Tier 4 違反監査、PR レビューでのテストポリシー違反検出に使用します。
+
+検出ルール (6):
+
+- Missing Tier docstring (= Tier 宣言の欠如)
+- Format pinning (= 行数 / 文字数等の Tier 4 違反)
+- Private state assertion (= プライベート状態への assertion)
+- MagicMock / AsyncMock / patch の使用
+- Bounded-life test in regular dir (= scaffold/ 候補)
+- Snapshot/golden test outside scaffold
+
+完全リファレンス: [docs/reference/test-tier-audit.md](../../reference/test-tier-audit.md)

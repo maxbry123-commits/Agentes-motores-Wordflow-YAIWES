@@ -1,0 +1,51 @@
+{
+	"name": "@rivet-dev/agentos-shell",
+	"version": "0.0.1",
+	"private": false,
+	"type": "module",
+	"bin": {
+		"agentos-shell": "./dist/main.js",
+		"agent-os-shell": "./dist/main.js"
+	},
+	"scripts": {
+		"build": "tsc",
+		"check-types": "tsc --noEmit",
+		"shell": "tsx src/main.ts",
+		"test": "pnpm build && vitest run --fileParallelism=false"
+	},
+	"dependencies": {
+		"@agentos-software/codex-cli": "workspace:*",
+		"@agentos-software/coreutils": "workspace:*",
+		"@agentos-software/curl": "workspace:*",
+		"@agentos-software/diffutils": "workspace:*",
+		"@agentos-software/duckdb": "workspace:*",
+		"@agentos-software/fd": "workspace:*",
+		"@agentos-software/file": "workspace:*",
+		"@agentos-software/findutils": "workspace:*",
+		"@agentos-software/gawk": "workspace:*",
+		"@agentos-software/git": "workspace:*",
+		"@agentos-software/grep": "workspace:*",
+		"@agentos-software/gzip": "workspace:*",
+		"@agentos-software/jq": "workspace:*",
+		"@agentos-software/ripgrep": "workspace:*",
+		"@agentos-software/sed": "workspace:*",
+		"@agentos-software/sqlite3": "workspace:*",
+		"@agentos-software/tar": "workspace:*",
+		"@agentos-software/tree": "workspace:*",
+		"@agentos-software/unzip": "workspace:*",
+		"@agentos-software/vim": "workspace:*",
+		"@agentos-software/wget": "workspace:*",
+		"@agentos-software/yq": "workspace:*",
+		"@agentos-software/zip": "workspace:*",
+		"@rivet-dev/agentos": "workspace:*",
+		"@rivet-dev/agentos-core": "workspace:*",
+		"commander": "^14.0.2",
+		"rivetkit": "catalog:rivetkit"
+	},
+	"devDependencies": {
+		"@types/node": "^22.19.3",
+		"tsx": "^4.19.2",
+		"typescript": "^5.7.2",
+		"vitest": "^2.1.8"
+	}
+}

@@ -1,0 +1,551 @@
+/**
+ * AI Provider — Alice's credential vault.
+ *
+ * Post-Workspace-pivot the in-process model loop is gone; the only thing this
+ * page manages is the central set of api-key credentials that can be selected
+ * for per-process Workspace Session bindings. The native-project config editor
+ * is retained separately as a deprecated compatibility export. This page is
+ * NOT a profile editor anymore — no backend/loginMethod, no active profile, no
+ * SDK adapters, and Test runs the lightweight HTTP probe, not the old provider
+ * router.
+ *
+ * Subscription logins (Claude Pro/Max via `claude login`, ChatGPT via
+ * `codex login`) are deliberately absent — those live in the CLI's own auth,
+ * not in Alice. The preset catalog is reused here purely as an "add credential"
+ * helper: it carries each vendor's endpoint + model suggestions + request shape.
+ */
+
+import { useState, useEffect, useMemo, useRef, useCallback } from 'react'
+import { useTranslation } from 'react-i18next'
+import { api, type Preset, type WireShape } from '../api'
+import type {
+  CredentialSummary,
+  WorkspaceCredentialDefault,
+  WorkspaceCredentialDefaultsResponse,
+} from '../api/config'
+import { PageHeader } from '../components/PageHeader'
+import { PageLoading, Skeleton } from '../components/StateViews'
+import { SettingsScrollArea, inputClass } from '../components/form'
+import { CredentialModal } from '../components/credentials/CredentialModal'
+import { ConfirmDialog } from '../components/ConfirmDialog'
+import {
+  AGENT_LABELS,
+  WIRE_SHAPE_GUIDANCE,
+  agentWireShapes,
+  compatibleAgentIds,
+  credentialMatchesQuery,
+  describeModelSemantics,
+  isApiKeyPreset,
+  presetDefaultModel,
+  presetModel,
+  vendorLabel,
+  vendorPreset,
+} from '../lib/presetHelpers'
+import { notifyWorkspaceDefaultsChanged } from '../lib/workspaceAiEvents'
+import type { AgentInfo } from '../components/workspace/api'
+import { useAgentRuntimes } from '../hooks/useAgentRuntimes'
+import { useWorkspace } from '../tabs/store'
+
+function credentialLabel(cred: Pick<CredentialSummary, 'slug' | 'vendor' | 'label'>): string {
+  return cred.label?.trim() || cred.slug
+}
+
+// ==================== Page ====================
+
+export function AIProviderPage() {
+  const { t } = useTranslation()
+  const openOrFocus = useWorkspace((state) => state.openOrFocus)
+  const { agents } = useAgentRuntimes()
+  const [credentials, setCredentials] = useState<CredentialSummary[] | null>(null)
+  const [credentialsLoadError, setCredentialsLoadError] = useState(false)
+  const [presets, setPresets] = useState<Preset[]>([])
+  const [modal, setModal] = useState<{ mode: 'add' } | { mode: 'edit'; cred: CredentialSummary } | null>(null)
+  const [pendingDelete, setPendingDelete] = useState<CredentialSummary | null>(null)
+  const [vaultQuery, setVaultQuery] = useState('')
+
+  const reload = useCallback(async () => {
+    setCredentials(null)
+    setCredentialsLoadError(false)
+    try {
+      const { credentials: next } = await api.config.getCredentials()
+      setCredentials(next)
+    } catch {
+      setCredentialsLoadError(true)
+    }
+  }, [])
+
+  useEffect(() => {
+    void reload()
+    api.config.getPresets().then(({ presets: p }) => setPresets(p)).catch(() => {})
+  }, [reload])
+
+  const apiKeyPresets = useMemo(() => presets.filter(isApiKeyPreset), [presets])
+  const visibleCredentials = useMemo(
+    () => (credentials ?? []).filter((cred) => credentialMatchesQuery(cred, vaultQuery)),
+    [credentials, vaultQuery],
+  )
+
+  const handleDelete = async (slug: string): Promise<boolean> => {
+    try {
+      await api.config.deleteCredential(slug)
+      await reload()
+      return true
+    } catch (err) {
+      alert(err instanceof Error ? err.message : t('aiProvider.deleteFailed'))
+      return false
+    }
+  }
+
+  if (!credentials) {
+    return (
+      <div className="flex flex-col flex-1 min-h-0">
+        <PageHeader title={t('aiProvider.title')} description={t('aiProvider.description')} />
+        {credentialsLoadError ? (
+          <div className="flex flex-1 items-center justify-center px-6 py-12">
+            <div role="alert" className="max-w-md text-center">
+              <h2 className="text-sm font-semibold text-foreground">{t('aiProvider.loadErrorTitle')}</h2>
+              <p className="mt-1.5 text-[12px] leading-relaxed text-muted-foreground">
+                {t('aiProvider.loadErrorDescription')}
+              </p>
+              <button type="button" className="btn-secondary-sm mt-4" onClick={() => void reload()}>
+                {t('common.retry')}
+              </button>
+            </div>
+          </div>
+        ) : (
+          <PageLoading />
+        )}
+      </div>
+    )
+  }
+
+  return (
+    <div className="flex flex-col flex-1 min-h-0">
+      <PageHeader title={t('aiProvider.title')} description={t('aiProvider.description')} />
+      <SettingsScrollArea className="px-4 py-6 md:px-8">
+        <div className="mx-auto grid min-w-0 max-w-[1100px] gap-6 2xl:grid-cols-2">
+          {/* ============== Credentials ============== */}
+          <section className="min-w-0">
+            <div className="rounded-lg border border-border/50 bg-secondary/50 px-4 py-3 mb-4">
+              <p className="text-[13px] text-muted-foreground leading-relaxed">
+                {t('aiProvider.vaultIntro')}
+              </p>
+            </div>
+
+            <div className="flex items-center justify-between mb-3">
+              <div className="flex min-w-0 items-baseline gap-1.5">
+                <h2 className="text-[13px] font-semibold text-foreground uppercase tracking-wide">{t('aiProvider.credentials')}</h2>
+                {credentials.length > 0 && (
+                  <span className="text-[11px] text-muted-foreground">
+                    {vaultQuery.trim()
+                      ? t('aiProvider.credentialsFiltered', {
+                          shown: visibleCredentials.length,
+                          total: credentials.length,
+                        })
+                      : t('aiProvider.credentialsCount', { count: credentials.length })}
+                  </span>
+                )}
+              </div>
+              <button
+                onClick={() => setModal({ mode: 'add' })}
+                className="text-[11px] px-2 py-1 rounded-md border border-border text-muted-foreground hover:text-primary hover:border-primary transition-colors"
+              >
+                + {t('common.add')}
+              </button>
+            </div>
+
+            {credentials.length > 0 && (
+              <input
+                className={`${inputClass} mb-3`}
+                value={vaultQuery}
+                onChange={(event) => setVaultQuery(event.target.value)}
+                placeholder={t('aiProvider.searchCredentials')}
+                aria-label={t('aiProvider.searchCredentials')}
+              />
+            )}
+
+            <div className="space-y-2.5">
+              {visibleCredentials.map((cred) => {
+                const compatibleAgents = compatibleAgentIds(cred.wires, agents)
+                return (
+                  <div key={cred.slug} className="flex min-w-0 flex-col gap-3 rounded-lg border border-border bg-background px-4 py-3 sm:flex-row sm:items-center">
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className="text-[13px] font-medium text-foreground">{credentialLabel(cred)}</span>
+                        <span className="text-[11px] text-muted-foreground">{vendorLabel(cred.vendor)}</span>
+                        {cred.label && (
+                          <span className="text-[11px] text-muted-foreground font-mono">{cred.slug}</span>
+                        )}
+                        {compatibleAgents.map((agentId) => (
+                          <span key={agentId} className="text-[10px] text-muted-foreground border border-border rounded px-1">{AGENT_LABELS[agentId] ?? agentId}</span>
+                        ))}
+                        {cred.hasApiKey && (
+                          <span className="text-[10px] text-success border border-success/40 rounded px-1">{t('aiProvider.keySet')}</span>
+                        )}
+                      </div>
+                      <div className="mt-0.5 truncate text-[11px] text-muted-foreground">
+                        {t('aiProvider.defaultModel')}: <span className="font-mono">{cred.lastModel || t('aiProvider.notSet')}</span>
+                        <span className="px-1.5 text-muted-foreground/50">·</span>
+                        <span className="font-mono">{Object.values(cred.wires)[0] || t('aiProvider.officialEndpoint')}</span>
+                      </div>
+                    </div>
+                    <div className="flex shrink-0 gap-2 self-end sm:self-auto">
+                      <button
+                        type="button"
+                        onClick={() => setModal({ mode: 'edit', cred })}
+                        title={t('aiProvider.editCredentialAria', {
+                          credential: credentialLabel(cred),
+                        })}
+                        aria-label={t('aiProvider.editCredentialAria', {
+                          credential: credentialLabel(cred),
+                        })}
+                        className="text-[11px] px-2 py-1 rounded-md border border-border text-muted-foreground hover:text-foreground transition-colors"
+                      >
+                        {t('common.edit')}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setPendingDelete(cred)}
+                        title={t('aiProvider.deleteCredentialAria', {
+                          credential: credentialLabel(cred),
+                        })}
+                        aria-label={t('aiProvider.deleteCredentialAria', {
+                          credential: credentialLabel(cred),
+                        })}
+                        className="text-[11px] px-2 py-1 rounded-md border border-border text-muted-foreground hover:text-destructive transition-colors"
+                      >
+                        {t('common.delete')}
+                      </button>
+                    </div>
+                  </div>
+                )
+              })}
+
+              {credentials.length > 0 && visibleCredentials.length === 0 && (
+                <p className="rounded-lg border border-dashed border-border px-4 py-6 text-center text-[12px] text-muted-foreground">
+                  {t('aiProvider.noCredentialMatches', { query: vaultQuery })}
+                </p>
+              )}
+
+              {credentials.length === 0 && (
+                <button
+                  onClick={() => setModal({ mode: 'add' })}
+                  className="w-full p-4 rounded-xl border-2 border-dashed border-border text-muted-foreground hover:border-primary/50 hover:text-primary transition-all text-[13px] font-medium"
+                >
+                  + {t('aiProvider.addFirst')}
+                </button>
+              )}
+            </div>
+          </section>
+
+          {/* ============== Default workspace credentials ============== */}
+          <WorkspaceDefaultsSection credentials={credentials} presets={presets} agents={agents} />
+        </div>
+
+        <div className="mx-auto mt-6 max-w-[1100px] rounded-lg border border-border/70 bg-background px-4 py-3">
+          <p className="text-[13px] leading-relaxed text-muted-foreground">
+            {t('aiProvider.openAgentRuntimesDescription')}
+          </p>
+          <button
+            type="button"
+            onClick={() => openOrFocus({ kind: 'settings', params: { category: 'agent-runtimes' } })}
+            className="oa-pressable mt-2 text-[12px] font-medium text-primary hover:underline"
+          >
+            {t('aiProvider.openAgentRuntimes')}
+          </button>
+        </div>
+      </SettingsScrollArea>
+
+      {modal && (
+        <CredentialModal
+          mode={modal.mode}
+          cred={modal.mode === 'edit' ? modal.cred : undefined}
+          presets={apiKeyPresets}
+          agents={agents}
+          onClose={() => setModal(null)}
+          onSaved={async () => { await reload(); setModal(null) }}
+        />
+      )}
+      {pendingDelete && (
+        <ConfirmDialog
+          title={t('aiProvider.deleteConfirmTitle', {
+            credential: credentialLabel(pendingDelete),
+          })}
+          message={t('aiProvider.deleteConfirmMessage', {
+            slug: pendingDelete.slug,
+          })}
+          confirmLabel={t('common.delete')}
+          cancelLabel={t('common.cancel')}
+          onConfirm={async () => {
+            if (await handleDelete(pendingDelete.slug)) {
+              setPendingDelete(null)
+            }
+          }}
+          onClose={() => setPendingDelete(null)}
+        />
+      )}
+    </div>
+  )
+}
+
+// ==================== Legacy new-Workspace creation seeds ====================
+// Existing installation-level defaults are translated into the new Workspace's
+// secret-free `.alice/settings.json`. They never write native CLI project files.
+
+const PRIMARY_DEFAULT_AGENTS = [
+  { id: 'opencode', name: 'opencode' },
+  { id: 'pi', name: 'Pi' },
+] as const
+
+const ADVANCED_DEFAULT_AGENTS = [
+  { id: 'claude', name: 'Claude Code' },
+  { id: 'codex', name: 'Codex' },
+] as const
+
+function WorkspaceDefaultsSection({
+  credentials,
+  presets,
+  agents,
+}: {
+  credentials: CredentialSummary[]
+  presets: Preset[]
+  agents: readonly AgentInfo[]
+}) {
+  const { t } = useTranslation()
+  const [data, setData] = useState<WorkspaceCredentialDefaultsResponse | null>(null)
+  const [showAdvanced, setShowAdvanced] = useState(false)
+  const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'saved'>('idle')
+  const saveRevision = useRef(0)
+  const [error, setError] = useState('')
+  const saving = saveStatus === 'saving'
+
+  const reload = () =>
+    api.config.getWorkspaceCredentialDefaults()
+      .then(setData)
+      .catch(() => setData({ defaults: {}, compatibleByAgent: {} }))
+
+  // Re-derive when the vault changes (a deleted cred drops from compatible lists,
+  // and the backend also clears any default that pointed at it).
+  useEffect(() => { void reload() }, [credentials])
+
+  const credLabel = (slug: string) => {
+    const c = credentials.find((x) => x.slug === slug)
+    return c ? `${credentialLabel(c)} · ${slug}` : slug
+  }
+
+  const persist = async (
+    nextDefaults: Record<string, WorkspaceCredentialDefault>,
+  ) => {
+    if (!data) return
+    const revision = ++saveRevision.current
+    setSaveStatus('saving'); setError('')
+    setData({ ...data, defaults: nextDefaults }) // optimistic
+    try {
+      const res = await api.config.setWorkspaceCredentialDefaults(nextDefaults)
+      setData((d) => (d ? { ...d, defaults: res.defaults } : d))
+      notifyWorkspaceDefaultsChanged()
+      if (saveRevision.current === revision) {
+        setSaveStatus('saved')
+        setTimeout(() => {
+          if (saveRevision.current === revision) setSaveStatus('idle')
+        }, 1800)
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : t('aiProvider.saveFailed'))
+      await reload()
+      if (saveRevision.current === revision) setSaveStatus('idle')
+    }
+  }
+
+  const setAgentDefault = async (agentId: string, slug: string) => {
+    if (!data) return
+    const nextDefaults = { ...data.defaults }
+    if (slug) {
+      const cred = credentials.find((candidate) => candidate.slug === slug)
+      const wireShape = cred ? agentWireShapes(cred.wires, agents, agentId, cred.vendor)[0] : undefined
+      nextDefaults[agentId] = { credentialSlug: slug, ...(wireShape ? { wireShape } : {}) }
+    } else {
+      delete nextDefaults[agentId]
+    }
+    await persist(nextDefaults)
+  }
+
+  const setAgentWire = async (agentId: string, wireShape: WireShape) => {
+    if (!data) return
+    const current = data.defaults[agentId]
+    if (!current) return
+    await persist({
+      ...data.defaults,
+      [agentId]: { ...current, wireShape },
+    })
+  }
+
+  const setReasoningOverride = async (
+    agentId: 'pi' | 'opencode',
+    modelId: string | undefined,
+    reasoning: boolean | null,
+  ) => {
+    if (!data) return
+    const current = data.defaults[agentId]
+    if (!current) return
+    const {
+      reasoning: _previous,
+      reasoningModel: _previousModel,
+      ...withoutReasoning
+    } = current
+    await persist({
+      ...data.defaults,
+      [agentId]: {
+        ...withoutReasoning,
+        ...(typeof reasoning === 'boolean' && modelId
+          ? { reasoning, reasoningModel: modelId }
+          : {}),
+      },
+    })
+  }
+
+  const renderAgent = (agent: { id: string; name: string }, note?: string) => {
+    const options = data?.compatibleByAgent[agent.id] ?? []
+    const current = data?.defaults[agent.id]?.credentialSlug ?? ''
+    const selectedCredential = credentials.find((candidate) => candidate.slug === current)
+    const wireShapes = selectedCredential
+      ? agentWireShapes(selectedCredential.wires, agents, agent.id, selectedCredential.vendor)
+      : []
+    const configuredWire = data?.defaults[agent.id]?.wireShape
+    const selectedWire = configuredWire && wireShapes.includes(configuredWire)
+      ? configuredWire
+      : wireShapes[0] ?? ''
+    const selectedPreset = selectedCredential ? vendorPreset(selectedCredential.vendor, presets) : undefined
+    const selectedModelId = data?.defaults[agent.id]?.model?.trim()
+      || selectedCredential?.lastModel?.trim()
+      || presetDefaultModel(selectedPreset)
+    const selectedSemantics = presetModel(selectedPreset, selectedModelId)?.semantics ?? null
+    const semanticsSummary = describeModelSemantics(selectedSemantics)
+    return (
+      <div key={agent.id} className="flex flex-col gap-3 rounded-lg border border-border bg-background px-4 py-3 sm:flex-row sm:items-center">
+        <div className="flex-1 min-w-0">
+          <div className="flex items-baseline gap-2">
+            <span className="text-[13px] font-medium text-foreground">{agent.name}</span>
+            <span className="text-[11px] text-muted-foreground font-mono">{agent.id}</span>
+          </div>
+          {note && <p className="text-[11px] text-muted-foreground mt-0.5 leading-snug">{note}</p>}
+          {options.length === 0 && (
+            <p className="text-[11px] text-muted-foreground/70 mt-0.5 leading-snug">{t('aiProvider.noCompatible')}</p>
+          )}
+        </div>
+        <div className="flex w-full flex-col gap-2 sm:w-auto sm:min-w-[260px]">
+          <select
+            aria-label={t('aiProvider.defaultCredentialLabel', { agent: agent.name })}
+            className={inputClass}
+            value={current}
+            disabled={saving || options.length === 0}
+            onChange={(e) => void setAgentDefault(agent.id, e.target.value)}
+          >
+            <option value="">{t('aiProvider.dontSeed')}</option>
+            {options.map((slug) => <option key={slug} value={slug}>{credLabel(slug)}</option>)}
+          </select>
+          {current && wireShapes.length > 1 && (
+            <select
+              aria-label={t('aiProvider.apiProtocolLabel', { agent: agent.name })}
+              className={inputClass}
+              value={selectedWire}
+              disabled={saving}
+              onChange={(e) => void setAgentWire(agent.id, e.target.value as WireShape)}
+            >
+              {wireShapes.map((shape) => (
+                <option key={shape} value={shape}>{WIRE_SHAPE_GUIDANCE[shape]}</option>
+              ))}
+            </select>
+          )}
+          {current && wireShapes.length === 1 && (
+            <p className="px-1 text-[10.5px] text-muted-foreground">
+              {t('aiProvider.protocol', { protocol: WIRE_SHAPE_GUIDANCE[wireShapes[0]!] })}
+            </p>
+          )}
+          {(agent.id === 'pi' || agent.id === 'opencode') && current && semanticsSummary && (
+            <p className="px-1 text-[10.5px] leading-snug text-muted-foreground">
+              {t('aiProvider.model', { model: selectedModelId })}<br />
+              {t('aiProvider.automatic', { summary: semanticsSummary })}
+            </p>
+          )}
+          {(agent.id === 'pi' || agent.id === 'opencode') && current && !selectedSemantics?.reasoning && (
+            <details className="px-1 text-[10.5px] text-muted-foreground">
+              <summary className="cursor-pointer">{t('aiProvider.advancedReasoning')}</summary>
+              <select
+                aria-label={t('aiProvider.reasoningOverrideLabel', { agent: agent.name })}
+                className={inputClass + ' mt-1.5'}
+                value={typeof data?.defaults[agent.id]?.reasoning !== 'boolean' ||
+                  data.defaults[agent.id]?.reasoningModel !== selectedModelId
+                  ? 'auto'
+                  : data.defaults[agent.id]!.reasoning ? 'enabled' : 'disabled'}
+                disabled={saving}
+                onChange={(event) => void setReasoningOverride(
+                  agent.id as 'pi' | 'opencode',
+                  selectedModelId,
+                  event.target.value === 'auto' ? null : event.target.value === 'enabled',
+                )}
+              >
+                <option value="auto">{t('aiProvider.useRuntimeDefault')}</option>
+                <option value="enabled">{t('aiProvider.supportsReasoning')}</option>
+                <option value="disabled">{t('aiProvider.noReasoning')}</option>
+              </select>
+            </details>
+          )}
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <section className="min-w-0">
+      <div className="rounded-lg border border-border/50 bg-secondary/50 px-4 py-3 mb-4">
+        <p className="text-[13px] text-muted-foreground leading-relaxed">
+          {t('aiProvider.defaultsIntro')}
+        </p>
+      </div>
+
+      <div className="mb-3 flex min-h-5 items-center justify-between gap-3">
+        <h2 className="text-[13px] font-semibold text-foreground uppercase tracking-wide">{t('aiProvider.defaultsTitle')}</h2>
+        <span aria-live="polite" className={`text-[11px] ${saveStatus === 'saved' ? 'text-success' : 'text-muted-foreground'}`}>
+          {saveStatus === 'saving' ? t('common.saving') : saveStatus === 'saved' ? t('common.saved') : ''}
+        </span>
+      </div>
+
+      {!data ? (
+        <div className="space-y-2.5" aria-hidden="true">
+          {PRIMARY_DEFAULT_AGENTS.map((a) => (
+            <div key={a.id} className="flex items-center gap-3 rounded-lg border border-border bg-background px-4 py-3">
+              <div className="flex-1 min-w-0 space-y-1.5">
+                <Skeleton className="h-3.5 w-28 rounded" />
+                <Skeleton className="h-2.5 w-44 rounded" />
+              </div>
+              <Skeleton className="h-8 w-[240px] max-w-[240px] rounded" />
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div className="space-y-2.5">
+          {PRIMARY_DEFAULT_AGENTS.map((a) => renderAgent(a))}
+
+          <button
+            onClick={() => setShowAdvanced((v) => !v)}
+            className="text-[11px] text-muted-foreground hover:text-foreground transition-colors pt-1"
+          >
+            {showAdvanced ? '▾' : '▸'} {t('aiProvider.advancedAgents')}
+          </button>
+
+          {showAdvanced && (
+            <>
+              <p className="text-[11px] text-muted-foreground/80 leading-snug px-1">
+                {t('aiProvider.advancedAgentsDescription')}
+              </p>
+              {ADVANCED_DEFAULT_AGENTS.map((a) => renderAgent(a))}
+            </>
+          )}
+
+          {error && <p className="text-[12px] text-destructive">{error}</p>}
+        </div>
+      )}
+    </section>
+  )
+}

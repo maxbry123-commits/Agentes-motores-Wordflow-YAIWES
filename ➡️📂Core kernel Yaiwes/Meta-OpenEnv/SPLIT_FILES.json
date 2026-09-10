@@ -1,0 +1,30 @@
+[
+  {
+    "repo": "Meta-OpenEnv",
+    "path": "envs/openapp_env/assets/02-editor.mov",
+    "chunks_dir": "Meta-OpenEnv/envs/openapp_env/assets/02-editor.mov.chunks",
+    "bytes": 11875181,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "Meta-OpenEnv",
+    "path": "envs/openapp_env/assets/04-todo.mov",
+    "chunks_dir": "Meta-OpenEnv/envs/openapp_env/assets/04-todo.mov.chunks",
+    "bytes": 9591496,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "Meta-OpenEnv",
+    "path": "envs/openapp_env/assets/01-messages.mov",
+    "chunks_dir": "Meta-OpenEnv/envs/openapp_env/assets/01-messages.mov.chunks",
+    "bytes": 10889481,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "Meta-OpenEnv",
+    "path": "envs/openapp_env/assets/03-calendar.mov",
+    "chunks_dir": "Meta-OpenEnv/envs/openapp_env/assets/03-calendar.mov.chunks",
+    "bytes": 10553742,
+    "chunk_bytes": 8388608
+  }
+]

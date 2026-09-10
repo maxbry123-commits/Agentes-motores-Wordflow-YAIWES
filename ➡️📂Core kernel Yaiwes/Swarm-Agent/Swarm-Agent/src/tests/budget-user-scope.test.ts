@@ -1,0 +1,373 @@
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import { unlink } from "node:fs/promises";
+import {
+  createServer as createHttpServer,
+  type IncomingMessage,
+  type Server,
+  type ServerResponse,
+} from "node:http";
+import type { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { __resetKillSwitchWarnedForTests, canClaim } from "../be/budget-admission";
+import {
+  closeDb,
+  createAgent,
+  createSessionCost,
+  createTaskExtended,
+  createUser,
+  getDailySpendForUser,
+  getDbClient,
+  getTaskById,
+  initDb,
+  upsertBudget,
+} from "../be/db";
+import { type IdentityActor, mintToken } from "../be/users";
+import { handleCore } from "../http/core";
+import { handleMcpUser } from "../http/mcp-user";
+import { handlePoll } from "../http/poll";
+import { listenOnFreePort } from "./test-net";
+
+const TEST_DB_PATH = "./test-budget-user-scope.sqlite";
+const NOW = new Date("2026-04-28T15:30:00.000Z");
+const TODAY = "2026-04-28";
+const API_KEY = "test-budget-user-scope-key";
+const ACTOR: IdentityActor = { kind: "operator", id: "phase6-test" };
+
+async function removeDbFiles(path: string): Promise<void> {
+  for (const suffix of ["", "-wal", "-shm"]) {
+    try {
+      await unlink(path + suffix);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        throw error;
+      }
+    }
+  }
+}
+
+beforeAll(() => {
+  initDb(TEST_DB_PATH);
+});
+
+afterAll(async () => {
+  closeDb();
+  await removeDbFiles(TEST_DB_PATH);
+});
+
+beforeEach(async () => {
+  const db = getDbClient();
+  await db.run("DELETE FROM session_costs");
+  await db.run("DELETE FROM budget_refusal_notifications");
+  await db.run("DELETE FROM agent_tasks");
+  await db.run("DELETE FROM budgets");
+  await db.run("DELETE FROM user_identity_events");
+  await db.run("DELETE FROM user_tokens");
+  await db.run("DELETE FROM users");
+  await db.run("DELETE FROM agents");
+  await createAgent({
+    id: "agent-1",
+    name: "agent-1",
+    isLead: false,
+    status: "idle",
+  });
+});
+
+afterEach(() => {
+  delete process.env.BUDGET_ADMISSION_DISABLED;
+  __resetKillSwitchWarnedForTests();
+});
+
+async function insertUserTaskSpend(
+  userId: string,
+  totalCostUsd: number,
+  createdAt = `${TODAY}T12:00:00.000Z`,
+) {
+  const task = await createTaskExtended(`task for ${userId}`, {
+    requestedByUserId: userId,
+    status: "unassigned",
+  });
+  const cost = await createSessionCost({
+    sessionId: `sess-${crypto.randomUUID()}`,
+    taskId: task.id,
+    agentId: "agent-1",
+    totalCostUsd,
+    durationMs: 1000,
+    numTurns: 1,
+    model: "test-model",
+  });
+  await getDbClient().run("UPDATE session_costs SET createdAt = ? WHERE id = ?", [
+    createdAt,
+    cost.id,
+  ]);
+  return { task, cost };
+}
+
+function createMcpUserTestServer(): Server {
+  const transportsUser: Record<string, StreamableHTTPServerTransport> = {};
+  const sessionUsers: Record<string, string> = {};
+
+  return createHttpServer(async (req: IncomingMessage, res: ServerResponse) => {
+    const myAgentId = req.headers["x-agent-id"] as string | undefined;
+    if (await handleCore(req, res, myAgentId, API_KEY)) return;
+    if (await handleMcpUser(req, res, transportsUser, sessionUsers)) return;
+    res.writeHead(404);
+    res.end("Not Found");
+  });
+}
+
+function parseMcpPayload(text: string): unknown {
+  const trimmed = text.trim();
+  if (!trimmed) return null;
+  if (trimmed.startsWith("event:") || trimmed.startsWith("data:")) {
+    const data = trimmed
+      .split("\n")
+      .filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice("data:".length).trim())
+      .join("\n");
+    return JSON.parse(data);
+  }
+  return JSON.parse(trimmed);
+}
+
+async function mcpPost(
+  baseUrl: string,
+  token: string,
+  body: Record<string, unknown>,
+  sessionId?: string,
+): Promise<{ response: Response; payload: unknown }> {
+  const headers: Record<string, string> = {
+    Accept: "application/json, text/event-stream",
+    Authorization: `Bearer ${token}`,
+    "Content-Type": "application/json",
+  };
+  if (sessionId) headers["mcp-session-id"] = sessionId;
+
+  const response = await fetch(`${baseUrl}/mcp-user`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body),
+  });
+  const text = await response.text();
+  return { response, payload: text ? parseMcpPayload(text) : null };
+}
+
+async function initializeMcpUser(baseUrl: string, token: string): Promise<string> {
+  const { response } = await mcpPost(baseUrl, token, {
+    jsonrpc: "2.0",
+    id: 1,
+    method: "initialize",
+    params: {
+      protocolVersion: "2024-11-05",
+      clientInfo: { name: "budget-user-scope-test", version: "1" },
+      capabilities: {},
+    },
+  });
+  expect(response.status).toBe(200);
+  const sessionId = response.headers.get("mcp-session-id");
+  if (!sessionId) throw new Error("missing mcp-session-id");
+
+  const initialized = await mcpPost(
+    baseUrl,
+    token,
+    { jsonrpc: "2.0", method: "notifications/initialized" },
+    sessionId,
+  );
+  expect([200, 202]).toContain(initialized.response.status);
+  return sessionId;
+}
+
+async function callPoll(agentId: string): Promise<{
+  status: number;
+  body: { trigger: { type: string; [key: string]: unknown } | null } | { error: string };
+}> {
+  let status = 200;
+  let bodyStr = "";
+  const headers: Record<string, string> = {};
+
+  const req = {
+    method: "GET",
+    url: "/api/poll",
+    headers: { "x-agent-id": agentId },
+  } as unknown as Parameters<typeof handlePoll>[0];
+
+  const res = {
+    setHeader(name: string, value: string) {
+      headers[name.toLowerCase()] = value;
+    },
+    writeHead(code: number, h?: Record<string, string>) {
+      status = code;
+      if (h) {
+        for (const [k, v] of Object.entries(h)) headers[k.toLowerCase()] = v;
+      }
+    },
+    end(body?: string) {
+      bodyStr = body ?? "";
+    },
+  } as unknown as Parameters<typeof handlePoll>[1];
+
+  const handled = await handlePoll(req, res, ["api", "poll"], new URLSearchParams(), agentId);
+  if (!handled) throw new Error("handlePoll did not handle the request");
+  return { status, body: bodyStr ? JSON.parse(bodyStr) : { trigger: null } };
+}
+
+describe("user budget scope", () => {
+  test("getDailySpendForUser sums only costs for that user's tasks on that UTC day", async () => {
+    const userA = await createUser({ name: "User A" });
+    const userB = await createUser({ name: "User B" });
+
+    await insertUserTaskSpend(userA.id, 1.25);
+    await insertUserTaskSpend(userA.id, 2.75);
+    await insertUserTaskSpend(userA.id, 99, "2026-04-27T23:59:59.999Z");
+    await insertUserTaskSpend(userB.id, 10);
+
+    const unownedTask = await createTaskExtended("unowned", { status: "unassigned" });
+    await createSessionCost({
+      sessionId: `sess-${crypto.randomUUID()}`,
+      taskId: unownedTask.id,
+      agentId: "agent-1",
+      totalCostUsd: 100,
+      durationMs: 1000,
+      numTurns: 1,
+      model: "test-model",
+    });
+
+    expect(await getDailySpendForUser(userA.id, TODAY)).toBe(4);
+    expect(await getDailySpendForUser(userB.id, TODAY)).toBe(10);
+  });
+
+  test("canClaim refuses with cause='user' when requested user's spend is at the cap", async () => {
+    const user = await createUser({ name: "Budgeted User" });
+    await upsertBudget("user", user.id, 2);
+    await insertUserTaskSpend(user.id, 2);
+
+    const result = await canClaim("agent-1", NOW, user.id);
+
+    expect(result.allowed).toBe(false);
+    if (result.allowed) throw new Error("unreachable");
+    expect(result.cause).toBe("user");
+    expect(result.userSpend).toBe(2);
+    expect(result.userBudget).toBe(2);
+    expect(result.agentSpend).toBeUndefined();
+    expect(result.globalSpend).toBeUndefined();
+  });
+
+  test("canClaim allows user-scoped tasks when user spend is below the cap", async () => {
+    const user = await createUser({ name: "Budgeted User" });
+    await upsertBudget("user", user.id, 2);
+    await insertUserTaskSpend(user.id, 1.99);
+
+    const result = await canClaim("agent-1", NOW, user.id);
+
+    expect(result.allowed).toBe(true);
+  });
+
+  test("agent and global gates keep their existing precedence", async () => {
+    const user = await createUser({ name: "Budgeted User" });
+    await upsertBudget("global", "", 1);
+    await upsertBudget("agent", "agent-1", 1);
+    await upsertBudget("user", user.id, 1);
+    await insertUserTaskSpend(user.id, 1);
+
+    const globalResult = await canClaim("agent-1", NOW, user.id);
+    expect(globalResult.allowed).toBe(false);
+    if (globalResult.allowed) throw new Error("unreachable");
+    expect(globalResult.cause).toBe("global");
+
+    await getDbClient().run("DELETE FROM budgets WHERE scope = 'global'");
+    const agentResult = await canClaim("agent-1", NOW, user.id);
+    expect(agentResult.allowed).toBe(false);
+    if (agentResult.allowed) throw new Error("unreachable");
+    expect(agentResult.cause).toBe("agent");
+  });
+
+  test("user gate is skipped when the candidate task has no requested user", async () => {
+    const user = await createUser({ name: "Budgeted User" });
+    await upsertBudget("user", user.id, 0);
+
+    const result = await canClaim("agent-1", NOW);
+
+    expect(result.allowed).toBe(true);
+  });
+
+  test("/mcp-user task is refused at worker admission when user budget is spent", async () => {
+    const server = createMcpUserTestServer();
+    const port = await listenOnFreePort(server, "127.0.0.1");
+    try {
+      const lead = await createAgent({ name: "lead", isLead: true, status: "idle", maxTasks: 1 });
+      const worker = await createAgent({
+        name: "worker",
+        isLead: false,
+        status: "idle",
+        maxTasks: 1,
+      });
+      const user = await createUser({ name: "MCP Budget User", dailyBudgetUsd: 0.5 });
+      await upsertBudget("user", user.id, 0.5);
+      const token = await mintToken(user.id, "qa", ACTOR);
+      const baseUrl = `http://127.0.0.1:${port}`;
+      const sessionId = await initializeMcpUser(baseUrl, token.plaintext);
+
+      const sent = await mcpPost(
+        baseUrl,
+        token.plaintext,
+        {
+          jsonrpc: "2.0",
+          id: 2,
+          method: "tools/call",
+          params: {
+            name: "send-task",
+            arguments: { task: "Phase 6 budget QA task" },
+          },
+        },
+        sessionId,
+      );
+      expect(sent.response.status).toBe(200);
+      const payload = sent.payload as {
+        result: { structuredContent: { task: { id: string; requestedByUserId?: string } } };
+      };
+      const taskId = payload.result.structuredContent.task.id;
+      expect(payload.result.structuredContent.task.requestedByUserId).toBe(user.id);
+
+      await createSessionCost({
+        sessionId: `sess-${crypto.randomUUID()}`,
+        taskId,
+        agentId: worker.id,
+        totalCostUsd: 0.5,
+        durationMs: 1000,
+        numTurns: 1,
+        model: "test-model",
+      });
+
+      const firstPoll = await callPoll(worker.id);
+      expect(firstPoll.status).toBe(200);
+      if ("error" in firstPoll.body) throw new Error("unexpected poll error");
+      expect(firstPoll.body.trigger?.type).toBe("budget_refused");
+      expect((firstPoll.body.trigger as { cause: string }).cause).toBe("user");
+      expect((firstPoll.body.trigger as { userSpend: number }).userSpend).toBe(0.5);
+      expect((firstPoll.body.trigger as { userBudget: number }).userBudget).toBe(0.5);
+      expect((await getTaskById(taskId))?.status).toBe("unassigned");
+
+      const firstDedup = await getDbClient().get<{
+        follow_up_task_id: string | null;
+        user_spend_usd: number | null;
+      }>(
+        "SELECT follow_up_task_id, user_spend_usd FROM budget_refusal_notifications WHERE task_id = ?",
+        [taskId],
+      );
+      expect(firstDedup?.user_spend_usd).toBe(0.5);
+      expect(firstDedup?.follow_up_task_id).toBeTruthy();
+      const firstFollowUpId = firstDedup?.follow_up_task_id;
+      expect(firstFollowUpId ? (await getTaskById(firstFollowUpId))?.agentId : null).toBe(lead.id);
+
+      const secondPoll = await callPoll(worker.id);
+      expect(secondPoll.status).toBe(200);
+      if ("error" in secondPoll.body) throw new Error("unexpected poll error");
+      expect(secondPoll.body.trigger?.type).toBe("budget_refused");
+      const notificationCount = await getDbClient().get<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM budget_refusal_notifications WHERE task_id = ?",
+        [taskId],
+      );
+      expect(notificationCount?.count).toBe(1);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+});

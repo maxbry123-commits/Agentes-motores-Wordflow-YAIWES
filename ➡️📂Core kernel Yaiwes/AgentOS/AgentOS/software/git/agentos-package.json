@@ -1,0 +1,19 @@
+{
+	"commands": [
+		"git",
+		"git-remote-http"
+	],
+	"aliases": {
+		"git-remote-https": "git-remote-http",
+		"git-upload-pack": "git",
+		"git-receive-pack": "git",
+		"git-upload-archive": "git"
+	},
+	"registry": {
+		"title": "git",
+		"description": "Upstream Git version control for AgentOS VMs.",
+		"priority": 90,
+		"image": "/images/registry/git.svg",
+		"category": "developer-tools"
+	}
+}

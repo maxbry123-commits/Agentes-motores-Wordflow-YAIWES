@@ -1,0 +1,288 @@
+<div class="max-w-3xl mx-auto px-6 py-8">
+  <div class="mb-8">
+    <h1 class="text-2xl font-bold text-white">Heartbeat</h1>
+    <p class="text-text-muted mt-1">A system assistant that wakes up periodically and works through a checklist. Your other agents can add tasks to the checklist using their tools.</p>
+  </div>
+
+  <div class="bg-surface-card rounded-xl border border-border-default p-6 mb-6">
+    <%= form_tag update_heartbeat_path, method: :patch do %>
+
+      <!-- Enable Toggle -->
+      <div class="flex items-center justify-between mb-6 pb-6 border-b border-border-default">
+        <div>
+          <p class="text-white font-semibold">Enable Heartbeat</p>
+          <p class="text-text-faint text-sm">System assistant will check in on a recurring schedule</p>
+        </div>
+        <label class="relative inline-flex items-center cursor-pointer">
+          <%= check_box_tag :enabled, "1", @config["enabled"], class: "sr-only peer" %>
+          <div class="w-11 h-6 bg-surface-overlay rounded-full peer peer-checked:bg-green-600 peer-checked:after:translate-x-full after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all"></div>
+        </label>
+      </div>
+
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6">
+        <!-- Model — dynamic, built from enabled ProviderConfig records -->
+        <div>
+          <label class="block text-text-primary text-sm font-medium mb-2">Model</label>
+          <p class="text-text-faint text-xs mb-2">Only models from enabled providers are shown.</p>
+
+          <%# Hidden field carries the provider; updated by the onchange handler below %>
+          <input type="hidden" name="provider" id="heartbeat_provider" value="<%= @config["provider"] %>">
+
+          <% if @provider_models.any? %>
+            <select name="model"
+                    id="heartbeat_model"
+                    onchange="document.getElementById('heartbeat_provider').value = this.selectedOptions[0].dataset.provider"
+                    class="w-full px-4 py-3 bg-surface-raised border border-border-default rounded-lg text-white focus:outline-none focus:ring-2 focus:ring-brand">
+              <% @provider_models.each do |group| %>
+                <optgroup label="<%= group[:provider_name] %>">
+                  <% group[:models].each do |model| %>
+                    <option value="<%= model[:id] %>"
+                            data-provider="<%= group[:adapter_type] %>"
+                            <%= 'selected' if @config["model"] == model[:id] %>>
+                      <%= model[:name] %>
+                    </option>
+                  <% end %>
+                </optgroup>
+              <% end %>
+            </select>
+          <% else %>
+            <p class="text-text-faint text-sm py-3">
+              No providers configured.
+              <%= link_to "Add a provider →", providers_path, class: "text-brand-light hover:underline" %>
+            </p>
+          <% end %>
+        </div>
+
+        <!-- Interval -->
+        <div>
+          <label class="block text-text-primary text-sm font-medium mb-2">Interval</label>
+          <p class="text-text-faint text-xs mb-2">How often the assistant checks in.</p>
+          <select name="interval_minutes"
+                  class="w-full px-4 py-3 bg-surface-raised border border-border-default rounded-lg text-white focus:outline-none focus:ring-2 focus:ring-brand">
+            <% [5, 10, 15, 30, 60, 120, 360, 720, 1440].each do |mins| %>
+              <% label = mins < 60 ? "Every #{mins} min" : mins == 60 ? "Every hour" : mins < 1440 ? "Every #{mins / 60} hours" : "Once a day" %>
+              <option value="<%= mins %>" <%= 'selected' if @config["interval_minutes"].to_i == mins %>><%= label %></option>
+            <% end %>
+          </select>
+        </div>
+      </div>
+
+      <!-- Additional Prompt -->
+      <div class="mb-6">
+        <label class="block text-text-primary text-sm font-medium mb-2">Additional Instructions <span class="text-gray-600">(optional)</span></label>
+        <%= text_area_tag :prompt, @config["prompt"],
+            rows: 3,
+            placeholder: "Any extra context or standing instructions for the heartbeat assistant...",
+            class: "w-full px-4 py-3 bg-surface-raised border border-border-default rounded-lg text-white placeholder-text-faint text-sm focus:outline-none focus:ring-2 focus:ring-brand resize-y" %>
+      </div>
+
+      <!-- Light Context Toggle -->
+      <div class="flex items-center justify-between mb-6 pb-6 border-b border-border-default">
+        <div>
+          <p class="text-white font-semibold">Light Context Mode</p>
+          <p class="text-text-faint text-sm">Use a minimal prompt to reduce token usage</p>
+        </div>
+        <label class="relative inline-flex items-center cursor-pointer">
+          <%= check_box_tag :light_context, "1", @config["light_context"], class: "sr-only peer" %>
+          <div class="w-11 h-6 bg-surface-overlay rounded-full peer peer-checked:bg-green-600 peer-checked:after:translate-x-full after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all"></div>
+        </label>
+      </div>
+
+      <!-- Status Bar -->
+      <div class="p-4 bg-surface-base rounded-lg mb-6">
+        <p class="text-text-muted text-xs">Last run</p>
+        <% last_run = Setting.get("heartbeat_last_run") %>
+        <p class="text-white text-sm">
+          <% if last_run.present? %>
+            <%= time_ago_in_words(Time.parse(last_run)) %> ago
+          <% else %>
+            Never
+          <% end %>
+        </p>
+      </div>
+
+      <div class="flex justify-end">
+        <%= submit_tag "Save", class: "px-6 py-3 bg-brand hover:bg-brand-dark text-white font-medium rounded-lg transition cursor-pointer" %>
+      </div>
+    <% end %>
+
+    <!-- Trigger Now — outside the settings form to avoid nested <form> elements (nested forms are invalid HTML) -->
+    <div class="flex justify-end mt-3">
+      <%= button_to "Trigger Now", trigger_heartbeat_path, method: :post,
+          form: { data: { turbo: false } },
+          class: "px-4 py-2 bg-yellow-600 hover:bg-yellow-700 text-white text-sm font-medium rounded-lg transition" %>
+    </div>
+  </div>
+
+  <!-- Soul Viewer / Editor -->
+  <div class="bg-surface-card rounded-xl border border-border-default p-6 mb-6">
+    <div class="flex items-center justify-between mb-2">
+      <h2 class="text-lg font-semibold text-white">Soul</h2>
+      <button type="button"
+              onclick="document.getElementById('soul-editor').classList.toggle('hidden')"
+              class="text-xs text-brand-light hover:underline">
+        Edit
+      </button>
+    </div>
+    <p class="text-text-faint text-sm mb-4">The system prompt that defines how the heartbeat assistant behaves. This is its core identity — the "soul" it wakes up with every run.</p>
+
+    <!-- Read-only soul view -->
+    <div id="soul-viewer" class="p-4 bg-surface-base rounded-lg">
+      <pre class="text-text-primary text-xs whitespace-pre-wrap leading-relaxed font-mono"><%= @soul_agent.system_prompt %></pre>
+    </div>
+
+    <!-- Inline editor (hidden by default) -->
+    <div id="soul-editor" class="hidden mt-4">
+      <%= form_tag update_soul_heartbeat_path, method: :patch do %>
+        <%= text_area_tag :system_prompt, @soul_agent.system_prompt,
+            rows: 16,
+            class: "w-full px-4 py-3 bg-surface-raised border border-border-default rounded-lg text-white text-xs font-mono focus:outline-none focus:ring-2 focus:ring-brand resize-y" %>
+        <div class="flex justify-end gap-3 mt-3">
+          <button type="button"
+                  onclick="document.getElementById('soul-editor').classList.add('hidden')"
+                  class="px-4 py-2 bg-surface-overlay text-text-primary text-sm rounded-lg hover:bg-surface-raised transition">
+            Cancel
+          </button>
+          <%= submit_tag "Save Soul", class: "px-4 py-2 bg-brand hover:bg-brand-dark text-white text-sm font-medium rounded-lg transition cursor-pointer" %>
+        </div>
+      <% end %>
+    </div>
+  </div>
+
+  <!-- Current Memory -->
+  <div class="bg-surface-card rounded-xl border border-border-default p-6 mb-6">
+    <div class="flex items-center justify-between mb-2">
+      <h2 class="text-lg font-semibold text-white">Memory</h2>
+      <% if @heartbeat_memory.present? %>
+        <%= button_to "Clear", clear_heartbeat_memories_path, method: :delete,
+            data: { turbo_confirm: "Clear all heartbeat memories? The next heartbeat run will create a fresh one." },
+            class: "px-3 py-1 bg-red-900/40 hover:bg-red-800/60 text-red-400 text-xs rounded-lg transition" %>
+      <% end %>
+    </div>
+    <p class="text-text-faint text-sm mb-4">The system assistant keeps a single memory that gets overwritten each heartbeat. If it contains bad data, clear it and the next run will start fresh.</p>
+
+    <% if @heartbeat_memory.present? %>
+      <div class="p-4 bg-surface-base rounded-lg">
+        <pre class="text-text-primary text-xs whitespace-pre-wrap leading-relaxed font-mono"><%= @heartbeat_memory.content %></pre>
+        <p class="text-gray-600 text-xs mt-3">Last updated <%= time_ago_in_words(@heartbeat_memory.updated_at) %> ago</p>
+      </div>
+    <% else %>
+      <p class="text-text-faint text-sm text-center py-4">No memory stored. One will be created after the next heartbeat run.</p>
+    <% end %>
+  </div>
+
+  <!-- Task Checklist -->
+  <div class="bg-surface-card rounded-xl border border-border-default p-6">
+    <h2 class="text-lg font-semibold text-white mb-1">Checklist</h2>
+    <p class="text-text-faint text-sm mb-4">
+      Standing items (<span class="inline-flex items-center gap-1">🔒 <span class="text-xs">protected</span></span>) persist across every heartbeat — only you can delete them.
+      Temporary items are one-off tasks added by agents and are auto-wiped after being handled.
+    </p>
+
+    <!-- Add Standing Task Form -->
+    <div class="mb-5">
+      <%= form_tag add_standing_heartbeat_task_path, method: :post, class: "flex items-center gap-2" do %>
+        <%= text_field_tag :task, nil,
+            placeholder: "Add a standing task…",
+            class: "flex-1 px-4 py-2.5 bg-surface-raised border border-border-default rounded-lg text-white text-sm placeholder-text-faint focus:outline-none focus:ring-2 focus:ring-amber-500/50 focus:border-amber-500/50" %>
+        <%= submit_tag "Add", class: "px-4 py-2.5 bg-amber-600 hover:bg-amber-700 text-white text-sm font-medium rounded-lg transition cursor-pointer" %>
+      <% end %>
+    </div>
+
+    <% tasks = begin; JSON.parse(Setting.get("heartbeat_tasks") || "[]"); rescue; []; end %>
+    <% standing_tasks = tasks.select { |t| t["protected"] == true } %>
+    <% temporary_tasks = tasks.reject { |t| t["protected"] == true } %>
+
+    <% if tasks.any? %>
+      <% if standing_tasks.any? %>
+        <p class="text-text-muted text-xs font-medium uppercase tracking-wide mb-2">Standing Monitors</p>
+        <div class="space-y-2 mb-4">
+          <% standing_tasks.each do |task| %>
+            <div class="flex items-center justify-between bg-surface-base rounded-lg px-4 py-3 border border-amber-800/30">
+              <div class="flex items-center gap-2 min-w-0">
+                <span class="text-amber-400 flex-shrink-0" title="Protected — only users can delete this">🔒</span>
+                <div class="min-w-0">
+                  <p class="text-white text-sm"><%= task["task"] %></p>
+                  <p class="text-gray-600 text-xs">Added by <%= task["added_by"] || "unknown" %> · <%= task["added_at"] ? time_ago_in_words(Time.parse(task["added_at"])) + " ago" : "" %></p>
+                </div>
+              </div>
+              <%= button_to "Delete", delete_standing_heartbeat_task_path(task: task["task"]), method: :delete,
+                  data: { turbo_confirm: "Delete this standing item permanently?" },
+                  class: "flex-shrink-0 ml-4 px-3 py-1 bg-red-900/40 hover:bg-red-800/60 text-red-400 text-xs rounded-lg transition" %>
+            </div>
+          <% end %>
+        </div>
+      <% end %>
+
+      <% if temporary_tasks.any? %>
+        <p class="text-text-muted text-xs font-medium uppercase tracking-wide mb-2">One-Off Tasks</p>
+        <div class="space-y-2">
+          <% temporary_tasks.each do |task| %>
+            <div class="flex items-center justify-between bg-surface-base rounded-lg px-4 py-3">
+              <div>
+                <p class="text-white text-sm"><%= task["task"] %></p>
+                <p class="text-gray-600 text-xs">Added by <%= task["added_by"] || "unknown" %> · <%= task["added_at"] ? time_ago_in_words(Time.parse(task["added_at"])) + " ago" : "" %></p>
+              </div>
+            </div>
+          <% end %>
+        </div>
+      <% end %>
+    <% else %>
+      <p class="text-text-faint text-sm text-center py-4">No tasks yet. Your agents can add tasks using the <code class="text-text-muted">heartbeat_write</code> tool.</p>
+    <% end %>
+  </div>
+
+  <!-- Recent Runs -->
+  <div class="bg-surface-card rounded-xl border border-border-default p-6 mt-6">
+    <h2 class="text-lg font-semibold text-white mb-2">Recent Runs</h2>
+    <p class="text-text-faint text-sm mb-4">History of heartbeat executions.</p>
+
+    <% if @runs.any? %>
+      <div class="space-y-2">
+        <% @runs.each do |run| %>
+          <div class="bg-surface-base rounded-lg px-4 py-3">
+            <div class="flex items-center justify-between mb-1">
+              <div class="flex items-center gap-2">
+                <% case run.status %>
+                <% when "ok" %>
+                  <span class="w-2 h-2 rounded-full bg-green-400"></span>
+                  <span class="text-green-400 text-xs font-medium">OK</span>
+                <% when "action_taken" %>
+                  <span class="w-2 h-2 rounded-full bg-amber-400"></span>
+                  <span class="text-amber-400 text-xs font-medium">Action Taken</span>
+                <% when "error" %>
+                  <span class="w-2 h-2 rounded-full bg-red-400"></span>
+                  <span class="text-red-400 text-xs font-medium">Error</span>
+                <% when "skipped" %>
+                  <span class="w-2 h-2 rounded-full bg-gray-400"></span>
+                  <span class="text-gray-400 text-xs font-medium">Skipped</span>
+                <% end %>
+                <span class="text-text-muted text-xs">·</span>
+                <span class="text-text-primary text-xs"><%= run.agent.name %></span>
+                <span class="text-text-muted text-xs">·</span>
+                <span class="text-text-faint text-xs"><%= run.model %></span>
+              </div>
+              <div class="flex items-center gap-3 text-text-faint text-xs">
+                <% if run.total_tokens > 0 %>
+                  <span><%= number_with_delimiter(run.total_tokens) %> tokens</span>
+                <% end %>
+                <% if run.duration_ms.present? %>
+                  <span><%= (run.duration_ms / 1000.0).round(1) %>s</span>
+                <% end %>
+                <span><%= time_ago_in_words(run.created_at) %> ago</span>
+              </div>
+            </div>
+            <% if run.summary.present? && run.status != "ok" %>
+              <p class="text-text-muted text-sm mt-1 line-clamp-2"><%= run.summary.truncate(300) %></p>
+            <% end %>
+            <% if run.session.present? %>
+              <%= link_to "View session →", session_path(run.session), class: "text-brand-light text-xs hover:underline" %>
+            <% end %>
+          </div>
+        <% end %>
+      </div>
+    <% else %>
+      <p class="text-text-faint text-sm text-center py-4">No heartbeat runs yet. Enable heartbeat and trigger one to see results here.</p>
+    <% end %>
+  </div>
+</div>

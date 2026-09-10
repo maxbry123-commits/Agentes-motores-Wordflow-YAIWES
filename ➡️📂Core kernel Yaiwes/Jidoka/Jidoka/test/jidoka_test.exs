@@ -1,0 +1,460 @@
+defmodule JidokaTest.Support.LocalTimeAction do
+  use Jidoka.Action,
+    name: "local_time",
+    description: "Returns a deterministic local time for a city.",
+    schema:
+      Zoi.object(%{
+        city: Zoi.string() |> Zoi.default("Chicago")
+      })
+
+  @impl true
+  def run(params, context) do
+    city = Map.get(params, :city) || Map.get(params, "city") || "Chicago"
+
+    case Jidoka.Context.get(context, :test_pid) || Jidoka.Context.get_runtime(context, :test_pid) do
+      nil -> :ok
+      pid -> send(pid, {:local_time_called, city})
+    end
+
+    agent_module = Jidoka.Context.get_runtime(context, :agent_module)
+
+    {:ok,
+     %{
+       city: city,
+       time: "09:30",
+       canary: "jidoka_dsl_tool_canary",
+       jido_agent_name: agent_module.name()
+     }}
+  end
+end
+
+defmodule JidokaTest.Support.TimeAgent do
+  use Jidoka.Agent
+
+  agent :dsl_time_agent do
+    model %{provider: :test, id: "model"}
+    instructions "Use local_time when asked for the time."
+  end
+
+  tools do
+    action JidokaTest.Support.LocalTimeAction
+  end
+end
+
+defmodule JidokaTest do
+  use ExUnit.Case, async: true
+
+  alias Jidoka.Runtime.LocalOperations
+  alias Jidoka.Agent
+  alias Jidoka.Agent.Spec.Operation
+  alias Jidoka.Snapshot
+  alias Jidoka.Effect
+  alias Jidoka.Turn
+  alias JidokaTest.Support.TimeAgent
+
+  test "top-level API builds agents, plans, and runs string turns" do
+    default_model = Jidoka.Config.default_model()
+
+    spec =
+      Jidoka.agent!(
+        id: "echo_agent",
+        instructions: "Echo tersely.",
+        runtime_defaults: %{max_model_turns: 1}
+      )
+
+    plan = Jidoka.plan!(spec)
+
+    llm = fn intent, _journal, _ctx ->
+      assert Jidoka.Config.model_ref(intent.payload.model) ==
+               Jidoka.Config.model_ref(default_model)
+
+      assert intent.payload.prompt.model == Jidoka.Config.model_ref(default_model)
+      {:ok, %{type: :final, content: "echo"}}
+    end
+
+    assert {:ok, %Turn.Result{content: "echo"}} = Jidoka.Harness.run_turn(plan, "Echo", llm: llm)
+    assert {:ok, %Turn.Result{content: "echo"}} = Jidoka.turn(plan, "Echo", llm: llm)
+    assert {:ok, "echo"} = Jidoka.chat(spec, "Echo", capabilities: [llm: llm])
+  end
+
+  test "top-level turn accepts DSL agent modules with their default operation capability" do
+    llm = time_agent_llm()
+
+    assert {:ok, %Turn.Result{content: "Chicago is 09:30."} = result} =
+             Jidoka.turn(
+               TimeAgent,
+               Turn.Request.new!(input: "What time is it in Chicago?", context: %{test_pid: self()}),
+               llm: llm
+             )
+
+    assert_receive {:local_time_called, "Chicago"}
+
+    assert [%{operation: "local_time", output: %{"canary" => "jidoka_dsl_tool_canary"}}] =
+             result.agent_state.operation_results
+  end
+
+  test "compiled DSL plans keep default runtime capabilities" do
+    plan = Jidoka.plan!(TimeAgent)
+    llm = time_agent_llm()
+
+    assert {:ok, %Turn.Result{content: "Chicago is 09:30."}} =
+             Jidoka.turn(
+               plan,
+               Turn.Request.new!(input: "What time is it in Chicago?", context: %{test_pid: self()}),
+               llm: llm
+             )
+
+    assert_receive {:local_time_called, "Chicago"}
+  end
+
+  test "compiled DSL plans install a default ReqLLM capability when llm is omitted" do
+    plan = Jidoka.plan!(TimeAgent)
+
+    assert {:error, %Jidoka.Error.ExecutionError{} = error} = Jidoka.turn(plan, "Hello")
+    refute missing_llm_capability_error?(error)
+  end
+
+  test "partial capability attrs keep default DSL operation capabilities" do
+    plan = Jidoka.plan!(TimeAgent)
+
+    assert {:ok, %Turn.Result{content: "Chicago is 09:30."}} =
+             Jidoka.turn(
+               plan,
+               Turn.Request.new!(input: "What time is it in Chicago?", context: %{test_pid: self()}),
+               capabilities: [llm: time_agent_llm()]
+             )
+
+    assert_receive {:local_time_called, "Chicago"}
+  end
+
+  test "partial capability attrs keep default ReqLLM capabilities" do
+    spec =
+      Agent.Spec.new!(
+        id: "partial_capability_agent",
+        instructions: "Use tools when useful.",
+        model: %{provider: :test, id: "model"},
+        operations: [
+          Operation.new!(
+            name: "weather",
+            description: "Looks up weather by city.",
+            idempotency: :idempotent
+          )
+        ]
+      )
+
+    operations =
+      LocalOperations.operations(%{
+        weather: fn _intent, _journal, _ctx -> {:ok, %{condition: "sunny"}} end
+      })
+
+    assert {:error, %Jidoka.Error.ExecutionError{} = error} =
+             Jidoka.turn(spec, "Weather in Paris?", capabilities: [operations: operations])
+
+    refute missing_llm_capability_error?(error)
+  end
+
+  test "agent specs are normalized through Zoi schemas" do
+    assert {:ok, %Agent.Spec{} = spec} =
+             Agent.Spec.new(%{
+               "id" => :weather_agent,
+               "instructions" => "Use tools when useful.",
+               "operations" => [
+                 %{"name" => :weather, "description" => "Looks up weather by city."}
+               ],
+               "runtime_defaults" => %{"max_model_turns" => 2}
+             })
+
+    assert spec.id == "weather_agent"
+
+    assert Jidoka.Config.model_ref(spec.model) ==
+             Jidoka.Config.model_ref(Jidoka.Config.default_model())
+
+    assert spec.generation.params == %{temperature: 0.0, max_tokens: 500}
+    assert [%Operation{name: "weather", idempotency: :idempotent}] = spec.operations
+    assert Jidoka.plan!(spec).max_model_turns == 2
+
+    assert {:error, [%Zoi.Error{path: [:operations, 0, :idempotency]}]} =
+             Agent.Spec.new(%{
+               id: "bad_agent",
+               instructions: "Invalid tool.",
+               operations: [%{name: "weather", idempotency: :not_an_idempotency}]
+             })
+
+    assert {:error, {:model, :fast, _message}} =
+             Agent.Spec.new(%{
+               id: "bad_model_agent",
+               instructions: "Invalid model.",
+               model: :fast
+             })
+  end
+
+  test "runs a minimal ReAct-style tool loop through effect intents" do
+    spec =
+      Agent.Spec.new!(
+        id: "weather_agent",
+        instructions: "Use tools when useful, then answer.",
+        operations: [
+          Operation.new!(
+            name: "weather",
+            description: "Looks up weather by city.",
+            idempotency: :idempotent
+          )
+        ],
+        runtime_defaults: %{max_model_turns: 4}
+      )
+
+    llm = fn _intent, %Effect.Journal{} = journal, _ctx ->
+      llm_calls = count_results(journal, :llm)
+
+      case llm_calls do
+        0 ->
+          {:ok, %{type: :operation, name: "weather", arguments: %{"city" => "Paris"}}}
+
+        1 ->
+          {:ok, %{type: :final, content: "The weather in Paris is sunny."}}
+      end
+    end
+
+    operations =
+      LocalOperations.operations(%{
+        weather: fn intent, _journal, _ctx ->
+          assert intent.payload.name == "weather"
+          assert intent.idempotency == :idempotent
+          assert is_binary(intent.idempotency_key)
+          {:ok, %{city: intent.payload.arguments["city"], condition: "sunny"}}
+        end
+      })
+
+    assert {:ok, %Turn.Result{} = result} =
+             Jidoka.turn(spec, Turn.Request.new!(input: "Weather in Paris?"),
+               llm: llm,
+               operations: operations
+             )
+
+    assert result.content == "The weather in Paris is sunny."
+    assert Enum.count(result.journal.results) == 3
+    assert [%Effect.OperationResult{operation: "weather"}] = result.agent_state.operation_results
+  end
+
+  test "minimal agent DSL compiles to a Jido-backed tool loop" do
+    assert %Jido.Agent{name: "dsl_time_agent"} = TimeAgent.new()
+
+    assert %{
+             id: "dsl_time_agent",
+             model: %LLMDB.Model{} = model,
+             instructions: "Use local_time when asked for the time.",
+             actions: [JidokaTest.Support.LocalTimeAction]
+           } = TimeAgent.__jidoka_agent__()
+
+    assert Jidoka.Config.model_ref(model) == "test:model"
+
+    spec = TimeAgent.spec()
+    assert spec.id == "dsl_time_agent"
+    assert Jidoka.Config.model_ref(spec.model) == "test:model"
+    assert [%Operation{name: "local_time"} = operation] = spec.operations
+    assert is_map(operation.metadata["parameters_schema"])
+
+    llm = fn _intent, %Effect.Journal{} = journal, _ctx ->
+      case count_results(journal, :llm) do
+        0 ->
+          {:ok, %{type: :operation, name: "local_time", arguments: %{"city" => "Chicago"}}}
+
+        1 ->
+          {:ok, %{type: :final, content: "Chicago time is 09:30."}}
+      end
+    end
+
+    assert {:ok, "Chicago time is 09:30."} =
+             TimeAgent.chat("What time is it in Chicago?",
+               llm: llm,
+               operation_context: %{test_pid: self()}
+             )
+
+    assert_received {:local_time_called, "Chicago"}
+    refute_received {:local_time_called, _city}
+  end
+
+  test "agent operation context accepts trusted context runtime" do
+    llm = fn _intent, %Effect.Journal{} = journal, _ctx ->
+      case count_results(journal, :llm) do
+        0 ->
+          {:ok, %{type: :operation, name: "local_time", arguments: %{"city" => "Chicago"}}}
+
+        1 ->
+          {:ok, %{type: :final, content: "Chicago time is 09:30."}}
+      end
+    end
+
+    operation_context =
+      Jidoka.Context.from_data!(%{test_pid: :public_data},
+        runtime: %{test_pid: self()}
+      )
+
+    assert {:ok, "Chicago time is 09:30."} =
+             TimeAgent.chat("What time is it in Chicago?",
+               llm: llm,
+               operation_context: operation_context
+             )
+
+    assert_received {:local_time_called, "Chicago"}
+  end
+
+  test "hibernates at a phase boundary and resumes from the snapshot" do
+    default_model = Jidoka.Config.default_model()
+
+    spec =
+      Agent.Spec.new!(
+        id: "chat_agent",
+        instructions: "Answer tersely.",
+        runtime_defaults: %{max_model_turns: 2}
+      )
+
+    llm = fn intent, _journal, _ctx ->
+      model = Map.get(intent.payload, :model) || Map.get(intent.payload, "model")
+
+      assert Jidoka.Config.model_ref(model) == Jidoka.Config.model_ref(default_model)
+
+      {:ok, %{"type" => "final", "content" => "hello"}}
+    end
+
+    operations = fn _intent, _journal, _ctx ->
+      {:error, :unexpected_operation}
+    end
+
+    assert {:hibernate, %Snapshot{} = snapshot} =
+             Jidoka.turn(spec, Turn.Request.new!(input: "Say hello"),
+               llm: llm,
+               operations: operations,
+               checkpoint: :after_prompt
+             )
+
+    assert snapshot.cursor.phase == :after_prompt
+    assert Turn.State.current_pending_effect(snapshot.turn_state).kind == :llm
+
+    assert {:ok, %Snapshot{} = restored_snapshot} =
+             snapshot
+             |> portable_map()
+             |> Snapshot.new()
+
+    assert {:ok, %Turn.Result{content: "hello"} = result} =
+             Jidoka.resume(restored_snapshot, llm: llm, operations: operations)
+
+    assert [%Effect.Result{kind: :llm, status: :ok}] = Map.values(result.journal.results)
+  end
+
+  test "checkpoint after each phase can pause before a planned operation" do
+    spec =
+      Agent.Spec.new!(
+        id: "checkpoint_agent",
+        instructions: "Use weather once.",
+        operations: [
+          Operation.new!(
+            name: "weather",
+            description: "Looks up weather by city.",
+            idempotency: :idempotent
+          )
+        ],
+        runtime_defaults: %{max_model_turns: 4}
+      )
+
+    llm = fn _intent, %Effect.Journal{} = journal, _ctx ->
+      case count_results(journal, :llm) do
+        0 -> {:ok, %{type: :operation, name: "weather", arguments: %{"city" => "Paris"}}}
+        1 -> {:ok, %{type: :final, content: "Paris is sunny."}}
+      end
+    end
+
+    operations =
+      LocalOperations.operations(%{
+        weather: fn intent, _journal, _ctx ->
+          arguments = Jidoka.Schema.get_key(intent.payload, :arguments)
+          {:ok, %{city: arguments["city"], condition: "sunny"}}
+        end
+      })
+
+    assert {:hibernate, %Snapshot{} = prompt_snapshot} =
+             Jidoka.turn(spec, Turn.Request.new!(input: "Weather in Paris?"),
+               llm: llm,
+               operations: operations,
+               checkpoint: :after_each_phase
+             )
+
+    assert prompt_snapshot.cursor.phase == :after_prompt
+    assert Turn.State.current_pending_effect(prompt_snapshot.turn_state).kind == :llm
+
+    assert {:hibernate, %Snapshot{} = operation_snapshot} =
+             Jidoka.resume(prompt_snapshot,
+               llm: llm,
+               operations: operations,
+               checkpoint: :after_each_phase
+             )
+
+    assert operation_snapshot.cursor.phase == :before_effect
+    assert operation_snapshot.cursor.metadata["effect_kind"] == :operation
+    assert Turn.State.current_pending_effect(operation_snapshot.turn_state).kind == :operation
+
+    assert {:ok, %Snapshot{} = restored_operation_snapshot} =
+             operation_snapshot
+             |> portable_map()
+             |> Snapshot.new()
+
+    assert {:ok, %Turn.Result{content: "Paris is sunny."}} =
+             Jidoka.resume(restored_operation_snapshot, llm: llm, operations: operations)
+  end
+
+  test "context schemas are enforced before the turn runs" do
+    spec =
+      Agent.Spec.new!(
+        id: "context_agent",
+        instructions: "Use tenant context.",
+        context_schema: Zoi.object(%{tenant_id: Zoi.string()})
+      )
+
+    llm = fn _intent, _journal, _ctx -> {:ok, %{type: :final, content: "ok"}} end
+
+    assert {:error, %Jidoka.Error.ValidationError{field: :context}} =
+             Jidoka.turn(spec, Turn.Request.new!(input: "Hello", context: %{}), llm: llm)
+
+    assert {:ok, %Turn.Result{content: "ok"}} =
+             Jidoka.turn(
+               spec,
+               Turn.Request.new!(input: "Hello", context: %{tenant_id: "tenant_123"}),
+               llm: llm
+             )
+  end
+
+  defp count_results(%Effect.Journal{results: results}, kind) do
+    Enum.count(results, fn {_id, %Effect.Result{kind: result_kind}} -> result_kind == kind end)
+  end
+
+  defp time_agent_llm do
+    fn _intent, %Effect.Journal{} = journal, _ctx ->
+      case count_results(journal, :llm) do
+        0 -> {:ok, %{type: :operation, name: "local_time", arguments: %{"city" => "Chicago"}}}
+        1 -> {:ok, %{type: :final, content: "Chicago is 09:30."}}
+      end
+    end
+  end
+
+  defp missing_llm_capability_error?(%Jidoka.Error.ExecutionError{details: %{cause: cause}}) do
+    missing_llm_capability_cause?(cause)
+  end
+
+  defp missing_llm_capability_error?(_error), do: false
+
+  defp missing_llm_capability_cause?(errors) when is_list(errors) do
+    Enum.any?(errors, &missing_llm_capability_cause?/1)
+  end
+
+  defp missing_llm_capability_cause?(%Zoi.Error{path: [:llm]}), do: true
+  defp missing_llm_capability_cause?(_cause), do: false
+
+  defp portable_map(%_{} = value), do: value |> Map.from_struct() |> portable_map()
+
+  defp portable_map(value) when is_map(value) do
+    Map.new(value, fn {key, nested} -> {to_string(key), portable_map(nested)} end)
+  end
+
+  defp portable_map(value) when is_list(value), do: Enum.map(value, &portable_map/1)
+  defp portable_map(value), do: value
+end

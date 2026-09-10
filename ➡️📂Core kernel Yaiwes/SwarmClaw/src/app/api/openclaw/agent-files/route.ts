@@ -1,0 +1,83 @@
+import { NextResponse } from 'next/server'
+import { ensureGatewayConnected } from '@/lib/server/openclaw/gateway'
+import { resolveOpenClawGatewayAgentId } from '@/lib/server/openclaw/agent-resolver'
+import { errorMessage } from '@/lib/shared-utils'
+import { safeParseBody } from '@/lib/server/safe-parse-body'
+
+const AGENT_FILES = ['SOUL.md', 'IDENTITY.md', 'USER.md', 'TOOLS.md', 'HEARTBEAT.md', 'MEMORY.md', 'AGENTS.md'] as const
+
+/** GET ?agentId=X — fetch all agent files from gateway */
+export async function GET(req: Request) {
+  const { searchParams } = new URL(req.url)
+  const agentId = searchParams.get('agentId')
+  if (!agentId) {
+    return NextResponse.json({ error: 'Missing agentId' }, { status: 400 })
+  }
+
+  const gw = await ensureGatewayConnected()
+  if (!gw) {
+    return NextResponse.json({ error: 'OpenClaw gateway not connected' }, { status: 503 })
+  }
+
+  let gatewayAgentId: string
+  try {
+    gatewayAgentId = await resolveOpenClawGatewayAgentId(agentId, gw)
+  } catch (err: unknown) {
+    const message = errorMessage(err)
+    const status = message.includes('not an OpenClaw agent') ? 400 : 404
+    return NextResponse.json({ error: message }, { status })
+  }
+
+  const files: Record<string, { content: string; error?: string }> = {}
+  await Promise.all(
+    AGENT_FILES.map(async (filename) => {
+      try {
+        const result = await gw.rpc('agents.files.get', {
+          agentId: gatewayAgentId,
+          name: filename,
+        }) as { file?: { content?: string } } | undefined
+        files[filename] = { content: result?.file?.content ?? '' }
+      } catch (err: unknown) {
+        files[filename] = { content: '', error: errorMessage(err) }
+      }
+    }),
+  )
+
+  return NextResponse.json(files)
+}
+
+/** PUT { agentId, filename, content } — save an agent file */
+export async function PUT(req: Request) {
+  const { data: body, error } = await safeParseBody<Record<string, unknown>>(req)
+  if (error) return error
+  const { agentId, filename, content } = body as { agentId?: string; filename?: string; content?: string }
+  if (!agentId || !filename) {
+    return NextResponse.json({ error: 'Missing agentId or filename' }, { status: 400 })
+  }
+  if (!AGENT_FILES.includes(filename as typeof AGENT_FILES[number])) {
+    return NextResponse.json({ error: `Invalid filename: ${filename}` }, { status: 400 })
+  }
+
+  const gw = await ensureGatewayConnected()
+  if (!gw) {
+    return NextResponse.json({ error: 'OpenClaw gateway not connected' }, { status: 503 })
+  }
+
+  try {
+    const gatewayAgentId = await resolveOpenClawGatewayAgentId(agentId, gw)
+    await gw.rpc('agents.files.set', {
+      agentId: gatewayAgentId,
+      name: filename,
+      content: content ?? '',
+    })
+    return NextResponse.json({ ok: true })
+  } catch (err: unknown) {
+    const message = errorMessage(err)
+    const status = message.includes('not an OpenClaw agent')
+      ? 400
+      : message.includes('not found')
+        ? 404
+        : 502
+    return NextResponse.json({ error: message }, { status })
+  }
+}

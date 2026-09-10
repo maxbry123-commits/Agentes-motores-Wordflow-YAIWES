@@ -1,0 +1,626 @@
+"""Lifecycle Governance Kernel - deterministic FSM for task and agent transitions.
+
+Every task and agent status change flows through this module. Illegal
+transitions raise ``IllegalTransitionError``; legal ones emit a typed
+``LifecycleEvent`` for replay, audit, and metrics.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import hashlib
+import json
+import logging
+import time
+from collections import OrderedDict
+from typing import TYPE_CHECKING, Any, Literal
+
+from bernstein.core.tasks.errors import TaskDomainError
+from bernstein.core.tasks.models import AbortReason, AgentSession, LifecycleEvent, Task, TaskStatus, TransitionReason
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from bernstein.core.audit import AuditLog
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Idempotency token tracking (TASK-001)
+# ---------------------------------------------------------------------------
+
+# Bounded LRU set of recently seen transition IDs.  Prevents replay of
+# duplicate requests while keeping memory usage predictable.
+_SEEN_TRANSITION_IDS_MAX: int = 10_000
+
+
+class _LRUSet:
+    """Bounded set with LRU eviction, backed by an OrderedDict."""
+
+    def __init__(self, maxsize: int) -> None:
+        self._data: OrderedDict[str, None] = OrderedDict()
+        self._maxsize = maxsize
+
+    def __contains__(self, key: str) -> bool:
+        return key in self._data
+
+    def add(self, key: str) -> None:
+        if key in self._data:
+            self._data.move_to_end(key)
+            return
+        self._data[key] = None
+        if len(self._data) > self._maxsize:
+            self._data.popitem(last=False)
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+
+_seen_transition_ids = _LRUSet(_SEEN_TRANSITION_IDS_MAX)
+
+
+class DuplicateTransitionError(TaskDomainError):
+    """Raised when a transition_id has already been applied."""
+
+    def __init__(self, transition_id: str) -> None:
+        self.transition_id = transition_id
+        super().__init__(f"Duplicate transition_id: {transition_id!r}")
+
+
+# ---------------------------------------------------------------------------
+# Prometheus transition-reason recording (best-effort, never raises)
+# ---------------------------------------------------------------------------
+
+
+def _record_prometheus_transition(reason: str, role: str, *, entity_type: str = "agent") -> None:
+    """Forward a transition reason to the Prometheus counter.
+
+    Import is deferred so the lifecycle module stays import-cheap when
+    ``prometheus_client`` is not installed.
+    """
+    try:
+        from bernstein.core.prometheus import record_transition_reason
+
+        record_transition_reason(reason, role, entity_type=entity_type)
+    except Exception:
+        logger.debug("Failed to record Prometheus transition reason", exc_info=True)
+
+
+# ---------------------------------------------------------------------------
+# Audit log integration
+# ---------------------------------------------------------------------------
+
+_audit_log: AuditLog | None = None
+
+
+def set_audit_log(audit_log: AuditLog) -> None:
+    """Wire an AuditLog instance into the lifecycle module.
+
+    Once set, every task and agent transition is recorded as an HMAC-chained
+    audit event in addition to the normal LifecycleEvent dispatch.
+    """
+    global _audit_log
+    _audit_log = audit_log
+
+
+def get_audit_log() -> AuditLog | None:
+    """Return the currently wired AuditLog, or None."""
+    return _audit_log
+
+
+def _content_hash(data: Any) -> str:
+    """SHA-256 hash of canonical JSON representation."""
+    return hashlib.sha256(json.dumps(data, sort_keys=True, default=str).encode()).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Exception
+# ---------------------------------------------------------------------------
+
+
+class IllegalTransitionError(TaskDomainError):
+    """Raised when a status transition is not in the allowed table."""
+
+    def __init__(self, entity_type: str, entity_id: str, from_status: str, to_status: str) -> None:
+        self.entity_type = entity_type
+        self.entity_id = entity_id
+        self.from_status = from_status
+        self.to_status = to_status
+        super().__init__(f"Illegal {entity_type} transition: {from_status!r} -> {to_status!r} (entity {entity_id})")
+
+
+# ---------------------------------------------------------------------------
+# Guard helpers
+# ---------------------------------------------------------------------------
+
+
+def _always(_task: Task) -> bool:
+    return True
+
+
+def _always_agent(_agent: AgentSession) -> bool:
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Task transition table
+# ---------------------------------------------------------------------------
+
+TASK_TRANSITIONS: dict[tuple[TaskStatus, TaskStatus], Callable[[Task], bool]] = {
+    # Plan mode
+    (TaskStatus.PLANNED, TaskStatus.OPEN): _always,
+    (TaskStatus.PLANNED, TaskStatus.CANCELLED): _always,
+    (TaskStatus.PLANNED, TaskStatus.FAILED): _always,  # batch stage failure
+    # Claiming
+    (TaskStatus.OPEN, TaskStatus.CLAIMED): _always,
+    (TaskStatus.OPEN, TaskStatus.WAITING_FOR_SUBTASKS): _always,
+    (TaskStatus.OPEN, TaskStatus.CANCELLED): _always,
+    (TaskStatus.OPEN, TaskStatus.FAILED): _always,  # batch stage failure on unclaimed task
+    # Work progression from CLAIMED
+    (TaskStatus.CLAIMED, TaskStatus.IN_PROGRESS): _always,
+    (TaskStatus.CLAIMED, TaskStatus.OPEN): _always,  # force-claim / unclaim
+    (TaskStatus.CLAIMED, TaskStatus.DONE): _always,  # fast completion
+    (TaskStatus.CLAIMED, TaskStatus.FAILED): _always,
+    (TaskStatus.CLAIMED, TaskStatus.CANCELLED): _always,
+    (TaskStatus.CLAIMED, TaskStatus.WAITING_FOR_SUBTASKS): _always,  # agent splits work
+    (TaskStatus.CLAIMED, TaskStatus.BLOCKED): _always,
+    # Work progression from IN_PROGRESS
+    (TaskStatus.IN_PROGRESS, TaskStatus.DONE): _always,
+    (TaskStatus.IN_PROGRESS, TaskStatus.FAILED): _always,
+    (TaskStatus.IN_PROGRESS, TaskStatus.BLOCKED): _always,
+    (TaskStatus.IN_PROGRESS, TaskStatus.WAITING_FOR_SUBTASKS): _always,  # agent splits work
+    (TaskStatus.IN_PROGRESS, TaskStatus.OPEN): _always,  # force-claim / requeue
+    (TaskStatus.IN_PROGRESS, TaskStatus.CANCELLED): _always,
+    (TaskStatus.IN_PROGRESS, TaskStatus.ORPHANED): _always,
+    # Recovery from orphaned
+    (TaskStatus.ORPHANED, TaskStatus.DONE): _always,
+    (TaskStatus.ORPHANED, TaskStatus.FAILED): _always,
+    (TaskStatus.ORPHANED, TaskStatus.OPEN): _always,
+    # Recovery from blocked
+    (TaskStatus.BLOCKED, TaskStatus.OPEN): _always,
+    (TaskStatus.BLOCKED, TaskStatus.CANCELLED): _always,
+    (TaskStatus.BLOCKED, TaskStatus.FAILED): _always,  # batch stage failure
+    (TaskStatus.WAITING_FOR_SUBTASKS, TaskStatus.DONE): _always,
+    (TaskStatus.WAITING_FOR_SUBTASKS, TaskStatus.BLOCKED): _always,  # subtask timeout escalation
+    (TaskStatus.WAITING_FOR_SUBTASKS, TaskStatus.CANCELLED): _always,
+    (TaskStatus.WAITING_FOR_SUBTASKS, TaskStatus.FAILED): _always,  # batch stage failure
+    # Retry from failed
+    (TaskStatus.FAILED, TaskStatus.OPEN): _always,
+    # Verification gate (orchestrator closes after janitor + merge)
+    (TaskStatus.DONE, TaskStatus.CLOSED): _always,
+    (TaskStatus.DONE, TaskStatus.FAILED): _always,
+    # Janitor reopen (bounded): a done task that fails janitor verification
+    # is re-queued under the SAME id for another attempt. The reopen budget
+    # is enforced by the orchestrator via metadata['janitor_reopen_count'].
+    (TaskStatus.DONE, TaskStatus.OPEN): _always,
+    # Abandon primitive (#1350) - agent-initiated structured exit.
+    # ABANDONED is a terminal state distinct from FAILED so dashboards can
+    # split intentional vs. unintentional exits. Downstream consumers move
+    # to BLOCKED_BY_ABANDON instead of waiting forever for an output that
+    # will never arrive.
+    (TaskStatus.OPEN, TaskStatus.ABANDONED): _always,
+    (TaskStatus.CLAIMED, TaskStatus.ABANDONED): _always,
+    (TaskStatus.IN_PROGRESS, TaskStatus.ABANDONED): _always,
+    (TaskStatus.WAITING_FOR_SUBTASKS, TaskStatus.ABANDONED): _always,
+    (TaskStatus.BLOCKED, TaskStatus.ABANDONED): _always,
+    (TaskStatus.ORPHANED, TaskStatus.ABANDONED): _always,
+    (TaskStatus.OPEN, TaskStatus.BLOCKED_BY_ABANDON): _always,
+    (TaskStatus.CLAIMED, TaskStatus.BLOCKED_BY_ABANDON): _always,
+    (TaskStatus.IN_PROGRESS, TaskStatus.BLOCKED_BY_ABANDON): _always,
+    (TaskStatus.WAITING_FOR_SUBTASKS, TaskStatus.BLOCKED_BY_ABANDON): _always,
+    # Operator may requeue a blocked-by-abandon downstream once the
+    # parent backlog is reseeded.
+    (TaskStatus.BLOCKED_BY_ABANDON, TaskStatus.OPEN): _always,
+    (TaskStatus.BLOCKED_BY_ABANDON, TaskStatus.CANCELLED): _always,
+    (TaskStatus.BLOCKED_BY_ABANDON, TaskStatus.ABANDONED): _always,
+    # Typed refusal outcomes (#2244) - a worker that cannot proceed reports
+    # a contract-validated refusal at the completion boundary. REFUSED is a
+    # terminal state distinct from FAILED so status surfaces can split
+    # "blocked by design" from "broke while trying". OPEN is a legal source
+    # because /complete auto-claims tasks that reverted to open before the
+    # payload is applied.
+    (TaskStatus.OPEN, TaskStatus.REFUSED): _always,
+    (TaskStatus.CLAIMED, TaskStatus.REFUSED): _always,
+    (TaskStatus.IN_PROGRESS, TaskStatus.REFUSED): _always,
+    # Post-execution sign-off (#3081) - work that finished is held in
+    # PENDING_APPROVAL until a decision is recorded, and the decision that
+    # accepts it completes the task. Without this edge the state has no way
+    # out and the sign-off is rejected by ``transition_task``.
+    (TaskStatus.PENDING_APPROVAL, TaskStatus.DONE): _always,
+    # Failed-dependency cascade (#3452) - the FAILED counterpart of the
+    # abandon cascade above. A task whose dependency ended without
+    # delivering moves here instead of being re-queued forever. Kept
+    # distinct from BLOCKED_BY_ABANDON so the record still says whether the
+    # upstream was abandoned on purpose or broke while trying.
+    (TaskStatus.OPEN, TaskStatus.BLOCKED_BY_FAILED_DEP): _always,
+    (TaskStatus.CLAIMED, TaskStatus.BLOCKED_BY_FAILED_DEP): _always,
+    (TaskStatus.IN_PROGRESS, TaskStatus.BLOCKED_BY_FAILED_DEP): _always,
+    (TaskStatus.WAITING_FOR_SUBTASKS, TaskStatus.BLOCKED_BY_FAILED_DEP): _always,
+    # Same operator recovery paths the abandon-blocked state has: requeue
+    # once the upstream is retried, or close the branch out.
+    (TaskStatus.BLOCKED_BY_FAILED_DEP, TaskStatus.OPEN): _always,
+    (TaskStatus.BLOCKED_BY_FAILED_DEP, TaskStatus.CANCELLED): _always,
+    (TaskStatus.BLOCKED_BY_FAILED_DEP, TaskStatus.ABANDONED): _always,
+}
+
+# Precompute terminal statuses (no outbound transitions).
+TERMINAL_TASK_STATUSES: frozenset[TaskStatus] = frozenset(
+    s for s in TaskStatus if s not in {frm for (frm, _to), _guard in TASK_TRANSITIONS.items()}
+)
+
+
+# ---------------------------------------------------------------------------
+# Dependency-satisfaction classification (#3452)
+# ---------------------------------------------------------------------------
+
+# ``TERMINAL_TASK_STATUSES`` answers "can this status transition at all", which
+# is the wrong question for a dependent waiting on an upstream. FAILED,
+# ORPHANED and both blocked-by states each keep a recovery edge back to OPEN,
+# so they are absent from that set while still stranding every dependent until
+# an operator intervenes. The three sets below answer the dependency question
+# instead, and partition ``TaskStatus`` exhaustively so a newly added status
+# cannot slip through unclassified (asserted by the lifecycle FSM tests).
+
+# A dependency in one of these has delivered; dependents may proceed.
+SUCCESSFUL_TASK_STATUSES: frozenset[TaskStatus] = frozenset(
+    {
+        TaskStatus.DONE,
+        TaskStatus.CLOSED,
+    }
+)
+
+# A dependency in one of these will never deliver on its own. Dependents are
+# stranded until the upstream is explicitly requeued.
+UNSUCCESSFUL_TERMINAL_STATUSES: frozenset[TaskStatus] = frozenset(
+    {
+        TaskStatus.FAILED,
+        TaskStatus.CANCELLED,
+        TaskStatus.REFUSED,
+        TaskStatus.ORPHANED,
+        TaskStatus.ABANDONED,
+        TaskStatus.BLOCKED_BY_ABANDON,
+        TaskStatus.BLOCKED_BY_FAILED_DEP,
+    }
+)
+
+# The subset of the above that a task reaches because its own dependency was
+# stranded, rather than by running and ending. Members propagate the strand
+# onward but are themselves reported as stranded rather than as a root cause.
+DEPENDENCY_BLOCKED_STATUSES: frozenset[TaskStatus] = frozenset(
+    {
+        TaskStatus.BLOCKED_BY_ABANDON,
+        TaskStatus.BLOCKED_BY_FAILED_DEP,
+    }
+)
+
+# Neither delivered nor ended: the dependent may still become claimable.
+IN_FLIGHT_TASK_STATUSES: frozenset[TaskStatus] = frozenset(
+    {
+        TaskStatus.PLANNED,
+        TaskStatus.OPEN,
+        TaskStatus.CLAIMED,
+        TaskStatus.IN_PROGRESS,
+        TaskStatus.BLOCKED,
+        TaskStatus.WAITING_FOR_SUBTASKS,
+        TaskStatus.SUSPENDED,
+        TaskStatus.PENDING_APPROVAL,
+    }
+)
+
+
+# ---------------------------------------------------------------------------
+# Approval gates
+# ---------------------------------------------------------------------------
+
+# The task states where the next transition is a decision, mapped to what a
+# per-task approval verb does with that decision.
+#
+#   PENDING_APPROVAL  - post-execution. The work is finished and the result is
+#                       held until the decision is recorded, so accepting it
+#                       completes the task (-> DONE) with the approver's note
+#                       as the result summary. The decision belongs to the
+#                       task, so a per-task verb may grant it.
+#
+# Every other status is running, blocked on something other than a decision,
+# or terminal: there is no approval to grant, so an approval verb must refuse
+# rather than force the task forward.
+TASK_APPROVAL_TARGETS: dict[TaskStatus, TaskStatus] = {
+    TaskStatus.PENDING_APPROVAL: TaskStatus.DONE,
+}
+
+# The statuses an approval verb may act on, derived from the table above so
+# callers cannot drift from the state machine.
+APPROVABLE_TASK_STATUSES: frozenset[TaskStatus] = frozenset(TASK_APPROVAL_TARGETS)
+
+# States whose decision is NOT the task's to grant. PLANNED is the plan gate:
+# plan mode holds every task of a plan in PLANNED until an operator decides
+# the plan as a whole, and ``POST /plans/{plan_id}/approve`` records that
+# decision and promotes the tasks it covers. Promoting a single task instead
+# releases the work while the plan stays undecided, so the operator's later
+# rejection finds nothing left to cancel. A per-task approval verb refuses
+# these and points at the route that owns the decision.
+PLAN_GATED_TASK_STATUSES: frozenset[TaskStatus] = frozenset({TaskStatus.PLANNED})
+
+# The states a worker may report its own completion from. A worker holds a
+# task it claimed (CLAIMED / IN_PROGRESS), or one that reverted to OPEN under
+# reconciliation, which ``POST /tasks/{id}/complete`` re-claims before
+# applying the payload.
+#
+# The remaining states with a legal edge to DONE are deliberately excluded:
+# WAITING_FOR_SUBTASKS is completed by its last subtask finishing, ORPHANED
+# belongs to crash recovery because its worker is gone, and PENDING_APPROVAL
+# is a decision, not a report of work. Completing any of those on request
+# marks work done that the caller did not do.
+WORKER_COMPLETABLE_TASK_STATUSES: frozenset[TaskStatus] = frozenset(
+    {
+        TaskStatus.OPEN,
+        TaskStatus.CLAIMED,
+        TaskStatus.IN_PROGRESS,
+    }
+)
+
+
+# ---------------------------------------------------------------------------
+# Agent session transition table
+# ---------------------------------------------------------------------------
+
+AgentStatus = Literal["starting", "working", "idle", "dead"]
+
+AGENT_TRANSITIONS: dict[tuple[AgentStatus, AgentStatus], Callable[[AgentSession], bool]] = {
+    ("starting", "working"): _always_agent,
+    ("starting", "dead"): _always_agent,  # spawn failure
+    ("working", "idle"): _always_agent,
+    ("working", "dead"): _always_agent,  # kill / crash / circuit break
+    ("idle", "working"): _always_agent,
+    ("idle", "dead"): _always_agent,  # recycled
+}
+
+
+def is_agent_alive(agent_or_status: Any) -> bool:
+    """Return True if an agent (AgentSession, AgentInfo, dict, or status str) is alive (not dead)."""
+    if isinstance(agent_or_status, str):
+        return agent_or_status != "dead"
+    if hasattr(agent_or_status, "status"):
+        return str(getattr(agent_or_status, "status", "")) != "dead"
+    if isinstance(agent_or_status, dict):
+        return str(agent_or_status.get("status", "")) != "dead"
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Event stream
+# ---------------------------------------------------------------------------
+
+_listeners: list[Callable[[LifecycleEvent], None]] = []
+
+
+def add_listener(callback: Callable[[LifecycleEvent], None]) -> None:
+    """Register a callback invoked on every lifecycle transition."""
+    _listeners.append(callback)
+
+
+def remove_listener(callback: Callable[[LifecycleEvent], None]) -> None:
+    """Unregister a previously registered callback."""
+    with contextlib.suppress(ValueError):
+        _listeners.remove(callback)
+
+
+def _emit(event: LifecycleEvent) -> None:
+    """Dispatch event to all registered listeners."""
+    for cb in _listeners:
+        try:
+            cb(event)
+        except Exception:
+            logger.exception("Lifecycle listener raised")
+
+
+# ---------------------------------------------------------------------------
+# Transition functions
+# ---------------------------------------------------------------------------
+
+
+def transition_task(
+    task: Task,
+    new_status: TaskStatus,
+    *,
+    actor: str = "",
+    reason: str = "",
+    transition_reason: TransitionReason | None = None,
+    transition_id: str | None = None,
+) -> LifecycleEvent:
+    """Validate and apply a task status transition.
+
+    Checks the ``TASK_TRANSITIONS`` table and guard predicate, mutates
+    ``task.status``, and emits a ``LifecycleEvent``.
+
+    Args:
+        task: The task to transition.
+        new_status: Target status.
+        actor: Who triggered this (e.g. "task_store", "plan_approval").
+        reason: Human-readable explanation.
+        transition_id: Optional UUID for idempotency.  If a transition with the
+            same ID has already been applied, ``DuplicateTransitionError`` is
+            raised and the task is left unchanged.
+
+    Returns:
+        The emitted LifecycleEvent.
+
+    Raises:
+        IllegalTransitionError: If the transition is not allowed.
+        DuplicateTransitionError: If *transition_id* was already applied.
+    """
+    # Idempotency check (TASK-001)
+    if transition_id is not None:
+        if transition_id in _seen_transition_ids:
+            raise DuplicateTransitionError(transition_id)
+        _seen_transition_ids.add(transition_id)
+
+    old_status = task.status
+    key = (old_status, new_status)
+
+    if key not in TASK_TRANSITIONS:
+        raise IllegalTransitionError("task", task.id, old_status.value, new_status.value)
+
+    guard = TASK_TRANSITIONS[key]
+    if not guard(task):
+        raise IllegalTransitionError("task", task.id, old_status.value, new_status.value)
+
+    task.status = new_status
+
+    from bernstein.core.telemetry import start_span
+
+    with start_span(
+        f"task.{new_status.value}",
+        attributes={
+            "task_id": task.id,
+            "role": task.role,
+            "from_status": old_status.value,
+            "actor": actor,
+        },
+    ):
+        event = LifecycleEvent(
+            timestamp=time.time(),
+            entity_type="task",
+            entity_id=task.id,
+            from_status=old_status.value,
+            to_status=new_status.value,
+            actor=actor,
+            reason=reason,
+            transition_reason=transition_reason,
+        )
+        _emit(event)
+
+    # Record transition reason in Prometheus counters
+    if transition_reason is not None:
+        _record_prometheus_transition(transition_reason.value, task.role, entity_type="task")
+
+    if _audit_log is not None:
+        input_state = {"task_id": task.id, "status": old_status.value}
+        output_state = {"task_id": task.id, "status": new_status.value}
+        _audit_log.log(
+            event_type="task.transition",
+            actor=actor,
+            resource_type="task",
+            resource_id=task.id,
+            details={
+                "action": f"{old_status.value}->{new_status.value}",
+                "from_status": old_status.value,
+                "to_status": new_status.value,
+                "reason": reason,
+                "transition_reason": transition_reason.value if transition_reason is not None else "",
+                "input_hash": _content_hash(input_state),
+                "output_hash": _content_hash(output_state),
+            },
+        )
+
+    return event
+
+
+def transition_agent(
+    agent: AgentSession,
+    new_status: AgentStatus,
+    *,
+    actor: str = "",
+    reason: str = "",
+    transition_reason: TransitionReason | None = None,
+    abort_reason: AbortReason | None = None,
+    abort_detail: str = "",
+    finish_reason: str = "",
+    transition_id: str | None = None,
+) -> LifecycleEvent:
+    """Validate and apply an agent session status transition.
+
+    Args:
+        agent: The agent session to transition.
+        new_status: Target status.
+        actor: Who triggered this.
+        reason: Human-readable explanation.
+        transition_id: Optional UUID for idempotency.  If a transition with the
+            same ID has already been applied, ``DuplicateTransitionError`` is
+            raised and the agent is left unchanged.
+
+    Returns:
+        The emitted LifecycleEvent.
+
+    Raises:
+        IllegalTransitionError: If the transition is not allowed.
+        DuplicateTransitionError: If *transition_id* was already applied.
+    """
+    # Idempotency check (TASK-001)
+    if transition_id is not None:
+        if transition_id in _seen_transition_ids:
+            raise DuplicateTransitionError(transition_id)
+        _seen_transition_ids.add(transition_id)
+
+    old_status: AgentStatus = agent.status
+    key = (old_status, new_status)
+
+    if key not in AGENT_TRANSITIONS:
+        raise IllegalTransitionError("agent", agent.id, old_status, new_status)
+
+    guard = AGENT_TRANSITIONS[key]
+    if not guard(agent):
+        raise IllegalTransitionError("agent", agent.id, old_status, new_status)
+
+    agent.status = new_status
+    if transition_reason is not None:
+        agent.transition_reason = transition_reason
+    if abort_reason is not None:
+        agent.abort_reason = abort_reason
+    if abort_detail:
+        agent.abort_detail = abort_detail
+    if finish_reason:
+        agent.finish_reason = finish_reason
+
+    from bernstein.core.telemetry import start_span
+
+    with start_span(
+        f"agent.{new_status}",
+        attributes={
+            "agent_id": agent.id,
+            "role": agent.role,
+            "from_status": old_status,
+            "actor": actor,
+        },
+    ):
+        event = LifecycleEvent(
+            timestamp=time.time(),
+            entity_type="agent",
+            entity_id=agent.id,
+            from_status=old_status,
+            to_status=new_status,
+            actor=actor,
+            reason=reason,
+            transition_reason=transition_reason,
+            abort_reason=abort_reason,
+        )
+        _emit(event)
+
+    # Record transition reason in Prometheus counters
+    if transition_reason is not None:
+        _record_prometheus_transition(transition_reason.value, agent.role, entity_type="agent")
+
+    if _audit_log is not None:
+        input_state = {"agent_id": agent.id, "status": old_status}
+        output_state = {"agent_id": agent.id, "status": new_status}
+        _audit_log.log(
+            event_type="agent.transition",
+            actor=actor,
+            resource_type="agent",
+            resource_id=agent.id,
+            details={
+                "action": f"{old_status}->{new_status}",
+                "from_status": old_status,
+                "to_status": new_status,
+                "reason": reason,
+                "transition_reason": transition_reason.value if transition_reason is not None else "",
+                "abort_reason": abort_reason.value if abort_reason is not None else "",
+                "abort_detail": abort_detail,
+                "finish_reason": finish_reason,
+                "input_hash": _content_hash(input_state),
+                "output_hash": _content_hash(output_state),
+            },
+        )
+
+    return event

@@ -1,0 +1,4377 @@
+# Release v2.39.0
+
+## Model Updates
+
+- **GLM 5.3 Flash** — Z.ai's new flash model replaces GLM 4.7 Flash. It is a major step up: a 1M-token context window (5x larger), it can now read images and video, and it reasons on every request. It launches at half price, so it currently costs only slightly more than the model it replaces. Agents on GLM 4.7 Flash move over automatically.
+- **Qwen3.8 Flash** — Alibaba's newest flash model replaces Qwen3.7 Flash, with better quality across the board and double the maximum output length. Agents on the previous version move over automatically.
+- **Ox Alpha has been retired.** The free preview period for this anonymous stealth model has ended and its provider has withdrawn it. By all the evidence it was GLM 5.3 Flash in disguise, so the same model remains available above under its real name. The few agents created with Ox Alpha as their model during the one-week trial need to be pointed at another model; new agents default to Gemini 3.7 Flash again.
+
+## Improvements
+
+- Strengthened the safeguards on the model catalog so that models routed through OpenRouter are always served by their vetted upstream provider.
+
+# Release v2.38.0
+
+## Video Generation
+
+The video toolset is now three models instead of six, and every one of them runs through OpenRouter:
+
+- **Seedance 2.0 Mini** — the fast, inexpensive option, for drafts and quick iteration.
+- **Seedance 2.5** — best for long-form storytelling and generating from a reference image.
+- **MiniMax H3** — omni-modal generation with native audio, up to 2K.
+
+**Sora, Sora Pro, Veo, Veo Fast and Grok video have been retired.** Agents that had any of these enabled will simply no longer show them; nothing else in the agent's setup changes, and MiniMax Hailuo keeps working under its existing entry, now on the newer H3 model. OpenAI is shutting its video API down entirely in September with no replacement, so Sora would have stopped working regardless.
+
+**Video is now billed on what it actually costs.** Previously each video tool charged a fixed price per call, which meant short clips subsidised long ones. Charges now follow the real cost of the generation — model, resolution and length — so a quick draft costs a fraction of a long high-resolution render.
+
+All three models are also available for image-to-video: supply a starting image and the model animates from it.
+
+## Improvements
+
+- Refreshed the platform's upstream dependencies, picking up upstream fixes across the model and payment integrations.
+- Improved how failures from model providers are recognised, so temporary provider problems are retried and permanent ones surface promptly instead of being retried in vain.
+- Fixed an issue where a starting image supplied in a format other than PNG could be misread by the provider.
+- Fixed bugs in the video generation and agent payment modules.
+
+# Release v2.37.0
+
+## Model Updates
+
+- **DeepSeek V4 Flash now understands images.** DeepSeek's multimodal build of V4 Flash replaces the text-only one, at the same speed and text quality, so the platform's cheapest workhorse model can now read charts, screenshots and documents. Agents on the previous version move over automatically — no action needed. It is an experimental build from DeepSeek, so image handling may change without notice.
+
+## Improvements
+
+- Corrected the billing rates recorded for the DeepSeek models, which sat below what DeepSeek actually charges.
+
+# Release v2.36.0
+
+## Model Updates
+
+- **Gemini 3.7 Flash** — Google's newest Flash replaces Gemini 3.6 Flash, both on Google directly and through OpenRouter. It is faster on agent workflows and multi-step reasoning, and Google has halved Flash pricing through the end of 2026, so it now costs half of what 3.6 did.
+- **Cheaper Gemini through OpenRouter** — Gemini requests routed through OpenRouter now go to Google's Vertex endpoint, which is currently discounted a further 50% below the AI Studio endpoint. Gemini 3.7 Flash on OpenRouter is a quarter of 3.6's launch price.
+- **GLM 5.3** — Z.ai's upgrade replaces GLM 5.2 at the same price, with a large step up on coding and long-running agent tasks.
+
+Agents still set to Gemini 3.6 Flash or GLM 5.2 are moved to the new models automatically — no action needed. The built-in web search's Gemini fallback also moves to 3.7 Flash.
+
+# Release v2.35.0
+
+## Model Updates
+
+- **Ox Alpha (Free)** — a new preview model from OpenRouter is now available to every team, free of charge while the preview lasts. It is a reasoning model built for coding and long-running agent work, understands images and video as well as text, and handles a million tokens of context. Note that as a preview offering it runs slower than the production models in the catalog, and the provider retains prompts and completions (they are not used for training).
+- **Ox Alpha is the default model for new agents** during this trial period. Existing agents keep whatever model they were configured with; the model picker still lists every other option.
+
+# Release v2.34.1
+
+## Improvements
+
+- Routine dependency maintenance across the whole platform: the AI provider SDKs, web framework, database drivers, management frontend, and messaging integrations were all brought up to their latest releases.
+
+## Bug Fixes
+
+- Fixed bugs in the agent engine's error handling that surfaced with the latest OpenAI SDK update: brief network interruptions are reliably retried again, and requests that run out of time are now reported as timeouts instead of a generic internal error.
+
+# Release v2.34.0
+
+## Model Updates
+
+- **Grok 4.6** — xAI's newest flagship replaces Grok 4.5, with stronger coding and knowledge performance and a new extra-deep reasoning level for the hardest problems. Available both via xAI directly and through OpenRouter.
+- **Qwen3.8 Max** — Alibaba's new flagship replaces Qwen3.7 Max and can now understand images and video, not just text.
+- **DeepSeek V4 Pro** — upgraded to the official general-availability build on OpenRouter.
+
+Agents still set to the previous model versions are moved to the new ones automatically — no action needed.
+
+# Release v2.33.0
+
+## Security
+
+- **Closed a server-side request forgery hole reported privately by an outside security researcher.** The website scraping tools fetched any address an agent conversation named, without checking where it pointed. That let the platform be steered at its own internal network or at a cloud provider's metadata service, and because the scraper indexes what it retrieves, the response could then be read back out of the agent's knowledge base.
+
+- **Every tool that fetches an address is now protected by one shared check, not several.** The platform previously carried three separate versions of this protection, each covering slightly different ground, and several fetching paths had none at all. All of them now share a single check that classifies the destination before the request, again after the address is resolved, and once more for every hop when a site forwards the request elsewhere. Anything aimed at an internal, reserved, or metadata address is refused before a connection is opened.
+
+- **The shared check also covers routes the previous versions missed**, including addresses that resolve to an internal destination only at request time, IPv6 wrappers around internal addresses, and the metadata endpoints of additional cloud providers. Fetching tools that had no protection at all — image editing and upscaling, image inputs to the image generators, paid HTTP requests, link previews, and stored-image downloads — are now covered on the same terms.
+
+## Improvements
+
+- Web page reading is cheaper and more reliable: plain-text and data endpoints are fetched directly instead of going through the browser-rendering service, rendering calls are paced to stay inside the service's rate limit, and rate-limit responses are retried automatically.
+- Publishing a post no longer fails when extra or blank tags are supplied; the extras are dropped instead of wasting the agent's turn.
+- Internal helper tasks such as page cleanup, memory merging, and search result formatting no longer spend reasoning effort on mechanical work, cutting a substantial amount of weekly token usage with no change in output quality.
+
+# Release v2.32.3
+
+## Improvements
+
+- Routine dependency maintenance across the platform: the backend libraries and the management console's web framework, UI libraries, and development tooling were updated to their latest patch releases for security and stability. No user-facing changes.
+
+# Release v2.32.2
+
+## Bug Fixes
+
+- Agent activity and post feeds now load correctly when the page address uses the agent's custom URL name. Previously, reloading an agent's activities or posts page could show an empty list even though the agent had content, and opening a single post from such an address could fail with a "not found" error.
+- Requesting content for an agent that doesn't exist now returns a clear "not found" error instead of a silently empty list.
+
+## Improvements
+
+- Every agent management endpoint in the local API now accepts the agent's custom URL name interchangeably with its ID, so all pages behave consistently after the address bar switches to the friendly URL.
+- Consolidated the internal agent lookup logic into a single shared helper, reducing the chance of this class of bug recurring in future endpoints.
+
+# Release v2.32.1
+
+## Security
+
+- Updated a low-level text-pattern dependency in the web app to close a recently disclosed denial-of-service weakness that could crash the build tooling on malicious input. No user-facing changes.
+
+# Release v2.32.0
+
+## Model Catalog Refresh
+
+- **GPT-5.6 price cuts passed through.** OpenAI reduced Terra by 20% and Luna by 80%; on OpenRouter both tiers currently run at half of OpenAI's list price, and the catalog now reflects each channel's real rate. Cached input stays at 10% of the input price everywhere.
+- **DeepSeek V4 Flash official build.** Agents on DeepSeek V4 Flash now get the official release build, which posts large gains on agent and coding benchmarks. Existing agents move over automatically — no changes needed. Its maximum response length also grew twelvefold.
+- **Qwen Flash upgraded to 3.7.** The new generation understands images and video, costs roughly a tenth of the previous flash on input, and existing agents are migrated automatically.
+- **Across-the-board price corrections.** Every OpenRouter model's price is now sourced from the first-party endpoint we actually route to, rather than marketplace-wide averages. Several models became cheaper (Qwen Max, MiniMax M3, both MiMo tiers, Grok cache reads), one had been undercharged and was corrected (GLM 5.2), and DeepSeek cache-hit pricing is now consistent across channels.
+- Fixed a routing configuration that could prevent Kimi K3 requests from reaching Moonshot's servers.
+
+## Team Lead
+
+- The built-in team lead orchestrator now runs on DeepSeek's new V4 Flash build, which leads agent-orchestration benchmarks while costing a fraction of the previous default model.
+
+## Platform
+
+- Connections to remote MCP tool servers were upgraded to the latest protocol SDK, and the service now properly identifies itself to those servers.
+- On startup, the service now waits for its database, cache, and storage to be reachable before accepting work, making deploys and restarts more predictable.
+- Routine AI SDK upgrades across the model integrations.
+
+# Release v2.31.2
+
+## Bug Fixes
+
+- Editing an agent that has a custom URL name now saves correctly. Previously, if you opened an agent's edit page, made a change, and reloaded the page before saving, the save could fail with an "agent not found" error.
+
+## Improvements
+
+- Codebase-wide quality pass: the project's automated code checks were expanded from a small hand-picked set to the linter's full recommended set, and roughly 1,600 findings were resolved across the codebase. Most were stylistic, but the sweep also corrected a few real issues, including timestamps recorded without a timezone in the autonomous task scheduler and the DeFi Llama market-data client, and error logs that repeated the same error text twice. Failure-case tests were tightened to verify the specific error they expect instead of accepting any failure.
+- Removed an unused third-party dependency, slightly reducing install size.
+
+# Release v2.31.1
+
+## Improvements
+
+- Clearer diagnostics for model provider failures: when a model provider rejects or fails a request, error logs and alerts now include the provider's status code and response details, instead of only a generic message like "Provider returned error". This applies to agent runs and to background history summarization, and makes it possible to tell at a glance whether a failure was a provider outage or a rejected request.
+
+# Release v2.31.0
+
+## Agent Form Rebuilt
+
+The agent creation and editing form has been rebuilt. It used to be generated from a schema the backend served; it is now written directly in the web app. That removes a layer of indirection that made every form change a two-sided edit, and it lets the create page render immediately instead of waiting on the server.
+
+**What you'll notice**
+
+- Fields are grouped into **Basic**, **LLM** and **Tools** sections rather than one long list.
+- Clearing a field while editing an agent — emptying the system prompt, deselecting every tool, or returning reasoning effort to the model default — now saves correctly. These previously reported success but kept the old value.
+- The form no longer rejects names, slugs or prompts that the service actually accepts.
+
+A new endpoint serves the tool catalogue to any client that needs to build a tool picker.
+
+## Claude Opus 5
+
+Agents can now run on **Claude Opus 5**, at the same price as Opus 4.8. Agents set to Opus 4.8 move over automatically and need no changes. Two long-standing errors in the Opus entry were also corrected — its maximum response length was understated by a wide margin, and file attachments were listed as unsupported when they work.
+
+## Performance
+
+- Startup is faster: agent definitions are now parsed with a native library, cutting that step from roughly 44ms to 2ms, and the work has been moved off the main request loop.
+- Several operations that could briefly block the service during startup and shutdown no longer do.
+
+## Maintenance
+
+- Python dependencies refreshed across the board, including the Redis client's first major release in some time. Connection timeouts are now set explicitly so the upgrade changes no behaviour.
+- Long-standing structural issues in the core module were resolved, restoring a clean bill of health from the project's static analysis and linting suite for the first time since mid-July.
+- Log records now identify which tool produced them; previously every tool logged under a shared name.
+- Fixed bugs in the activity notification, tool logging and agent configuration modules, and removed several pieces of dead code.
+
+# Release v2.30.1
+
+## Improvements
+
+- Refreshed all frontend dependencies to their latest compatible versions, including security patches: the image-processing library behind photo optimization was upgraded past several known vulnerabilities, and the dependency flaw flagged on the repository (a denial-of-service issue in a build-time tool) is resolved.
+- The management UI now runs on the latest Next.js and React patch releases for improved stability.
+
+# Release v2.30.0
+
+## New Features
+
+- Upgraded the Gemini model lineup: Gemini 3.6 Flash replaces Gemini 3.5 Flash as the default flash-tier model, and Gemini 3.5 Flash Lite replaces Gemini 3.1 Flash Lite as the lite-tier model. Both are available natively and via OpenRouter, and agents using the previous models switch over automatically — no configuration change needed.
+- Pricing follows the new models: Gemini 3.6 Flash produces output about 17% cheaper than its predecessor, while Gemini 3.5 Flash Lite costs slightly more than the old lite model (still the budget tier). Public agent templates and built-in web search now run on Gemini 3.6 Flash.
+
+## Improvements
+
+- Streamlined the agent management UI: the agent creation and editing pages now share one consistent form, and unused frontend code was removed for a lighter build.
+- Internal cleanup of legacy compatibility code, one-off migration scripts, and orphaned modules left over from earlier refactors.
+
+# Release v2.29.0
+
+## Improvements
+
+- Simplified the agent lifecycle: creating or updating an agent simply takes effect immediately. The leftover "deploy" wording from an older draft-based workflow is gone from agent tools, messages, and notifications, so assistants describe changes the way they actually work.
+- An agent's "last updated" time now reflects real edits only — routine background refreshes such as hourly account snapshots and asset caches no longer count. This keeps the Team Lead's view of recently active agents meaningful and avoids unnecessary periodic reinitialization of busy agents.
+- Internal cleanup of legacy code and a leftover database column from the retired draft system; the database schema updates itself automatically on upgrade.
+
+# Release v2.28.1
+
+## Improvements
+
+- When the Team Lead decides which agent should handle a request, it now considers the most recently updated agents first, so the agents you actively maintain stay front of mind on large teams.
+- Brand-new teams get a cleaner experience: the Team Lead now clearly knows the team has no agents yet, instead of looking for a roster that isn't there.
+
+# Release v2.28.0
+
+## Improvements
+
+- The Team Lead is now a noticeably more capable and proactive assistant. It understands how your team and its agents fit together, sees your team's own agents at a glance so it can hand a request straight to the right one, and takes ownership of your goal from start to finish rather than passing work off and stopping. When it delegates a task to another agent it now carries over the full context and relays any follow-up question back to you, so multi-step requests move along more smoothly.
+
+## Bug Fixes
+
+- Fixed an issue where a recent change to an agent's name or description could take a while to be reflected when the Team Lead was choosing which agent to hand a task to. Such edits now show up right away.
+
+# Release v2.27.4
+
+## Bug Fixes
+
+- Fixed web-enabled agents on OpenRouter models stalling mid-task. Certain models would occasionally emit their internal tool-call instructions as visible text instead of actually running the tool, leaving the task unfinished. These agents now use our own web search and page-reading tools, which run reliably across every model, so multi-step research and publishing flows complete as expected.
+
+# Release v2.27.3
+
+## Bug Fixes
+
+- Fixed a crash on the agent chat page ("Failed to load agent") that could occur while an agent streamed several updates in quick succession, such as live tool-call status frames. The chat now stays stable through rapid bursts of activity.
+- Follow-up messages in the same conversation now stream their replies live from the start; previously the beginning of a second reply could stay hidden until the response finished.
+
+# Release v2.27.2
+
+## Improvements
+
+- More reliable web-enabled agents: when a model's built-in web search or page-fetch briefly fails upstream, or a response is cut off in transit, the request is now retried automatically instead of surfacing as an error. Genuinely permanent failures — such as an exhausted usage limit — still stop right away, so real problems stay visible.
+- Routine maintenance: refreshed the underlying software dependencies to their latest compatible versions.
+
+# Release v2.27.1
+
+## Improvements
+
+- Smarter image storage: when an agent tries to persist an image that is already hosted on our CDN (for example, one it just generated), the existing link is now returned directly instead of downloading and uploading a duplicate copy. This eliminates wasted transfers and duplicate files in storage.
+
+# Release v2.27.0
+
+## New Features
+
+- Kimi K3 is now available: Moonshot's new flagship model with a 1M-token context window, image understanding, and deep reasoning, served exclusively through Moonshot's own infrastructure for consistent quality.
+
+## Improvements
+
+- Agents still configured with the older Kimi models (K2.6 and K2.7 Code) are automatically upgraded to Kimi K3 — no configuration change needed. K3 always reasons deeply before answering, so replies may be more thorough, and usage is billed at the new model's rates.
+
+# Release v2.26.3
+
+## Improvements
+
+- Fixed GPT image generation when running through OpenRouter: requests now go to the correct image endpoint, so `image_gpt` and `image_gpt_mini` work again without a native OpenAI key.
+- Publishing posts is more forgiving: an overlong URL slug no longer fails the whole request — it is now shortened automatically at a word boundary.
+
+# Release v2.26.2
+
+## Improvements
+
+- Significantly cheaper scheduled tasks: fixed an issue in the autonomous task module where each step of a run was billed as if the whole conversation were new, instead of reusing the AI provider's prompt cache. Long multi-step runs now cost a fraction of what they did, with no change in behavior.
+
+# Release v2.26.1
+
+## Improvements
+
+- More resilient replies: temporary AI provider hiccups — dropped connections, timeouts, rate limits, brief outages — are now retried automatically, including interruptions that happen midway through generating a response. When a request truly cannot be completed, the conversation now shows a proper error notice instead of occasionally recording the raw failure as if it were the agent's reply.
+- Faster long conversations: removed an ineffective context-trimming layer that added overhead to every reply and reduced caching efficiency in long threads. Long-history management is now handled entirely by the tiered history compression.
+
+# Release v2.26.0
+
+## Improvements
+
+- Task planning now runs only in live conversations, matching the interactive UI tools. Scheduled (cron) runs no longer build todo lists — they are single-shot and carry facts between runs via task memory — and delegated sub-agent runs keep leaving planning to the agent you are talking to. Chats with a real user watching keep the live checklist exactly as before.
+
+# Release v2.25.0
+
+## New Features
+
+- **Reasoning effort per agent**: agents can now set how much thinking their model does before answering — from none up to max — right next to the model choice. Leave it unset to use the model's recommended default. The setting automatically adapts to each model's real capabilities: models that can't turn thinking off run at their lightest level, and models with a simple on/off switch map your choice sensibly. The team lead can also configure this when creating or updating agents.
+
+## Improvements
+
+- **Model lineup cleanup**: retired the MiniMax M2 Her and Grok 4.20 models. Agents still using them switch automatically to MiniMax M3 and Grok 4.5 (Grok 4.5 is the newer model despite the smaller version number).
+- Fixed an issue where MiniMax M3 connected directly was not using its thinking mode.
+
+# Release v2.24.0
+
+## Improvements
+
+- **Task planning is now built in for every agent**: the per-agent "todo" toggle is gone. All agents — including the team lead — plan complex multi-step requests automatically, while delegated sub-agent runs still skip planning (the plan belongs to the agent you are talking to).
+- Removed the automatic tool picker that kicked in for agents with a very large tool list; agents now always work with their full set of tools directly.
+
+## Notes for operators
+
+- Predefined public agents will report a one-time "updated" during the next sync — their content fingerprint changed with the removed setting. No action needed.
+
+# Release v2.23.0
+
+## Improvements
+
+- **Models now run on provider-recommended settings**: manual tuning knobs (temperature and repetition penalties) are retired across agents and templates. Current-generation models are optimized for their providers' defaults — several reject or silently ignore manual values — so every model now runs the way its maker intended, with no configuration needed.
+- **Smarter reasoning control for DeepSeek**: DeepSeek models now switch thinking mode on or off exactly as configured, so the fast variant responds quicker and no longer spends hidden reasoning effort.
+- Fixed an invalid reasoning setting on the GPT-5.6 Luna model.
+
+# Release v2.22.0
+
+## New Features
+
+- **Nano Banana 2 Lite image model**: added Google's fastest and most affordable image generator to the image toolset — ideal for quick drafts and high-volume image workflows, at about half the price of Nano Banana 2.
+
+## Improvements
+
+- **Grok video upgraded to Imagine Video 1.5**: xAI's latest video model delivers steadier motion with clearer, better-synced speech and sound.
+- **Gemini image models moved to stable versions**: Nano Banana Pro, Nano Banana 2, and agent avatar generation now run on Google's production model releases instead of previews.
+- The China A-Share toolset now shows its own icon in the tool picker.
+- Fixed a performance issue where generating a Gemini image could briefly stall other conversations on the same server.
+
+# Release v2.21.0
+
+## New Features
+
+- **Smarter conversation memory**: long conversations are now compressed with a new in-house strategy that adapts to how active the chat is. Active conversations keep as much context as possible (and stay prompt-cache friendly); a chat resumed after hours or days is compacted more aggressively, cutting input cost and speeding up the first reply.
+- **Compression that keeps what matters**: instead of blindly trimming old messages, the agent now preserves the conversation's opening exchange and the most recent round in full, and replaces everything in between with an AI-written summary — so the agent still remembers how the conversation started and what was just said.
+- **Per-model tuning**: the compression thresholds (for active, recent, and idle conversations) can now be adjusted per model in the model catalog, with sensible defaults derived from each model's context window.
+
+## Improvements
+
+- Extremely long histories are now summarized reliably in stages, even when they exceed the summarizer model's own capacity.
+- A failed summarization no longer risks corrupting conversation history — the agent simply keeps the full history and retries later.
+- Fixed issues in the history compression module that could cause repeated re-summarization of the same conversation.
+
+# Release v2.20.0
+
+## New Features
+
+- **Task planning rebuilt**: agents with the todo feature enabled now reliably maintain a working plan for complex, multi-step requests. Plans stay accurate through very long conversations (the agent no longer loses sight of its list when older context is compacted away), a finished task's list is cleaned up automatically so it never leaks into the next request, and prompt-cache efficiency is preserved throughout.
+- **Visible plans everywhere**: web chat renders the plan as a live checklist with per-step states and a progress count. IM channels (Telegram, WeChat, Slack, Lark) show the checklist when a plan is created and a compact one-line progress note as steps complete.
+
+## Improvements
+
+- Fixed bugs in the todo module that could leave the planning tool entirely unavailable to the agent.
+- Sub-agent runs no longer carry their own todo lists — planning stays with the agent you are talking to. Scheduled (cron) runs keep full planning support.
+
+# Release v2.19.0
+
+## New Features
+
+- **Memory page**: a new "Memory" entry in the account area shows what your agents remember, split into Team Memory (shared with the whole team) and Your Memory (what each agent remembers about you personally). Entries are shown truncated — open one to read the full text rendered as Markdown, or edit it directly. Memories are managed automatically by your agents, so you normally don't need to read or change them. Available in both the bundled frontend and the team frontend.
+- **Memory API**: new endpoints to list and edit these memory documents (`/teams/{team_id}/memories` in the Team API, `/memories` in the local API), with size limits and per-user access control.
+
+## Improvements
+
+- **Long-term memory is always on**: memory now belongs to the conversation (team, user, channel, or cron task), not the agent, so the per-agent "Long-Term Memory" switch is gone. Agents skip the memory tool automatically in the few situations where it cannot work (sub-agent runs and anonymous visitors).
+- **Super mode removed**: every agent now runs with the higher execution step limit by default, so the per-agent "Super Mode" switch and badge are gone. The limit can still be tuned server-wide.
+- The lead agent's memory page entry shows the lead's real configured name and avatar.
+- Fixed minor issues in prompt assembly and memory loading performance.
+
+# Release v2.18.0
+
+## New Features
+
+- **One System Prompt**: the five separate prompt fields (Purpose, Personality, Principles, Knowledge Base, Advanced) are merged into a single "System Prompt" written in Markdown. It holds up to 200,000 characters and supports level-2+ headings, so you can structure the agent's role, personality, rules, and knowledge in one place, your way. Existing agents are migrated automatically — their old fields are stitched into the new prompt under matching section headings.
+- **Description is a first-class field**: the short public description is now edited right in the agent form instead of only through the publish flow. It appears in agent listings and search, and it is what other agents read when they delegate work to this one as a sub-agent. Agents that never set a description automatically inherit their old Purpose text.
+- **Team lead upgrades**: the lead's agent manager creates and updates agents with the new single system prompt and can set the description too, and its agent listings show the description consistently.
+
+## Improvements
+
+- All built-in public seed agents were converted to the new single-prompt format.
+- Avatar generation now handles very large prompts gracefully.
+- Internal cleanup of prompt assembly and validation logic.
+
+# Release v2.17.0
+
+## New Features
+
+- **All crypto tools under one roof**: the "Web3 Tools" section in the agent form now covers the entire crypto domain — market data, on-chain analytics, DeFi dashboards, and crypto news (Moralis, Dexscreener, CoinGecko, Dune, DeFiLlama, and more) join the wallet-operating tools there, instead of being scattered through the general tool list.
+- **Smarter wallet requirements**: only tools that actually operate on a team wallet still require the team to own one. Read-only crypto data and analytics tools no longer trigger wallet checks, no longer block wallet deletion, and no longer add wallet instructions to the agent's prompt.
+
+## Improvements
+
+- Internal cleanup of an unused agent editing flow and legacy migration scripts.
+
+# Release v2.16.0
+
+## Improvements
+
+- **Clearer model picker**: every model in the selection list now shows its provider as a small gray label on the right, and the selected model's provider is displayed in the closed selector too. The floating provider headers that could blend into the list while scrolling are gone.
+- The collapsed web3 toolset group in the agent form is now titled "Web3 Tools", matching what it actually contains.
+
+# Release v2.15.0
+
+## New Features
+
+- **Latest AI models**: the model catalog now offers the newest generation across providers — OpenAI GPT-5.6 (Sol, Terra, and Luna tiers), xAI Grok 4.5, Claude Sonnet 5, Qwen3.7 Plus, and GLM 5.2 — with up-to-date pricing and capability data.
+- **Seamless model upgrades**: retired models are now automatically routed to their successors. Existing agents configured with an older model keep working without any reconfiguration and transparently benefit from the newer model.
+- **Official model providers**: requests routed through OpenRouter are now pinned to each model's first-party provider, ensuring consistent quality and behavior.
+
+## Improvements
+
+- Each model series now keeps a single, current version in the catalog, making model selection simpler.
+- Agents created from the built-in templates and public agent gallery now use the latest models.
+- Fixed inaccurate pricing data and unavailable model identifiers in the model catalog module.
+
+# Release v2.14.1
+
+## Improvements
+
+- Fixed a database upgrade from the previous release that could fail to start the background services — including scheduled autonomous tasks — on deployments whose database was missing certain optional tables. The schema upgrade now applies safely regardless of which of those tables a database already has.
+
+# Release v2.14.0
+
+## New Features
+
+- Networks now follow wallets. Each team wallet carries its own default network, editable on the wallet page (Safe and Privy smart wallets stay on the chain they were deployed on). On-chain tools automatically operate on the network of the wallet they are called with, so one agent can work across several chains through different wallets. The agent-level network setting has been removed.
+- The agent create and edit forms are leaner: the model tuning parameters are gone, and all web3 toolsets are grouped under a collapsed "Advanced Settings" section that only appears when the team owns a wallet.
+
+## Improvements
+
+- Toolset rows in the agent form show a compact selected/total counter, and the toolset description expands together with the toolset.
+- The wallet management API's rename endpoint became a general update endpoint covering the name and the default network, with validation of the allowed networks.
+- Reduced redundant database lookups in the on-chain tool layer and fixed bugs in the OpenSea listing tools.
+
+# Release v2.13.0
+
+## New Features
+
+- Tool calls now report their status the moment they start. The chat stream sends a live frame as soon as the agent begins a tool call, so the web UI shows the agent's status line with a spinner right away — expanding a running call reveals its request parameters, and when the call finishes, the result folds into the same badge.
+- Telegram, WeChat, Slack, and Lark conversations get the status message at the start of the tool call instead of after it finished, so users see what the agent is doing while it works.
+
+## Improvements
+
+- Cancelled or interrupted conversations clean up their leftover "running" indicators automatically, and conversation history stays exactly as before — the live frames are never stored.
+- Fixed small inconsistencies in how non-streaming API responses assembled their message lists.
+
+# Release v2.12.0
+
+## New Features
+
+- Agents now narrate their tool use. Every tool call carries a short status line written by the agent in the user's own language — for example "Searching the web for the latest BTC news" — and the chat shows that line instead of the raw tool name. Expanding a tool call still reveals the tool name, parameters, and response for troubleshooting.
+- Telegram and WeChat conversations benefit too: the "Running tool..." notice now shows the agent's own description of what it is doing, and when several tools run at once, each one gets its own line.
+
+## Improvements
+
+- Older messages and tools without a status line keep the previous display, so existing conversations look the same as before.
+
+# Release v2.11.0
+
+## New Features
+
+- Linkable apps grew from 4 to 16: alongside Twitter/X, Notion, Gmail, and Supabase, teams can now link Outlook, Google Calendar, Google Docs, Sheets, Slides and Drive, LinkedIn, Airtable, Linear, GitHub, Jira, and Stripe.
+- Links now come in two levels. Team-level apps (GitHub, Notion, Stripe, and the rest) are linked once by an admin and shared by the whole team. Personal apps (Gmail, Outlook, Google Calendar, LinkedIn) are linked by each member for themselves — when the team lead agent talks to you, it acts on your own accounts, never a teammate's.
+- Every app carries category tags, and the Links page gained a search box and category filters, so the bigger catalog stays easy to navigate.
+
+## Improvements
+
+- The Links page is more compact: linking moved into each card's header, cards flow in a responsive grid, and apps are grouped into Personal and Team sections.
+- Personal accounts stay private — the page and the agent only ever see your own personal links; other members' accounts are invisible, even to admins.
+- Opening the Links page now refreshes the status of every linked account in the team, so an account that expired or was revoked shows up (and stops being used) sooner.
+- Fixed bugs in the linking flow and made permission errors clearer.
+
+# Release v2.10.0
+
+## New Features
+
+- Rich UI components (cards and clickable choice options) are now a built-in ability of every agent — nothing to enable in the tool picker anymore. Agents show them automatically wherever someone is actually watching the conversation: the web app, API clients, Telegram, WeChat, Lark, and Slack. Scheduled background runs and agent-to-agent delegation deliberately skip them, since there is no live user to click anything there.
+
+## Improvements
+
+- WeChat now displays card images as real pictures instead of dropping them; the rest of the card follows as text, which is the richest form WeChat's bot messaging supports.
+- Existing agents that had the UI components selected keep working unchanged — old configurations are accepted and tidied up automatically.
+
+# Release v2.9.0
+
+## New Features
+
+- Scoped long-term memory: an agent now keeps separate memory documents for the team using it, for each individual user it talks to, for each channel thread (Telegram, Slack, Lark, WeChat), and for each scheduled task — all maintained through a single memory tool. When different teams talk to the same public agent, each team's memory stays completely private to them.
+- Team wallet management: wallets can now be renamed and deleted, and Safe wallets' token spending limits adjusted, through new admin APIs. Deleting a team's last wallet is refused while agents still have on-chain tools configured, so an agent can never be left stranded.
+- Guests talking to a published agent now get its full read-side abilities — recent posts and activities, sub-agent delegation, on-chain data lookups, and personal memory — while publishing content, signing transactions, and anything else that acts with the agent's identity stays strictly reserved for the owning team, enforced both when tools are offered and again when they execute.
+- Publishing rules now keep delegation consistent: an agent can only be published when every sub-agent it uses is public too, and an agent that a public agent depends on cannot be hidden, archived, or deleted while the reference stands.
+
+## Improvements
+
+- Scheduled (autonomous) tasks no longer carry conversation history between runs. Every run starts fresh — dramatically cutting token costs for long-lived tasks — and tasks record the facts they need across runs in their own task memory instead.
+- All costs incurred by delegated sub-agent work are billed to the account that started the conversation, no matter how deep the delegation chain goes.
+- The tool catalog is now derived directly from the code instead of separate schema files, so tool pickers, validation, and the agent's own tool listing can never drift apart; toolsets that need a team wallet are now correctly hidden for teams without one.
+- Fixed bugs in the tool availability and agent visibility modules.
+
+# Release v2.8.0
+
+## New Features
+
+- Agents now always know which channel a conversation originally came from (web, Telegram, WeChat, Lark, Slack, or a scheduled task), even when the work is delegated through one or more sub-agents. Channel-specific behavior such as formatting rules now applies correctly to delegated agents at any depth.
+- Agents are now explicitly aware when they run as a sub-agent on behalf of another agent, and adjust their behavior accordingly — for example, sub-agents spawned by an autonomous task know they must complete the work without asking the user for input.
+
+## Improvements
+
+- Observability: traces are now labeled with the real entry channel instead of a generic internal marker, and delegated runs carry a dedicated sub-agent flag, making it much easier to filter and analyze multi-agent conversations.
+- Chat history records for delegated runs are now consistently attributed to the originating channel.
+
+# Release v2.7.2
+
+## Improvements
+
+- Updated third-party dependencies across the whole platform — backend, web console, and channel integrations — including fixes for two security advisories in underlying libraries.
+- Picked up upstream AI framework updates that improve tool-calling reliability across model providers and make conversation state handling more robust.
+
+# Release v2.7.1
+
+## Improvements
+
+- Database schema upgrades now run automatically when services start — deploying a new version no longer requires any manual migration step. Existing databases are adopted in place on their first start after this release, several services starting at the same time coordinate safely, and a service will refuse to start on a database it could not upgrade rather than run with a mismatched schema.
+
+# Release v2.7.0
+
+## New Features
+
+- Links: teams can now connect external app accounts — Twitter/X, Notion, Gmail, and Supabase — and the team lead agent gains the ability to act through them: read and send email, post to X, work with Notion pages, manage Supabase projects, and more. Connecting an account is always a standard OAuth authorization (users never copy API keys), accounts can be unlinked at any time, and when someone asks about an app that isn't linked yet, the lead points them to the Links page. Available in both the team API and the local single-user deployment.
+- Channels: Slack and Lark/Feishu join the team channel lineup — a team admin authorizes the official app into their own workspace with a single click. Telegram now runs through one official shared bot that groups join via a bind link, so teams no longer manage their own bot tokens.
+
+## Improvements
+
+- Database schema changes are now managed with Alembic migrations, making upgrades safer and more repeatable.
+- Release builds now ship ready-to-run images for the Lark and Slack channel services.
+
+# Release v2.6.9
+
+## Improvements
+
+- Team conversations are now private to each member. When working with a team agent, you see only your own chat threads, message history, and tool activity; conversations belonging to other team members are no longer shown or accessible. The shared default notification channel remains visible to the whole team.
+
+# Release v2.6.8
+
+## Improvements
+
+- Streamlined observability: agent run tracing now relies on a single platform (Langfuse). Support for the alternative tracing backend was removed to simplify configuration and reduce ongoing maintenance. No user-facing changes.
+
+# Release v2.6.7
+
+## New Features
+
+- Chat conversations now show friendly time markers between messages: a small timestamp appears after a pause or when the day changes (for example "Yesterday 15:12"), and hovering over a message's avatar reveals its exact time.
+
+# Release v2.6.6
+
+## Bug Fixes
+
+- Fixed a billing issue in agent-to-agent delegation: when an agent handed a task off to another agent, the cost of that delegated work was not charged back to the team paying for the conversation (and, with billing enabled, could even prevent the delegated task from running). Delegated work is now correctly billed to the caller's account.
+
+# Release v2.6.5
+
+## Improvements
+
+- Maintenance release: refreshed dependencies across the whole platform — the Python backend, the Go channel integrations, and the web frontend — to their latest compatible versions, with the internal code adjustments needed to stay current with those libraries. No user-facing changes.
+
+# Release v2.6.4
+
+## Improvements
+
+- Observability traces (Langfuse) now show a readable name — the agent's name and its owning team — instead of the raw agent id, and carry richer filterable details: agent and team display names, the caller's team for public agents (with an external-caller flag), visibility, and tags. No user-facing changes.
+
+## Bug Fixes
+
+- Fixed the test suite still sending traces to the observability backend (Langfuse): the earlier fix was undone by environment reloading, so test/local data kept appearing. Tests now reliably emit nothing.
+
+# Release v2.6.3
+
+## Improvements
+
+- Observability traces (Langfuse) now record a more accurate per-request cost: when the provider reports the actual charge (e.g. OpenRouter) it is used directly, otherwise the cost is computed from the model catalog — and cached input tokens are now priced at their discounted rate instead of being undercounted. No user-facing changes.
+
+# Release v2.6.2
+
+## Improvements
+
+- Internal plumbing only, no user-facing changes: added a cached team display-info lookup (team name/avatar) for read-time enrichment, and ensured the automated test suite no longer sends observability traces to Langfuse.
+
+# Release v2.6.1
+
+## New Features
+
+- Added Moonshot Kimi K2.7 Code, a coding-focused model, to the list of selectable LLM models.
+
+# Release v2.6.0
+
+## New Features
+
+- LLM models served through OpenRouter can now be pinned to a specific upstream provider. When a model defines an origin provider it is locked to that provider with no automatic fallback; models without one continue to let OpenRouter choose. This gives operators precise control over which upstream serves each OpenRouter model.
+
+## Improvements
+
+- The catalog of available LLM models is now defined in a single, easy-to-edit configuration file, replacing the previous comma-separated format and making it simpler to add, adjust, and annotate models.
+- Streamlined how model information is sourced: the bundled catalog is now the single source of truth, the unused database-override path was removed, and model lookups are served entirely from memory — removing unnecessary database and cache round-trips.
+
+# Release v2.5.1
+
+## Improvements
+
+- The team lead assistant now runs on a newer, more capable model (Gemini 3.5 Flash), improving the quality of its conversations and its delegation to team agents. Individual team agents are unaffected.
+
+# Release v2.5.0
+
+## New Features
+
+- Added Langfuse as an observability option alongside the existing LangSmith integration. Each deployment chooses a tracing service through its configuration: when Langfuse credentials are provided it is used automatically and LangSmith is turned off; otherwise LangSmith continues to be used. This makes it easy to evaluate both services and settle on the one that fits best.
+
+# Release v2.4.2
+
+## Improvements
+
+- MCP-based tool integrations (such as CoinGecko) are now configured with a single per-service control instead of a long per-tool list, and always expose whatever the remote service currently offers. There is no longer any need to re-sync when a provider changes its tools.
+
+## Bug Fixes
+
+- Fixed an issue where MCP-based tools could silently stop working after the remote provider changed its set of available tools.
+
+# Release v2.4.1
+
+## Improvements
+
+- WeChat agents can now reply using rich Markdown formatting — headings, bold and strikethrough text, bulleted (including nested) and numbered lists, blockquotes, links, inline code, code blocks, tables and dividers — instead of plain text only, making their replies clearer and easier to read.
+
+# Release v2.4.0
+
+## New Features
+
+- The package can now be installed with optional extras: `intentkit[pdf]` adds PDF generation support and `intentkit[ollama]` adds local Ollama model support, so deployments that don't need them stay lean.
+
+## Improvements
+
+- Internal architecture cleanup: the codebase now enforces a strict module layering, and the agent execution engine was reorganized into smaller, focused modules. Behavior and public APIs are unchanged.
+- The dependency list was tidied — unused packages removed and previously implicit ones now declared explicitly — for more reliable and reproducible installs.
+- Stronger automated quality gates (type checking, architecture-layer rules, dependency hygiene) and broader continuous-integration coverage now span the Python, Go and frontend code.
+- The DeFi Llama tool test suite was moved out of the shipped package and rewritten, so the published library no longer carries test files.
+
+## Bug Fixes
+
+- Fixed bugs in the tool integration module: external MCP-wrapped tools now send the correct tool name to remote servers, the Jupiter price and quote tools now honor their per-agent enable/disable settings, the Venice image-enhance tool can now be enabled, and the DeFi Llama price-chart tool now returns data instead of an empty result.
+
+# Release v2.3.1
+
+## Improvements
+
+- LangSmith tracing settings are now managed by the system configuration: values can come from environment variables or the AWS secret, the trace project name defaults to "intentkit", and stray legacy tracing variables in the deployment can no longer flip the tracing switch.
+- Configuration values accidentally wrapped in quotes (a common mistake in docker environment blocks) are now sanitized automatically for all settings.
+
+# Release v2.3.0
+
+## New Features
+
+- LangSmith tracing support: agent conversation runs now carry filterable metadata — environment, agent, team, user, channel, conversation thread, app and model — so all deployments can share a single LangSmith project and still be filtered by any of these dimensions. Multi-turn conversations are grouped in the LangSmith Threads view. Chat title generation calls are tagged and named as well. Tracing stays off unless the standard LangSmith environment variables are set on the server.
+
+## Improvements
+
+- Test runs never send traces to LangSmith, even when tracing is enabled in the developer's local environment.
+
+# Release v2.2.0
+
+## New Features
+
+- Agent display info (name, avatar, slug) is now resolved when content is read, backed by a shared Redis cache with a one-day TTL. Posts, activities, the team feed, post PDFs and push notifications always show the agent's current name and avatar; renaming an agent or changing its avatar propagates to all services immediately.
+- Autonomous task responses include the target agent's display info (`target_agent`), so clients can render the pinned agent as name + avatar + link instead of a raw ID. The frontend task pages do exactly that.
+
+## Breaking Changes
+
+- The denormalized `agent_name`/`agent_picture` snapshot columns on `agent_posts` and `agent_activities` are dropped automatically at startup. The historical publish-time snapshots are discarded; content now always reflects the agent's current profile.
+
+## Upgrade Notes
+
+- Deploy all backend services together for this release: instances of the previous version fail to read or publish posts/activities once the snapshot columns are dropped.
+
+# Release v2.1.2
+
+## Improvements
+
+- Existing tasks are now moved to team ownership automatically when the autonomous service starts — no manual migration step per environment. The import is skipped once tasks are present; if it cannot run yet, the service retries every minute and raises a single alert.
+- The migration now tolerates malformed legacy task data instead of failing as a whole.
+
+# Release v2.1.1
+
+## Improvements
+
+- WeChat push messages that cannot be delivered because the recipient has been inactive too long are now treated as an expected condition and skipped quietly, instead of triggering system error alerts.
+
+# Release v2.1.0
+
+## New Features
+
+- Autonomous tasks now belong to the team instead of a single agent. A task can target a specific agent, or leave the choice to the team lead, which delegates each run to the right agent.
+- Every task run is now recorded as an execution: status, how it was triggered, duration, token and credit usage, and a result preview, with the complete per-run log available from the new task detail page.
+- Tasks can be started on demand with the new "Run Now" action, in addition to their schedule.
+- A new task-manager assistant under the team lead handles tasks in conversation: create, edit, retarget, or remove scheduled tasks by simply asking the lead.
+- Tasks record who created them.
+
+## Improvements
+
+- Overlapping runs of the same task are prevented automatically, and runs orphaned by a service restart are cleaned up on the next run.
+- The scheduler process is leaner: agent and lead executions are routed to the core service instead of running inside the scheduler.
+- Fixed the long-standing issue where task logs could not be viewed; logs are now reliably available per run.
+
+## Upgrade Notes
+
+- After deploying, run `python scripts/migrate_autonomous_to_team.py` once to move existing per-agent tasks to their teams. The script is idempotent; agents without a team are skipped with a warning. The legacy task data on agents is kept for this release and will be removed in the next one.
+
+# Release v2.0.5
+
+## New Features
+
+- Team leads can now browse public agents from other teams, follow the useful ones, and delegate tasks to them just like in-team agents.
+
+## Improvements
+
+- The team lead now knows to hand off post and activity publishing to the right agents instead of doing everything itself.
+- Smarter model selection guidance when the lead creates or updates agents.
+- Channel connectivity incidents (WeChat and Telegram) now trigger a single consolidated alert with a follow-up when service recovers, instead of a flood of repeated error messages; reconnection attempts also back off more patiently during longer outages.
+
+# Release v2.0.4
+
+## Bug Fixes
+
+- Downloaded post PDFs no longer include the cover image, keeping the exported document consistent with the post and shared pages.
+
+## Improvements
+
+- Removed a deprecated internal utility that was no longer in use, trimming the codebase with no change to existing behavior.
+
+# Release v2.0.3
+
+## Improvements
+
+- Removed a superseded internal agent-management component that had already been fully replaced by the team lead experience, trimming the codebase with no change to existing behavior.
+- Made agent creation and editing a little faster by reusing the cached catalog of available tools instead of rebuilding it on every request.
+
+# Release v2.0.2
+
+## Improvements
+
+- Reduced noisy error alerts from the WeChat integration. Brief connection hiccups that recover on their own — common in the first moments after a restart — are no longer reported as errors; only sustained connection problems are escalated, making genuine issues easier to spot.
+
+# Release v2.0.1
+
+## Improvements
+
+- Upgraded locked dependencies across the backend and the web frontend to their current upstream releases.
+- Resolved all outstanding security advisories reported for backend and frontend dependencies.
+- Removed unused legacy packages left over from the move to the standalone messaging adapters, reducing the install footprint.
+
+# Release v2.0.0
+
+## Improvements
+
+- The platform's "skill" concept has been renamed to "tool" everywhere — in agent configuration, the API, and stored data — to align with standard agent terminology and make room for the upcoming Agent Skills capability. What used to be called a skill is now a tool, and skill categories are now "toolsets".
+- Existing agents, conversation history, and billing records are upgraded automatically the first time the updated service starts, so upgrading requires no manual migration steps.
+
+# Release v1.2.18
+
+## New Features
+
+- Agents running on models without a built-in web search (such as DeepSeek and MiniMax) now have reliable Internet Search. It draws on several search providers behind the scenes and automatically falls back to another whenever one is unavailable or out of quota, so searches keep succeeding without any manual switching.
+
+## Improvements
+
+- Web search is now delivered through a single, consistent built-in capability for these models; the standalone Tavily skill has been retired and its functionality folded into the unified search.
+
+# Release v1.2.17
+
+## New Features
+
+- Agents now report the current time together with a numeric Unix timestamp, so tools and workflows that need an exact machine-readable time value can use it directly.
+
+## Improvements
+
+- Agents running on OpenRouter models with Internet Search enabled can now read full web pages natively, on top of searching — giving more complete and reliable answers when they need details from a specific page.
+- Made timekeeping consistent across every agent: all models now use the same built-in time tool, so the time format and behavior no longer depend on the underlying model provider.
+
+# Release v1.2.16
+
+## New Features
+
+- Shared posts can now be downloaded as a styled PDF directly from their public share page, so a post can be saved or printed without signing in.
+- Expanded the available AI model lineup: added Qwen3.7 Max, Qwen3.6 Flash, and MiniMax M3, and upgraded Claude Opus to version 4.8.
+
+## Improvements
+
+- Strengthened safeguards on the PDF rendering service so it can no longer be tricked into fetching internal or restricted network addresses.
+- Bumped locked dependencies to current upstream releases.
+
+# Release v1.2.15
+
+## New Features
+
+- Agents with Internet Search enabled can now save external images to our CDN so the links stay valid in long-form output. When an agent is writing an article or post and wants to embed an image it found online, it can persist the image to our storage and reference it via a permanent CDN URL — protecting against broken images later when the source site rotates or removes the original asset. The capability is available across every supported LLM provider.
+
+# Release v1.2.14
+
+## Improvements
+
+- Activity links pushed into WeChat can now be served through a separate CDN domain for faster in-app loading. When `WECHAT_BASE_URL` is configured, share links inside WeChat messages are rewritten from the canonical app domain to the CDN domain at send time. Other channels (Telegram), persisted chat history, and frontend responses continue to use the canonical app domain unchanged.
+- Bumped locked dependencies to current upstream releases.
+
+# Release v1.2.13
+
+## Improvements
+
+- Added Google's newly released Gemini 3.5 Flash to the model catalog, available via both the Google native key and OpenRouter. The model offers stronger reasoning than the Gemini 3 Flash tier while keeping the full 1M-token context, native image / audio / video / PDF inputs, and Flash-class latency, giving team agents a new mid-tier multimodal option.
+- Refreshed DeepSeek's official pricing to reflect DeepSeek's current promotional discount: DeepSeek V4 Pro on the official key is now 75% off (running through 2026-05-31), and the cache-hit input rate on DeepSeek V4 Flash drops to one tenth of its launch price. Agents that route through the DeepSeek native key automatically benefit from the lower rates. OpenRouter routes for the same models are unaffected.
+- Bumped locked dependencies to current upstream releases.
+
+# Release v1.2.12
+
+## Improvements
+
+- Long agent conversations now cost less to persist. Checkpoint storage for chat history switches from a full per-step snapshot to incremental writes, so the same conversation that previously grew its database footprint quadratically with the number of turns now grows linearly. For threads that run dozens of turns, this is a meaningful reduction in both Postgres write volume and total stored bytes; existing threads continue to work without migration.
+- Conversations on Anthropic models (Claude family) now use Anthropic's native prompt caching for the system prompt and tool definitions. For agents with long instructions or many tools — which is most of our team agents — this can cut input-token cost by 50-90% on repeated turns within a 5-minute cache window, without changing model behavior.
+- Refreshed all LangChain and LangGraph dependency floors to match the actual installed 1.x lockfile, so new installs no longer risk resolving to versions that pre-date the agent and middleware framework we already rely on.
+
+# Release v1.2.11
+
+## Improvements
+
+- Added a new `cn_stock` skill package that surfaces Chinese A-share market data (Shanghai / Shenzhen / Beijing exchanges) to agents through nine tools backed by the `akshare` library: real-time spot quote, K-line history, major-index snapshot with optional 30-day history, industry/concept board snapshots ranked by intraday change, capital flow for an individual stock or the whole market, stock-specific or macro financial news, the day's listed-company announcements, fundamental financial metrics by reporting period, and a trading-day calendar gate for scheduled tasks. All akshare calls are dispatched off the event loop via `asyncio.to_thread`, share a category-level 60/min global rate limit, and use short-TTL Redis caching (10s for live quotes, up to 24h for the trading calendar) to absorb retry storms against akshare's free public endpoints. Stock codes accept any of the common formats (`600519`, `sh600519`, `SH600519`, `600519.SH`) and are normalized internally; the BSE `920xxx` prefix introduced in 2025 is correctly classified as Beijing without sweeping in `900xxx` SSE B-shares. Defaults for "today" use Asia/Shanghai rather than the server's local clock, so an agent running on a UTC host gets the right trading day during the Beijing morning window. Four ready-to-use public agents ship with the package — a market-overview leaf, a quote leaf, a news leaf, and a fundamentals leaf — designed to be composed by a team-built orchestrator via `lead_call_agent`.
+
+## Bug Fixes
+
+- Agent autonomous cron triggers are now pinned to UTC. They were previously created via APScheduler's `CronTrigger.from_crontab` without an explicit timezone, so the cron expression was interpreted in whatever local time the worker process happened to be running in; the same agent's `0 9 * * *` trigger would fire at a different wall-clock instant depending on which environment landed it, and could silently shift across DST transitions on hosts that observe them. The new triggers explicitly use UTC, matching the heartbeat trigger already in the same file, so schedules are stable and reproducible across environments.
+
+# Release v1.2.10
+
+## Improvements
+
+- The flagship OpenAI image-generation skill now uses the newly released GPT Image 2 model in place of GPT Image 1.5. GPT Image 2 produces higher-quality images and follows prompts more accurately. The per-call price is increased to reflect the new model's higher cost — about 1.5x the previous price at default quality.
+
+# Release v1.2.9
+
+## Improvements
+
+- The lead-agent's `lead_get_team_info` skill now also reports the team's public-agent quota usage (`public_agent_limit` and `current_public_agent_count`), so the lead can advise users before they try to publish another agent that would push them over the quota. The two underlying queries (team members + public-agent count) now run in parallel via `asyncio.gather`.
+- Added a `publish_agent` skill to the agent-manager so the manager can publish (or republish) the active agent to public on behalf of the user — without asking them to switch to the publish form. The skill collects the four user-visible fields (Description, Example Intro, Examples 1–6, Tags 0–3 from a predefined ~50-category enum) and forces `fee_percentage = 1` server-side; it returns user-friendly messages when the team has reached its public-agent quota, when the agent has no team, or when the agent isn't owned by the current user, so the manager can steer the conversation accordingly. Internally, the tag enum and the four-field input model were promoted out of the team API layer into the canonical model layer (`intentkit/models/agent/tags.py`, `intentkit/models/agent/public_info.py:AgentPublishInput`) so the team-publish endpoint and the new manager skill share a single `AgentPublishInput.to_public_info()` helper, keeping the field set and the fixed `fee_percentage = 1` policy in one place.
+
+# Release v1.2.8
+
+## Improvements
+
+- Simplified the team-version "publish agent to public" flow to the fields the team UI actually needs. The previous form was schema-driven against the full `AgentPublicInfo` model and surfaced every field on it, including the web3-era ticker / token-address / token-pool / external-website / x402-price / fee-percentage controls that are no longer relevant for the team product, and rendered the examples editor through a generic JSON-schema array widget that was awkward to use. The team publish endpoint now accepts only Description (required), Example Intro (required), Examples (required, 1–6 entries with name / description / prompt), and Tags (optional, up to 3 from a predefined ~50-category list spanning productivity, creative, education, lifestyle, entertainment, knowledge, health, companion, business, and tech). Other public-info fields on the agent are left untouched on republish, so any prior values are preserved. `fee_percentage` is now fixed at 1 for every team publish regardless of what the client sends. A new `GET /schema/agent-public-tags` endpoint serves the predefined tag list with module-level caching and an HTTP cache header so the frontend can render the multi-select grouped by category.
+
+# Release v1.2.7
+
+## Bug Fixes
+
+- Fixed Gemini still rejecting requests with an "empty mimeType in inlineData" error even after v1.2.6, when the conversation had any voice/video/file attachments from before v1.2.4. Those earlier turns were stored in chat history without a content type, and Gemini's adapter failed to recover one from the URL alone, so every subsequent reply in that conversation kept failing. The platform now repairs each historical attachment on the fly — guessing the content type from the URL extension and falling back to a per-type default — and drops the attachment when no reasonable type can be determined, so a single bad legacy attachment can no longer poison an entire conversation.
+
+# Release v1.2.6
+
+## Improvements
+
+- Audio, video, and document attachments now reach every model that claims to support them, not just Gemini. The previous release used a Google-specific delivery format and silently blocked the same attachment from reaching, for example, an OpenAI- or OpenRouter-routed model that supports audio. The platform now uses a provider-agnostic delivery shape that LangChain translates into each provider's native format (OpenAI's `input_audio`, Anthropic's `document`, Gemini's `inlineData`, etc.), so the model capability flags configured per model are the single source of truth.
+
+# Release v1.2.5
+
+## Bug Fixes
+
+- Fixed audio, video, and document attachments still failing with an "empty mimeType" error against Gemini, despite v1.2.4. The previous attempt added a content-type hint to the request and relied on the LangChain adapter to fetch the file and pass it through correctly; in production that path still produced empty values. The platform now downloads the file itself before calling the model and hands the bytes plus an explicit content type directly to Gemini, which removes the empty-mimeType failure mode entirely. The content type is derived from the file's HTTP headers, falling back to its extension and a per-type default so it is never empty.
+
+# Release v1.2.4
+
+## Bug Fixes
+
+- Fixed a regression introduced in v1.2.3 where Gemini rejected every audio, video, and document attachment with an "empty mimeType" error before the model ever saw the content. Media attachments are now sent with an explicit content-type hint so the model can actually open them.
+
+# Release v1.2.3
+
+## New Features
+
+- WeChat voice messages now reach audio-capable models as actual audio. Previously, voice notes were uploaded as raw SILK files that no model could read, so the model would just see a URL with a `.silk` extension in the prompt and politely refuse. They are now transcoded to MP3 inside the WeChat integration before upload, then delivered to the model through a proper audio attachment so Gemini (and any other audio-capable model added in the future) can actually listen to them.
+- Audio, video, and document attachments now follow the same rules as images. When an attachment type matches the model's capabilities the file is forwarded to the model as a media input; when it does not, the user gets a clear, type-specific message telling them their current model can't accept that kind of input. This replaces the previous behavior where non-image attachments silently turned into a URL embedded in the prompt text.
+
+## Improvements
+
+- Tightened the WeChat attachment summary so a voice message and a separately-attached file are both counted correctly when shown back as a "User sent ..." preview.
+
+# Release v1.2.2
+
+## Improvements
+
+- Streamlined how the team lead delegates to its built-in sub-agents. The "task manager" was folded into the agent manager, since autonomous tasks always belong to an agent. Operators now have a single destination for everything about a team agent — creating it, configuring it, and scheduling its autonomous tasks — which removes a class of routing mistakes the lead used to make between the two near-identical helpers.
+
+## Bug Fixes
+
+- Fixed an issue where the agent manager could suggest skills that were not actually enabled in the current deployment. The skill catalog shown to the LLM is now filtered against the system configuration, so unavailable categories never end up in a generated agent draft.
+
+## Other
+
+- Refreshed Go integration dependencies.
+
+# Release v1.2.1
+
+## New Features
+
+- Teams can now publish their agents to the public catalog directly from the team UI. Publishing prompts the operator to fill in the agent's public-facing info (description, ticker, example prompts, and so on) and immediately makes the agent visible to other teams. Unpublishing flips it back to team-only and automatically removes every subscription that pointed at the agent so other teams stop seeing its activity going forward; previously delivered timeline posts and activity feed entries are preserved.
+- Each team now has a `public_agent_limit` (default 1) that caps how many of the team's agents can be published at the same time. Operators can raise or lower this quota for any team via the new `scripts/admin_set_public_agent_limit.py` tool.
+
+## Improvements
+
+- Refreshed dependencies via `uv sync --upgrade`.
+
+# Release v1.2.0
+
+## New Features
+
+- Added Xiaomi's MiMo Token Plan as a built-in LLM provider. Operators with a MiMo subscription can now plug in `MIMO_PLAN_API_KEY` to make the new `mimo-v2.5-pro` and `mimo-v2.5` models available to agents directly, without going through OpenRouter.
+
+## Breaking Changes
+
+- The MiniMax provider environment variable was renamed from `MINIMAX_API_KEY` to `MINIMAX_PLAN_API_KEY` to reflect that the integration uses the MiniMax subscription plan. Deployments that referenced the old name need to update their configuration; there is no automatic fallback.
+
+# Release v1.1.0
+
+## New Features
+
+- WeChat agents now proactively reach out before their reply window closes. WeChat only lets a bot push messages within a day of the user's last inbound message; once that window expires, scheduled posts and other proactive notifications stop arriving. About 30 minutes before the window closes, the agent now sends a friendly heads-up that prompts the user to reply with any message (or assign a new task) to keep the channel open, and folds in a quick status summary of the team's agents and any pending autonomous tasks.
+
+# Release v1.0.0
+
+## New Features
+
+- WeChat agents now accept voice, video, and file messages in addition to images. Users can send an audio note, a short video, or a document and the agent will receive the content directly instead of a "type not supported" fallback.
+
+## Improvements
+
+- Expanded the catalog of selectable LLM models — the latest DeepSeek, Claude Opus, Kimi, and MiMo releases are now available when configuring agents.
+- When an agent's underlying model returns an empty response (for example, Gemini rejecting a malformed tool call), the conversation thread now recovers automatically instead of becoming stuck. The offending turn is cleaned up, and internal logs capture the surrounding tool-call history so engineers can diagnose the cause.
+
+## Other
+
+- Refreshed internal dependencies across the Python backend and Go integrations.
+
+# Release v0.18.0
+
+## New Features
+
+- WeChat agents now accept voice, video, and file messages in addition to images. Users can send an audio note, a short video, or a document and the agent will receive the content directly instead of a "type not supported" fallback.
+
+## Improvements
+
+- Expanded the catalog of selectable LLM models — the latest DeepSeek, Claude Opus, Kimi, and MiMo releases are now available when configuring agents.
+- When an agent's underlying model returns an empty response (for example, Gemini rejecting a malformed tool call), the conversation thread now recovers automatically instead of becoming stuck. The offending turn is cleaned up, and internal logs capture the surrounding tool-call history so engineers can diagnose the cause.
+
+## Other
+
+- Refreshed internal dependencies across the Python backend and Go integrations.
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.17.60...v0.18.0
+
+# Release v0.17.60
+
+## Bug Fixes
+
+- Fixed a long-standing issue where images sent through WeChat came through as unreadable garbage and the AI refused to process them. Inbound images now decrypt correctly, so users can share photos with their agents and get a real response.
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.17.59...v0.17.60
+
+# Release v0.17.59
+
+## Bug Fixes
+
+- Fixed an issue where images sent through WeChat could be stored incorrectly and cause the AI to reject them, with the error then blocking any further messages in the same conversation. Inbound images are now validated before being forwarded to the AI, and unrecognized or unsupported formats are dropped cleanly instead of poisoning the conversation.
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.17.58...v0.17.59
+
+# Release v0.17.58
+
+## Improvements
+
+- Improved reliability for agents with large skill catalogs. Built-in capabilities — current time, long-term memory, posts, activities, and sub-agent calls — now remain available even when the automatic tool-selection layer narrows the active tool set. Previously these core tools could be filtered out, causing agents to repeatedly attempt the same failed call without recovering.
+- Raised the threshold at which the automatic tool-selection layer activates and refined the counting logic so built-in provider tools no longer push borderline agents into the selection path prematurely.
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.17.57...v0.17.58
+
+# Release v0.17.57
+
+## New Features
+
+- Added time-limited **share links** for chats and posts. Team members can now generate a public URL that lets anyone — including recipients without an account — view a chat transcript or post for three days.
+- When posts are delivered to WeChat or Telegram, the push message now contains a share link instead of a login-gated URL, so off-platform recipients can open the content directly.
+
+## Improvements
+
+- Each public view increments a view counter on the share link, and creator metadata (user and team) is retained for future reporting.
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.17.56...v0.17.57
+
+# Release v0.17.56
+
+## Improvements
+
+- Tuned the threshold at which the automatic tool-selection layer activates, so agents with mid-sized skill sets now run without the extra selection step and only agents with larger skill catalogs trigger it.
+- Routine dependency updates.
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.17.55...v0.17.56
+
+# Release v0.17.55
+
+## Improvements
+
+- Added diagnostic logging that records which image URLs are forwarded to the model, making it easier to investigate image-processing errors in production.
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.17.54...v0.17.55
+
+# Release v0.17.54
+
+## Improvements
+
+- Silenced noisy Gemini-related warning logs (schema compatibility and automatic function calling notices) that were flooding production logs without adding operational value.
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.17.53...v0.17.54
+
+# Release v0.17.53
+
+## Bug Fixes
+
+- Fixed several issues in the WeChat integration that prevented inbound images from reaching the LLM and caused spurious "push failed" alerts even when messages were successfully delivered.
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.17.52...v0.17.53
+
+# Release v0.17.52
+
+## New Features
+
+- **Alert forwarding for Go integrations**: The Telegram and WeChat integration services now automatically forward error-level events to the configured alert channel (Telegram or Slack), matching the behavior already in place on the Python side. Both stacks share the same per-minute alert budget so operators are not flooded.
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.17.51...v0.17.52
+
+# Release v0.17.51
+
+## Bug Fixes
+
+- Fixed an issue where error-level events were not being forwarded to the configured alert channel (Telegram/Slack). Operators will once again receive automatic notifications when errors occur.
+
+## Other
+
+- Updated dependencies.
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.17.50...v0.17.51
+
+# Release v0.17.50
+
+## New Features
+
+- **WeChat image storage**: Images received from WeChat are now downloaded, decrypted, and stored on S3, providing stable URLs that the AI model can reliably access. Previously, WeChat's temporary CDN links could expire before the model processed them.
+
+- **Cross-turn media forwarding**: The lead agent can now forward images, videos, and files to sub-agents even when the media was received in a previous message. Attachment URLs are made visible to the lead so it can reference them across conversation turns.
+
+## Other
+
+- Updated dependencies.
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.17.49...v0.17.50
+
+# Release v0.17.49
+
+## New Features
+
+- **Media input support for LLM models**: Added audio, video, and file input support fields to model configuration, enabling richer media input options when selecting models.
+
+## Bug Fixes
+
+- Fixed markdown rendering on post pages — headings and other typography styles were not displaying correctly.
+
+## Other
+
+- Updated dependencies.
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.17.48...v0.17.49
+
+# Release v0.17.48
+
+## New Features
+
+- **WeChat image support**: Agents can now receive and process images sent by users through WeChat. Images are extracted from incoming messages and passed to the agent's model for understanding.
+
+## Improvements
+
+- Improved error handling when users send images to agents using models that don't support image input — a clear message is now returned instead of a silent failure.
+- Simplified image capability detection for agents by removing the deprecated image parser skill fallback.
+- Optimized agent delegation to avoid unnecessary database queries when forwarding attachments between agents.
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.17.47...v0.17.48
+
+# Release v0.17.47
+
+## Bug Fixes
+
+- Paid x402 actions now fail gracefully in agent conversations instead of surfacing as internal server errors when wallet funding or payment setup runs into trouble.
+
+## Improvements
+
+- Improved Safe wallet x402 payment reliability with clearer timeout handling.
+- Added automatic administrator alerts when the x402 paymaster runs out of gas, so platform issues can be addressed faster.
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.17.46...v0.17.47
+
+# Release v0.17.46
+
+## Improvements
+
+- Chat conversations now continue running on the server when you navigate to other pages — only the explicit Cancel button stops generation. Returning to the thread shows the latest messages, including ones produced while you were away.
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.17.45...v0.17.46
+
+# Release v0.17.45
+
+## Bug Fixes
+
+- Fixed a critical issue where autonomous (scheduled) tasks failed to run when payment was enabled — autonomous triggers now correctly bill the agent's team, matching the behavior of other platform channels.
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.17.44...v0.17.45
+
+# Release v0.17.44
+
+## Bug Fixes
+
+- Fixed OpenRouter-based image generation for both auto-generated agent/team avatars and image skills — generation now succeeds reliably.
+
+## Improvements
+
+- Migrated the OpenRouter integration to the official OpenRouter Python SDK for better retry handling and type safety.
+- Traffic going through OpenRouter is now attributed to IntentKit in the OpenRouter dashboard (previously attributed to LangChain).
+- Added cost reconciliation logging so OpenRouter-reported costs can be compared against internal token-based billing.
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.17.43...v0.17.44
+
+# Release v0.17.43
+
+## New Features
+
+- Added a team avatar generation API that lets user and team profiles create AI-generated avatars from a text prompt, with usage billed through a new direct media billing path.
+
+## Improvements
+
+- Improved WeChat integration reliability — media uploads to the WeChat CDN now retry automatically on transient failures.
+- Internal refresh of the Go integration documentation and dependency upgrades.
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.17.42...v0.17.43
+
+# Release v0.17.42
+
+## New Features
+
+- Sub-agent calls (via `call_agent`) now surface attachments (images, files, etc.) from the sub-agent back to the calling agent.
+
+## Bug Fixes
+
+- Fixed a critical issue in the skill pricing module where skill calls were not being charged their declared per-skill price.
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.17.41...v0.17.42
+
+# Release v0.17.41
+
+## Bug Fixes
+
+- Fixed a bug where sub-agent calls (via `call_agent`) reused the same conversation thread across invocations, causing stale message history to interfere with new skill configurations. Sub-agent calls are now stateless — each call gets a fresh conversation context.
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.17.40...v0.17.41
+
+# Release v0.17.40
+
+## Bug Fixes
+
+- Fixed WeChat image sending — images now display correctly instead of falling back to text links
+- Rewrote WeChat CDN upload protocol to correctly implement the iLink API specification (client-side encryption key generation, proper upload flow, correct message format)
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.17.39...v0.17.40
+
+# Release v0.17.39
+
+## Bug Fixes
+
+- Fixed image and video files not displaying correctly in WeChat and mobile browsers due to missing file extensions
+- Fixed Telegram messaging issues
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.17.38...v0.17.39
+
+# Release v0.17.38
+
+## Improvements
+
+- Improved type safety across the codebase, resolving 122 type checker errors in source code, models, and tests
+- Fixed Pydantic model field defaults to be compatible with static type checkers
+
+## Bug Fixes
+
+- Fixed a model name typo
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.17.37...v0.17.38
+
+---
+
+# Release v0.17.37
+
+## New Features
+
+- **Skill Validation for Agent Creation**: The agent manager now validates skill configurations when creating new agents, ensuring only valid skills can be assigned. Invalid skill names or formats are rejected with clear error messages.
+- **Enhanced Skill Listing**: The available skills listing now shows individual skill names and descriptions under each category, making it easier for the agent manager to select the right skills.
+- **Improved Agent Manager Prompt**: The agent manager now includes a detailed skill configuration format with concrete examples, guiding it to always check available skills before configuring an agent.
+
+## Improvements
+
+- Unified lead agent endpoints for all channel types (Telegram, WeChat, etc.)
+- Stale skills (removed from codebase) are now automatically cleaned up when agents are updated
+
+## Bug Fixes
+
+- Fixed Telegram lead agent verification code and auto-bind
+- Fixed skill message attachments not dispatching correctly to WeChat and Telegram
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.17.36...v0.17.37
+
+---
+
+# Release v0.17.36
+
+## Bug Fixes
+
+- Fixed a startup crash in public agents sync caused by accessing database objects after the session was closed.
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.17.35...v0.17.36
+
+---
+
+# Release v0.17.35
+
+## Bug Fixes
+
+- Fixed an issue where the lead agent could not delegate tasks to team agents via WeChat and Telegram channels. The agent routing was using an incorrect identifier, causing sub-agent calls to always fail from these channels.
+- Added a safety mechanism to prevent Gemini 3 model calls from failing with "empty parts" errors due to corrupted conversation history.
+
+## Improvements
+
+- Public agent sync now uses slug-based matching for more reliable updates, and supports tags and archive status.
+- Cleaned up Team API endpoint organization for better consistency.
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.17.34...v0.17.35
+
+---
+
+# Release v0.17.34
+
+## Bug Fixes
+
+- Fixed an issue where public agents could not be accessed for chat or content viewing through the Team API. Chat history, messages, activities, and posts for public agents were inaccessible to users outside the agent's owning team.
+
+## Improvements
+
+- Improved chat data isolation so that teams can only view and interact with their own conversations on public agents.
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.17.33...v0.17.34
+
+---
+
+# Release v0.17.33
+
+## Bug Fixes
+
+- Markdown images in chat messages are now constrained to a reasonable max height (320px) instead of rendering at full size.
+- Image attachment thumbnail hover overlay now matches the actual image bounds for portrait/narrow images instead of extending beyond the image area.
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.17.32...v0.17.33
+
+---
+
+# Release v0.17.32
+
+## Bug Fixes
+
+- Gemini image and Veo video skills now respect Vertex AI configuration (`GOOGLE_GENAI_USE_VERTEXAI`, `GOOGLE_CLOUD_PROJECT`), fixing failures when using Vertex AI credentials instead of a direct API key.
+- LLM tool selector middleware now uses a dedicated model picker (`pick_tool_selector_model`) restricted to OpenAI, avoiding structured-output incompatibilities with Gemini and GLM that caused tool selection to fail silently or return descriptions instead of tool names (see langchain-ai/langchain#33651).
+- Tool selector activation threshold raised from 10 to 15 tools, reducing unnecessary overhead for agents with moderate tool counts.
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.17.31...v0.17.32
+
+---
+
+# Release v0.17.31
+
+## Bug Fixes
+
+- Public agent pages can now be opened directly from the Discover page again, for both signed-in members of other teams and anonymous visitors.
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.17.30...v0.17.31
+
+---
+
+# Release v0.17.30
+
+## New Features
+
+- Activity push notifications on WeChat and Telegram now include a direct link back to the original post, so recipients can jump straight to the source.
+
+## Improvements
+
+- The team lead agent has a clearer role definition and a refined decision-making workflow, helping it more reliably choose between answering directly, delegating to a built-in helper, calling an existing team agent, or creating a new specialized agent when needed.
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.17.29...v0.17.30
+
+---
+
+# Release v0.17.29
+
+## Improvements
+
+- Free credit refills now happen once a day instead of every hour, giving a clearer daily allowance experience
+- Upgraded the web frontend to the latest Tailwind CSS v4 for a smoother styling pipeline
+
+## Bug Fixes
+
+- Fixed an issue where updates to the team lead agent's long-term memory would not take effect until the next cache refresh
+- Fixed a compatibility issue with older team plan data that could cause errors when loading teams
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.17.28...v0.17.29
+
+---
+
+# Release v0.17.28
+
+## New Features
+
+- Added a read-only default channel conversation view in the lead agent sidebar, allowing you to browse message history from the default channel (Telegram/WeChat) directly in the web UI
+
+## Improvements
+
+- Improved channel-related API path naming for consistency
+- Added proper WeChat type support in the frontend
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.17.27...v0.17.28
+
+---
+
+# Release v0.17.27
+
+## New Features
+
+- Redesigned the team lead agent with a coordinator and sub-agents architecture, improving task delegation and specialization
+- Added self-updater and content-manager sub-agents, allowing the team lead to better manage its own configuration and content workflows
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.17.26...v0.17.27
+
+---
+
+# Release v0.17.26
+
+## New Features
+
+- Added ACP (Agentic Commerce Protocol) skill category, enabling agents to browse and purchase products from ACP merchants using x402 crypto payments
+
+## Bug Fixes
+
+- Fixed form validation errors for optional fields with enum constraints in the agent creation form
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.17.25...v0.17.26
+
+---
+
+# Release v0.17.25
+
+## Improvements
+
+- Avatar images are now automatically normalized to a consistent 512x512 square format before uploading to CDN, ensuring uniform display across all platforms
+- Updated various dependencies to latest versions
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.17.24...v0.17.25
+
+---
+
+# Release v0.17.24
+
+## Bug Fixes
+
+- Fixed an issue where the team reward script failed to run due to uninitialized database connection
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.17.23...v0.17.24
+
+---
+
+# Release v0.17.23
+
+## New Features
+
+- OpenRouter agents now use native server tools for web search and datetime, improving response speed and accuracy
+- Added new LLM models: Gemma 4 31B, upgraded GLM 5.1, and updated Qwen 3.6 Plus pricing
+
+## Improvements
+
+- Streamlined internal system skills architecture for cleaner conditional loading
+- Various bug fixes and test improvements
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.17.22...v0.17.23
+
+---
+
+# Release v0.17.22
+
+## New Features
+
+- Users can now leave a team from their account page (owners must transfer ownership first)
+- Teams now include plan details (name, description, seats, pricing) for frontend display
+- Team list API now returns each user's role for proper role-based UI
+
+## Improvements
+
+- Improved EVM wallet detection for users who registered via Web3 login
+- Simplified account linking by removing unused EVM wallet unlink flow
+- Enriched team members API with additional user details
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.17.21...v0.17.22
+
+---
+
+# Release v0.17.21
+
+- Added push channel system for team lead agents, enabling proactive notifications
+- Adjusted account monitoring schedule for improved efficiency
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.17.20...v0.17.21
+
+---
+
+# Release v0.17.20
+
+- Migrated Z.AI web search and webpage reader from REST API to MCP protocol for improved reliability
+- Optimized LLM model selection priority for better performance and cost efficiency
+- Fixed an issue with team plan handling that could cause errors in certain configurations
+- Improved conversation cancellation reliability
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.17.19...v0.17.20
+
+---
+
+# Release v0.17.19
+
+- Provider-based web search: web search and webpage reading now use provider-native capabilities (OpenAI, xAI, Google, OpenRouter), with Z.AI fallback for other providers
+- Added Z.AI web search and webpage reader skills
+- Consolidated search logic from middleware into executor for cleaner architecture
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.17.18...v0.17.19
+
+---
+
+# Release v0.17.18
+
+- Added Qwen 3.6 Plus model support
+- Fixed an issue where team agent chat was not working due to missing billing context
+- Updated dependencies
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.17.17...v0.17.18
+
+---
+
+# Release v0.17.17
+
+- Added Anthropic Compatible LLM provider, allowing connection to any Anthropic-API-compatible service via environment variables
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.17.16...v0.17.17
+
+---
+
+# Release v0.17.16
+
+- Fixed a crash on the agent chat page that could occur when loading agents
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.17.15...v0.17.16
+
+---
+
+# Release v0.17.14
+
+- Added team usage page API for viewing credit balances and recent activity
+- Updated billing roadmap documentation to reflect completed milestones
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.17.13...v0.17.14
+
+---
+
+# Release v0.17.13
+
+- Added user profile with display name and avatar support
+- Users can now edit their name and upload an avatar in account settings
+- Google sign-up automatically populates name and avatar from Google account
+- EVM wallet sign-up generates a display name from the wallet address
+- Linking a Google account syncs avatar if not already set
+- Fixed tasks page header alignment and skeleton persistence during navigation
+- Improved team ID validation for the API layer
+- Fixed Google image model configuration
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.17.12...v0.17.13
+
+---
+
+# Release v0.17.12
+
+- Fixed authentication failure caused by missing JWT audience validation
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.17.11...v0.17.12
+
+---
+
+# Release v0.17.11
+
+- Fixed authentication failure in Team API where login always returned 401 due to JWT algorithm mismatch with modern Supabase signing keys
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.17.10...v0.17.11
+
+---
+
+# Release v0.17.10
+
+- Fixed false positive alerts in account checking where zero-amount events were incorrectly flagged as orphaned
+- Fixed incorrect check count and singular/plural formatting in account checking alerts
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.17.9...v0.17.10
+
+---
+
+# Release v0.17.9
+
+- Added startup notification alert when the autonomous service starts, including environment and release information.
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.17.8...v0.17.9
+
+---
+
+# Release v0.17.8
+
+## Improvements
+
+### Telegram Alert Formatting
+- Alert notifications sent to Telegram now display with proper formatting instead of raw data. Messages include bold titles, color-coded status indicators, and structured field layouts.
+- Account checking alerts now include detailed failure information (affected event/transaction IDs, amounts, etc.) directly in the notification, making it easier to diagnose issues without checking logs.
+
+### Documentation
+- Updated documentation links and added a local deployment guide.
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.17.7...v0.17.8
+
+---
+
+# Release v0.17.7
+
+## New Features
+
+### Account Linking & Plan Initialization
+- Users can now link Google and EVM wallet accounts to their profile, with a dedicated account management page showing linked providers.
+- Team plans are automatically initialized when creating a team: Google users receive a Free plan, and EVM wallet users with a portfolio value over $20 also receive a Free plan.
+- Linking a Google account upgrades the user's first team from None to Free plan.
+- Google accounts cannot be unlinked once linked. EVM wallets can only be unlinked if a Google account is already linked.
+
+### Pricing Plan Tiers
+- Added four pricing plan tiers (None, Free, Pro, Max) with configurable quotas, refill rates, and monthly credit issuance for paid plans.
+
+### Team-Based Billing
+- Migrated billing system from user-based to team-based, aligning credit accounts and plan management with team ownership.
+
+## Improvements
+- Improved documentation with PyPI badge and security features in README.
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.17.6...v0.17.7
+
+---
+
+# Release v0.17.5
+
+## Improvements
+
+### Floating Version Footer
+- The version and copyright footer now floats at the bottom-left corner of every page, ensuring it's always visible regardless of which section you're viewing.
+
+### Infrastructure
+- Optimized Docker health check intervals for better resource efficiency.
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.17.4...v0.17.5
+
+---
+
+# Release v0.17.4
+
+## New Features
+
+### Version Display
+- The frontend sidebar now shows the current IntentKit version, making it easier to identify which release is deployed.
+
+### On-Chain Skills Test Coverage
+- Added comprehensive BDD tests for on-chain read-only skills including Aave V3, Aerodrome, ERC-20, ERC-721, Morpho, PancakeSwap, and Uniswap, tested against real RPC endpoints.
+
+## Improvements
+- Fixed and updated broken tests across the test suite to match the current implementation.
+- Resolved a circular import issue in the lead agent module.
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.17.3...v0.17.4
+
+---
+
+# Release v0.17.2
+
+## New Features
+
+### Telegram Channel Verification System
+- Team Telegram channels now require verification before chats can interact with the bot. When a bot is connected, a 4-digit verification code is generated. New private chats or group conversations must send this code to activate. The code automatically regenerates after each successful verification for security.
+
+### Telegram Bot Status Monitoring
+- The Channels page now shows real-time bot listening status (Listening / Connecting / Error), bot username, and a list of all verified chats. Admins can remove verified chats directly from the UI.
+
+### Verification Rate Limiting
+- To prevent brute-force attempts, verification is limited to 3 attempts per chat within a 10-minute window.
+
+## Improvements
+- Minor gitignore improvements.
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.17.1...v0.17.2
+
+---
+
+# Release v0.17.1
+
+## New Features
+
+### Team WeChat Integration
+- **WeChat QR code login** is now available for team deployments. Team admins can connect a WeChat bot to their team's Lead agent through the channel management interface, using the same QR code scan flow available in the local version.
+
+## Improvements
+- Extracted shared code (health endpoint, metadata, chat helpers, autonomous helpers, WeChat helpers) from local API into a common module, reducing duplication between local and team API servers.
+- Synchronized team Docker Compose configuration with latest changes.
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.17.0...v0.17.1
+
+---
+
+# Release v0.17.0
+
+## New Features
+
+### Discover Page & Public Agents
+- **30 curated public agents** are now available out of the box, covering content creation (Blog Writer, Email Copywriter, SEO Optimizer), research (Market Researcher, Academic Researcher, Fact Checker), education (Study Tutor, Language Coach), productivity (Resume Coach, Business Plan Writer, Meeting Minutes), health (Nutrition Planner, Fitness Coach), and more.
+- **Discover page** with three tabs — Agents, Timeline, and Posts — lets users explore all public agents and their content in one place.
+- **Subscribe to public agents** directly from the agent detail page. Subscribed agents appear in your Timeline and Posts, and your agents can call them as sub-agents.
+
+### Permission-Aware Agent Detail Pages
+- Agent detail pages now show or hide Edit, Archive, and task management controls based on ownership. Public agents you don't own display a "Public" badge and a Subscribe button instead.
+
+### Public Feed System
+- Activities and posts from public agents are automatically distributed to a shared public feed, powering the Discover page's Timeline and Posts tabs.
+
+### Smart Agent Sync
+- Public agents are automatically synced from configuration files on startup. If a required AI model is not available in the current deployment, the agent is gracefully archived and automatically restored when the model becomes available.
+
+## Improvements
+- Improved local agent list to only show your own agents, keeping the interface clean.
+- Feed fan-out logic refactored for better maintainability.
+
+## API Changes
+- New public endpoints: `GET /public/agents`, `GET /public/timeline`, `GET /public/posts`, `GET /public/posts/{post_id}`
+- New subscription endpoints: `POST /subscriptions/{agent_id}`, `DELETE /subscriptions/{agent_id}`, `GET /subscriptions`
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.16.6...v0.17.0
+
+---
+
+# Release v0.16.6
+
+## New Features
+
+- **Tasks Overview Page**: Added a new "Tasks" page in the top navigation that displays all autonomous tasks across all agents. Tasks are organized by agent with a two-level hierarchy showing agent name and avatar alongside their configured tasks, making it easy to get a bird's-eye view of all scheduled automation.
+
+## Improvements
+
+- Improved frontend development hot reload support in Docker.
+
+# Release v0.16.5
+
+## Bug Fixes
+
+- Fixed full-width digit rendering in PDF generation when using CJK fonts.
+
+# Release v0.16.4
+
+## New Features
+
+- **PDF Download for Posts**: Posts can now be downloaded as professionally styled PDF files directly from the browser. The backend generates high-quality PDFs with full support for CJK characters and emoji.
+- **Lead as Default Landing Page**: The Lead agent page is now the default home page, making it easier to start conversations immediately.
+
+## Improvements
+
+- Cleaner, more compact timeline and post list design with better readability.
+- Improved navigation structure and page layout consistency.
+
+# Release v0.16.2
+
+## New Features
+
+- **Morpho Blue Skills**: Added full Morpho Blue lending protocol support — supply collateral, withdraw collateral, borrow, repay, and query market positions directly on Morpho Blue markets.
+- **MetaMorpho Vault Query**: New vault data skill to check MetaMorpho Vault info including total assets, share price, and underlying token.
+- **Agent UI Enhancements**: Agent cards now display description/purpose fallback text, skill & capability tags, and slug identifiers for easier navigation.
+- **Image Upload**: Added image upload support for team and agent profile pictures.
+- **WeChat Debug Logging**: Added DEBUG log level support and diagnostic logging for WeChat integration.
+
+## Improvements
+
+- Payment-related scheduler jobs are now gated behind the payment_enabled configuration flag.
+- Removed auto-creation of example agent on startup for cleaner initial setup.
+
+## Bug Fixes
+
+- Fixed an issue with fractional token triggers in the Summarization middleware.
+- Fixed API proxy path handling in frontend deployments.
+
+# Release v0.16.1
+
+## Improvements
+
+- **Simplified Deployment**: Consolidated from three domains (API, App, CDN) to a single domain, reducing DNS and certificate setup complexity.
+- **Basic Auth Support**: Added optional username/password authentication for the web UI, configurable via environment variables.
+- **Updated Documentation**: Revised Docker Compose deployment guide to reflect the simplified setup.
+
+## Bug Fixes
+
+- Fixed an issue where the frontend could not reach the API in Docker deployments due to Next.js build-time environment variable limitations.
+
+# Release v0.16.0
+
+## New Features
+
+- **WeChat Integration**: Full WeChat bot support via iLink Bot API, with rich media messaging and SSE streaming.
+- **Telegram Rich Media**: Enhanced Telegram bot with image, video, and audio message support via SSE streaming.
+- **Team Lead API**: New team lead endpoints for managing agents, channels, and chat through the team API.
+- **DeFi Protocol Skills**: Added Aave V3 (lending/borrowing), Uniswap V3 (DEX trading), Aerodrome Slipstream (DEX), and Polymarket (prediction markets) skill categories.
+- **OpenSea NFT Skills**: Buy, sell, list, and manage NFTs on OpenSea marketplace.
+- **Remote MCP Server Support**: Wrap remote MCP servers as IntentKit skill categories.
+- **Per-Skill Availability Check**: Skills can now declare availability based on multi-provider configuration.
+- **Lead Agent Improvements**: Auto-generate avatars for lead-created agents, require slug and purpose fields, dynamic LLM model selection.
+
+## Improvements
+
+- Improved LLM model picker with dynamic OpenAI-compatible provider fallbacks.
+- Activities and Posts tabs now conditionally display based on agent configuration.
+- Standardized error handling across 16 skill categories.
+- Restructured documentation and updated deployment configurations.
+
+## Bug Fixes
+
+- Fixed various type errors across the codebase.
+- Fixed tab visibility logic and UI improvements in the frontend.
+- Fixed lead cache invalidation and context propagation issues.
+- Resolved frontend dependency security alerts.
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.15.0...v0.16.0
+
+---
+
+# Release v0.15.0
+
+## New Features
+
+- **Supabase Authentication & User Management**: Full Supabase-based authentication with user and team management, enabling secure multi-user access to team resources.
+- **Standalone Team API**: Comprehensive team API with endpoints for agent management, core configuration, metadata, autonomous scheduling, content feeds, and chat — ready for frontend integration.
+- **JWKS JWT Verification**: Team API now supports RS256 JWT verification via JWKS, with automatic key rotation support. Legacy HS256 signing key remains as a fallback.
+
+## Improvements
+
+- Improved team API structure with dedicated routers for core and metadata operations.
+- Enhanced team membership and permission system.
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.14.0...v0.15.0
+
+---
+
+# Release v0.14.0
+
+## New Features
+
+- **Team API**: Full team-scoped API for agent management, autonomous scheduling, and chat — enabling multi-user teams to manage agents collaboratively via authenticated endpoints.
+- **Team Content Feed**: Teams can now subscribe to agents and receive aggregated activity and post feeds. Teams auto-subscribe to their own agents, and can subscribe to any public agent. Content is distributed in real-time via fan-out-on-write.
+- **Video Generation Skills**: New video generation skill category with support for Grok, Sora (OpenAI), Veo (Google), and MiniMax providers.
+- **MiniMax LLM Provider**: Added MiniMax as a supported LLM provider, including image generation support.
+
+## Improvements
+
+- Agent-to-agent calls now propagate attachments from the called agent's response.
+- Updated LLM model list with latest provider offerings.
+
+## Bug Fixes
+
+- Fixed documentation site domain configuration.
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.13.0...v0.14.0
+
+---
+
+# Release v0.13.0
+
+## New Features
+
+- **Team Lead Chat**: A new "Lead" tab in the frontend lets you chat directly with a team lead agent that manages all your agents. Create, configure, update, and monitor agents through natural conversation.
+- **Team Channel Integration**: Added Telegram team channel integration for team-level communication.
+- **Image Skills**: New image skill category with multi-provider support for image generation and processing.
+- **Image Attachments in Chat**: Chat messages now render image attachments with lightbox preview and download support.
+- **Custom LLM Providers**: Added support for configuring custom LLM providers.
+- **Team Management**: New team management features with invite system and Redis-based caching.
+
+## Improvements
+
+- Reorganized skill system for better maintainability — cleaned up unused skills and consolidated categories.
+- Simplified LLM model configuration by removing legacy fields.
+- Improved agent executor architecture with extracted helpers and reduced complexity.
+- Enhanced data integrity with fixes for quota race conditions and credit handling.
+- Various stability improvements including cache eviction, timeouts, and resource management.
+
+## Bug Fixes
+
+- Fixed issues in the security module.
+- Fixed chat cancellation handling to cleanly remove dangling messages.
+- Fixed search pricing calculation.
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.12.3...v0.13.0
+
+---
+
+# Release v0.12.3
+
+## New Features
+
+- **LLM Thinking/Reasoning Display**: Agent responses now show the model's thinking process. Thinking content appears as a collapsible block in the chat, giving users insight into how the agent reasons before acting.
+- **Stop Generation Button**: Users can now cancel in-progress streaming responses.
+
+## Improvements
+
+- Redesigned chat message layout: thinking and tool call indicators now appear without avatar or background, keeping the conversation view cleaner and more focused on the agent's actual responses.
+- Optimized system skill loading for providers with native search capabilities.
+
+## Bug Fixes
+
+- Fixed issues with thinking content not displaying for tool call responses.
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.12.2...v0.12.3
+
+---
+
+# Release v0.12.2
+
+## New Features
+
+- **Read Webpage Skill**: Agents can now read and extract content from any webpage using Cloudflare Browser Rendering. The content is automatically cleaned and formatted for better readability. Enabled when the agent's internet search toggle is on and Cloudflare credentials are configured.
+- **Activity Timeline Cards**: The activity timeline now displays rich post cards and link cards with Open Graph metadata previews.
+
+## Improvements
+
+- Enhanced input validation for the activity publishing skill
+- Improved activity skill prompts for better agent behavior
+- Better example agent configuration
+
+## Bug Fixes & Maintenance
+
+- Fixed minor issues in the release workflow
+- Removed unused debug components
+- Updated dependencies
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.12.1...v0.12.2
+
+---
+
+# Release v0.12.1
+
+## What's New
+
+- **Sub-Agents**: Agents can now delegate tasks to other agents with controlled access and configurable timeout
+- **Skill Category Icons**: Skill categories now display icons in the frontend for better visual identification
+
+## Improvements
+
+- Skill categories that depend on platform API keys are now properly gated by key availability
+- Improved stability for agent delegation calls
+
+## Bug Fixes
+
+- Fixed issues in the agent management UI
+- Fixed various sub-agent related bugs
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.12.0...v0.12.1
+
+---
+
+# Release v0.12.0
+
+## New Features
+
+- **Long-Term Memory**: Agents can now maintain persistent long-term memory across conversations. When enabled, agents can store and recall important information using an LLM-powered memory management system that intelligently merges and consolidates memories.
+
+## Improvements
+
+- Minor code formatting fixes in tests.
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.11.27...v0.12.0
+
+---
+
+# Release v0.11.26
+
+## New Features
+
+- **Agent Slug Identifiers**: Agents can now be identified by human-readable slugs in addition to their IDs, making agent URLs and references more user-friendly.
+- **New AI Models**: Added Hunter Alpha and Healer Alpha models from OpenRouter, expanding the available model selection.
+
+## Improvements
+
+- Improved system prompt generation for better agent behavior.
+- Refactored internal engine architecture for clearer naming and better maintainability.
+- Fixed a cache invalidation bug where changes to agent data (such as wallet addresses, API keys, or credentials) were not properly triggering agent reloads.
+- Removed legacy skill pattern mechanism to simplify the codebase.
+- Updated dependencies.
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.11.25...v0.11.26
+
+---
+
+# Release v0.11.24
+
+## New Features
+
+- **UI Skills**: Added a new UI skill group with `show_card` and `ask_user` skills, enabling agents to display rich card components and interactive prompts to users.
+
+## Improvements
+
+- **Simplified Skill Pricing**: Streamlined the skill pricing system by moving prices directly onto skill definitions, removing the need for a separate CSV-based configuration. This makes skill pricing more maintainable and transparent.
+- **Removed Developer Fee System**: Removed the developer fee / author revenue sharing mechanism from the credit system, simplifying cost calculations for skill calls.
+- Updated project dependencies.
+
+Full Changelog: [v0.11.23...v0.11.24](https://github.com/crestalnetwork/intentkit/compare/v0.11.23...v0.11.24)
+
+---
+
+# Release v0.11.23
+
+## What's New
+
+- **Activity and Post Skills**: Agents can now optionally enable activity tracking and post management skills (create post, get post, recent posts) via dedicated toggle settings.
+- **Dynamic Wallet Provider Options**: The wallet provider selection now automatically adapts based on your deployment configuration — only showing providers (CDP, Privy, Safe) that have the required credentials configured.
+
+## Improvements
+
+- Reorganized internal agent schema files for better maintainability.
+- Fixed a UI warning related to checkbox inputs in the agent editor.
+
+Full Changelog: [v0.11.22...v0.11.23](https://github.com/crestalnetwork/intentkit/compare/v0.11.22...v0.11.23)
+
+---
+
+# Release v0.11.20
+
+## New Features
+
+- **Agent Middleware Support**: Agents now support LangChain middleware including Todo List for task planning, automatic LLM Tool Selector when agents have more than 10 skills, Context Editing for efficient context management, and built-in Tool Retry and Model Retry for improved reliability.
+- **New Agent Settings**: Added Internet Search, Super Mode, and Todo List toggles to the agent configuration UI with proper labels and descriptions.
+
+## Improvements
+
+- Refactored web search and super mode internals for cleaner architecture.
+- Upgraded frontend to Node.js 24 and added a dedicated development Dockerfile for better hot reload support in Docker Compose.
+- Fixed frontend rendering issues with checkbox fields.
+- Updated dependencies.
+
+---
+
+# Release v0.11.10
+
+## New Features
+- Introduced a new abstract logo design for the frontend
+
+## Improvements & Bug Fixes
+- Improved blockchain transaction reliability by fixing nonce management issues
+- Fixed a bug in the asynchronous Web3 client to ensure smoother network interactions
+- Added missing configuration files for improved test suite organization
+
+Full Changelog: [v0.11.9...v0.11.10](https://github.com/crestalnetwork/intentkit/compare/v0.11.9...v0.11.10)
+# Release v0.11.9
+
+## New Features
+- Added support for setting per-token spending limits on Safe wallets — agents can now have independent spending limits for any ERC20 token, not just USDC
+
+## Improvements & Bug Fixes
+- Refactored Safe spending limit internals to share a unified implementation
+
+Full Changelog: [v0.11.8...v0.11.9](https://github.com/crestalnetwork/intentkit/compare/v0.11.8...v0.11.9)
+
+# Release v0.11.8
+
+## New Features
+- Update LLM reasoning effort config and add Google Vertex AI support
+- Add support for Qwen 3.5
+- Improve side bar UI
+- Automatically generate chat titles
+
+## Improvements & Bug Fixes
+- Refactor model provider implementation
+- Fix chat avatar display issues
+
+Full Changelog: [v0.11.7...v0.11.8](https://github.com/crestalnetwork/intentkit/compare/v0.11.7...v0.11.8)
+
+# Release v0.11.7
+
+## Bug Fixes & Improvements
+
+- Improved timeout error handling for more reliable agent responses during network issues
+- Added environment and version information to alert notifications for better incident tracking
+- Fixed CDP wallet skill functionality
+- Improved error handling consistency across skill modules
+- Fixed avatar display fallback in frontend activity and posts pages
+- Fixed chat input disappearing on new thread in frontend
+- Fixed tool call display in local UI
+
+## Infrastructure
+
+- Added heartbeat monitoring to local Docker Compose setup
+- Updated Go runtime to 1.26
+
+Full Changelog: [v0.11.6...v0.11.7](https://github.com/crestalnetwork/intentkit/compare/v0.11.6...v0.11.7)
+
+# Release v0.11.6
+
+## Bug Fixes
+
+- Fixed an issue where "new conversation" in the agent chat interface would flicker or require multiple clicks.
+
+## Improvements
+
+- Refactored the wallet interface to be fully asynchronous, improving performance and consistency across different wallet providers (Native, CDP, Safe).
+
+Full Changelog: [v0.11.5...v0.11.6](https://github.com/crestalnetwork/intentkit/compare/v0.11.5...v0.11.6)
+
+# Release v0.11.5
+
+## New Features
+
+- Added support for Langchain OpenRouter.
+
+## Bug Fixes
+
+- Fixed an issue causing bugs in tests.
+
+## Improvements
+
+- Improved exception handling for system skills.
+- Updated project dependencies.
+
+Full Changelog: [v0.11.4...v0.11.5](https://github.com/crestalnetwork/intentkit/compare/v0.11.4...v0.11.5)
+
+# Release v0.11.4
+
+## Bug Fixes
+
+- Fixed template model inheritance when creating agents.
+- Fixed docker compose configuration issues.
+
+## Testing
+
+- Switched to testing.postgres for database tests.
+
+## Improvements
+
+- Updated project dependencies.
+
+Full Changelog: [v0.11.3...v0.11.4](https://github.com/crestalnetwork/intentkit/compare/v0.11.3...v0.11.4)
+
+# Release v0.11.3
+
+## New Features
+
+- Added x402 updates to expand onchain payment support.
+- Enabled frontend hot-reload in docker-compose for faster local development.
+- Introduced LLM packer improvements to streamline model packaging.
+- Launched the Hugo-based documentation site with initial installation guidance.
+
+## Improvements
+
+- Improved avatar generation and frontend error handling for smoother UI experiences.
+- Refined autonomous task defaults and display formatting.
+- Updated image handling to use relative paths with CDN resolution.
+- Stabilized local API behavior and development reload flows.
+
+Full Changelog: [v0.11.2...v0.11.3](https://github.com/crestalnetwork/intentkit/compare/v0.11.2...v0.11.3)
+
+# Release v0.11.2
+
+## New Features
+
+- Added support for new AI models: MiniMax M2.5 with enhanced intelligence and structured output capabilities, and GLM 5 with improved performance and reasoning abilities.
+
+## Improvements
+
+- Enhanced error logging in autonomous tasks with detailed exception information and stack traces for better debugging.
+- Updated model configurations to reflect the latest available models and their capabilities.
+
+Full Changelog: [v0.11.1...v0.11.2](https://github.com/crestalnetwork/intentkit/compare/v0.11.1...v0.11.2)
+
+# Release v0.11.1
+
+## Improvements
+
+- Introduced a unified base class for system skills, reducing code duplication and improving consistency across built-in agent capabilities.
+- Added detection and error reporting for cases where the AI model produces an empty response, preventing silent failures during conversations.
+
+Full Changelog: [v0.11.0...v0.11.1](https://github.com/crestalnetwork/intentkit/compare/v0.11.0...v0.11.1)
+
+# Release v0.11.0
+
+## New Features
+
+- **Frontend**: Added containerization support with a new Dockerfile.
+- **Frontend**: Refactored API client for better authentication and error handling.
+- **DevOps**: Improved Docker Compose setup with version-aware builds.
+- **Telegram**: Optimized Telegram integration container setup.
+
+Full Changelog: [v0.10.5...v0.11.0](https://github.com/crestalnetwork/intentkit/compare/v0.10.5...v0.11.0)
+
+# Release v0.10.5
+
+## New Features
+
+- **Telegram**: Added Telegram Go image service to docker-compose.
+
+Full Changelog: [v0.10.4...v0.10.5](https://github.com/crestalnetwork/intentkit/compare/v0.10.4...v0.10.5)
+
+# Release v0.10.4
+
+## Bug Fixes
+
+- **Search**: Fixed issues with Grok, OpenRouter, and XAI search functionality.
+- **Engine**: Addressed various engine bugs.
+- **Linting**: Resolved code linting errors.
+
+Full Changelog: [v0.10.3...v0.10.4](https://github.com/crestalnetwork/intentkit/compare/v0.10.3...v0.10.4)
+
+# Release v0.10.3
+
+## New Features
+
+- **Testing**: Initialized BDD testing framework.
+
+## Bug Fixes
+
+- **Agent Model**: Fixed default values for agent models.
+
+## Improvements
+
+- **Dependencies**: Upgraded project dependencies.
+
+Full Changelog: [v0.10.2...v0.10.3](https://github.com/crestalnetwork/intentkit/compare/v0.10.2...v0.10.3)
+# Release v0.10.2
+
+## New Features
+
+- **Model Picker**: Implemented model picker functionality.
+
+## Bug Fixes
+
+- **UI**: Fixed bug in agent edit interface.
+- **Middleware**: Fixed lint issue in middleware.
+- **LLM**: Fixed LLM test failure.
+
+## Tests
+
+- **Native Wallet**: Added tests for native wallet.
+
+Full Changelog: [v0.10.1...v0.10.2](https://github.com/crestalnetwork/intentkit/compare/v0.10.1...v0.10.2)
+
+# Release v0.10.1
+
+## New Features
+
+- **LLM Models**: Added new LLM models to configuration
+
+Full Changelog: [v0.10.0...v0.10.1](https://github.com/crestalnetwork/intentkit/compare/v0.10.0...v0.10.1)
+
+# Release v0.10.0
+
+## New Features
+
+- **Gasless Batch Transactions**: Added support for batching multiple transactions into a single on-chain transaction for Safe wallets. When a master wallet is configured, transactions can be executed gaslessly (master wallet pays for gas).
+
+## Improvements
+
+- Fixed lint issues across multiple modules
+- Removed deprecated agent plugin data
+- Removed some unused skills for cleaner codebase
+
+Full Changelog: [v0.9.31...v0.10.0](https://github.com/crestalnetwork/intentkit/compare/v0.9.31...v0.10.0)
+
+# Release v0.9.31
+
+## Improvement
+
+- **Transfer Script**: Optimized `scripts/transfer_cdp_agent_wallets.py` to:
+  - Automatically resolve invalid owner addresses by stripping whitespace and adding `0x` prefixes.
+  - Lower `DEFAULT_GAS_RESERVE_ETH` to `0.00001` to allow transfers regarding small balances.
+  - Suppress logs for zero-balance wallets to reduce noise.
+  - Improve error logging to explicitly state why a transfer is skipped (e.g., `skip:owner_not_found`, `skip:owner_address_invalid`).
+  - Added transaction summary report at the end of execution.
+
+- **CDP Wallet**: Exposed `close_cdp_client` method in `intentkit/wallets/cdp.py` for better resource management.
+
+## New Features
+
+- **Diagnostic Tool**: Added `scripts/list_agent_assets.py` to list agent assets and wallet addresses for verification.
+
+Full Changelog: [v0.9.30...v0.9.31](https://github.com/crestalnetwork/intentkit/compare/v0.9.30...v0.9.31)## v0.9.30
+
+### Bug Fixes
+
+- **CDP Wallet Transfer**: Fixed a crash in `scripts/transfer_cdp_agent_wallets.py` caused by insufficient ETH balance/gas. The script now gracefully skips such agents.
+
+### Improvements
+
+- **Logging**: Added summary logging to the CDP transfer script to show total agents processed and skipped.
+- **Logging**: Refined log levels to reduce noise; skipped transfers are now logged at DEBUG level.
+
+[Full Changelog](https://github.com/crestalnetwork/intentkit/compare/v0.9.29...v0.9.30)
+
+## v0.9.28
+
+### New Features
+
+- **Wallet**: Added CDP wallet transfer and export capabilities (`scripts/transfer_cdp_agent_wallets.py`)
+
+### Improvements
+
+- **Credit**: Significant refactoring of the credit model structure into a dedicated package
+- **Agent**: Refactored core agent module into responsibility-based submodules
+- **Agent**: Improved autonomous agent tasks and models organization
+- **Wallet**: Refactored wallet and public info modules
+
+### Bug Fixes
+
+- **Autonomous**: Fixed autonomous agent behaviors
+- **Tests**: Cleaned up data and improved test imports after agent module refactor
+
+[Full Changelog](https://github.com/crestalnetwork/intentkit/compare/v0.9.27...v0.9.28)## v0.9.27
+
+### Improvements
+
+- Refactored system skills to manager skills for better organization and scalability
+- Updated skill loading mechanism to support new structure
+
+[Full Changelog](https://github.com/crestalnetwork/intentkit/compare/v0.9.26...v0.9.27)
+## v0.9.26
+
+### Improvements
+
+- Refactored credit module for better code organization and maintainability
+- Refactored agent models for improved structure
+- Added comprehensive test coverage for the credit module
+- Fixed issues in x402 skills error handling
+
+### Bug Fixes
+
+- Fixed error handling in x402 skills to properly catch and convert IntentKitAPIError to ToolException
+- Fixed code linting issues
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.9.25...v0.9.26
+
+## v0.9.25
+
+### Improvements
+
+- Fixed bugs in the credit module
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.9.24...v0.9.25
+
+## v0.9.24
+
+### Improvements
+- **Privy Client**: Enhanced transaction handling by returning receipts and ensuring proper resource cleanup (disconnecting provider) to prevent unclosed session warnings.
+
+[Full Changelog](https://github.com/crestalnetwork/intentkit/compare/v0.9.23...v0.9.24)## v0.9.23
+
+### New Features
+- **Native Wallet Support**: Added comprehensive native wallet functionality for agent operations, enabling direct blockchain interactions with native tokens
+
+### Improvements
+- Fixed deployment issues in the Docker image configuration
+
+[Full Changelog](https://github.com/crestalnetwork/intentkit/compare/v0.9.22...v0.9.23)
+
+## v0.9.22
+
+### Improvements
+
+- Enhanced error diagnostics in the x402 payment module for better troubleshooting
+
+[Full Changelog](https://github.com/crestalnetwork/intentkit/compare/v0.9.21...v0.9.22)
+
+## v0.9.21
+
+### New Features
+- Added richer x402 payment requirement output with schema and example details to improve price inspection workflows
+
+### Improvements
+- Improved x402 payment requirement visibility with richer debug context and schema details for faster troubleshooting
+
+[Full Changelog](https://github.com/crestalnetwork/intentkit/compare/v0.9.20...v0.9.21)
+
+## v0.9.20
+
+### Improvements
+
+- Fixed bugs in the X402 Twitter integration module
+
+[Full Changelog](https://github.com/crestalnetwork/intentkit/compare/v0.9.19...v0.9.20)
+
+## v0.9.19
+
+### New Features
+- Added X402 check price skill for real-time price checking functionality
+- Enhanced HTTP request handling in X402 integration with improved compatibility layer
+
+### Improvements
+- Improved HTTP handling and HTTPX compatibility across X402 skills module
+- Enhanced error handling and response processing in price checking operations
+
+### Bug Fixes
+- Fixed bugs in the X402 module related to HTTP request processing
+
+### Development
+- Added test script for X402 check price functionality
+- Added jsonschema as development dependency for schema validation
+
+[Full Changelog](https://github.com/crestalnetwork/intentkit/compare/v0.9.18...v0.9.19)
+
+## v0.9.18
+
+### Improvements
+- Unified alert system with support for both Telegram and Slack notifications
+- Improved alert handling mechanism across all application components
+
+[Full Changelog](https://github.com/crestalnetwork/intentkit/compare/v0.9.17...v0.9.18)
+
+## v0.9.17
+
+### New Features
+- Hourly Budget Tracking: Added configurable hourly budget limit for base LLM usage with Redis-backed tracking. When the limit is exceeded, agents return a friendly message instead of processing requests.
+
+### Bug Fixes
+- Fixed minor issues in the budget and credit modules.
+
+[Full Changelog](https://github.com/crestalnetwork/intentkit/compare/v0.9.16...v0.9.17)
+
+## v0.9.16
+
+### New Features
+- Make Redis a required dependency: The project now strictly requires Redis for operation. Configuration and application entry points have been updated to enforce this.
+
+[Full Changelog](https://github.com/crestalnetwork/intentkit/compare/v0.9.15...v0.9.16)
+
+## v0.9.15
+
+### New Features
+- Implement soft-off credit charging policy: Allow expenses processing even when payment is disabled (recording costs as 0 or discounted).
+- Adjust `expense_summarize` and `expense_message` to correctly handle `created_at` timestamp for Credit Events.
+
+### Improvements
+- Enhanced test coverage for credit calculations.
+
+[Full Changelog](https://github.com/crestalnetwork/intentkit/compare/v0.9.14...v0.9.15)
+
+## v0.9.14
+
+### New Features
+- Enhanced agent system prompts with improved context awareness
+- Added agent ID to system prompts for better agent identification
+- Improved autonomous task execution with clearer guidelines and current time awareness
+
+### Improvements
+- Optimized Twitter skill integration - social account information now only appears in prompts when Twitter skill is enabled
+- Refined prompt structure for better clarity and organization
+- Enhanced autonomous task handling with better error reporting guidance
+- Improved system prompt ordering for more logical information flow
+- Updated debug endpoint to support new prompt context requirements
+
+### Bug Fixes
+- Fixed prompt generation issues in Twitter-related functionality
+- Resolved missing context parameter issues in debug endpoints
+
+[Full Changelog](https://github.com/crestalnetwork/intentkit/compare/v0.9.13...v0.9.14)
+
+## v0.9.13
+
+### Features
+
+- Add redundant agent info to activity and post models to optimize data retrieval and display.
+- Name and picture are now stored directly in AgentActivity and AgentPost records.
+
+[Full Changelog](https://github.com/crestalnetwork/intentkit/compare/v0.9.12...v0.9.13)
+
+## v0.9.12
+
+### Fixes
+
+- Made `payer` field in `X402Order` optional to support older records and cases where payer information is missing.
+- Added unit tests for ensuring `X402Order` creation works without `payer` field.
+
+[Full Changelog](https://github.com/crestalnetwork/intentkit/compare/v0.9.11...v0.9.12)
+
+## v0.9.10
+
+### Improvements
+
+- Updated release operations guide for better clarity and correct sequencing.
+- Synchronized dependency lock file with correct package version.
+
+[Full Changelog](https://github.com/crestalnetwork/intentkit/compare/v0.9.9...v0.9.10)
+
+## v0.9.9
+
+### Fixes
+
+- Fixed `pytest` failures in `tests/models/test_x402_order.py` by adding the missing required `payer` field to `X402OrderCreate` and `X402OrderTable` instantiations.
+
+[Full Changelog](https://github.com/crestalnetwork/intentkit/compare/v0.9.8...v0.9.9)
+
+## v0.9.8
+
+### Fixes
+
+- Fixed `x402_order` table missing `payer` field, ensuring proper record of who paid.
+- Fixed `pay_to` field being "unknown" in some x402 payment scenarios by capturing it from payment requirements.
+
+[Full Changelog](https://github.com/crestalnetwork/intentkit/compare/v0.9.7...v0.9.8)
+
+## v0.9.6
+
+### Features
+- Added `force_admin_execution` parameter to Safe transfer methods (both ERC20 and gasless) to allow bypassing the Allowance Module when necessary.
+
+[Full Changelog](https://github.com/crestalnetwork/intentkit/compare/v0.9.5...v0.9.6)
+
+## v0.9.5
+
+### Bug Fixes
+- Fixed Privy error handling to correctly check for transaction failures using the correct error attribute.
+- Added `scripts/deploy_allowance.py` for Allowance Module deployment on non-canonical chains.
+
+[Full Changelog](https://github.com/crestalnetwork/intentkit/compare/v0.9.4...v0.9.5)
+
+## v0.9.4
+
+### Fixes
+
+- Fixed missing canonical allowance module on Base Sepolia by deploying and configuring a custom one.
+
+[Full Changelog](https://github.com/crestalnetwork/intentkit/compare/v0.9.3...v0.9.4)## v0.9.3
+
+### Bug Fixes
+- Fixed a critical security bypass in `transfer_erc20_gasless` where omitting the `privy_wallet_address` would cause the transfer to fall back to a direct owner transfer, bypassing the Allowance Module limits.
+- Added `get_wallet` method to `PrivyClient` to fetch wallet details by ID.
+- Automatically fetch wallet address in `transfer_erc20_gasless` if not provided, ensuring the secure Allowance Module path is always attempted first when enabled.
+
+[Diff v0.9.2...v0.9.3](https://github.com/crestalnetwork/intentkit/compare/v0.9.2...v0.9.3)
+
+## v0.9.2
+
+### Bug Fixes
+- Fixed an issue in the Privy client where transfers would fail if the Allowance Module was not enabled or used incorrectly. Now implements a smart fallback to use the Allowance Module if available, and direct owner transfer otherwise.
+
+[Diff v0.9.1...v0.9.2](https://github.com/crestalnetwork/intentkit/compare/v0.9.1...v0.9.2)
+
+## v0.9.1
+
+- Refactored sidebar for better navigation.
+- Fixed UI bug in agent edit page.
+- Fixed timeline avatar display issue.
+- Fixed safe limit bug.
+
+[Diff](https://github.com/crestalnetwork/intentkit/compare/v0.9.0...v0.9.1)## v0.9.0
+
+**Bug Fixes:**
+- Fixed JSON serialization errors in autonomous task storage that occurred when saving datetime fields to the database
+
+**Improvements:**
+- Enhanced autonomous task model with proper datetime serialization for better database compatibility
+- Added comprehensive test coverage for autonomous task JSON serialization
+
+**Full Changelog:** https://github.com/crestalnetwork/intentkit/compare/v0.8.74...v0.9.0
+
+## v0.8.74
+
+**New Features:**
+- Added real-time status tracking for autonomous tasks, providing visibility into task execution states (waiting, running, error)
+- Added next run time display for scheduled autonomous tasks
+
+**Improvements:**
+- Enhanced autonomous task management with automatic status updates based on scheduler events
+- Improved task state consistency across the autonomous system
+
+**Full Changelog:** https://github.com/crestalnetwork/intentkit/compare/v0.8.73...v0.8.74
+
+# v0.8.73
+
+## New Features
+
+- **x402 Get Orders Skill**: Added new skill to retrieve recent successful x402 payment orders for agents, displaying transaction history with timestamps, URLs, descriptions, amounts (with proper decimal formatting), and transaction hashes
+
+## Improvements
+
+- Enhanced x402 order tracking with description field to capture payment details from the x402 protocol
+- Improved amount display formatting to show human-readable decimal values based on asset type (USDC, USDT, DAI, WETH, etc.)
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.8.72...v0.8.73
+
+## v0.8.72
+
+### New Features
+
+- Added httpx compatibility layer for X402 payment protocol skills, enabling better HTTP request handling and improved integration
+
+### Improvements
+
+- Improved QuickNode network alias handling for better blockchain network compatibility
+- Enhanced network mapping for Arbitrum and Optimism chains in QuickNode integration
+
+### Bug Fixes
+
+- Fixed bugs in QuickNode network alias normalization module
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.8.71...v0.8.72
+
+## v0.8.71
+
+### Features
+- Added prefunding support for Privy wallets in x402 safe payment operations
+
+### Improvements
+- Improved payment strategy for x402 safe transactions
+- Enhanced x402 base module functionality
+
+### Bug Fixes
+- Fixed issues in the x402 payment module
+- Fixed linting errors
+
+### Documentation
+- Added copilot instruction file
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.8.70...v0.8.71
+
+## v0.8.70
+
+### Improvements
+- Updated wallet provider system with enhanced support for Safe and Privy modes
+- Improved x402 payment validation
+- Updated dependencies (async-lru, boto3, botocore)
+- Code formatting improvements
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.8.69...v0.8.70
+
+## v0.8.69
+
+### Bug Fixes
+
+- Fixed x402 payment signing with Safe wallets by adding support for specifying the address that holds funds
+- Fixed chat memory clearing functionality to directly delete from database tables
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.8.68...v0.8.69
+
+## v0.8.66
+
+### Bug Fixes
+- Fixed JSON serialization issues in x402 payment signing with Privy wallets
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.8.65...v0.8.66
+
+## v0.8.65
+
+### Bug Fixes
+- Fixed x402 payment signing issues in Privy wallet integration
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.8.64...v0.8.65
+
+## v0.8.64
+
+### Bug Fixes
+- Fixed autonomous task selection to correctly filter out archived agents
+- Improved test stability by removing unused variables in Safe deployment tests
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.8.63...v0.8.64
+
+## v0.8.63
+
+### Bug Fixes
+- Fixed transaction collision issues in Safe wallet deployment operations
+- Improved reliability of module configuration after Safe deployment
+- Added local nonce tracking to prevent race conditions with distributed RPC nodes
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.8.62...v0.8.63
+
+## v0.8.62
+
+### Bug Fixes
+- Fixed intermittent GS026 errors in Safe wallet operations by adding deployment visibility check
+- Safe contracts are now verified to be visible across RPC nodes before proceeding with module operations
+
+### Improvements
+- Added `_wait_for_safe_deployed` function with retry logic to handle RPC node synchronization delays
+- Improved reliability of Safe wallet deployments in distributed RPC environments
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.8.61...v0.8.62
+
+## v0.8.61
+
+
+### Bug Fixes
+- Fixed Safe wallet deployment on L2 networks (Base, Base Sepolia, BNB Chain) by using correct L2 singleton addresses
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.8.60...v0.8.61
+
+## v0.8.60
+
+### Bug Fixes
+- Fixed critical nonce collision issue in Safe wallet deployments under high concurrency
+
+### Improvements
+- Improved transaction reliability for multi-worker deployments
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.8.59...v0.8.60
+
+## v0.8.59 - 2026-01-14
+
+### New Features
+- Server authorization keys are now automatically integrated into key quorums, enabling both server and users to independently control wallets while maintaining security
+- Added `get_authorization_public_keys()` method to expose server public keys for key quorum creation
+
+### Improvements
+- Authorization keys are now loaded and cached during initialization for better performance and reliability
+- Improved JSON canonicalization with proper primitive type handling for better signature consistency
+- Added validation to ensure Privy owner IDs start with 'did:privy:' prefix
+- Authorization signature support now applies to all Privy RPC calls including send_transaction
+- Enhanced logging with key fingerprints for easier debugging of authorization issues
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.8.58...v0.8.59
+
+
+## v0.8.58 - 2026-01-14
+
+### New Features
+- Added Privy authorization signature support using ECDSA signatures for enhanced API security
+- Support for multiple authorization keys via `PRIVY_AUTHORIZATION_KEYS` environment variable
+
+### Improvements
+- Fixed spending limit synchronization when agent configuration changes, ensuring allowance module settings are properly updated
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.8.57...v0.8.58
+
+## v0.8.57 - 2026-01-14
+
+### New Features
+- Added key quorum support for Privy wallets, enabling multi-signature configurations with customizable authorization thresholds
+- Added configurable Privy base URL for flexible API endpoint configuration
+
+### Improvements
+- Fixed circular dependencies in agent and user modules by using dynamic imports
+- Improved agent post tags field handling with proper null normalization
+- Enhanced Privy wallet creation with key quorum signer support
+
+### Bug Fixes
+- Fixed type casting issues in Web3 transaction parameter handling
+- Improved Safe deployment event parsing for better address extraction
+- Updated test suite to match new agent model structure
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.8.56...v0.8.57
+
+## v0.8.56 - 2026-01-13
+
+### New Features
+- Added gasless transaction support for Safe wallets using the relayer pattern
+- Safe wallet owners can now execute transactions without holding ETH for gas
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.8.55...v0.8.56
+
+## v0.8.55 - 2026-01-13
+
+### New Features
+- Added user server wallet creation system with Safe smart accounts
+- Added UserData model for flexible key-value storage per user
+
+### Improvements
+- Refactored agent list endpoint to use dynamic template rendering
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.8.54...v0.8.55
+
+## v0.8.54 - 2026-01-13
+
+### New Features
+- Added BNB Smart Chain (bnb-mainnet) support across all chain configurations
+- Pass Privy user ID as wallet owner when creating agent wallet
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.8.53...v0.8.54
+
+## v0.8.53 - 2026-01-13
+
+### Bug Fixes
+- Fixed Privy signing methods to use correct RPC methods for different use cases (personal_sign for messages, secp256k1_sign for raw hashes)
+
+### Dependencies
+- Updated dependencies via uv sync
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.8.52...v0.8.53
+
+## v0.8.52 - 2026-01-13
+
+### Bug Fixes
+- Fixed Privy signMessage method to use correct API method and encoding parameters
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.8.51...v0.8.52
+
+## v0.8.51 - 2026-01-13
+
+### Bug Fixes
+- Fixed Safe nonce retrieval to handle empty '0x' response from RPC, defaulting to 0 instead of failing
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.8.50...v0.8.51
+
+## v0.8.50 - 2026-01-13
+
+### Bug Fixes
+- Fixed Safe CREATE2 address calculation bug - the initializer should only be included in the salt calculation, not in the deploymentData
+- Added address validation to ensure predicted address matches actual deployed address
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.8.49...v0.8.50
+
+## v0.8.49 - 2026-01-12
+
+### Bug Fixes
+- Fixed wallet processing when creating agents from templates
+- Wallet initialization now properly triggered during template-based agent creation
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.8.48...v0.8.49
+
+## v0.8.48 - 2026-01-12
+
+### New Features
+- **Local Chat Interface**: New local chat functionality with private mode
+- **Agent UI Improvements**: Redesigned agent creation and editing pages
+- **Post System**: Added post creation, viewing, and timeline features
+- **Chat Sidebar**: Enhanced chat UI with conversation history
+- **Agent Activities**: New activity tracking and viewing for agents
+
+### Improvements
+- Better frontend navigation and user experience
+- Enhanced skill availability management
+- Improved agent template handling with dynamic field application
+
+### Bug Fixes
+- Fixed issues in agent network ID enum handling
+- Resolved bugs in post-related modules
+- Fixed UI bugs in agent update and skill state mapping
+- Patched Pydantic upgrade compatibility issues
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.8.47...v0.8.48
+
+## v0.8.45 - 2026-01-08
+
+### New Features
+- **x402 Payment Protocol Skills**: Added two new skills for working with 402-protected resources:
+  - `x402_check_price`: Check the price of a paid API resource before making a payment
+  - `x402_pay`: Perform paid HTTP requests with configurable maximum payment limits
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.8.44...v0.8.45
+
+## v0.8.44 - 2026-01-07
+
+### New Features
+- **x402 Payment Protocol Skills**: Added two new skills for working with 402-protected resources:
+  - `x402_check_price`: Check the price of a paid API resource before making a payment
+  - `x402_pay`: Perform paid HTTP requests with configurable maximum payment limits
+
+### Improvements
+- Enhanced agent creation with field descriptions and validation
+- Improved credit and asset management for agents
+- Refined scheduler and engine components
+- Better Privy wallet client integration
+
+### Documentation
+- Clarified documentation on folder structure and local development setup
+- Updated operational guides for release management
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.8.43...v0.8.44
+
+## v0.8.43 - 2026-01-07
+
+### Features
+- Support recovery of partially created Privy wallets
+
+### Fixes
+- Fix core API to hide from public docs
+- Fix test issue
+
+### Tests
+- Add new tests for core engine functionality
+- Add new tests for credit system
+- Add new tests for scheduler
+- Improve agent asset tests
+
+### Documentation
+- Refactor LLM docs
+- Fix ops guide
+- Add skill development guide
+- Add operations guide
+- Update changelog
+
+### Dependencies
+- Upgrade dependencies via uv sync
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.8.42...v0.8.43
+
+## v0.8.42 - 2025-01-31
+
+### Features
+- Added Pydantic field descriptions to `AgentCreationFromTemplate` for better API documentation and clarity
+- Enhanced validation in `AgentUpdate` to include `extra_prompt` field, preventing level 1 and level 2 headings
+
+### Improvements
+- Updated test coverage to verify optional fields (readonly_wallet_address, weekly_spending_limit, extra_prompt) are correctly passed through during agent creation from templates
+
+### Documentation
+- Added descriptive field documentation for all parameters in agent creation from template
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.8.41...v0.8.42
+
+## v0.8.41 - 2025-01-29
+
+### Features
+- **Agent Visibility System**: Added public/private agent visibility controls, allowing agents to be marked as public or private for better access management
+- **Jupiter Skill Integration**: New Jupiter skill for Solana DeFi operations including token price queries and swap functionality
+- **Enhanced Template Creation**: Improved agent template creation with support for visibility settings and additional field mappings
+
+### Improvements
+- **Prompt Structure**: Refined prompt structure and formatting for better clarity and consistency
+- **Template Fields**: Added more comprehensive field support when creating agents from templates
+
+### Bug Fixes
+- **Template Agent Creation**: Fixed field mapping issues in template-based agent creation
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.8.40...v0.8.41
+
+## v0.8.40 - 2025-01-31
+
+### Features
+- **Autonomous Error Tracking**: Added comprehensive error activity tracking for autonomous task execution. The system now automatically creates agent activities when tasks fail, return empty responses, or encounter unexpected errors, improving error visibility and debugging capabilities.
+- **Memory Management**: Added `has_memory` flag support for autonomous tasks, allowing fine-grained control over thread memory persistence per task execution.
+
+### Bug Fixes
+- **Changelog Generation**: Fixed bug in changelog generation process.
+
+### Technical Details
+- Enhanced `run_autonomous_task` function with error detection and activity creation
+- Improved error handling for empty responses, system errors, and exceptions
+- Added proper logging for error activity creation failures
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.8.39...v0.8.40
+
+## v0.8.39 - 2026-01-04
+
+### Features
+- **Safe Smart Wallet Integration**: Implemented Safe smart wallet functionality with Privy wallet provider for enhanced security and multi-signature support
+- **Agent Activity & Post Modules**: Added comprehensive agent activity and post modules with complete models, core logic, and unit tests
+- **System Skills**: Introduced system skills for creating posts and activities, enabling agents to interact with the platform
+- **Skill Call Agent**: Implemented skill call agent functionality with improved error handling and validation
+- **Default System Skills**: System skills are now included by default for all agents
+
+### Improvements
+- **Unified Agent API Router**: Refactored auth and openai_compatible endpoints into a unified agent_api router for better organization
+- **Better Error Handling**: Enhanced error messages and handling in call agent skill
+- **Agent Post Skill**: Improved agent post skill functionality
+
+### Testing
+- Added comprehensive unit tests for template functions including `create_template_from_agent` and `render_agent`
+
+### Maintenance
+- Upgraded dependencies to latest versions
+- Fixed various lint issues
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.8.38...v0.8.39
+
+## v0.8.38 - 2025-12-31
+
+### Features
+- **Template System**: Added comprehensive agent template functionality
+  - New `Template` model for storing reusable agent configurations
+  - Template rendering system that applies template fields to agents
+  - Support for `extra_prompt` field when creating agents from templates
+  - Template management API endpoints in admin interface
+
+### Refactoring
+- **Agent Retrieval Architecture**: Moved template rendering logic from model layer to core layer
+  - Created new `get_agent()` function in `core/agent.py` for centralized agent retrieval with template rendering
+  - Deprecated `Agent.get()` method with backward compatibility maintained
+  - Updated all non-model code to use new `get_agent()` function
+  - Cleaner separation of concerns between data models and business logic
+
+### Improvements
+- Refactored `send_slack_message()` to have no return value for cleaner async handling
+- Enhanced code organization and maintainability
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.8.37...v0.8.38
+
+## v0.8.37 - 2025-12-27
+
+### Features
+- Frontend skill box display in chat interface
+- Local frontend development improvements
+- GPT image model updated to version 1.5
+
+### Fixes
+- Docker compose configuration fixes
+- Debug authentication removed
+- Various lint fixes
+
+### Chores
+- Dependency updates
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.8.36...v0.8.37
+
+## v0.8.35 - 2025-11-30
+
+### Features
+- Add GPT-5.2 model with enhanced capabilities (1.75 input pricing, 14 output pricing)
+- Add Gemini 3 Pro Preview model support
+- Add OpenRouter provider integration for additional model access
+- Add DeepSeek 3.2 model support
+- Filter available models based on provider API key presence
+- Initialize frontend application with Next.js
+  - Agent management interface
+  - Dashboard with agent cards
+  - Responsive UI with Tailwind CSS
+- Add checkpoint cleanup functionality in core engine
+- Add cleanup scheduler for automatic maintenance
+
+### Improvements
+- Reorganize llm.csv model entries for better readability
+- Enhanced LLM model filtering logic
+- Add comprehensive tests for LLM model functionality
+
+### Fixes
+- Remove readonly router and service for cleaner architecture
+- Resolve linting errors and deprecation warnings across codebase
+- Fix type hints and import statements
+- Update error handling utilities
+
+### Documentation
+- Add AGENTS.md with detailed frontend architecture guidelines
+- Update CHANGELOG.md with recent changes
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.8.34...v0.8.35
+
+## v0.8.34 - 2025-11-28
+
+### Features
+- Add LangGraph 2.0 checkpoints table migration
+- Add dev and prod docker image tags for releases
+- Keep short memory only 90 days
+- Add daily scheduled task to clean up old LangGraph checkpoints, writes, and blobs
+- Team model support
+- Add draft functionality and manager module
+- Third party S3 support
+- Autonomous use internal service to chat
+- Agent testing capabilities
+- Move checker to core
+
+### Fixes
+- Reorder checkpoint migration steps to drop columns after pk update
+- Cache checkpointer
+- Improve checkpointer clean
+- Clean old generator model
+- Cache by agent deploy
+- Change node to middleware
+- Fix astream bug
+- Add basedpyright to llm.md
+
+### Refactoring
+- Migrate checkpointer to shallow saver implementation
+- Migrate langchain agent middleware
+- Move s3 to clients
+
+### Chores
+- Remove EKS deployment steps from CI workflow
+- Disable kubectl deployments in build workflow
+- Disable autonomous, telegram, and checker deployments in testnet-dev
+- Remove x402 server
+- Upgrade dependencies (uv sync --upgrade)
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.8.33...v0.8.34
+
+## v0.8.33 - 2025-11-14
+
+### Bug Fixes
+- Fixed lifi bug in token execution
+- Updated code formatting with ruff
+
+### Documentation
+- Updated changelog
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.8.32...v0.8.33
+
+## v0.8.32 - 2025-11-14
+
+### Fixes
+- Add default value to x402 price field in agent model
+- Update changelog documentation
+
+**Changes:**
+- Changed x402_price default from None to 0.01 in AgentPublicInfo model
+- Updated changelog with v0.8.31 release notes
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.8.31...v0.8.32
+
+## v0.8.31 - 2025-11-14
+
+### Changes
+- Updated multiple dependencies to latest versions
+- Enhanced LLM model configurations
+- Updated agent model definitions
+
+**Dependency Updates:**
+- langchain-mcp-adapters: 0.1.12 → 0.1.13
+- langgraph-prebuilt: 1.0.2 → 1.0.4  
+- MCP: 1.21.0 → 1.21.1
+- OpenAI: 2.7.2 → 2.8.0
+- Ruff: 0.14.4 → 0.14.5
+- Slack SDK: 3.37.0 → 3.38.0
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.8.30...v0.8.31
+
+## v0.8.30 - 2025-11-13
+
+### Features
+- System prompt now support search and super functionality
+
+### Documentation
+- Updated changelog
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.8.29...v0.8.30
+
+## v0.8.29 - 2025-11-13
+
+### Bug Fixes
+- Fixed engine.py with latest changes
+
+### Documentation
+- Updated changelog
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.8.28...v0.8.29
+
+## v0.8.28 - 2025-11-13
+
+### Changes
+- chore: release prep
+- chore: uv sync
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.8.27...v0.8.28
+
+## v0.8.24 - 2025-11-11
+
+### Configuration Updates
+- Updated uv.lock dependencies with 243 changes
+- Enhanced configuration system in `intentkit/config/config.py`
+- Updated LLM model configurations in `intentkit/models/llm.csv`
+- Added new LLM model support in `intentkit/models/llm.py`
+
+### Documentation
+- Updated CHANGELOG.md with recent changes
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.8.23...v0.8.24
+
+## v0.8.23 - 2025-11-10
+
+### Bug Fixes
+- Enhanced chain utility functions with better error handling
+- Improved ENS resolution with fallback mechanisms
+- Updated logging and error reporting
+- Fixed various bugs in utility functions
+
+### Features
+- Added comprehensive test coverage for chain utilities
+- Enhanced ENS utilities for improved reliability
+- Improved agent and chat model functionality
+- Updated configuration handling
+
+### Improvements
+- Refactored chain utility functions for better performance
+- Enhanced error handling in various components
+- Dependency updates and optimizations
+- Improved code organization and structure
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.8.22...v0.8.23
+
+## v0.8.22
+
+### Features
+- **feat: get user by wallet** - Added functionality to retrieve user by wallet address
+- Enhanced user model with wallet lookup capabilities
+- Added comprehensive tests for wallet-based user retrieval
+
+### Improvements
+- **refactor**: restructure to root only pyproject config for better project organization
+- **chore**: update uv.lock dependencies for latest security and performance updates
+- **build**: updated build configuration and package files
+
+### Documentation
+- Updated x402 documentation with demo information
+- Enhanced changelog documentation
+
+### Technical Details
+- Updated `intentkit/models/user.py` with wallet lookup functionality
+- Added comprehensive tests in `tests/models/test_user.py`
+- Multiple model updates for better structure and organization
+- Updated build workflows and configuration files
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.8.21...v0.8.22
+
+## v0.8.21
+
+### Bug Fixes
+- Fixed moralis assets bug in core/asset.py
+- Updated related tests in tests/core/test_agent_asset.py
+- Updated changelog
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.8.20...v0.8.21
+## v0.8.20
+
+### Features
+- Updated changelog with latest changes
+- Improvements to GPT avatar generator functionality
+
+### Technical Details
+- Enhanced GPT avatar generator with better error handling and functionality
+- Updated changelog documentation
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.8.19...v0.8.20
+
+## v0.8.19
+
+### Bug Fixes
+- **Credit System**: Updated credit system logic in core credit module
+- **Skill Author Handling**: Fixed skill author handling in credit calculations
+
+### Technical Details
+- Updated `intentkit/core/credit.py` with improved logic
+- All linting checks passed
+- No breaking changes
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.8.18...v0.8.19
+
+## v0.8.18
+
+### Features
+- Updated OpenAI image generation skills configuration
+- Enhanced image generation capabilities
+
+### Changes
+- Updated `intentkit/skills/openai/gpt_avatar_generator.py`
+- Updated `intentkit/skills/openai/gpt_image_mini_generator.py`
+- Added changelog documentation
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.8.17...v0.8.18
+
+## v0.8.17
+
+### Features
+- **feat: update openai gpt avatar generator and skills metadata** - Enhanced OpenAI GPT avatar generator functionality with improved skills metadata
+- **feat: add gpt avatar generator skill** - Added new GPT avatar generator skill to the OpenAI skills collection
+
+### Bug Fixes
+- **fix: a import bug** - Fixed import issue in the codebase
+
+### Other Changes
+- Updated dependency lock file (uv.lock)
+- Code formatting and linting improvements
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.8.16...v0.8.17
+
+## v0.8.16
+
+### Documentation
+- **docs: update x402 documentation and fix icon bug (#885)** - Updated x402 API documentation with latest changes
+- **docs: add x402 api documentation** - Added comprehensive x402 API documentation
+
+### Bug Fixes
+- **fix: icon bug** - Fixed icon-related bug in the application
+
+### Other Changes
+- **doc: changelog** - Updated changelog documentation
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.8.15...v0.8.16
+
+## v0.8.15
+
+### Bug Fixes
+- **x402 error handling**: Improved error handling mechanisms for x402 operations
+- **x402 message bug**: Fixed message processing issues in x402 integration
+- **documentation**: Updated changelog and documentation
+
+### Features
+- Enhanced x402 skill integration with better reliability and functionality
+
+### Summary
+This release focuses on improving the x402 integration with better error handling and message processing capabilities.
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.8.14...v0.8.15
+
+## v0.8.14
+
+### Features
+- **x402 Skill Improvements**: Updated x402 skill image format from PNG to WebP for better performance and smaller file size
+- **Model Configuration Updates**: Enhanced agent and LLM model configurations for improved functionality
+- **Schema Updates**: Updated x402 skill schema configuration
+
+### Changes
+- Converted x402 skill image from PNG to WebP format
+- Updated `intentkit/models/agent.py` with improved agent model configurations
+- Updated `intentkit/models/llm.py` with enhanced LLM model configurations
+- Updated `intentkit/skills/x402/schema.json` with latest skill schema
+- Removed temporary analysis script `analyze_schema_defs.py`
+- Updated dependencies in `uv.lock`
+
+### Impact
+- Improved performance with WebP image format
+- Better model configurations for enhanced functionality
+- Cleaner codebase with removal of temporary files
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.8.13...v0.8.14
+
+## v0.8.13
+
+### New Features
+- **X402 Server Implementation**: Complete x402 server implementation with routing and API endpoints
+- **Base Onchain Skill Class**: Added foundational class for onchain operations and blockchain interactions
+- **EVM Account Support**: Enhanced EVM account management capabilities for better blockchain integration
+
+### Improvements
+- **API Updates**: Enhanced API functionality and x402 ask agent capabilities
+- **CDP Client Refactor**: Improved CDP (Coinbase Developer Platform) client implementation for better reliability and performance
+
+### Bug Fixes
+- **X402 Router**: Fixed x402 router bug for improved stability
+- **X402 Input Schema**: Corrected x402 input schema validation
+- **API Routing**: Fixed x402 path commenting in API routing
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.8.12...v0.8.13
+
+## v0.8.12
+
+### Features
+- **feat: update asset scheduler and llm model configuration** - Enhanced asset scheduler functionality, improved core scheduler operations, and updated LLM model configuration in CSV file
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.8.11...v0.8.12
+
+## v0.8.11
+
+### New Features
+- **Import Checking Scripts**: Added comprehensive import validation tools to maintain code quality
+  - `check_imports.py` - Basic import validation script
+  - `check_imports_comprehensive.py` - Advanced import analysis with circular dependency detection  
+  - `simple_import_check.py` - Lightweight import checker
+
+### Improvements
+- **Code Quality**: Automated code formatting updates across multiple skill modules
+- **Developer Tools**: Enhanced dependency management and organization capabilities
+- **CI/CD Ready**: Scripts can be integrated into continuous integration pipelines
+
+### Benefits
+- Early detection of circular dependencies
+- Improved code quality through automated import validation
+- Better dependency management and organization
+- Consistent code formatting across the codebase
+
+### Changes
+- Added 3 new import checking scripts in the `scripts/` directory
+- Code formatting updates across 32+ skill module files
+- Enhanced development workflow with automated quality assurance tools
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.8.10...v0.8.11
+
+## v0.8.10
+
+### Bug Fixes
+- **fix: improve token address handling in wallet prompt** - Updated the prompt message in `_build_wallet_section` to provide clearer guidance on when to use `token_search` skill. Improved the logic for token address resolution by specifying that the skill should be used when only a token symbol is provided and the address cannot be found in context. Added network_id reference to make the prompt more specific about which chain to search on.
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.8.9...v0.8.10
+
+## v0.8.9
+
+### Features
+- **feat: update wallet section in prompt** - Enhanced wallet section building logic in `_build_wallet_section` function and improved prompt handling for wallet-related operations
+
+### Bug Fixes
+- **fix: update dockerfile configuration** - Updated Dockerfile configuration for better deployment
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.8.8...v0.8.9
+
+## v0.8.7
+
+### Bug Fixes
+- **Telegram Event Loop Handling**: Improved stability and reliability of the telegram integration by fixing event loop handling
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.8.6...v0.8.7
+
+## v0.8.6
+
+### Bug Fixes
+- **Checker and Scheduler Modules**: Updated checker and scheduler modules to improve functionality
+- **Readonly Instance**: Removed readonly instance to fix configuration issues
+
+### Maintenance
+- **Dependencies**: Upgraded dependencies with uv sync --upgrade
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.8.5...v0.8.6
+
+## v0.8.5
+
+### Bug Fixes
+- **Clear Change Functionality**: Restored functionality for clearing changes in the system
+- **Draft Chat Bug**: Fixed issues with draft chat functionality that were preventing proper message handling
+- **Private Skill Bug**: Resolved bugs related to private skills system that were affecting skill execution
+
+### Documentation
+- **Changelog Updates**: Updated changelog documentation for better release tracking
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.8.4...v0.8.5
+
+## v0.8.4
+
+### New Features
+- **CDP Client Enhancement**: Enhanced CDP client implementation with improved configuration management
+- **Agent Configuration**: Updated agent configurations for better functionality
+
+### Improvements
+- **Skill Schemas**: Updated skill schemas for cookiefun and twitter integrations
+- **Build Workflow**: Enhanced build workflow configuration
+- **Documentation**: Updated LLM documentation
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.8.3...v0.8.4
+
+## v0.8.3
+
+### Bug Fixes
+- **Clear command detection**: Fixed the logic for correctly detecting clear commands in the system
+
+### Maintenance
+- **Dependencies**: Updated project dependencies and changelog to reflect recent changes
+- **Code quality**: Applied linting and formatting improvements
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.8.2...v0.8.3
+
+## v0.8.2
+
+### New Features
+- **Improved @clear command matching**: Enhanced the @clear command with case-insensitive regex matching and support for both @clear and /clear formats
+  - Case-insensitive matching: Now supports @Clear, @CLEAR, /Clear, /CLEAR, etc.
+  - Multiple formats: Added support for both @clear and /clear commands
+  - Word boundary matching: Uses regex with  to ensure exact word matching
+  - Trim support: Messages are trimmed before matching to handle whitespace
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.8.1...v0.8.2
+
+## v0.8.1
+
+### New Features
+- **Agent Slug Enhancement**: Automatically update agent slug with EVM wallet address when slug is empty
+
+### Maintenance
+- Updated uv.lock dependencies for improved compatibility and security
+- Updated project configuration and dependencies
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.8.0...v0.8.1
+
+## v0.8.0
+
+### New Features
+- **Agent System Enhancements**: Enhanced agent deployment with wallet processing and notifications
+- **Agent Fields**: Added new agent fields and public schema support
+- **LLM and Skills Management**: Added centralized LLM and skills CSV model files
+- **S3 File Storage**: Added generic S3 file storage helper functionality
+- **Agent Response Validation**: Added required field validation for agent name in JSON schema
+
+### Improvements
+- **Code Quality**: Improved type annotations and error handling throughout the agent system
+- **Agent Model**: Refactored agent model schema with public schema support
+- **Agent Core**: Major refactoring of agent core functionality
+- **Skill Store**: Changed skill store to agent store for better organization
+- **LiFi Functions**: Added annotations to LiFi functions
+- **Account Balance**: Improved account balance checking precision with diagnostic script
+
+### Bug Fixes
+- **Environment Configuration**: Fixed environment example configuration
+- **Scheduler**: Fixed duplicate job errors by adding replace_existing=True to scheduler jobs
+- **Telegram**: Fixed Telegram uvloop issues
+- **Coinbase Dependencies**: Dropped coinbase langchain dependency
+- **SQLite Compatibility**: Fixed incompatible SQLite SQL issues
+- **Fee Validation**: Commented out fee validation and set default wallet provider to CDP
+- **Agent Deployment**: Fixed agent deployment issues and variable naming conflicts
+- **HTTP Errors**: Improved HTTP error handling
+- **Agent Response**: Fixed agent response model validation and data conversion
+
+### Refactoring
+- **Agent Provider Icons**: Replaced provider icons
+- **Code Formatting**: Improved code formatting and removed unused imports
+- **Agent Model**: Major refactoring of agent model structure
+- **Engine**: Fixed various engine bugs
+- **User Model**: Fixed user model issues
+
+### Documentation
+- **Agent Documentation**: Added agents documentation symlink
+- **Changelog**: Updated changelog documentation
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.7.4...v0.8.0
+
+## v0.7.4
+
+### Features
+- **Memory Management**: Auto clear error memory for improved agent performance
+
+### Bug Fixes
+- **Code Quality**: Lint improvements
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.7.3...v0.7.4
+
+## v0.7.3
+
+### Features
+- **Telegram Bot Enhancements**: Major improvements to telegram bot functionality
+  - Added telegram bot owner configuration and message routing for better control
+  - Added processing reactions to telegram bot messages for user feedback
+  - Updated telegram bot processing reaction emoji to thinking face for better UX
+  - Added telegram unauthorized error handling and failed agents cache for improved reliability
+
+### Bug Fixes
+- **Telegram Bot Fixes**: 
+  - Updated telegram bot reactions to use ReactionTypeEmoji format for proper display
+  - Removed redundant reply_to_message_id in AI relayer error handling
+
+### Technical Improvements
+- Enhanced error handling and caching mechanisms
+- Improved message routing and bot configuration
+- Better reaction handling and emoji formatting
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.7.2...v0.7.3
+
+## v0.7.2
+
+### Features
+- Updated firecrawl skill with improved configuration and base implementation
+- Enhanced agent generator configuration
+
+### Bug Fixes
+- Fixed credit system precision and transaction type handling
+- Added SQL script for fixing existing transaction types
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.7.1...v0.7.2
+
+## v0.7.1
+
+### Features
+- **Database**: Add connection health check and max lifetime to pool
+- **Credit System**: Add transaction statistics tracking to credit accounts
+- **Account Checking**: Enhance balance consistency check with detailed verification
+
+### Bug Fixes
+- Add database initialization and improve account filtering in migration script
+- Use direct permanent_profit field from database in agent statistics
+- Ensure decimal precision with quantize in credit calculations
+- Add missing amount fields to CreditTransactionTable instantiations in refill function
+
+### Documentation
+- Update changelog
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.7.0...v0.7.1
+
+## v0.7.0
+
+### Features
+- **Config Enhancement**: Add intentkit_prompt to config and prompt system for better customization
+- **Credit Management**: Add comprehensive credit event consistency checker with base validation
+- **Migration Tools**: Add script to migrate credit accounts from transactions
+- **Optimization**: Optimize credit event consistency checking scripts for better performance
+
+### Fixes
+- **Model Update**: Change default model to gpt-5.4-mini for improved performance
+- **Credit Events**: Update and improve credit event consistency check script
+- **Workflow**: Update pypi publish workflow and changelog
+
+### Refactoring
+- **Credit Event Logic**: Improve readability of credit type distribution logic
+- **Performance**: Remove redundant logs and add batch stats tracking for better monitoring
+
+### Chores
+- **Documentation**: Update LLM rules and guidelines
+- **Migration Scripts**: Fix and improve migration scripts
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.6.26...v0.7.0
+
+## v0.6.26
+
+### Refactoring
+- Move asyncio import to top of file in account_checking.py
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.6.25...v0.6.26
+
+## v0.6.25
+
+### Refactoring
+- Simplified Dockerfile dependency installation process
+- Removed unnecessary await from sync get_system_config calls in Twitter module
+
+### Build & Configuration
+- Updated project name and added workspace configuration
+
+### Documentation
+- Updated changelog for v0.6.23 release
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.6.23...v0.6.25
+
+## v0.6.23
+
+### Features
+- Add reasoning_effort parameter for gpt-5 models
+
+### Documentation
+- Update changelog
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.6.22...v0.6.23
+
+## v0.6.22
+
+### Features
+- **XMTP Skills Enhancement**: Expanded XMTP skills to support multiple networks, improving cross-chain communication capabilities
+- **DexScreener Integration**: Added comprehensive DexScreener skills for enhanced token and pair information retrieval
+  - New `get_pair_info` skill for detailed trading pair data
+  - New `get_token_pairs` skill for token pair discovery
+  - New `get_tokens_info` skill for comprehensive token information
+  - Enhanced search functionality with improved utilities
+
+### Technical Improvements
+- Added new Web3 client utilities for better blockchain interaction
+- Enhanced chat functionality in core system
+- Updated agent schema with improved configuration options
+- Improved skill base classes with better error handling
+
+### Dependencies
+- Updated project dependencies for better compatibility and security
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.6.21...v0.6.22
+
+## v0.6.21
+
+### Features
+- Added agent onchain fields support
+- Added web3 client and updated skill base class
+- Added clean thread memory functionality
+
+### Improvements
+- Package upgrade and maintenance
+
+### Bug Fixes
+- Fixed typo in intentkit package info
+
+### Documentation
+- Updated changelog documentation
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.6.20...v0.6.21
+
+## v0.6.20
+
+### Features
+- **Firecrawl Integration**: Enhanced firecrawl scraping capabilities by consolidating logic into a single `firecrawl_scrape` skill, removing the redundant `firecrawl_replace_scrape` skill
+- **Web3 Client**: Added web3 client support to skills for better blockchain integration
+- **XMTP Transfer**: Improved XMTP transfer validation and checking mechanisms
+
+### Bug Fixes
+- Fixed Supabase integration bugs
+- Better XMTP transfer validation and error handling
+- Removed deprecated skill context to improve performance
+
+### Documentation
+- Updated Firecrawl skill documentation
+- Enhanced changelog maintenance
+
+### Technical Improvements
+- Code quality improvements and lint fixes
+- Minor performance optimizations
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.6.19...v0.6.20
+
+## v0.6.19
+
+### Features
+- **Credit System**: Add base credit type amount fields and migration script
+- **Credit Events**: Enhance consistency checker and add fixer script
+- **Event System**: Add event check functionality
+- **Transaction Details**: Add fee detail in event and tx
+
+### Bug Fixes
+- **CDP Networks**: Add network id mapping hack for cdp mainnet networks
+- **UI**: Always hide skill details
+- **Onchain Options**: Better onchain options description
+
+### Technical Improvements
+- Enhanced credit event consistency checking and fixing capabilities
+- Improved network compatibility for CDP mainnet operations
+- Better transaction fee tracking and reporting
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.6.18...v0.6.19
+
+## v0.6.18
+
+### New Features
+- **Casino Skills**: Added comprehensive gambling and gaming skill set for interactive agent entertainment
+    - **Deck Shuffling**: Multi-deck support with customizable jokers for Blackjack and card games
+    - **Card Drawing**: Visual card display with PNG/SVG images for interactive gameplay
+    - **Quantum Dice Rolling**: True quantum randomness using QRandom API for authentic dice games
+    - **State Management**: Persistent game sessions with deck tracking and rate limiting
+    - **Gaming APIs**: Integration with Deck of Cards API and QRandom quantum random number generator
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.6.17...v0.6.18
+
+## v0.6.17
+
+### ✨ New Features
+- **Error Tracking**: Add error_type field to chat message model for better error tracking
+
+### 🔧 Improvements
+- **Core Engine**: Refactor core engine and update models for better performance
+- **System Messages**: Refactor system messages handling
+- **Error Handling**: Refactor error handling system
+
+### 🐛 Bug Fixes
+- **Wallet Provider**: Fix wallet provider JSON configuration
+- **Linting**: Fix linting issues
+
+### 📚 Documentation
+- Update changelog documentation
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.6.16...v0.6.17
+
+## v0.6.16
+
+### 🐛 Bug Fixes
+- **Agent Generator**: Fixed missing wallet_provider default configuration in agent schema generation
+- **Schema Updates**: Updated agent schema JSON to reflect latest configuration requirements
+
+### 🔧 Improvements
+- Enhanced agent generator to include CDP wallet provider as default
+- Improved agent configuration consistency
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.6.15...v0.6.16
+
+## v0.6.15
+
+### 🔧 Improvements
+- **Validation Logging**: Enhanced error logging in schema validation for better debugging
+- **Documentation**: Updated changelog with v0.6.14 release notes
+
+### 🐛 Bug Fixes
+- Improved error handling and logging in generator validation
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.6.14...v0.6.15
+
+## v0.6.14
+
+### 🐛 Bug Fixes
+- **Readonly Wallet Address**: Fixed readonly_wallet_address issue
+
+### 🔧 Changes
+- Fixed readonly wallet address handling
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.6.13...v0.6.14
+
+## v0.6.13
+
+### ✨ New Features
+- **Readonly Wallet Support**: Added readonly wallet provider and functionality
+- **Agent API Streaming**: Implemented SSE (Server-Sent Events) for chat stream mode in agent API
+- **Internal Stream Client**: Added internal streaming client capabilities
+- **Entrypoint System Prompts**: Added system prompt support for entrypoints, including XMTP entrypoint prompts
+- **Agent Model Configuration**: Updated agent model configuration system
+
+### 🔧 Improvements
+- **Documentation**: Updated changelog and LLM documentation
+- **Twitter Entrypoint**: Removed deprecated Twitter entrypoint
+
+### 🐛 Bug Fixes
+- **Agent Context Type**: Fixed agent context type issues
+- **Error Messages**: Improved error message handling
+
+### Diff
+[Compare v0.6.12...v0.6.13](https://github.com/crestalnetwork/intentkit/compare/v0.6.12...v0.6.13)
+
+## v0.6.12
+
+### 🔧 Improvements
+- **Skill Messages**: Consolidated artifact attachments into skill messages for better organization
+- **Documentation**: Updated changelog entries
+
+### Diff
+[Compare v0.6.11...v0.6.12](https://github.com/crestalnetwork/intentkit/compare/v0.6.11...v0.6.12)
+
+## v0.6.11
+
+### ✨ New Features
+- **XMTP Integration**: Added new XMTP features including swap and price skills
+- **User Wallet Info**: Enhanced user wallet information display
+- **DeepSeek Integration**: Updated DeepSeek integration with improved functionality
+
+### 🐛 Bug Fixes
+- **Search Functionality**: Temporarily disabled search for GPT-5 to resolve issues
+- **Configuration**: Better handling of integer config loading and number type validation
+- **Fee Agent Account**: Fixed fee_agent_account assignment in expense_summarize function
+- **Security**: Fixed clear-text logging of sensitive information (CodeQL alerts #31, #32)
+- **XMTP Schema**: Added missing XMTP schema files
+- **DeepSeek Bug**: Resolved DeepSeek-related bugs
+
+### 🔧 Improvements
+- **Prompt System**: Refactored prompt system for better performance
+- **Code Quality**: Improved formatting and code organization
+- **Build Configuration**: Updated GitHub workflow build configuration
+- **Dependencies**: Updated uv sync and dependency management
+
+### 📚 Documentation
+- Updated changelog entries throughout development cycle
+- Enhanced documentation for new features
+
+### Diff
+[Compare v0.6.10...v0.6.11](https://github.com/crestalnetwork/intentkit/compare/v0.6.10...v0.6.11)
+
+## v0.6.10
+
+### ✨ New Features
+- **XMTP Integration**: Added new XMTP message transfer skill with attachment support
+- **LangGraph 6.0 Upgrade**: Updated to LangGraph 6.0 for improved agent capabilities
+
+### 🔧 Improvements
+- **API Key Management**: Standardized API key retrieval across all skills for better consistency
+- **Skill Context**: Refactored skill context handling for improved performance and maintainability
+- **Skill Architecture**: Enhanced base skill classes with better API key management patterns
+- **XMTP Skill**: Updated XMTP skill image format and schema configuration
+- **Dependencies**: Added jsonref dependency for JSON reference handling
+- **Build Workflow**: Updated GitHub Actions build workflow configuration
+
+### 🐛 Bug Fixes
+- **XMTP Skill**: Align state typing and schema enum/titles for public/private options
+- **GPT-5 Features**: Fixed GPT-5 model features and capabilities implementation
+- **CI Improvements**: Fixed continuous integration workflow issues
+- **Agent & LLM Model Validation**: Enhanced agent and LLM models with improved validation capabilities and error handling
+
+### 🛠️ Technical Changes
+- Updated 169 files with comprehensive refactoring
+- Added XMTP skill category with transfer capabilities
+- Improved skill base classes across all categories
+- Enhanced context handling in core engine and nodes
+- Updated dependencies and lock files
+- Enhanced XMTP skill metadata and configuration files
+- Updated skill image format for better compatibility
+- Updated `intentkit/pyproject.toml` with jsonref dependency
+- Enhanced `.github/workflows/build.yml` configuration
+- Updated `intentkit/uv.lock` with new dependency
+
+### 📚 Documentation
+- **Changelog**: Updated changelog documentation with comprehensive release notes
+
+### Diff
+[Compare v0.6.9...v0.6.10](https://github.com/crestalnetwork/intentkit/compare/v0.6.9...v0.6.10)
+
+## v0.6.9
+
+### 📚 Documentation
+- **API Documentation**: Updated API documentation URLs to use localhost for development
+
+### 🔧 Maintenance  
+- **Sentry Configuration**: Updated sentry configuration settings
+
+### Diff
+[Compare v0.6.8...v0.6.9](https://github.com/crestalnetwork/intentkit/compare/v0.6.8...v0.6.9)
+
+## v0.6.8
+
+### 🚀 Features & Improvements
+
+#### 🔧 Dependency Updates
+- **LangGraph SDK & LangMem**: Updated to latest versions for improved performance
+- **FastAPI**: Updated core dependencies for better stability
+
+#### 📚 Documentation
+- **LLM Integration Guide**: Enhanced guide with better examples and updated instructions
+- **Cursor Rules**: Converted to symlink for better maintainability
+
+#### 💾 Database
+- **Connection Pooling**: Enhanced database connection pooling configuration with new parameters for better performance and resource management
+
+### 🐛 Bug Fixes
+- **Twitter**: Fixed rate limit handling for improved reliability
+
+### 🔧 Maintenance
+- **Elfa**: Migrated to v2 API for better functionality
+- **Documentation**: Various changelog and documentation updates
+
+### Diff
+[Compare v0.6.7...v0.6.8](https://github.com/crestalnetwork/intentkit/compare/v0.6.7...v0.6.8)
+
+## v0.6.7
+
+### 🚀 Features
+- **Autonomous Task Management System**: Added comprehensive autonomous task management capabilities with new skills for creating, updating, and managing autonomous tasks
+- **Agent Information Endpoint**: New endpoint to retrieve current agent information including EVM and Solana wallet addresses
+- **Enhanced Agent Model**: Added EVM and Solana wallet address fields to AgentResponse model
+- **Configurable Payment Settings**: Added configurable free_quota and refill_amount to payment settings
+
+### 🔧 Improvements
+- **Simplified Autonomous Tasks**: Removed enabled parameter from add_autonomous_task skill - tasks are now always enabled by default
+- **Better Task Integration**: Autonomous task information is now included in entrypoint rules system prompt
+- **Code Organization**: Refactored quota reset functions to AgentQuota class and moved update_agent_action_cost function to agent module
+
+### 🐛 Bug Fixes
+- Fixed autonomous skill bugs and ensured proper serialization of autonomous tasks in agent operations
+- Improved code formatting and removed unused files
+
+### 📚 Documentation
+- Updated changelog with comprehensive release notes
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.6.6...v0.6.7
+
+## v0.6.6
+
+### 🚀 Features
+- **Twitter Timeline Enhancement**: Exclude replies from twitter timeline by default to improve content quality and relevance
+
+### 🔧 Technical Details
+- Modified twitter timeline skill to filter out reply tweets by default
+- This change improves the signal-to-noise ratio when fetching timeline data
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.6.5...v0.6.6
+
+## v0.6.5
+
+### 🚀 Features
+- Add sanitize_privacy method to ChatMessage model for better privacy handling
+- Add redis_db parameter to all redis connections for improved database management
+
+### 🔧 Improvements
+- Prevent twitter reply skill from replying to own tweets to avoid self-loops
+- Better agent API documentation with improved clarity and examples
+- Enhanced agent documentation with clearer explanations
+
+### 🐛 Bug Fixes
+- Fix agent data types for better type safety
+- Fix bug in agent schema validation
+- Remove number field in agent model to simplify structure
+- Use separate connection for langgraph migration setup to prevent conflicts
+- Fix typo in documentation
+
+### 📚 Documentation
+- Improved agent API documentation
+- Updated changelog entries
+- Better agent documentation structure
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.6.4...v0.6.5
+
+## v0.6.4
+
+### 🔧 Maintenance
+- **Dependency Management**: Rollback langgraph-checkpoint-postgres version for stability
+- **Package Updates**: Update dependencies in pyproject.toml
+- **Documentation**: Documentation improvements
+
+### 🐛 Bug Fixes
+- **Compatibility**: Fixed dependency compatibility issues
+
+### 🚀 Improvements
+- **Stability**: Enhanced system stability with dependency rollbacks
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.6.3...v0.6.4
+
+## v0.6.3
+
+### 🚀 Features
+- **CDP Swap Skill**: Added CDP swap skill for token swapping functionality
+
+### 🐛 Bug Fixes
+- Fixed lint error
+- Fixed a type error
+
+### 🔧 Maintenance
+- Updated dependencies in pyproject.toml
+- Fixed dependency error
+- Updated package versions
+- Documentation changelog updates
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.6.2...v0.6.3
+
+## v0.6.2
+
+### 🚀 Features
+- **Agent API Enhancement**: Added comprehensive agent API sub-application with CORS support and improved error handling
+- **Authentication Improvements**: Implemented token-based authentication for agent API endpoints
+- **Credit Tracking**: Enhanced credit event tracking with agent_wallet_address field for better monitoring
+- **Chat API Flexibility**: Made user_id optional in chat API with automatic fallback to agent.owner
+- **Documentation Updates**: Restructured and updated API documentation for better clarity
+
+### 🔧 Improvements
+- **Twitter Service**: Refactored twitter service for better maintainability
+- **Text Processing**: Improved formatting in extract_text_and_images function
+- **Agent Authentication**: Streamlined agent and admin authentication systems
+- **Supabase Integration**: Fixed supabase link issues
+- **API Key Skills**: Enhanced description for get API key skills
+
+### 📚 Documentation
+- Updated README with latest information
+- Restructured API documentation files
+- Added comprehensive agent API documentation
+
+### 🛠️ Technical Changes
+- Updated dependencies with uv sync
+- Various code refactoring for better code quality
+- Fixed typos in chat message handling
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.6.1...v0.6.2
+
+## v0.6.1
+
+### Features
+- feat: add public key to supabase
+
+### Bug Fixes
+- fix: node log level
+- fix: cdp get balance bug
+- fix: close some default skills
+
+### Documentation
+- doc: changelog
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.6.0...v0.6.1
+
+## v0.6.0
+
+### 🚀 Features
+- **IntentKit Package Publishing**: The intentkit package is now published and available for installation
+- **Web Scraper Skills**: Added comprehensive web scraping capabilities to scrape entire sites in one prompt
+- **Firecrawl Integration**: New Firecrawl skill for advanced web content extraction
+- **Supabase Skills**: Complete Supabase integration with data operations and error handling
+- **HTTP Skills**: Generic HTTP request capabilities for external API interactions
+- **Enhanced Skill Context**: More contextual information available to skills during execution
+
+### 🔧 Improvements
+- **Core Refactoring**: Major refactoring of the intentkit core system for better performance
+- **Stream Executor**: Improved streaming capabilities for real-time responses
+- **Agent Creation**: Streamlined agent creation process
+- **Memory Management**: Better memory handling with SQLite support for testing
+- **CDP Wallet Integration**: Enhanced CDP wallet functionality with automatic wallet creation
+- **Skill Schema Updates**: Improved skill schemas with conditional validation
+- **LangGraph Integration**: Better PostgreSQL saver initialization for LangGraph
+
+### 🐛 Bug Fixes
+- Fixed import issues in core modules
+- Corrected skills path and added webp support in admin schema
+- Fixed CDP balance retrieval functionality
+- Resolved wallet creation issues during agent initialization
+- Various lint and formatting fixes
+
+### 📚 Documentation
+- Updated LLM integration guide
+- Enhanced skill development documentation
+- Improved changelog maintenance
+
+### Breaking Changes
+- Core intentkit package structure has been refactored
+- Some skill interfaces may have changed due to enhanced context support
+
+### Migration Guide
+- Update your intentkit package installation to use the new published version
+- Review skill implementations if using custom skills
+- Check agent creation code for any compatibility issues
+
+**Full Changelog**: https://github.com/crestalnetwork/intentkit/compare/v0.5.9...v0.6.0
+
+## v0.5.0
+
+### Breaking Changes
+- Switch to uv as package manager
+
+## v0.4.0
+
+### New Features
+- Support Payment
+
+## 2025-02-26
+
+### New Features
+- Chat entity and API
+
+## 2025-02-25
+
+### New Features
+- Elfa integration
+
+## 2025-02-24
+
+### New Features
+- Add input token limit to config
+- Auto clean memory after agent update
+
+## 2025-02-23
+
+### New Features
+- Defillama skills
+
+## 2025-02-21
+
+### New Features
+- CDP SDK upgrade to new package
+
+## 2025-02-20
+
+### New Features
+- Add new skill config model
+- Introduce json schema for skill config
+
+## 2025-02-18
+
+### New Features
+- Introduce json schema for agent model
+- Chain provider abstraction and quicknode
+
+## 2025-02-17
+
+### New Features
+- Check and get the telegram bot info when creating an agent
+
+## 2025-02-16
+
+### New Features
+- Chat History API
+- Introduce to Chat ID concept
+
+## 2025-02-15
+
+### New Features
+- GOAT Integration
+- CrossMint Wallet Integration
+
+## 2025-02-14
+
+### New Features
+- Auto create cdp wallet when create agent
+- CryptoCompare skills
+
+## 2025-02-13
+
+### New Features
+- All chats will be saved in the db table chat_messages
+
+### Breaking Changes
+- Remove config.debug_resp flag, you can only use debug endpoint for debugging
+- Remove config.autonomous_memory_public, the autonomous task will always use chat id "autonomous"
+
+## 2025-02-11
+
+### Improvements
+- Twitter account link support redirect after authorization
+
+## 2025-02-05
+
+### New Features
+- Acolyt integration
+
+## 2025-02-04
+
+### Improvements
+- split scheduler to new service
+- split singleton to new service
+
+## 2025-02-03
+
+### Breaking Changes
+- Use async everywhere
+
+## 2025-02-02
+
+### Bug Fixes
+- Fix bugs in twitter account binding
+
+## 2025-02-01
+
+### New Features
+- Readonly API for better performance
+
+## 2025-01-30
+
+### New Features
+- LLM creativity in agent config
+- Agent memory cleanup by token count
+
+## 2025-01-28
+
+### New Features
+- Enso tx CDP wallet broadcast
+
+## 2025-01-27
+
+### New Features
+- Sentry Error Tracking
+
+### Improvements
+- Better short memory management, base on token count now
+- Better logs
+
+## 2025-01-26
+
+### Improvements
+- If you open the jwt verify of admin api, it now ignore the request come from internal network
+- Improve the docker compose tutorial, comment the twitter and tg entrypoint service by default
+
+### Break Changes
+- The new docker-compose.yml change the service name, add "intent-" prefix to all services
+
+## 2025-01-25
+
+### New Features
+- DeepSeek LLM Support!
+- Enso skills now use CDP wallet
+- Add an API for frontend to link twitter account to an agent
+
+## 2025-01-24
+
+### Improvements
+- Refactor telegram services
+- Save telegram user info to db when it linked to an agent
+
+### Bug Fixes
+- Fix bug when twitter token refresh some skills will not work
+
+## 2025-01-23
+
+### Features
+- Chat API released, you can use it to support a web UI
+
+### Improvements
+- Admin API: 
+  - When create agent, id is not required now, we will generate a random id if not provided
+  - All agent response data is improved, it has more data now
+- ENSO Skills improved
+
+## 2025-01-22
+
+### Features
+- If admin api enable the JWT authentication, the agent can only updated by its owner
+- Add upstream_id to Agent, when other service call admin API, can use this field to keep idempotent, or track the agent
+
+## 2025-01-21
+
+### Features
+- Enso add network skill
+
+### Improvements
+- Enso skills behavior improved
+
+## 2025-01-20
+
+### Features
+- Twitter skills now get more context, agent can know the author of the tweet, the thread of the tweet, and more.
+
+## 2025-01-19
+
+### Improvements
+- Twitter skills will not reply to your own tweets
+- Twitter docs improved
+
+## 2025-01-18
+
+### Improvements
+- Twitter rate limit only affected when using OAuth
+- Better twitter rate limit numbers
+- Slack notify improved
+
+## 2025-01-17
+
+### New Features
+- Add twitter skill rate limit
+
+### Improvements
+- Better doc/create_agent.sh
+- OAuth 2.0 refresh token failure handling
+
+### Bug Fixes
+- Fix bug in twitter search skill
+
+## 2025-01-16
+
+### New Features
+- Twitter Follow User
+- Twitter Like Tweet
+- Twitter Retweet
+- Twitter Search Tweets
+
+## 2025-01-15
+
+### New Features
+- Twitter OAuth 2.0 Authorization Code Flow with PKCE
+- Twitter access token auto refresh
+- AgentData table and AgentStore interface
+
+## 2025-01-14
+
+### New Features
+- ENSO Skills
+
+## 2025-01-12
+
+### Improvements
+- Better architecture doc: [Architecture](docs/architecture.md)
+
+## 2025-01-09
+
+### New Features
+- Add IntentKitSkill abstract class, for now, it has a skill store interface out of the box
+- Use skill store in Twitter skills, fetch skills will store the last processed tweet ID, prevent duplicate processing
+- CDP Skills Filter in Agent, choose the skills you want only, the less skills, the better performance
+
+### Improvements
+- Add a document for skill contributors: [How to add a new skill](docs/contributing/skills.md)
+
+## 2025-01-08
+
+### New Features
+- Add `prompt_append` to Agent, it will be appended to the entire prompt as system role, it has stronger priority
+- When you use web debug mode, you can see the entire prompt sent to the AI model
+- You can use new query param `thread` to debug any conversation thread
+
+## 2025-01-07
+
+### New Features
+- Memory Management
+
+### Improvements
+- Refactor the core ai agent creation
+
+### Bug Fixes
+- Fix bug that resp debug model is not correct
+
+## 2025-01-06
+
+### New Features
+- Optional JWT Authentication for admin API
+
+### Improvements
+- Refactor the core ai agent engine for better architecture
+- Telegram entrypoint greeting message
+
+### Bug Fixes
+- Fix bug that agent config update not taking effect sometimes
+
+## 2025-01-05
+
+### Improvements
+- Telegram entrypoint support regenerate token
+- Telegram entrypoint robust error handling
+
+## 2025-01-03
+
+### Improvements
+- Telegram entrypoint support dynamic enable and disable
+- Better conversation behavior about the wallet
+
+## 2025-01-02
+
+### New Features
+- System Prompt, It will affect all agents in a deployment.
+- Nation number in Agent model
+
+### Improvements
+- Share agent memory between all public entrypoints
+- Auto timestamp in db model
+
+### Bug Fixes
+- Fix bug in db create from scratch
+
+## 2025-01-01
+
+### Bug Fixes
+- Fix Telegram group bug
+
+## 2024-12-31
+
+### New Features
+- Telegram Entrypoint
+
+## 2024-12-30
+
+### Improvements
+- Twitter Integration Enchancement
+
+## 2024-12-28
+
+### New Features
+- Twitter Entrypoint
+- Admin cron for quota clear
+- Admin API get all agents
+
+### Improvements
+- Change lint tools to ruff
+- Improve CI
+- Improve twitter skills
+
+### Bug Fixes
+- Fix bug in db base code
+
+## 2024-12-27
+
+### New Features
+- Twitter Skills
+    - Get Mentions
+    - Get Timeline
+    - Post Tweet
+    - Reply Tweet
+
+### Improvements
+- CI/CD refactoring for better security
+
+## 2024-12-26
+
+### Improvements
+- Change default plan to "self-hosted" from "free", new agent now has 9999 message limit for testing
+- Add a flag "DEBUG_RESP", when set to true, the Agent will respond with thought processes and time costs
+- Better DB session management
+
+## 2024-12-25
+
+### Improvements
+- Use Poetry as package manager
+- Docker Compose tutorial in readme
+
+## 2024-12-24
+
+### New Features
+- Multiple Agent Support
+- Autonomous Agent Management
+- Blockchain Integration (CDP for now, will add more)
+- Extensible Skill System
+- Extensible Plugin System
+
+### Improvements
+- Change lint tools to ruff
+- Improve CI
+- Improve twitter skills
+
+### Bug Fixes
+- Fix bug in db base code

@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "bernstein": {
+      "command": "bernstein",
+      "args": ["mcp"]
+    }
+  }
+}

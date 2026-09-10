@@ -1,0 +1,315 @@
+---
+title: Retrieval Augmented Generation (RAG)
+description: Build knowledge-enhanced AI applications with external document retrieval
+sidebar_label: RAG (Retrieval Augmented Generation)
+sidebar_position: 2
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Retrieval Augmented Generation (RAG)
+
+
+RAG enables your applications to reference and recall information from external documents. OGX makes Agentic RAG available through OpenAI's Responses API.
+
+## Quick Start
+
+### 1. Start the Server
+
+In one terminal, start the OGX server:
+
+```bash
+ogx list-deps starter | xargs -L1 uv pip install
+ogx run starter
+```
+
+### 2. Choose Your Approach
+
+OGX supports various approaches for building RAG applications. The server provides two APIs (Responses and Chat Completions), plus a high-level client wrapper (Agent class):
+
+#### Approach 1: Agent Class (Client-Side)
+
+The **Agent class** is a high-level client wrapper around the Responses API with automatic tool execution and session management. Best for conversational agents and multi-turn RAG.
+
+```python
+from ogx_client import Agent, AgentEventLogger, OgxClient
+import requests
+from io import BytesIO
+
+client = OgxClient(base_url="http://localhost:8321")
+
+# Create vector store
+vs = client.vector_stores.create(name="my_vector_db")
+
+# Upload document
+url = "https://www.paulgraham.com/greatwork.html"
+response = requests.get(url)
+file_buffer = BytesIO(response.content)
+file_buffer.name = "greatwork.html"
+
+file = client.files.create(file=file_buffer, purpose="assistants")
+client.vector_stores.files.create(vector_store_id=vs.id, file_id=file.id)
+
+# Create agent with file_search tool (client-side wrapper)
+agent = Agent(
+    client,
+    model="ollama/llama3.2:3b",
+    instructions="You are a helpful assistant",
+    tools=[
+        {
+            "type": "file_search",
+            "vector_store_ids": [vs.id],  # Agent searches this automatically
+        }
+    ],
+)
+
+# Just ask - agent handles retrieval automatically
+response = agent.create_turn(
+    messages=[{"role": "user", "content": "How do you do great work?"}],
+    session_id=agent.create_session("my_session"),
+    stream=True,
+)
+
+for log in AgentEventLogger().log(response):
+    print(log, end="")
+```
+
+**How it works:**
+- Client-side `Agent` class wraps the Responses API
+- Agent automatically decides when to search the vector store
+- Uses internal Python API for vector search (no HTTP overhead)
+- Maintains conversation context across turns
+- Best for: Interactive applications, chatbots, multi-turn conversations
+
+#### Approach 2: Responses API
+
+
+```python
+import io, requests
+from openai import OpenAI
+
+url = "https://www.paulgraham.com/greatwork.html"
+client = OpenAI(base_url="http://localhost:8321/v1/", api_key="none")
+
+# Create vector store
+vs = client.vector_stores.create()
+
+response = requests.get(url)
+pseudo_file = io.BytesIO(str(response.content).encode('utf-8'))
+file_id = client.files.create(file=(url, pseudo_file, "text/html"), purpose="assistants").id
+client.vector_stores.files.create(vector_store_id=vs.id, file_id=file_id)
+
+# Automatic tool calling (calls Responses API directly)
+resp = client.responses.create(
+    model="gpt-4o",
+    input="How do you do great work?",
+    tools=[{"type": "file_search", "vector_store_ids": [vs.id]}],
+    include=["file_search_call.results"],
+)
+
+print(resp.output[-1].content[-1].text)
+```
+
+**How it works:**
+- Server-side API with automatic tool calling
+- Uses internal Python API for vector search
+- No built-in session management (stateless by default)
+- Best for: Single-turn queries, OpenAI-compatible applications
+
+#### Approach 3: Chat Completions API
+
+The **Chat Completions API** is a server-side API that gives you explicit control over retrieval and generation. Best for custom RAG pipelines and batch processing.
+
+```python
+import io, requests
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8321/v1/", api_key="none")
+
+# Create vector store and add documents
+vs = client.vector_stores.create()
+# ... upload and add files ...
+
+# Explicitly search vector store via REST API
+query = "How do you do great work?"
+search_results = client.vector_stores.search(
+    vector_store_id=vs.id,
+    query=query,
+    limit=3
+)
+
+# Manually extract context
+context = "\n\n".join([r.content for r in search_results.data if r.content])
+
+# Manually construct prompt with context
+completion = client.chat.completions.create(
+    model="gpt-4o",
+    messages=[
+        {"role": "system", "content": "Use the provided context to answer questions."},
+        {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {query}"}
+    ]
+)
+
+print(completion.choices[0].message.content)
+
+Doing great work is about more than just hard work and ambition; it involves combining several elements:
+
+1. **Pursue What Excites You**: Engage in projects that are both ambitious and exciting to you. It's important to work on something you have a natural aptitude for and a deep interest in.
+
+2. **Explore and Discover**: Great work often feels like a blend of discovery and creation. Focus on seeing possibilities and let ideas take their natural shape, rather than just executing a plan.
+
+3. **Be Bold Yet Flexible**: Take bold steps in your work without over-planning. An adaptable approach that evolves with new ideas can often lead to breakthroughs.
+
+4. **Work on Your Own Projects**: Develop a habit of working on projects of your own choosing, as these often lead to great achievements. These should be projects you find exciting and that challenge you intellectually.
+
+5. **Be Earnest and Authentic**: Approach your work with earnestness and authenticity. Trying to impress others with affectation can be counterproductive, as genuine effort and intellectual honesty lead to better work outcomes.
+
+6. **Build a Supportive Environment**: Work alongside great colleagues who inspire you and enhance your work. Surrounding yourself with motivating individuals creates a fertile environment for great work.
+
+7. **Maintain High Morale**: High morale significantly impacts your ability to do great work. Stay optimistic and protect your mental well-being to maintain progress and momentum.
+
+8. **Balance**: While hard work is essential, overworking can lead to diminishing returns. Balance periods of intensive work with rest to sustain productivity over time.
+
+This approach shows that great work is less about following a strict formula and more about aligning your interests, ambition, and environment to foster creativity and innovation.
+```
+
+## Architecture Overview
+
+OGX provides OpenAI-compatible RAG capabilities through:
+
+- **Vector Stores API**: OpenAI-compatible vector storage with automatic embedding model detection
+- **Files API**: Document upload and processing using OpenAI's file format
+- **Responses API**: Enhanced chat completions with agentic tool calling via file search
+
+## GraphRAG with Neo4j
+
+Standard RAG retrieves chunks that are semantically or lexically similar to a
+query. GraphRAG starts with those same vector or keyword results, then follows
+relationships in a graph to find related chunks that may not contain the query
+terms themselves. This is useful for questions that depend on shared entities,
+references, or multi-hop relationships across documents.
+
+OGX provides GraphRAG through the `remote::neo4j` VectorIO provider. The
+provider performs the initial vector, keyword, or hybrid search in Neo4j, then
+expands the result through connected chunk nodes. In the deterministic example
+below, standard retrieval returns a Python chunk, while GraphRAG can also return
+a machine-learning chunk connected through the `python` entity.
+
+### Configure Neo4j
+
+Start Neo4j locally:
+
+```bash
+docker run -d --name ogx-neo4j \
+  -p 7474:7474 -p 7687:7687 \
+  -e NEO4J_AUTH=neo4j/ogxpassword \
+  neo4j:2025.10
+```
+
+Add a Neo4j provider to your stack configuration and enable graph retrieval:
+
+```yaml
+providers:
+  vector_io:
+    - provider_id: neo4j
+      provider_type: remote::neo4j
+      config:
+        uri: ${env.NEO4J_URI:=bolt://localhost:7687}
+        user: ${env.NEO4J_USER:=neo4j}
+        password: ${env.NEO4J_PASSWORD:=}
+        database: ${env.NEO4J_DATABASE:=neo4j}
+        graph_retrieval_enabled: true
+        graph_expansion_depth: 2
+        graph_max_neighbors: 10
+        graph_expansion_weight: 0.15
+        persistence:
+          backend: kv_default
+          namespace: vector_io::neo4j
+```
+
+For the local container above, set `NEO4J_PASSWORD=ogxpassword` before starting
+OGX. Use a secret manager or an environment-specific secret in production.
+
+The provider supports vector, keyword, and hybrid search. `graph_expansion_depth`
+is limited to three hops, and `graph_relationship_types` can restrict traversal
+to selected relationship types. Neighbors receive a score based on the seed
+chunk score multiplied by `graph_expansion_weight`.
+
+### Index Documents and Add Relationships
+
+Create and populate the vector store using the normal Files and Vector Stores
+APIs. Select Neo4j when creating the store:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8321/v1", api_key="none")
+vector_store = client.vector_stores.create(
+    name="knowledge-graph",
+    extra_body={"provider_id": "neo4j"},
+)
+
+# Upload files and attach them to vector_store as shown above.
+```
+
+OGX stores chunks and their embeddings, but it does not infer entities or
+relationships for you. Add graph structure with the Neo4j driver or
+`cypher-shell`. Chunk labels are derived from the vector store identifier; for
+example, a store with the identifier `vs_demo` uses the `OGXChunk_vs_demo` label:
+
+```cypher
+MERGE (python:Entity {name: 'python'})
+MATCH (python_chunk:OGXChunk_vs_demo {chunk_id: 'chunk-python'})
+MATCH (ml_chunk:OGXChunk_vs_demo {chunk_id: 'chunk-ml'})
+MERGE (python_chunk)-[:MENTIONS]->(python)
+MERGE (ml_chunk)-[:MENTIONS]->(python)
+```
+
+Use the same Vector Stores search or Responses `file_search` workflow after
+relationships are present. With `graph_retrieval_enabled: false`, retrieval is
+standard RAG. With it enabled, the Neo4j provider expands the initial results
+through the graph and returns the highest-scoring seed and related chunks.
+
+GraphRAG quality depends on the graph structure: add relationships that encode
+meaningful connections, keep traversal depth and neighbor limits bounded, and
+compare results against standard retrieval before enabling it broadly.
+
+## Configuring Default Embedding Models
+
+To enable automatic vector store creation without specifying embedding models, configure a default embedding model in your config.yaml like so:
+
+```yaml
+vector_stores:
+  default_provider_id: faiss
+  default_embedding_model:
+    provider_id: sentence-transformers
+    model_id: nomic-ai/nomic-embed-text-v1.5
+```
+
+With this configuration:
+- `client.vector_stores.create()` works without requiring embedding model or provider parameters
+- The system automatically uses the default vector store provider (`faiss`) when multiple providers are available
+- The system automatically uses the default embedding model (`sentence-transformers/nomic-ai/nomic-embed-text-v1.5`) for any newly created vector store
+- The `default_provider_id` specifies which vector storage backend to use
+- The `default_embedding_model` specifies both the inference provider and model for embeddings
+
+## Vector Store Operations
+
+### Creating Vector Stores
+
+You can create vector stores with automatic or explicit embedding model selection:
+
+```python
+# Automatic - uses default configured embedding model and vector store provider
+vs = client.vector_stores.create()
+
+# Explicit - specify embedding model and/or provider when you need specific ones
+vs = client.vector_stores.create(
+    extra_body={
+        "provider_id": "faiss",  # Optional: specify vector store provider
+        "embedding_model": "sentence-transformers/nomic-ai/nomic-embed-text-v1.5",
+        "embedding_dimension": 768  # Optional: will be auto-detected if not provided
+    }
+)
+```

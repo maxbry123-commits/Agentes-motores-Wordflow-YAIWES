@@ -1,0 +1,922 @@
+# Builtin RAG -- ingest pipeline. Ships as part of the `rag` builtin plugin
+# (ADR 0064 P5 -- docs/deep-dives/proposals/0064-plugin-model.md), originally
+# authored under FP-0063 (docs/deep-dives/proposals/0063-builtin-turnkey-user-rag.md).
+#
+# Reads a file or a folder, converts each document to Markdown (the
+# `markitdown` MCP server), chunks it (the `chunker` MCP server), embeds
+# only the NEW/CHANGED chunks (reyn's own `embed` tool -- C1: reyn is the
+# SOLE embedder), and upserts them into a user-named sqlite vector store
+# (the `vectorstore` MCP server) -- FP-0057 C2: the store is external, reyn
+# hosts none of it.
+#
+# This file IS the extension mechanism (R2): copy it and re-point the
+# `*_server` inputs (or the MCP config entries they name) at a different
+# backend. Every tunable is a `ctx.*` INPUT with a sane default, never a
+# constant baked into a step (R4).
+#
+# This pipeline runs NO python of its own. It calls MCP tools and reyn's
+# own ops -- nothing else. reyn does not own the operator's python runtime
+# and must not assume one, so the four things the R1 expression language
+# cannot express each live with the party that already holds the relevant
+# data: `glob_files` (reyn's own op) walks the folder, the chunker returns
+# each chunk's own content_hash/chunk_index/est_tokens, and the vector
+# store pairs items with vectors by index inside `upsert`.
+#
+# Both builtin MCP servers + this pipeline itself are registered by
+# `install_plugin(source={"kind": "builtin", "name": "rag"})` -- one call
+# copies the plugin to ~/.reyn/plugins/rag/ and registers the mcp servers +
+# pipelines + skill (register-only, #3209 -- it does NOT install the
+# plugin's Python deps). The operator/LLM creates the plugin's own venv +
+# `pip install -r requirements.txt` (per this skill's SETUP steps) and
+# points each server's registered `command` at that venv's interpreter --
+# spawn is then network-free (ADR 0064 §3.11b).
+#
+# Inputs (all optional except `input_path`/`output_db`):
+#   input_path          -- (required) a path to a document file OR a folder
+#                          of them, absolute OR relative (resolved against
+#                          the workspace root/CWD, same as any other reyn
+#                          file op -- #3102). The file-discovery `glob_files`
+#                          call below always passes `absolute: true`, so the
+#                          matches handed to `file://` conversion and the
+#                          stored source_path column are absolute regardless
+#                          of which form `input_path` was given in -- that
+#                          contract holds unconditionally, not just when the
+#                          operator happens to type an absolute path.
+#   output_db           -- (required) the sqlite file to write into.
+#   file_extensions     -- extensions to ingest when input_path is a folder
+#                          (default: the proposal-0063 target formats
+#                          txt/md/pdf/xlsx/pptx/docx). Written as glob
+#                          character classes so the match is
+#                          case-insensitive (`[pP][dD][fF]` also finds
+#                          `.PDF`) on case-sensitive filesystems too.
+#   max_files           -- cap on files discovered per extension (default
+#                          10000). Passed EXPLICITLY to every glob_files
+#                          call: that op's own default is 50, and a folder
+#                          with more files than the cap is truncated
+#                          SILENTLY (no error) -- #2994. Left implicit,
+#                          document 51+ of a real corpus would vanish from
+#                          the index with nothing in the summary to say so.
+#   chunk_size          -- chunker token size (default 400 -- the 2026
+#                          256-512-token persistent-RAG band, NOT FP-0057's
+#                          800-1024 (that number is for throwaway ephemeral
+#                          attachments -- a different case, R4)).
+#   chunk_overlap_ratio -- chunker overlap fraction (default 0.125 = 12.5%,
+#                          within the 10-15% 2026 default band).
+#   embedding_model     -- passed to reyn's `embed` tool (default
+#                          "standard"). This may be a model-CLASS alias;
+#                          what gets STAMPED onto each chunk's
+#                          `embedding_model` column (C4) is the model the
+#                          provider actually RESOLVED, read back from
+#                          `embed`'s own envelope meta -- so the column can
+#                          never disagree with the vectors beside it.
+#   filter_none_conversions -- treat a conversion whose ENTIRE output is the
+#                          literal string "None" as a failed conversion
+#                          (default true). markitdown manufactures that
+#                          string from an undecodable file and reports
+#                          SUCCESS -- see the long note at the gate in
+#                          _ingest_one_file for the measured chain and the
+#                          upstream line responsible. Exact equality only, so
+#                          a document merely mentioning None is unaffected;
+#                          set false if a document's real content IS "None"
+#                          (a .txt of exactly that is content, not a bug, and
+#                          this pipeline cannot tell the two apart).
+#   markitdown_server / chunker_server / vectorstore_server -- the MCP
+#                          server names as configured under `mcp.servers`
+#                          (defaults: reyn_markitdown / reyn_chunker /
+#                          reyn_vector_store -- see
+#                          docs/cookbook/configs/with-builtin-rag-mcp.yaml).
+#
+# Output: `ctx.result` -- either `_ingest_body`'s summary (files/chunks
+# added/updated/removed/unchanged, the resolved `embedding_model`, and the
+# X2a METERED spend for this batch: `tokens_embedded` / `cost_usd` /
+# `priced`, read from `embed`'s own envelope meta -- plus X5's
+# `estimated_tokens_saved_by_dedup`, the one necessarily-estimated figure,
+# and #3010's `files_skipped` / `skipped_files` naming every discovered file
+# that produced NO indexed content -- whether its conversion failed, it
+# reported an empty body, or it simply chunked to zero -- each with the
+# reason, so a file can never leave the corpus silently -- plus #3102's
+# `all_discovered_files_skipped`, true when EVERY discovered file was
+# skipped (0 chunks indexed this run despite `status: ok`), so a caller
+# does not have to re-derive that special case from files_scanned ==
+# files_skipped itself -- plus #3010 cause-3's `files_ingested`
+# (`[{source_path, chunks_produced, preview}, ...]`), one entry per file that
+# WAS indexed: `chunks_produced` is the count this file contributed (before
+# dedup -- see _ingest_chunk_file) and `preview` is its first chunk's text
+# VERBATIM (chunk_size already bounds its length -- no truncation, and R1 has
+# no string-slice to do one anyway). This is NOT a detector: mojibake (a
+# converter mis-detecting a file's charset, e.g. Shift-JIS decoded as UTF-8)
+# produces text that is non-empty, not the literal "None", and chunks to
+# ≥1 -- i.e. it passes every gate above by construction, because garbled
+# bytes are semantically indistinguishable from legitimate content (no
+# gate can tell them apart without a false-positive rate on real prose).
+# `files_ingested` does not try; it makes every ingested file's content
+# VISIBLE so an operator can see garbling directly in `preview` and act
+# (re-ingest / fix the encoding / exclude the file) -- reyn reports, the
+# operator judges. `files_scanned == count(skipped_files) +
+# count(files_ingested)` always: every discovered file lands in exactly
+# one of the two lists, so none can leave the corpus's outcome silently)
+# or `_blocked`'s X1 pre-flight failure message (cause + concrete remedy
+# per unreachable server -- mirrors #2932's `require_mcp` decision-enabling
+# error, never a bare transport exception).
+schema: PreflightCheck
+fields:
+  status: {type: enum, values: ["ok"]}
+---
+# #2955 weak-model-hardening follow-up: gates `_ingest_embed_and_upsert`'s
+# `embed` tool step. `embed`'s op handler (op_runtime/embed.py) stamps
+# `total_tokens` ONLY on a successful embed -- an error/cancelled result
+# carries `status`+`error`/`model` instead and never `total_tokens`. Before
+# this gate, a litellm failure (bad key, unpriceable model, provider outage)
+# canonicalized to an EMPTY view (`embed_to_canonical`'s `meta`/`structured`
+# stay unpopulated on error), so the pipeline crashed two steps later on
+# `ctx.embedded.meta.model` being absent -- discarding the real litellm
+# error text in favour of a generic "field absent" message. Requiring
+# `total_tokens` here makes the SAME `_run_tool_step` schema-failure detail
+# path #3070/#3064 already built (`result.get("error")` appended to the
+# raised message) surface the actual provider failure at the embed step
+# itself, not a misleading one two steps downstream.
+schema: EmbedOk
+fields:
+  total_tokens: {type: number, required: true}
+---
+pipeline: ingest
+description: >-
+  FP-0063 P3 builtin RAG ingest: chunk -> embed -> store a file or folder
+  into a user-named sqlite vector store, incrementally by content_hash
+  (add/update/remove). Pre-flights its 3 MCP servers before any embedding
+  spend (X1); reports spend AFTER the dedup skip (X2a/X5). Runs no python
+  of its own -- MCP tools and reyn ops only (#2972).
+steps:
+  # ---- inputs-with-defaults (R4: never a constant baked into a step) ----
+  - transform: {value: "get(ctx, 'chunk_size', 400)", output: chunk_size}
+  - transform: {value: "get(ctx, 'chunk_overlap_ratio', 0.125)", output: chunk_overlap_ratio}
+  - transform: {value: "get(ctx, 'embedding_model', 'standard')", output: embedding_model}
+  - transform: {value: "get(ctx, 'markitdown_server', 'reyn_markitdown')", output: markitdown_server}
+  - transform: {value: "get(ctx, 'chunker_server', 'reyn_chunker')", output: chunker_server}
+  - transform: {value: "get(ctx, 'vectorstore_server', 'reyn_vector_store')", output: vectorstore_server}
+  - transform:
+      value: >-
+        get(ctx, 'file_extensions', ['[tT][xX][tT]', '[mM][dD]', '[pP][dD][fF]',
+                                     '[xX][lL][sS][xX]', '[pP][pP][tT][xX]', '[dD][oO][cC][xX]'])
+      output: file_extensions
+  - transform: {value: "get(ctx, 'max_files', 10000)", output: max_files}
+  - transform:
+      value: "get(ctx, 'filter_none_conversions', true)"
+      output: filter_none_conversions
+
+  # ---- X1: pre-flight -- a REAL probe call per server (not just "is it
+  # configured"), schema-gated to status=="ok" so an MCP-layer error
+  # (unconfigured server / permission-denied / transport fault / a raised
+  # ImportError inside the server itself -- e.g. "No module named 'apsw'")
+  # fails that ONE branch without aborting the others (`parallel`'s
+  # `on_error: continue` -- a dropped branch's key is simply absent from
+  # `collect`'s named map, so we know WHICH server failed by name, with no
+  # need to parse the underlying transport error text). ----
+  - transform:
+      value: >-
+        {markitdown: "MarkItDown MCP server '" + ctx.markitdown_server + "' is unreachable. (1) it is probably not installed yet -- builtin MCP configs ship INERT by design, so install it yourself and the operator is prompted at the permission gate: mcp_install_local(name=\"" + ctx.markitdown_server + "\", command=\"uvx\", args=[\"markitdown-mcp\"]). Do not ask the operator to hand-edit YAML, and do not add a permissions block -- a configured server is granted when this pipeline runs it. (2) if the install itself fails, uvx could not fetch markitdown-mcp from PyPI on first run (e.g. a firewalled network) -- install it into its OWN isolated venv (never reyn's) and point command at that absolute path: python3 -m venv ~/.reyn-markitdown && ~/.reyn-markitdown/bin/pip install markitdown-mcp, then command=\"~/.reyn-markitdown/bin/markitdown-mcp\" (absolute).",
+         chunker: "Chunker MCP server '" + ctx.chunker_server + "' is unreachable. It ships as part of the builtin `rag` plugin, not pre-installed. (1) Not registered yet -- install it yourself and the operator is prompted at the permission gate: install_plugin(source={\"kind\": \"builtin\", \"name\": \"rag\"}). This registers ALL of the rag plugin's capabilities (both MCP servers + the ingest/query pipelines + its RAG skill) in one call -- it does NOT install the plugin's Python deps for you. (2) Deps/venv missing (the common cause post-registration) -- read the `build-and-query-rag-corpus` skill's SETUP section: create a venv, `pip install -r ~/.reyn/plugins/rag/requirements.txt` into it, then point `reyn_chunker`'s registered `command` (.reyn/config/mcp.yaml) at that venv's python interpreter absolute path.",
+         vectorstore: "Vector-store MCP server '" + ctx.vectorstore_server + "' is unreachable. It ships as part of the builtin `rag` plugin, not pre-installed. (1) Not registered yet -- install it yourself and the operator is prompted at the permission gate: install_plugin(source={\"kind\": \"builtin\", \"name\": \"rag\"}). This registers ALL of the rag plugin's capabilities (both MCP servers + the ingest/query pipelines + its RAG skill) in one call -- it does NOT install the plugin's Python deps for you. (2) Deps/venv missing (the common cause post-registration) -- read the `build-and-query-rag-corpus` skill's SETUP section: create a venv, `pip install -r ~/.reyn/plugins/rag/requirements.txt` into it, then point `reyn_vector_store`'s registered `command` (.reyn/config/mcp.yaml) at that venv's python interpreter absolute path."}
+      output: remedies
+
+  # X1 pre-flight is now PURELY MCP reachability (#2972). It used to also
+  # probe "can the ambient python3 import reyn?" -- a question that only
+  # existed because this pipeline shelled out to python, i.e. it was reyn
+  # checking an assumption reyn had no business making. With the shell-outs
+  # gone, the only prerequisite left is the one the operator actually owns:
+  # are the MCP servers they configured reachable? That is the #2932
+  # `require_mcp` shape -- a real probe call per server, answered with cause
+  # + concrete remedies the operator can act on.
+  - parallel:
+      on_error: continue
+      branches:
+        markitdown:
+          tool:
+            name: call_mcp_tool
+            schema: PreflightCheck
+            args:
+              server: !expr ctx.markitdown_server
+              mcp_tool_name: convert_to_markdown
+              tool_args: {uri: "data:text/plain;base64,cmVhY2hhYmlsaXR5IHByb2Jl"}
+        chunker:
+          tool:
+            name: call_mcp_tool
+            schema: PreflightCheck
+            args:
+              server: !expr ctx.chunker_server
+              mcp_tool_name: chunk
+              tool_args: {text: "reachability probe", size: 50, overlap_ratio: 0.0}
+        vectorstore:
+          tool:
+            name: call_mcp_tool
+            schema: PreflightCheck
+            args:
+              server: !expr ctx.vectorstore_server
+              mcp_tool_name: list_metadata
+              tool_args: !expr "{db_path: ctx.output_db, limit: 1}"
+      collect:
+        transform:
+          # #3070: a branch is dropped on ANY failure of its `tool` step --
+          # including the "handshake ok, the PROBE TOOL CALL ITSELF errored"
+          # case (e.g. a half-materialised per-plugin venv raising ImportError
+          # inside the server, or a bad tool arg) -- which
+          # is a DIFFERENT fact than "the MCP server is unreachable" and was
+          # previously indistinguishable from it. `get(pipe, "__branch_errors__.<name>",
+          # "")` (executor.py's PARALLEL_BRANCH_ERRORS_KEY) reads the real
+          # cause text a dropped branch's schema-validation-failure exception
+          # now carries (`_run_tool_step`'s tool-result detail, #3070) --
+          # empty string for a branch that never dropped.
+          value: >-
+            {markitdown: {ok: get(pipe, "markitdown", null) != null, cause: get(pipe, "__branch_errors__.markitdown", "")},
+             chunker: {ok: get(pipe, "chunker", null) != null, cause: get(pipe, "__branch_errors__.chunker", "")},
+             vectorstore: {ok: get(pipe, "vectorstore", null) != null, cause: get(pipe, "__branch_errors__.vectorstore", "")}}
+      output: reachable
+  - transform:
+      value: >-
+        [{name: "markitdown (" + ctx.markitdown_server + ")", ok: ctx.reachable.markitdown.ok, remedy: ctx.remedies.markitdown, cause: ctx.reachable.markitdown.cause},
+         {name: "chunker (" + ctx.chunker_server + ")", ok: ctx.reachable.chunker.ok, remedy: ctx.remedies.chunker, cause: ctx.reachable.chunker.cause},
+         {name: "vectorstore (" + ctx.vectorstore_server + ")", ok: ctx.reachable.vectorstore.ok, remedy: ctx.remedies.vectorstore, cause: ctx.reachable.vectorstore.cause}]
+      output: preflight_checks
+  - transform:
+      value: "count(filter(ctx.preflight_checks, c -> not c.ok)) == 0"
+      output: preflight_ok
+  # The real per-server cause (#3070) is appended to its remedy, never
+  # replacing it: the remedy still names the concrete install/config step,
+  # and the cause is the EVIDENCE the failed branch actually reported --
+  # "install not done" vs "misconfigured" vs "transport fault" now read
+  # differently instead of collapsing into one static "is unreachable" string.
+  - transform:
+      value: >-
+        join(map(filter(ctx.preflight_checks, c -> not c.ok),
+                 c -> c.name + ": " + c.remedy +
+                      join(map(filter([{fired: c.cause != "", text: "\n\n[actual error observed] " + c.cause}], f -> f.fired), f -> f.text), "")),
+             "\n\n")
+      output: preflight_message
+
+  # ---- gate: only proceed to the real ingest work if every server probed
+  # OK; otherwise return the decision-enabling message as the run's own
+  # output (never a bare exception -- see _blocked below). ----
+  - match:
+      on: ctx.preflight_ok
+      cases:
+        "True":
+          pipeline: _ingest_body
+          pass:
+            input_path: ctx.input_path
+            output_db: ctx.output_db
+            chunk_size: ctx.chunk_size
+            chunk_overlap_ratio: ctx.chunk_overlap_ratio
+            embedding_model: ctx.embedding_model
+            markitdown_server: ctx.markitdown_server
+            chunker_server: ctx.chunker_server
+            vectorstore_server: ctx.vectorstore_server
+            file_extensions: ctx.file_extensions
+            max_files: ctx.max_files
+            filter_none_conversions: ctx.filter_none_conversions
+      default:
+        pipeline: _blocked
+        pass: {message: ctx.preflight_message}
+      output: result
+---
+pipeline: _blocked
+description: >-
+  Sibling of ingest -- returns the X1 pre-flight failure as the run's own
+  (successful) output: a typed, decision-enabling message naming every
+  unreachable MCP server and its concrete remedy, instead of letting a bare
+  transport exception (e.g. "ImportError: No module named 'apsw'") reach the
+  operator.
+steps:
+  - transform:
+      value: >-
+        "rag ingest blocked -- one or more prerequisites are unreachable:\n\n" + ctx.message
+      output: blocked_reason
+---
+pipeline: _ingest_one_file
+description: >-
+  Convert one file to Markdown (markitdown) and, when the conversion
+  actually produced a document, chunk it (chunker). Called once per file by
+  ingest's for_each fan-out. Returns this file's OUTCOME:
+  {source_path, items, skipped_reason} -- `items` is the candidate chunk
+  list ([{source_path, text, content_hash, chunk_index, size_tokens,
+  est_tokens, start_index, end_index}, ...]; the chunker returns
+  content_hash/chunk_index/est_tokens/start_index/end_index itself (#2972,
+  #3644), so the only work left is tagging each chunk with the file
+  it came from), and `skipped_reason` is "" for an ingested file or the
+  operator-facing reason string for a skipped one (the single skipped/not
+  representation -- all three ways to yield nothing report through it).
+steps:
+  - tool:
+      name: call_mcp_tool
+      args:
+        server: !expr ctx.markitdown_server
+        mcp_tool_name: convert_to_markdown
+        tool_args: !expr "{uri: 'file://' + ctx.source_path}"
+      output: converted
+
+  # ---- #3010: the two facts the converter already told us, READ ----
+  #
+  # Cause 1 -- `meta.isError`. A failed conversion (e.g. a corrupt/zero-byte
+  # PDF -> PDFSyntaxError) comes back as an MCP result with `isError: true`,
+  # whose `text` IS the error message ("Error executing tool
+  # convert_to_markdown: ..."). The MCP layer RAISES NOTHING for it, so
+  # ingest's `for_each on_error: continue` never fires -- the step
+  # "succeeds" and, before this gate, the error MESSAGE ITSELF was handed to
+  # the chunker, embedded (real token spend) and upserted into the store as
+  # though it were the document's content.
+  #
+  # Cause 2 -- `meta.empty`. A file that converts PERFECTLY but holds no
+  # text (the scanned PDF with no text layer -- the most common real-corpus
+  # case) is NOT an error: markitdown faithfully returns "". reyn renders
+  # that legit-empty success as the marker "(no content)" for the chat LLM,
+  # and before #3010 the marker was the ONLY form the fact had -- so this
+  # pipeline chunked and embedded the literal string "(no content)".
+  # `meta.empty` is that same fact as DATA. We read the FACT, never the
+  # marker text: string-matching "(no content)" would bind this pipeline to
+  # today's chat wording and break silently the day it changes.
+  #
+  # Both are reported, never silently dropped -- silence over a poisoned
+  # index is precisely the bug (`chunks_upserted: 12`, all garbage).
+  - transform:
+      value: "get(ctx.converted, 'meta.isError', false)"
+      output: conversion_failed
+  - transform:
+      value: "get(ctx.converted, 'meta.empty', false)"
+      output: conversion_empty
+
+  # ---- the "None" filter: working around a markitdown BUG ----
+  #
+  # This is a literal string comparison against a converter's output, which
+  # is normally indefensible. It is here because markitdown MANUFACTURES the
+  # string "None" out of an unreadable file, and says it succeeded:
+  #
+  #   markitdown/converters/_plain_text_converter.py -- PlainTextConverter.convert()
+  #       else:
+  #           text_content = str(from_bytes(file_stream.read()).best())   # <- no None check
+  #
+  # `charset_normalizer.from_bytes(...).best()` returns None for bytes whose
+  # encoding it cannot determine, and `str(None)` == "None". Measured chain
+  # (converters instrumented) on a 16-byte non-PDF:
+  #
+  #   corrupt.pdf (\x00\x01\x02 not a pdf \xff\xfe)
+  #     PdfConverter       -> raised PDFSyntaxError "No /Root object!"   (correct)
+  #     PlainTextConverter -> SUCCESS  markdown='None'                   (the bug)
+  #     final result: 'None'
+  #
+  # The fixture contains no "None" (16 bytes, hexdump-verified) -- markitdown
+  # GENERATES it. And markitdown's own design is right (_markitdown.py:624):
+  # `if len(failed_attempts) > 0: raise FileConversionException(...)` -- had
+  # PlainTextConverter not "succeeded", the file would have raised and our
+  # meta.isError gate above would have caught it. One missing None check
+  # disables markitdown's own official error channel, which is why a defense
+  # this crude is the only thing left at this layer.
+  #
+  # EXACT equality, never `"None" in text`: a legitimate document that merely
+  # MENTIONS None must not be dropped. Even so, a .txt whose entire content
+  # is "None" is CONTENT, not a bug (markitdown detects the charset and takes
+  # the `.decode(charset)` branch, correctly returning "None") -- and this
+  # pipeline cannot see which branch ran. That false positive is structural,
+  # not an oversight, which is why the filter is opt-out
+  # (`filter_none_conversions: false`) rather than clever. No extension
+  # sniffing: "only distrust .pdf" would be a guess about which converters
+  # can hit this path, and the census of markitdown's converters is not ours
+  # to keep -- the operator's own opt-out is the honest lever.
+  #
+  # It converts to an ERROR rather than a silent skip: the file did not
+  # convert, so it reports through the same named-with-a-reason path as a
+  # raised conversion failure. One reporting path, not three.
+  - transform:
+      value: "ctx.filter_none_conversions and ctx.converted.text == 'None'"
+      output: conversion_is_none
+
+  # The reason strings, built like X1's `preflight_message`: a filtered list
+  # + join, since R1 has no conditional expression.
+  - transform:
+      value: >-
+        join(map(filter([{fired: ctx.conversion_failed, why: "conversion failed: " + ctx.converted.text},
+                         {fired: ctx.conversion_is_none, why: "conversion returned the literal string \"None\" -- a markitdown bug (PlainTextConverter has no None check on charset detection failure), meaning the file could not be decoded at all. If this document's real content IS \"None\", set filter_none_conversions: false."},
+                         {fired: ctx.conversion_empty, why: "no text content extracted (e.g. a scanned PDF with no text layer, or an empty document)"}],
+                        r -> r.fired), r -> r.why), "; ")
+      output: skip_reason
+  - transform:
+      value: "ctx.conversion_failed or ctx.conversion_is_none or ctx.conversion_empty"
+      output: unusable
+  - match:
+      on: ctx.unusable
+      cases:
+        "True":
+          pipeline: _ingest_skipped_file
+          pass:
+            source_path: ctx.source_path
+            reason: ctx.skip_reason
+      default:
+        pipeline: _ingest_chunk_file
+        pass:
+          source_path: ctx.source_path
+          converted_text: ctx.converted.text
+          chunk_size: ctx.chunk_size
+          chunk_overlap_ratio: ctx.chunk_overlap_ratio
+          chunker_server: ctx.chunker_server
+      output: outcome
+---
+pipeline: _ingest_chunk_file
+description: >-
+  Sibling of _ingest_skipped_file -- the "the conversion produced a
+  document" branch: chunk it and tag each chunk with its source file.
+  Reached only when the convert step flagged neither `meta.isError` nor
+  `meta.empty`, so the chunker/embedder are never handed an error message
+  or an explicit-empty marker as if either were content. Carries the
+  zero-chunk gate: converting cleanly to no chunks is still "nothing was
+  indexed", and is reported as such.
+steps:
+  - tool:
+      name: call_mcp_tool
+      args:
+        server: !expr ctx.chunker_server
+        mcp_tool_name: chunk
+        tool_args: !expr "{text: ctx.converted_text, size: ctx.chunk_size, overlap_ratio: ctx.chunk_overlap_ratio}"
+      output: chunked
+  # Tag each chunk with its source file. content_hash / chunk_index /
+  # est_tokens already ride the chunker's own output (#2972) -- R1 could
+  # compute none of them (no hash, no enumerate, no string length), which is
+  # what used to force this step to shell out to python.
+  #
+  # #3644: start_index/end_index also ride the chunker's own output
+  # (chunker_server.py's chunk_text has ALWAYS computed these -- this was a
+  # pure wiring gap, not new computation) so _ingest_embed_and_upsert can
+  # pass them to the vector store's upsert, making a query hit's chunk text
+  # recoverable later (source_path sliced at [start_index:end_index]).
+  # Before this, the offsets were computed and immediately discarded here.
+  - transform:
+      value: >-
+        map(ctx.chunked.structured.result, c -> {source_path: ctx.source_path,
+                                                 text: c.text,
+                                                 content_hash: c.content_hash,
+                                                 chunk_index: c.chunk_index,
+                                                 size_tokens: c.token_count,
+                                                 est_tokens: c.est_tokens,
+                                                 start_index: c.start_index,
+                                                 end_index: c.end_index})
+      output: items
+
+  # #3010 cause-3 (mojibake): this file's first chunk's text, VERBATIM --
+  # the visibility lever for garbled content that passes every gate above
+  # (non-empty, not "None", ≥1 chunk -- mojibake is semantically
+  # indistinguishable from legitimate prose, so it cannot be GATED, only
+  # SHOWN; see the note at this pipeline's Output header). `find` rather
+  # than an index (R1 has no `get(list, int)` -- `get`'s path is
+  # Mapping-only, see expr.py's `_resolve_path_safe`): the chunker stamps
+  # each chunk's own 0-based `chunk_index` (#2972), so `chunk_index == 0`
+  # IS "the first chunk" without R1 needing list indexing at all. `get(...,
+  # 'text', '')` covers the (already-reported-elsewhere) zero-chunk case,
+  # where `find` returns null and this value is simply unused by the
+  # summary (filtered out via `skipped_reason != ""` below).
+  - transform:
+      value: "get(find(ctx.items, i -> i.chunk_index == 0), 'text', '')"
+      output: preview
+
+  # ---- #3010, the SILENT-ZERO gate: a file that yielded no chunks ----
+  # The `meta.empty` gate above catches an empty conversion only when the
+  # converter says so. It cannot when the converter's MCP server returns
+  # structured output alongside its empty text (a `structuredContent`-era
+  # MCP SDK sends {"content": "", "structuredContent": {"result": ""}}):
+  # reyn carries that as a structured attachment, and an attachment-carrying
+  # result never takes the explicit-empty path, so `meta.empty` is absent
+  # and `text` is a bare "". Nothing is garbage here -- and nothing is
+  # REPORTED either: the file chunks to zero, contributes no items, and
+  # vanishes from the run entirely. `files_scanned` counts it; nothing says
+  # it produced nothing. That is the same "the operator cannot tell what
+  # happened" failure as the garbage, arrived at from the opposite side.
+  #
+  # So the last word is the STRUCTURAL outcome, not any signal: zero chunks
+  # means nothing was indexed, whatever the converter did or did not say.
+  # This gate needs no marker, no meta and no SDK assumption -- which is
+  # also why it stays even though `meta.empty` usually fires first.
+  - transform:
+      value: >-
+        join(map(filter([{fired: count(ctx.items) == 0,
+                          why: "no chunks produced (the document converted, but yielded no text to index)"}],
+                        r -> r.fired), r -> r.why), "; ")
+      output: zero_chunk_reason
+  - transform:
+      value: >-
+        {source_path: ctx.source_path, items: ctx.items,
+         skipped_reason: ctx.zero_chunk_reason, preview: ctx.preview}
+      output: outcome
+---
+pipeline: _ingest_skipped_file
+description: >-
+  Sibling of _ingest_chunk_file -- the "this file yielded no usable
+  document" branch. Contributes ZERO chunk items (nothing to chunk, embed or
+  index) and carries the reason so the run's summary can NAME the file the
+  operator's corpus is missing, instead of the silent-garbage alternative.
+steps:
+  - transform:
+      value: >-
+        {source_path: ctx.source_path, items: [], skipped_reason: ctx.reason}
+      output: outcome
+---
+pipeline: _ingest_body
+description: >-
+  The real ingest work, run only after ingest's X1 pre-flight passes:
+  discover files -> per-file convert+chunk+hash (fan-out) -> flatten ->
+  diff against the vector store's existing metadata by content_hash (C5:
+  add/update/remove) -> embed only the new/changed chunks, stamping
+  embedding_model from the RESOLVED model on embed's own envelope meta
+  (C4 -- see _ingest_embed_and_upsert) -> upsert + remove -> report a
+  summary carrying the X2a METERED spend for the batch plus X5's
+  dedup-saved estimate.
+steps:
+  # ---- file discovery (#2972: reyn's own `glob_files` op, no shell-out) ----
+  # One recursive glob pattern per target extension (input_path itself is
+  # NOT in this list -- see the #3101 upfront-gate step immediately below,
+  # which globs it separately and FIRST).
+  #
+  # The extensions live in the PATTERN rather than in an R1 `filter`
+  # because R1 has no string-suffix/lower primitive -- there is no
+  # expression that says "ends with .pdf". The glob character classes
+  # (`[pP][dD][fF]`) get case-insensitivity from the globber instead.
+  - transform:
+      value: "map(ctx.file_extensions, e -> ctx.input_path + '/**/*.' + e)"
+      output: file_patterns
+
+  # ---- #3101: upfront recursive-grant gate, SERIAL and BEFORE the fan-out
+  # below ----
+  #
+  # Requests read access to the corpus directory (`input_path`) itself, in
+  # ONE call, before ANY of the (up to 7) glob_files calls below run
+  # concurrently. This is the FIRST `glob_files` call this pipeline makes
+  # against `input_path` -- it also does the "input_path names a single
+  # FILE" job the removed 7th fan-out pattern used to do (`glob_files`
+  # returns files only, so a literal file path matches itself while a
+  # literal directory path matches nothing -- its result is folded into
+  # `files` below alongside the fan-out's).
+  #
+  # WHY upfront, not inside the fan-out: `require_file_read`'s recursive-
+  # parent grant (permissions.py's "[r] grant the parent directory
+  # recursively" JIT choice) is the model's already-correct answer to "one
+  # approval should cover this whole corpus" -- but it only WORKS when the
+  # grant is established before any sibling glob consults it. Architect
+  # analysis (#3101): there is no data race (approvals are a shared
+  # in-memory map, consulted/persisted synchronously, single-threaded
+  # asyncio) -- the bug is purely that the fan-out's `max_parallel: 4`
+  # starts every pattern's permission consult BEFORE any of them has
+  # reached the grant, so each one independently JIT-prompts (N prompts for
+  # 1 conceptual approval, and #3101's witness saw a `.txt` pattern denied
+  # mid-run because ITS prompt was answered "no" while another pattern's
+  # "yes, recursively" was still in flight). Gating the directory ONCE,
+  # here, before the fan-out starts means every pattern the fan-out globs
+  # is a descendant of `input_path` and therefore already covered by the
+  # recursive grant this call either found pre-existing or, on a fresh
+  # corpus, obtained interactively right here -- decision-enabling: the
+  # operator sees ONE prompt naming the corpus directory, not one per file
+  # extension. No new permission model or op -- this reuses `glob_files`'
+  # existing `require_file_read` gate (src/reyn/core/op_runtime/file.py),
+  # just called once, serially, ahead of the parallel patterns.
+  #
+  # `schema: PreflightCheck` is REQUIRED here (unlike the fan-out `do:`
+  # step below, where #3099 corrective (a) made a per-call schema gate
+  # redundant): this is a single, non-fan-out `tool:` step, and only the
+  # fan-out coordinator was taught to trip `on_error` on a canonical error
+  # result (#3099). A bare `tool:` step still returns a `status: "denied"`
+  # result NORMALLY (`execute_op` degrades every op error to a status-
+  # carrying dict rather than raising) -- without this gate, a denied
+  # upfront glob would flow on silently instead of aborting cleanly the
+  # same way the fan-out below does.
+  - tool:
+      name: glob_files
+      schema: PreflightCheck
+      args:
+        pattern: !expr ctx.input_path
+        max_results: !expr ctx.max_files
+        absolute: true
+      output: upfront_glob
+
+  # #3095/#3099 corrective (a): the `on_error: abort` below FIRES on a
+  # `glob_files` failure without any `schema:` gate. #3098 landed an interim
+  # `schema: PreflightCheck` here (a non-"ok" status fails validation and
+  # raises) because at the time the executor's `for_each`/`parallel`
+  # on_error trigger was raise-only -- a `tool:` step's own op-level failure
+  # (e.g. `glob_files` hitting `status: "denied"`, no file.read permission
+  # yet for `input_path`, the common case when it names a folder outside the
+  # reyn project root) returns NORMALLY (`execute_op` degrades it to a
+  # status-carrying dict, by design, rather than raising), so `on_error`
+  # never saw it. #3099 corrective (a) closed that at the SOURCE: the
+  # executor's fan-out coordinator now also trips `on_error` on a `tool:`
+  # step's CANONICAL error result (`meta.isError`, the SAME FP-0056 v2
+  # shared-error-seam signal a handle-inline step already branches on
+  # below -- see `meta.isError` further down this file), not just a raised
+  # exception. The per-call `schema: PreflightCheck` gate is therefore
+  # redundant here and removed -- point-fix + the now-general mechanism
+  # would otherwise coexist (owner no-debt ruling). By the time this fan-out
+  # starts, the #3101 upfront step above has already established (or
+  # confirmed) the recursive read-grant on `input_path`, so every pattern
+  # here -- a descendant path -- resolves as a synchronous grant HIT with no
+  # further prompt.
+  - for_each:
+      over: ctx.file_patterns
+      max_parallel: 4
+      on_error: abort
+      do:
+        tool:
+          name: glob_files
+          args:
+            pattern: !expr item
+            # EXPLICIT, load-bearing: glob_files defaults to 50 and truncates
+            # SILENTLY past it (#2994). Omit this and file 51+ of a real
+            # corpus is dropped with no error anywhere -- the summary would
+            # report a files_scanned that is simply wrong.
+            max_results: !expr ctx.max_files
+            # #3102: EXPLICIT, load-bearing. `_ingest_one_file` builds
+            # `file://` + this match verbatim (see that pipeline's convert
+            # step) -- a bare relative match there ('corpus/note1.md')
+            # produces a MALFORMED URI ('file://corpus/note1.md', which the
+            # URI parser reads 'corpus' as a netloc, not a path segment) --
+            # markitdown then rejects every file with "Netloc must be empty
+            # or localhost", the whole folder is silently skipped, and
+            # ingest still reports `status: ok` with 0 chunks. `input_path`
+            # being relative (the natural way an operator points this
+            # pipeline at a project-root corpus, e.g. './corpus') is enough
+            # to hit this -- glob_files' own pattern-vs-path-root contract
+            # (a relative PATTERN globs relative to base_dir/CWD and
+            # returns project-relative matches; see Workspace.glob_files)
+            # is correct and shared by many other callers that WANT
+            # relative display paths, so it stays the default. `absolute:
+            # true` is the opt-in that makes THIS caller's contract hold
+            # unconditionally: file:// is always built from an absolute
+            # path, regardless of whether the operator's own input_path was
+            # relative or absolute.
+            absolute: true
+      collect: {transform: {value: "pipe"}}
+      output: globbed
+  # Flatten one list per pattern into one flat file list, SEEDED with the
+  # #3101 upfront glob's own match(es) (`ctx.upfront_glob.structured` --
+  # `init`, like every other step, is a plain R1 expression evaluated
+  # against `ctx`) so the "input_path names a single FILE" match that step
+  # discovers is not lost now that it is no longer one of the fan-out's own
+  # patterns. `structured` is glob's real list of paths (#2994); before
+  # that it was newline-joined text, which R1 (no `split`) could not
+  # consume at all -- the reason this step had to be a python shell-out.
+  # Every item reaching here from the fan-out is now GUARANTEED
+  # `status: "ok"` (the `for_each: on_error: abort` above now fires on a
+  # canonical-error result too -- #3099 corrective (a) -- so a failed glob
+  # never survives to be collected), and the upfront glob is GUARANTEED
+  # `status: "ok"` by its own `schema: PreflightCheck` gate above, so
+  # `.structured` is guaranteed a list on both sides -- `acc + item.structured`
+  # can no longer see a dict.
+  - fold:
+      over: ctx.globbed
+      init: "ctx.upfront_glob.structured"
+      do: {transform: {value: "acc + item.structured"}}
+      output: files
+
+  # Per-file fan-out (concurrent, isolated -- pipeline-dsl.md's for_each):
+  # one bad file does not abort the whole ingest (on_error: continue).
+  - for_each:
+      over: ctx.files
+      max_parallel: 4
+      on_error: continue
+      do:
+        call:
+          pipeline: _ingest_one_file
+          pass:
+            source_path: item
+            chunk_size: ctx.chunk_size
+            chunk_overlap_ratio: ctx.chunk_overlap_ratio
+            markitdown_server: ctx.markitdown_server
+            chunker_server: ctx.chunker_server
+            filter_none_conversions: ctx.filter_none_conversions
+      collect: {transform: {value: "pipe"}}
+      output: per_file_outcomes
+
+  # Flatten the per-file outcomes' item lists into one flat list of chunk
+  # items -- `fold` + list concatenation (R1's `+` also concatenates lists;
+  # there is no flatten/flatMap combinator). A skipped file (#3010 cause 1)
+  # carries `items: []`, so it contributes nothing here BY CONSTRUCTION --
+  # no chunk, no embedding spend, no store entry.
+  - fold:
+      over: ctx.per_file_outcomes
+      init: "[]"
+      do: {transform: {value: "acc + item.items"}}
+      output: all_items
+
+  # #3010 -- the skipped files, NAMED. `files_scanned` alone cannot tell an
+  # operator that a file was discovered but yielded nothing: that is exactly
+  # the "clean number over a poisoned index" reporting this bug was made of.
+  # Each entry is {source_path, reason} so the summary says WHICH file is
+  # absent from the corpus and WHY. A file is skipped iff it carries a
+  # reason -- one representation, so the three ways to yield nothing
+  # (isError / meta.empty / zero chunks) all report through one path.
+  - transform:
+      value: >-
+        map(filter(ctx.per_file_outcomes, o -> o.skipped_reason != ""),
+            o -> {source_path: o.source_path, reason: o.skipped_reason})
+      output: skipped_files
+
+  # #3010 cause-3 -- the files that WERE ingested, NAMED with enough to spot
+  # mojibake: `chunks_produced` (this file's own contribution, before the C5
+  # dedup diff below -- a re-ingest of an unchanged file still shows its true
+  # chunk count here, not 0) and `preview` (the first chunk's text, verbatim
+  # -- see _ingest_chunk_file's `preview` step for why `find` on
+  # `chunk_index == 0` rather than an index). Exactly the complement of
+  # `skipped_files` above (`skipped_reason == ""` here vs `!= ""` there), so
+  # `files_scanned == count(skipped_files) + count(files_ingested)` holds by
+  # construction -- every discovered file lands in exactly one of the two.
+  - transform:
+      value: >-
+        map(filter(ctx.per_file_outcomes, o -> o.skipped_reason == ""),
+            o -> {source_path: o.source_path, chunks_produced: count(o.items),
+                  preview: o.preview})
+      output: files_ingested
+
+  # #3102 -- the STRUCTURAL zero-yield gate. `skipped_files` (above) already
+  # names every individual file and why it was skipped, but a caller has to
+  # compute `files_scanned == files_skipped` itself to notice the SPECIAL
+  # case: every single discovered file was unusable, so this run indexed
+  # NOTHING, yet the pipeline still returns `status: ok` (no step raised --
+  # #3010's per-file skip path is a legitimate non-error outcome, and
+  # correctly so for a PARTIAL skip). A caller (chat rendering, an
+  # orchestrating pipeline, or an operator reading the summary) should not
+  # have to re-derive "ok but did nothing" from two counts; this flag names
+  # it directly. `count(ctx.files) > 0` excludes the (also legitimate)
+  # "input_path matched nothing" case from being reported as a skip.
+  - transform:
+      value: "count(ctx.files) > 0 and count(ctx.skipped_files) == count(ctx.files)"
+      output: all_discovered_files_skipped
+
+  # C5: fetch the existing corpus SCOPED TO THIS input_path (via
+  # `parent_context` -- repurposed here as the ingest-root tag stamped on
+  # every chunk this pipeline writes, since `list_metadata`'s filter is
+  # single-field-equality only, and content_hash/source_path alone can't
+  # scope a multi-file "what did THIS folder ingest previously" query).
+  - tool:
+      name: call_mcp_tool
+      args:
+        server: !expr ctx.vectorstore_server
+        mcp_tool_name: list_metadata
+        tool_args: !expr "{db_path: ctx.output_db, filters: {parent_context: ctx.input_path}, limit: 1000000}"
+      output: existing_raw
+  - transform: {value: "ctx.existing_raw.structured.result", output: existing}
+
+  # C5 diff: new/changed = no existing entry with the SAME identity
+  # (source_path + chunk_index) AND the SAME content_hash. remove = an
+  # existing entry whose identity is no longer present among the current
+  # items (the file was deleted, or re-chunked away).
+  #
+  # Identity is compared field-wise rather than by a composed id string:
+  # the store owns its own key format (#2972) and hands opaque `id` values
+  # back through list_metadata, which is what `delete` below consumes. R1
+  # could not build such a key anyway (no number -> string coercion).
+  - transform:
+      value: >-
+        filter(ctx.all_items, i -> find(ctx.existing, e -> e.metadata.source_path == i.source_path
+                                                       and e.metadata.chunk_index == i.chunk_index
+                                                       and e.metadata.content_hash == i.content_hash) == null)
+      output: to_upsert
+  - transform:
+      value: >-
+        map(filter(ctx.existing, e -> find(ctx.all_items, i -> i.source_path == e.metadata.source_path
+                                                           and i.chunk_index == e.metadata.chunk_index) == null), e -> e.id)
+      output: to_remove_ids
+
+  # X5: dedup visibility -- how many chunks were SKIPPED (unchanged), and
+  # the tokens that would have been spent re-embedding them. The SKIPPED
+  # side is inherently an ESTIMATE (chars/4, the same fallback embed's own
+  # provider uses): the only way to know a skipped chunk's true token count
+  # is to send it to the embedder, which is exactly the spend the skip
+  # exists to avoid. The EMBEDDED side, by contrast, is measured exactly --
+  # see the summary step below.
+  - transform: {value: "count(ctx.all_items) - count(ctx.to_upsert)", output: unchanged_count}
+  - transform: {value: "sum(map(ctx.all_items, i -> i.est_tokens))", output: est_tokens_if_no_dedup}
+  - transform: {value: "sum(map(ctx.to_upsert, i -> i.est_tokens))", output: est_tokens_embedded}
+
+  # embed ONLY the new/changed chunks (C1: reyn is the sole embedder). The
+  # `embed` tool itself REJECTS an empty `texts` array (a hard "missing
+  # required arg" result, not a graceful empty-vectors reply) -- gate it
+  # behind a match so a fully-deduped run (X5: to_upsert empty) never calls
+  # it at all, rather than feeding it something it refuses.
+  - match:
+      on: "count(ctx.to_upsert) > 0"
+      cases:
+        "True":
+          pipeline: _ingest_embed_and_upsert
+          pass:
+            to_upsert: ctx.to_upsert
+            embedding_model: ctx.embedding_model
+            input_path: ctx.input_path
+            output_db: ctx.output_db
+            vectorstore_server: ctx.vectorstore_server
+        "False":
+          pipeline: _ingest_noop_upsert
+      output: upsert_outcome
+
+  - tool:
+      name: call_mcp_tool
+      args:
+        server: !expr ctx.vectorstore_server
+        mcp_tool_name: delete
+        tool_args: !expr "{db_path: ctx.output_db, ids: ctx.to_remove_ids}"
+      output: delete_result
+
+  # X2a -- the spend report. `tokens_embedded` / `cost_usd` are embed's OWN
+  # METERED figures (envelope meta), not an estimate; `embedding_model` is
+  # the model that actually produced the vectors (C4). Only
+  # `estimated_tokens_saved_by_dedup` is an estimate, and necessarily so
+  # (see the X5 step above) -- its name says which of the two it is.
+  - transform:
+      value: >-
+        {files_scanned: count(ctx.files),
+         files_skipped: count(ctx.skipped_files),
+         skipped_files: ctx.skipped_files,
+         files_ingested: ctx.files_ingested,
+         all_discovered_files_skipped: ctx.all_discovered_files_skipped,
+         chunks_upserted: ctx.upsert_outcome.upserted,
+         chunks_removed: ctx.delete_result.structured.deleted,
+         chunks_unchanged_skipped: ctx.unchanged_count,
+         embedding_model: ctx.upsert_outcome.model,
+         tokens_embedded: ctx.upsert_outcome.tokens,
+         cost_usd: ctx.upsert_outcome.cost_usd,
+         priced: ctx.upsert_outcome.priced,
+         estimated_tokens_saved_by_dedup: ctx.est_tokens_if_no_dedup - ctx.est_tokens_embedded}
+      output: summary
+---
+pipeline: _ingest_embed_and_upsert
+description: >-
+  Embed the to_upsert chunks and hand them to the vector store's upsert,
+  which pairs each item with its vector by position and stamps
+  embedding_model + parent_context (C4). Called only when to_upsert is
+  non-empty (see ingest's match gate above -- embed rejects an empty texts
+  array).
+steps:
+  - tool:
+      name: embed
+      schema: EmbedOk
+      args:
+        texts: !expr "map(ctx.to_upsert, i -> i.text)"
+        embedding_model: !expr ctx.embedding_model
+      output: embedded
+
+  # C4 -- stamp the RESOLVED model (`embed`'s own envelope meta), NOT this
+  # pipeline's `embedding_model` INPUT. The input is typically a model-CLASS
+  # alias ("standard"); writing that into the per-chunk embedding_model
+  # column would record a model that never produced these vectors -- the
+  # exact "the column becomes a lie" failure FP-0057's C1 hard gate exists
+  # to prevent. `envelope.model` is what the provider actually resolved, so
+  # C4 holds BY CONSTRUCTION here.
+  - transform: {value: "ctx.embedded.meta.model", output: resolved_model}
+
+  # `items` and `vectors` ride as PARALLEL ARRAYS -- upsert pairs them by
+  # index server-side (#2972). R1 has no index-zip, which is what used to
+  # force a python shell-out between these two steps.
+  # `text` itself is projected away: the store still has no column for it
+  # (FP-0057/0063 -- reyn does not double-persist the user's document
+  # body), and shipping every chunk's body over stdio a second time (it
+  # already went to the chunker and the embedder) is pure waste. Instead
+  # (#3644) `start_index`/`end_index` ride along -- a POINTER into
+  # source_path, not a copy of its content -- so a later `query` can
+  # recover this chunk's text by slicing source_path, instead of the text
+  # being unrecoverable at query time (the defect #3644 closes).
+  - transform:
+      value: >-
+        map(ctx.to_upsert, i -> {source_path: i.source_path,
+                                 content_hash: i.content_hash,
+                                 chunk_index: i.chunk_index,
+                                 size_tokens: i.size_tokens,
+                                 start_index: i.start_index,
+                                 end_index: i.end_index})
+      output: upsert_items
+  - tool:
+      name: call_mcp_tool
+      args:
+        server: !expr ctx.vectorstore_server
+        mcp_tool_name: upsert
+        tool_args: !expr >-
+          {db_path: ctx.output_db, items: ctx.upsert_items,
+           vectors: ctx.embedded.structured,
+           embedding_model: ctx.resolved_model,
+           parent_context: ctx.input_path}
+      output: upsert_result
+
+  # X2a -- the MEASURED spend for this batch (embed's own metered usage),
+  # not an estimate. `cost_usd` is null when litellm cannot price the model
+  # (an unpriced model degrades VISIBLY, never silently as $0.00 -- the
+  # #1829 sentinel), so it is carried through as-is alongside `priced`.
+  - transform:
+      value: >-
+        {upserted: ctx.upsert_result.structured.upserted,
+         tokens: ctx.embedded.meta.total_tokens,
+         cost_usd: get(ctx.embedded, "meta.cost_usd", null),
+         priced: get(ctx.embedded, "meta.priced", false),
+         model: ctx.resolved_model}
+      output: outcome
+---
+pipeline: _ingest_noop_upsert
+description: >-
+  Sibling of _ingest_embed_and_upsert -- the "nothing new to embed" branch
+  (X5: a fully-deduped re-ingest), returning the same outcome shape without
+  calling embed at all. Spend is a REAL zero here (nothing was embedded),
+  hence priced: true -- distinct from the unpriced-model null cost_usd the
+  sibling can carry.
+steps:
+  - transform:
+      value: "{upserted: 0, tokens: 0, cost_usd: 0.0, priced: true, model: null}"
+      output: outcome

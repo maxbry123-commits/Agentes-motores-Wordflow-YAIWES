@@ -1,0 +1,23 @@
+[
+  {
+    "repo": "CORAL",
+    "path": "assets/demo.gif",
+    "chunks_dir": "CORAL/assets/demo.gif.chunks",
+    "bytes": 17976802,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "CORAL",
+    "path": "examples/mnist/seed/data/train.npz",
+    "chunks_dir": "CORAL/examples/mnist/seed/data/train.npz.chunks",
+    "bytes": 16910682,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "CORAL",
+    "path": "examples/stanford_covid_vaccine/seed/data/train.json",
+    "chunks_dir": "CORAL/examples/stanford_covid_vaccine/seed/data/train.json.chunks",
+    "bytes": 11445889,
+    "chunk_bytes": 8388608
+  }
+]

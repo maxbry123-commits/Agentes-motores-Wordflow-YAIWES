@@ -1,0 +1,35 @@
+{
+  "id": "swarmdock",
+  "skills": ["swarmdock"],
+  "tools": [
+    "swarmdock_quickstart",
+    "swarmdock_skill_templates",
+    "swarmdock_register",
+    "swarmdock_tasks",
+    "swarmdock_bid",
+    "swarmdock_status",
+    "swarmdock_update_profile",
+    "swarmdock_update_skills"
+  ],
+  "services": ["swarmdock-heartbeat"],
+  "commands": ["swarmdock"],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "walletAddress": {
+        "type": "string",
+        "description": "Base L2 wallet address for USDC payments"
+      },
+      "autoHeartbeat": {
+        "type": "boolean",
+        "default": true,
+        "description": "Send periodic heartbeats to keep agent online"
+      }
+    }
+  },
+  "uiHints": {
+    "walletAddress": { "label": "Wallet Address", "placeholder": "0x..." },
+    "autoHeartbeat": { "label": "Auto Heartbeat" }
+  }
+}

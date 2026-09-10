@@ -1,0 +1,128 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openverification.dev/schemas/verification.config.schema.json",
+  "title": "Verification Config",
+  "type": "object",
+  "required": ["schema_version", "mode", "default_on_unknown"],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "ovk.config.v1"
+    },
+    "mode": {
+      "type": "string",
+      "enum": ["advisory", "strict"]
+    },
+    "default_on_unknown": {
+      "type": "string",
+      "enum": ["require_human_review", "block", "allow_with_warning"]
+    },
+    "budget": {
+      "type": "object",
+      "properties": {
+        "max_wall_time_seconds": { "type": "number", "minimum": 1 },
+        "total_wall_time_seconds": { "type": "number", "minimum": 1 },
+        "per_backend_wall_time_seconds": { "type": "number", "minimum": 1 },
+        "max_memory_mb": { "type": "integer", "minimum": 64 },
+        "max_parallel_backends": { "type": "integer", "minimum": 1 },
+        "allow_network": { "type": "boolean" },
+        "allow_repository_write": { "type": "boolean" },
+        "allowed_backends": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true
+        },
+        "denied_backends": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "routing": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": ["legacy", "shadow", "enforced"],
+          "default": "shadow",
+          "description": "legacy keeps lane evaluators authoritative; shadow runs the control plane for comparison; enforced is gated until acceptance tests pass."
+        },
+        "strategy": {
+          "type": "string",
+          "enum": ["primary_with_optional_corroboration"],
+          "default": "primary_with_optional_corroboration"
+        },
+        "aggregation": {
+          "type": "string",
+          "default": "ovk.aggregate.fail_dominant.v1"
+        },
+        "max_selected_backends": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 8,
+          "default": 2
+        },
+        "prefer_deterministic": { "type": "boolean", "default": false },
+        "allow_fallback": {
+          "type": "boolean",
+          "default": false,
+          "description": "Deprecated broad compatibility flag. Authoritative/enforced execution must not use this flag as fallback authorization; use exact fallback_rules once executor support is enabled."
+        },
+        "fallback_rules": {
+          "type": "array",
+          "description": "Exact fallback authorization tuples. Presence does not by itself enable enforced cross-backend fallback; the executor must support and validate the full tuple.",
+          "items": {
+            "type": "object",
+            "required": [
+              "primary_backend",
+              "primary_guarantee",
+              "fallback_backend",
+              "fallback_guarantee",
+              "allowed_causes"
+            ],
+            "properties": {
+              "primary_backend": { "type": "string", "minLength": 1 },
+              "primary_guarantee": { "type": "string", "minLength": 1 },
+              "fallback_backend": { "type": "string", "minLength": 1 },
+              "fallback_guarantee": { "type": "string", "minLength": 1 },
+              "allowed_causes": {
+                "type": "array",
+                "minItems": 1,
+                "uniqueItems": true,
+                "items": {
+                  "type": "string",
+                  "enum": ["tool_unavailable", "timeout", "resource_exhausted", "tool_error", "invalid_output"]
+                }
+              },
+              "requires_independent_attempt": { "type": "boolean", "default": true }
+            },
+            "additionalProperties": false
+          }
+        },
+        "accept_partial_primary": { "type": "boolean", "default": false },
+        "enforced_lanes": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true,
+          "description": "Lanes permitted to use enforced control-plane execution once acceptance tests pass."
+        }
+      },
+      "additionalProperties": false
+    },
+    "allowed_backends": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "uniqueItems": true
+    },
+    "denied_backends": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "uniqueItems": true
+    },
+    "max_wall_time_seconds": { "type": "number", "minimum": 1 },
+    "max_memory_mb": { "type": "integer", "minimum": 64 }
+  },
+  "additionalProperties": false
+}

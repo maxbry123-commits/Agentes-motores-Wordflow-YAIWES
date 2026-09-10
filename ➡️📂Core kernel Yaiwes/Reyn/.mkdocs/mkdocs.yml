@@ -1,0 +1,249 @@
+site_name: Reyn
+site_description: An operating system for LLM agents — they decide, organize, and orchestrate; the OS makes every action typed, permissioned, audited, and recoverable by construction
+site_url: https://tya5.github.io/reyn/
+docs_dir: ../docs
+# Build output to repo-root site/ (config now lives in .mkdocs/, so make the
+# output dir explicit rather than relying on the default .mkdocs/site/).
+site_dir: ../site
+
+# Show a GitHub icon in the top-right of the docs header that links back
+# to the source repository. mkdocs-material renders this automatically
+# when both repo_url and repo_name are set.
+repo_url: https://github.com/tya5/reyn
+repo_name: tya5/reyn
+edit_uri: edit/main/docs/
+
+# Files / directories tracked in git for development reference but NOT
+# published to the static site. Patterns are gitignore-style, relative to
+# docs_dir.  Add an entry here when you want to keep working notes in the
+# repo without exposing them on the public docs site.
+exclude_docs: |
+  # Internal documentation — moved out of public site (P1-P3 restructure).
+  # Single subtree captures journal / research / spec / decisions /
+  # contributing (= maintainer / design history).
+  deep-dives/
+  # Cookbook: render the example READMEs (first-class Cookbook section), but
+  # exclude runnable source dirs — those are executable examples, not doc pages.
+  cookbook/translate-doc/translate_doc/
+
+theme:
+  name: material
+  custom_dir: overrides
+  features:
+    - navigation.indexes
+    - navigation.top
+    - search.suggest
+    - content.code.copy
+    - content.code.annotate
+  font: false
+  logo: assets/reyn-mark-white.png
+  palette:
+    scheme: default
+    primary: custom
+
+# #4173: injects a per-character-ASCII-fold-or-keep slugify for the `toc`
+# extension below (config-level `slugify:` can't reach it — a bare-module-name
+# `!!python/name:` YAML tag only resolves if the module happens to already be
+# importable from mkdocs's own CWD, which `.mkdocs/` is not). Byte-identical
+# output to python-markdown's own default slugify for every character it can
+# already ASCII-fold (Latin diacritics, circled numerals, ...); differs only
+# for a character whose fold would be empty (Japanese has none), where it
+# keeps the original character instead of dropping it. See reyn_slugify_hook.py.
+hooks:
+  - reyn_slugify_hook.py
+
+plugins:
+  - search
+  - i18n:
+      docs_structure: suffix
+      fallback_to_default: true
+      languages:
+        - locale: en
+          name: English
+          default: true
+          build: true
+        - locale: ja
+          name: 日本語
+          build: true
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: true
+      pygments_lang_class: true
+  - pymdownx.tabbed:
+      alternate_style: true
+  - toc:
+      permalink: true
+
+nav:
+  - Home: index.md
+  - Start here: start.md
+  - Feature Map: feature-map.md
+  - Guide:
+      - Getting started:
+          - Installation & setup:
+              - guide/getting-started/01-installation.md
+              - guide/getting-started/02-chat-mode.md
+      - For users:
+          - guide/for-users/index.md
+          - Using Reyn:
+              - guide/for-users/chat-and-web-ui.md
+              - guide/for-users/time-travel.md
+              - guide/for-users/manage-permissions.md
+              - guide/for-users/configure-sandbox.md
+              - guide/for-users/protect-credentials-in-shell-commands.md
+              - guide/for-users/cap-spending.md
+          - Files & integrations:
+              - guide/for-users/work-with-files.md
+              - guide/for-users/enable-semantic-search.md
+              - guide/for-users/build-a-rag-corpus.md
+              - guide/for-users/popular-mcp-servers.md
+              - guide/for-users/oauth-login.md
+              - guide/for-users/manage-memory.md
+              - guide/for-users/write-a-pipeline.md
+              - guide/for-users/monitor-and-improve-with-cron.md
+      - For Reyn developers:
+          - guide/for-reyn-developers/index.md
+          - Concepts & principles:
+              - guide/for-reyn-developers/principles-and-code.md
+          - Extending Reyn:
+              - guide/for-reyn-developers/add-an-op-kind.md
+              - guide/for-reyn-developers/write-replay-tests.md
+          - Benchmarking:
+              - guide/for-reyn-developers/run-swe-bench.md
+  - Cookbook:
+      - cookbook/README.md
+      - Examples:
+          - cookbook/multi-agent-research/README.md
+          - cookbook/research-topic/README.md
+          - cookbook/translate-doc/README.md
+          - cookbook/weekly-summary/README.md
+          - cookbook/write-readme/README.md
+      - Configs: cookbook/configs/README.md
+  - Reference:
+      - CLI:
+          - Running Reyn:
+              - reference/cli/run-once.md
+              - reference/cli/chat.md
+              - reference/cli/dogfood.md
+              - reference/cli/web.md
+          - Multi-agent & tools:
+              - reference/cli/agent.md
+              - reference/cli/topology.md
+              - reference/cli/mcp.md
+              - reference/cli/pipe.md
+              - reference/cli/plugin.md
+              - reference/cli/embeddings.md
+          - Configuration & auth:
+              - reference/cli/config.md
+              - reference/cli/permissions.md
+              - reference/cli/secret.md
+              - reference/cli/auth.md
+              - reference/cli/init.md
+              - reference/cli/audit.md
+          - Session & ops:
+              - reference/cli/events.md
+              - reference/cli/memory.md
+              - reference/cli/cron.md
+              - reference/cli/storage.md
+              - reference/cli/doctor.md
+              - reference/cli/support-bundle.md
+              - reference/cli/common-flags.md
+      - Runtime:
+          - reference/runtime/control-ir.md
+          - reference/runtime/events.md
+          - reference/runtime/pipeline-dsl.md
+          - reference/runtime/agui-transport.md
+      - Config:
+          - Core:
+              - reference/config/reyn-yaml.md
+              - reference/config/permissions.md
+              - reference/config/budget.md
+          - Infrastructure:
+              - reference/config/state-dir.md
+              - reference/config/multi-agent.md
+      - Testing:
+          - reference/testing/replay.md
+          - reference/test-tier-audit.md
+      - Replay & Tracing:
+          - reference/dogfood-tracing.md
+          - reference/dogfood-sp-render.md
+      - Contributor Tools:
+          - reference/agent-worktree-cleanup.md
+      - Other:
+          - reference/glossary.md
+          - reference/upgrade-policy.md
+  - Concepts:
+      - Architecture:
+          - concepts/architecture/charter.md
+          - concepts/architecture/care-boundary.md
+          - concepts/architecture/llm-invocation-surfaces.md
+          - concepts/architecture/interaction-layers.md
+          - concepts/architecture/llm-as-decision-engine.md
+          - concepts/architecture/sandbox-vs-permission.md
+      - Runtime:
+          - concepts/runtime/workspace.md
+          - concepts/runtime/events.md
+          - concepts/runtime/hooks.md
+          - concepts/runtime/config-hot-reload.md
+          - concepts/runtime/time-travel.md
+          - concepts/runtime/durability-scope.md
+          - concepts/runtime/permission-model.md
+          - concepts/runtime/capability-profile.md
+          - concepts/runtime/delegation-policy.md
+          - concepts/runtime/sandbox.md
+          - concepts/runtime/secret-handling.md
+          - concepts/runtime/pipelines.md
+          - concepts/runtime/pipeline-registration.md
+      - Multi-agent:
+          - concepts/multi-agent/sessions.md
+          - concepts/multi-agent/multi-agent.md
+          - concepts/multi-agent/a2a.md
+          - concepts/multi-agent/topology.md
+          - concepts/multi-agent/org-design.md
+      - Data & retrieval:
+          - concepts/data-retrieval/rag.md
+          - concepts/data-retrieval/memory.md
+          - concepts/data-retrieval/operational-intelligence.md
+          - concepts/data-retrieval/chat-compaction.md
+      - Tools & integrations:
+          - concepts/tools-integrations/mcp.md
+          - concepts/tools-integrations/skills.md
+          - concepts/tools-integrations/universal-catalog.md
+          - concepts/tools-integrations/tool-use-schemes.md
+          - concepts/tools-integrations/codeact.md
+          - concepts/tools-integrations/voice.md
+      - Observability:
+          - concepts/observability/dogfood-scenarios.md
+      - Agent engineering — eight lenses:
+          - concepts/agent-engineering/index.md
+          - concepts/agent-engineering/system-design.md
+          - concepts/agent-engineering/tool-contract-design.md
+          - concepts/agent-engineering/retrieval-engineering.md
+          - concepts/agent-engineering/reliability-engineering.md
+          - concepts/agent-engineering/security.md
+          - concepts/agent-engineering/evaluation.md
+          - concepts/agent-engineering/observability.md
+          - concepts/agent-engineering/product-think.md
+
+extra_css:
+  - stylesheets/extra.css
+
+extra:
+  # Click the Reyn logo / site name in the docs header to go back to the
+  # landing page (one level above the docs site under GitHub Pages).
+  # Update this together with site_url when the project moves to a custom
+  # domain such as https://reyn.dev/.
+  homepage: https://tya5.github.io/reyn/
+  alternate:
+    - name: English
+      link: /
+      lang: en
+    - name: 日本語
+      link: /ja/
+      lang: ja

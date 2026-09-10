@@ -1,0 +1,125 @@
+# Pre-push hooks matching CI merge gate checks.
+# See .github/workflows/merge-gate.yml — the `detect-changes` job gates each
+# downstream job behind a per-domain path filter. The `files` regexes below
+# mirror those filters so a push only runs a hook when files it actually
+# validates changed. Meta-only pushes (workflows, docs, runbooks, this config)
+# match nothing and run no hooks — same as CI skipping every gated job.
+#
+# Mechanics: with `always_run` unset (default false) + `pass_filenames = false`,
+# prek runs the whole-project entry once, but only if a pushed file matches
+# `files`. Do NOT use `always_run = true` here — it bypasses the file gate.
+default_install_hook_types = ["pre-push"]
+
+[[repos]]
+repo = "local"
+
+[[repos.hooks]]
+id = "dedupe-check"
+name = "No duplicate lockfile versions"
+language = "system"
+entry = "bun dedupe --check"
+# Same CI "lint" domain: the check runs in the lint-and-typecheck job, right
+# after `bun install`, so it shares that job's path filter.
+files = '^(src/|apps/evals/|package\.json$|bun\.lock|bunfig\.toml$|tsconfig\.json$|biome\.json$)'
+pass_filenames = false
+stages = ["pre-push"]
+fail_fast = true
+
+[[repos.hooks]]
+id = "biome-lint"
+name = "Biome lint"
+language = "system"
+entry = "bun run lint"
+# CI "lint" domain: biome runs on src/ + apps/evals/; config + lockfile + tsconfig.
+files = '^(src/|apps/evals/|package\.json$|bun\.lock|bunfig\.toml$|tsconfig\.json$|biome\.json$)'
+pass_filenames = false
+stages = ["pre-push"]
+fail_fast = true
+
+[[repos.hooks]]
+id = "typecheck"
+name = "TypeScript type check"
+language = "system"
+entry = "bun run tsc:check"
+# Same CI "lint" domain (tsc:check is bundled in the lint-and-typecheck job).
+files = '^(src/|apps/evals/|package\.json$|bun\.lock|bunfig\.toml$|tsconfig\.json$|biome\.json$)'
+pass_filenames = false
+stages = ["pre-push"]
+fail_fast = true
+
+[[repos.hooks]]
+id = "test"
+name = "Unit tests (bun test --parallel=4, scoped with --changed)"
+language = "system"
+# scripts/pre-push-tests.sh runs `--changed=<merge-base with origin/main>` and
+# falls back to the full suite when migrations, templates/, bunfig.toml,
+# package.json, or bun.lock changed (those reach every test outside the import
+# graph) or when origin/main is missing. Blocking; CI stays authoritative.
+entry = "bash scripts/pre-push-tests.sh"
+# CI "test" domain: src/ + scripts tests import + lockfile/tsconfig/bunfig + templates.
+files = '^(src/|scripts/|templates/|package\.json$|bun\.lock|bunfig\.toml$|tsconfig\.json$)'
+pass_filenames = false
+stages = ["pre-push"]
+
+[[repos.hooks]]
+id = "bun-version"
+name = "Bun version pins match packageManager"
+language = "system"
+entry = "bun run check:bun-version"
+files = '^(package\.json$|Dockerfile$|Dockerfile\.worker$|apps/evals/Dockerfile$|scripts/check-bun-version\.ts$)'
+pass_filenames = false
+stages = ["pre-push"]
+fail_fast = true
+
+[[repos.hooks]]
+id = "db-boundary"
+name = "Worker/API DB boundary check"
+language = "system"
+entry = "bash scripts/check-db-boundary.sh"
+# Validates src/ import boundaries; also re-run if the check script itself changes.
+files = '^(src/|scripts/check-db-boundary\.sh$)'
+pass_filenames = false
+stages = ["pre-push"]
+fail_fast = true
+
+[[repos.hooks]]
+id = "check-test-spawn-sync"
+name = "Test spawnSync boundary check"
+language = "system"
+entry = "bash scripts/check-test-spawn-sync.sh"
+# Validates tests never spawn synchronously; also re-run if the check script itself changes.
+files = '^(src/|scripts/check-test-spawn-sync\.sh$)'
+pass_filenames = false
+stages = ["pre-push"]
+fail_fast = true
+
+[[repos.hooks]]
+id = "pi-skills-freshness"
+name = "Pi-skills freshness check"
+language = "system"
+entry = "bash -c 'bun run build:pi-skills && test -z \"$(git diff --name-only plugin/pi-skills/)\"'"
+# CI "pi_skills" domain: generator inputs + generated outputs.
+files = '^(plugin/commands/|plugin/pi-skills/|plugin/build-pi-skills\.ts$)'
+pass_filenames = false
+stages = ["pre-push"]
+
+[[repos]]
+repo = "local"
+
+[[repos.hooks]]
+id = "ui-lint"
+name = "UI Biome lint"
+language = "system"
+entry = "bash -c 'cd apps/ui && bun run lint'"
+files = "^apps/ui/"
+pass_filenames = false
+stages = ["pre-push"]
+
+[[repos.hooks]]
+id = "ui-typecheck"
+name = "UI TypeScript type check"
+language = "system"
+entry = "bash -c 'cd apps/ui && bunx tsc -b'"
+files = "^apps/ui/"
+pass_filenames = false
+stages = ["pre-push"]

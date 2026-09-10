@@ -1,0 +1,14 @@
+[package]
+name = "cmd-spawn-test-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Test binary for WasiChild spawn via host_process FFI"
+
+[[bin]]
+name = "spawn-test-host"
+path = "src/main.rs"
+
+[dependencies]
+wasi-spawn = { package = "agentos-wasi-spawn", path = "../../libs/wasi-spawn" }
+tokio = { version = "1.50.0", features = ["process", "rt"] }

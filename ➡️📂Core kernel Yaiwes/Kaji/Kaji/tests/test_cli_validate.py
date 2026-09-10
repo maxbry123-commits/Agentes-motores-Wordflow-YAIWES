@@ -1,0 +1,945 @@
+"""Tests for kaji validate subcommand.
+
+Covers S/M/L test sizes for the `kaji validate <file>...` CLI subcommand.
+"""
+
+from __future__ import annotations
+
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+from kaji_harness.commands.main import main
+from kaji_harness.commands.parser import create_parser
+from kaji_harness.commands.validate import cmd_validate
+
+# ============================================================
+# Shared fixtures
+# ============================================================
+
+VALID_WORKFLOW_YAML = """\
+name: test
+description: test workflow
+execution_policy: auto
+steps:
+  - id: step1
+    skill: test-skill
+    agent: claude
+    on:
+      PASS: end
+      ABORT: end
+"""
+
+MISSING_SKILL_YAML = """\
+name: test
+description: test workflow
+execution_policy: auto
+steps:
+  - id: step1
+    skill: nonexistent-skill-xyz
+    agent: claude
+    on:
+      PASS: end
+      ABORT: end
+"""
+
+INVALID_INJECT_VERDICT_YAML = """\
+name: test
+description: test workflow
+execution_policy: auto
+steps:
+  - id: step1
+    skill: test-skill
+    agent: claude
+    inject_verdict: "yes"
+    on:
+      PASS: end
+      ABORT: end
+"""
+
+PATH_TRAVERSAL_YAML = """\
+name: test
+description: test workflow
+execution_policy: auto
+steps:
+  - id: step1
+    skill: ../escape
+    agent: claude
+    on:
+      PASS: end
+      ABORT: end
+"""
+
+EXEC_STEP_YAML = """\
+name: test
+description: test workflow
+execution_policy: auto
+steps:
+  - id: collect-metrics
+    exec: python -m kaji_harness.scripts.collect_metrics
+    on:
+      PASS: end
+      ABORT: end
+"""
+
+EXEC_PLUS_AGENT_YAML = """\
+name: test
+description: test workflow
+execution_policy: auto
+steps:
+  - id: collect-metrics
+    exec: python -m kaji_harness.scripts.collect_metrics
+    agent: claude
+    on:
+      PASS: end
+      ABORT: end
+"""
+
+INVALID_SCHEMA_YAML = """\
+name: bad
+steps: not_a_list
+"""
+
+INVALID_FIELD_TYPE_YAML = """\
+name: [bad]
+description: test workflow
+execution_policy: auto
+steps:
+  - id: step1
+    skill: test-skill
+    agent: claude
+    on:
+      PASS: end
+"""
+
+INVALID_SYNTAX_YAML = """\
+name: bad
+steps:
+  - id: step1
+    on: {
+"""
+
+INVALID_TRANSITION_YAML = """\
+name: bad-transition
+description: invalid L2 transition
+execution_policy: auto
+steps:
+  - id: done
+    skill: test-skill
+    agent: claude
+    on:
+      PASS: missing
+"""
+
+L2_AND_L3_INVALID_YAML = """\
+name: bad-both
+description: invalid L2 transition and missing L3 skill
+execution_policy: auto
+steps:
+  - id: done
+    skill: nonexistent-skill-xyz
+    agent: claude
+    on:
+      PASS: missing
+"""
+
+NEW_VALIDATION_ERRORS_YAML = """\
+name: new-validation-errors
+description: exercises agent, PASS, and reachability validation
+execution_policy: auto
+steps:
+  - id: root
+    skill: test-skill
+    agent: cladue
+    on:
+      ABORT: end
+  - id: orphan
+    exec: ["true"]
+    on:
+      PASS: end
+"""
+
+DUPLICATE_STEP_ID_YAML = """\
+name: dup-step-id
+description: workflow with a duplicated step id
+execution_policy: auto
+steps:
+  - id: alpha
+    skill: test-skill
+    agent: claude
+    on:
+      PASS: beta
+  - id: beta
+    skill: test-skill
+    agent: claude
+    on:
+      PASS: end
+  - id: alpha
+    skill: test-skill
+    agent: codex
+    on:
+      PASS: end
+"""
+
+NON_STRING_STEP_ID_YAML = """\
+name: non-string-step-id
+description: workflow with a non-string step id
+execution_policy: auto
+steps:
+  - id: [alpha, beta]
+    skill: test-skill
+    agent: claude
+    on:
+      PASS: end
+"""
+
+REMOVED_INJECT_VERDICT_YAML = """\
+name: test
+description: test workflow
+execution_policy: auto
+steps:
+  - id: step1
+    skill: test-skill
+    agent: claude
+    inject_verdict: true
+    on:
+      PASS: end
+      ABORT: end
+"""
+
+EXEC_SCRIPT_SKILL_YAML = """\
+name: test
+description: test workflow
+execution_policy: auto
+steps:
+  - id: poll
+    skill: poll-skill
+    agent: claude
+    model: sonnet
+    on:
+      PASS: end
+"""
+
+
+def _create_config(project_root: Path, skill_dir: str = ".claude/skills") -> None:
+    """Create a minimal .kaji/config.toml for testing."""
+    config_dir = project_root / ".kaji"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / "config.toml").write_text(
+        f'[paths]\nskill_dir = "{skill_dir}"\nartifacts_dir = ".kaji/artifacts"\n\n[execution]\ndefault_timeout = 1800\n'
+    )
+
+
+def _create_skill(project_root: Path, skill_name: str, agent: str = "claude") -> None:
+    """Create a minimal SKILL.md for testing."""
+    agent_dirs = {
+        "claude": ".claude/skills",
+        "codex": ".agents/skills",
+        "antigravity": ".agents/skills",
+    }
+    skill_dir = project_root / agent_dirs[agent] / skill_name
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "SKILL.md").write_text(f"# {skill_name}\nTest skill.\n")
+
+
+def _create_skill_with_exec_script(project_root: Path, skill_name: str) -> None:
+    """Create a SKILL.md declaring `exec_script` frontmatter for testing."""
+    skill_dir = project_root / ".claude" / "skills" / skill_name
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "SKILL.md").write_text(
+        f"---\nname: {skill_name}\ndescription: d\nexec_script: package.poll\n---\n# {skill_name}\n"
+    )
+
+
+def _write_valid_yaml(project_root: Path, filename: str = "workflow.yaml") -> Path:
+    """Write valid YAML and create matching skill + config structure."""
+    p = project_root / filename
+    p.write_text(VALID_WORKFLOW_YAML)
+    _create_skill(project_root, "test-skill")
+    _create_config(project_root)
+    return p
+
+
+@pytest.fixture()
+def valid_yaml(tmp_path: Path) -> Path:
+    """Create a valid workflow YAML file with matching skill."""
+    return _write_valid_yaml(tmp_path)
+
+
+@pytest.fixture()
+def invalid_schema_yaml(tmp_path: Path) -> Path:
+    """Create an invalid (schema violation) workflow YAML file."""
+    p = tmp_path / "invalid_schema.yaml"
+    p.write_text(INVALID_SCHEMA_YAML)
+    return p
+
+
+@pytest.fixture()
+def invalid_syntax_yaml(tmp_path: Path) -> Path:
+    """Create an invalid (YAML syntax error) workflow YAML file."""
+    p = tmp_path / "invalid_syntax.yaml"
+    p.write_text(INVALID_SYNTAX_YAML)
+    return p
+
+
+# ============================================================
+# Small tests — cmd_validate logic
+# ============================================================
+
+
+class TestCmdValidateSmall:
+    """Small: cmd_validate() unit logic with capsys."""
+
+    @pytest.mark.small
+    def test_valid_yaml_exit_0(self, valid_yaml: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        exit_code = _cmd_validate_with_args(str(valid_yaml))
+        assert exit_code == 0
+        captured = capsys.readouterr()
+        assert "✓" in captured.out
+        assert str(valid_yaml) in captured.out
+
+    @pytest.mark.small
+    def test_invalid_schema_exit_1(
+        self, invalid_schema_yaml: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        exit_code = _cmd_validate_with_args(str(invalid_schema_yaml))
+        assert exit_code == 1
+        captured = capsys.readouterr()
+        assert "✗" in captured.err
+        assert str(invalid_schema_yaml) in captured.err
+        assert "steps" in captured.err
+        assert ".kaji/config.toml not found" not in captured.err
+
+    @pytest.mark.small
+    def test_invalid_field_type_exit_1(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A field type error returns exit 1 with the offending field in diagnostics."""
+        workflow = tmp_path / "invalid_field_type.yaml"
+        workflow.write_text(INVALID_FIELD_TYPE_YAML)
+
+        exit_code = _cmd_validate_with_args(str(workflow))
+
+        assert exit_code == 1
+        assert "name" in capsys.readouterr().err
+
+    @pytest.mark.small
+    def test_invalid_transition_precedes_missing_config(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        workflow = tmp_path / "invalid_transition.yaml"
+        workflow.write_text(INVALID_TRANSITION_YAML)
+
+        exit_code = _cmd_validate_with_args(str(workflow))
+
+        assert exit_code == 1
+        captured = capsys.readouterr()
+        assert "Step 'done' transitions to unknown step 'missing' on PASS" in captured.err
+        assert ".kaji/config.toml not found" not in captured.err
+
+    @pytest.mark.small
+    def test_l2_and_l3_errors_reported_together(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Preflight aggregates L2 and L3 errors instead of stopping at L2."""
+        _create_config(tmp_path)
+        workflow = tmp_path / "bad_both.yaml"
+        workflow.write_text(L2_AND_L3_INVALID_YAML)
+
+        exit_code = _cmd_validate_with_args(str(workflow))
+
+        assert exit_code == 1
+        captured = capsys.readouterr()
+        assert "Step 'done' transitions to unknown step 'missing' on PASS" in captured.err
+        assert "nonexistent-skill-xyz" in captured.err
+
+    @pytest.mark.small
+    def test_invalid_syntax_exit_1(
+        self, invalid_syntax_yaml: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        exit_code = _cmd_validate_with_args(str(invalid_syntax_yaml))
+        assert exit_code == 1
+        captured = capsys.readouterr()
+        assert "✗" in captured.err
+
+    @pytest.mark.small
+    def test_nonexistent_file_exit_1(self, capsys: pytest.CaptureFixture[str]) -> None:
+        exit_code = _cmd_validate_with_args("/no/such/file.yaml")
+        assert exit_code == 1
+        captured = capsys.readouterr()
+        assert "✗" in captured.err
+        assert "not found" in captured.err.lower() or "File not found" in captured.err
+
+    @pytest.mark.small
+    def test_multiple_valid_files_exit_0(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        _create_skill(tmp_path, "test-skill")
+        _create_config(tmp_path)
+        f1 = tmp_path / "a.yaml"
+        f2 = tmp_path / "b.yaml"
+        f1.write_text(VALID_WORKFLOW_YAML)
+        f2.write_text(VALID_WORKFLOW_YAML)
+        exit_code = _cmd_validate_with_args(str(f1), str(f2))
+        assert exit_code == 0
+        captured = capsys.readouterr()
+        assert captured.out.count("✓") == 2
+
+    @pytest.mark.small
+    def test_multiple_files_partial_failure_exit_1(
+        self, valid_yaml: Path, invalid_schema_yaml: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        exit_code = _cmd_validate_with_args(str(valid_yaml), str(invalid_schema_yaml))
+        assert exit_code == 1
+        captured = capsys.readouterr()
+        assert "✓" in captured.out
+        assert "✗" in captured.err
+        assert "Validation failed" in captured.err
+
+    @pytest.mark.small
+    def test_removed_inject_verdict_key_with_non_bool_value_exit_1(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """非 bool 値でも旧 'must be a boolean' 型検証ではなく migration error になる（#383）。"""
+        f = tmp_path / "bad_inject.yaml"
+        f.write_text(INVALID_INJECT_VERDICT_YAML)
+        exit_code = _cmd_validate_with_args(str(f))
+        assert exit_code == 1
+        captured = capsys.readouterr()
+        assert "✗" in captured.err
+        assert "inject_verdict" in captured.err
+        assert "must be a boolean" not in captured.err
+
+    @pytest.mark.small
+    def test_missing_skill_exit_1(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """Workflow referencing a nonexistent skill should fail validation."""
+        f = tmp_path / "missing_skill.yaml"
+        f.write_text(MISSING_SKILL_YAML)
+        exit_code = _cmd_validate_with_args(str(f))
+        assert exit_code == 1
+        captured = capsys.readouterr()
+        assert "✗" in captured.err
+
+    @pytest.mark.small
+    def test_path_traversal_exit_1(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Workflow with path traversal in skill name should fail, not traceback."""
+        f = tmp_path / "traversal.yaml"
+        f.write_text(PATH_TRAVERSAL_YAML)
+        exit_code = _cmd_validate_with_args(str(f))
+        assert exit_code == 1
+        captured = capsys.readouterr()
+        assert "✗" in captured.err
+
+    @pytest.mark.small
+    def test_yaml_in_subdirectory_resolves_project_root(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """YAML in an arbitrary subdirectory should resolve skills from project root."""
+        # Simulate repo layout: project_root/flows/wf.yaml + project_root/.claude/skills/
+        (tmp_path / "pyproject.toml").write_text("[project]\nname = 'test'\n")
+        flows_dir = tmp_path / "flows"
+        flows_dir.mkdir()
+        f = flows_dir / "wf.yaml"
+        f.write_text(VALID_WORKFLOW_YAML)
+        _create_skill(tmp_path, "test-skill")
+        _create_config(tmp_path)
+        exit_code = _cmd_validate_with_args(str(f))
+        assert exit_code == 0
+        captured = capsys.readouterr()
+        assert "✓" in captured.out
+
+    @pytest.mark.small
+    def test_explicit_project_root_option(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """--project-root should override automatic project root resolution."""
+        # YAML in one location, skills in another
+        yaml_dir = tmp_path / "yamls"
+        yaml_dir.mkdir()
+        f = yaml_dir / "wf.yaml"
+        f.write_text(VALID_WORKFLOW_YAML)
+
+        skills_root = tmp_path / "project"
+        skills_root.mkdir()
+        _create_skill(skills_root, "test-skill")
+        _create_config(skills_root)
+
+        exit_code = _cmd_validate_with_args(str(f), "--project-root", str(skills_root))
+        assert exit_code == 0
+        captured = capsys.readouterr()
+        assert "✓" in captured.out
+
+    @pytest.mark.small
+    def test_broken_config_not_silenced(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """validate --project-root must fail when config is broken (missing skill_dir)."""
+        f = tmp_path / "workflow.yaml"
+        f.write_text(VALID_WORKFLOW_YAML)
+        _create_skill(tmp_path, "test-skill")
+        # Create broken config: missing paths.skill_dir
+        kaji_dir = tmp_path / ".kaji"
+        kaji_dir.mkdir(parents=True, exist_ok=True)
+        (kaji_dir / "config.toml").write_text("[execution]\ndefault_timeout = 1800\n")
+        exit_code = _cmd_validate_with_args(str(f), "--project-root", str(tmp_path))
+        assert exit_code == 1
+        captured = capsys.readouterr()
+        assert "✗" in captured.err
+        assert "skill_dir" in captured.err.lower() or "paths" in captured.err.lower()
+
+    @pytest.mark.small
+    def test_missing_config_fails(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """validate must fail when no .kaji/config.toml exists."""
+        f = tmp_path / "workflow.yaml"
+        f.write_text(VALID_WORKFLOW_YAML)
+        _create_skill(tmp_path, "test-skill")
+        # No config at all
+        exit_code = _cmd_validate_with_args(str(f), "--project-root", str(tmp_path))
+        assert exit_code == 1
+        captured = capsys.readouterr()
+        assert "✗" in captured.err
+
+    @pytest.mark.small
+    def test_no_args_exit_2(self) -> None:
+        """argparse should exit 2 when no files are provided."""
+        with pytest.raises(SystemExit) as exc_info:
+            main(["validate"])
+        assert exc_info.value.code == 2
+
+    @pytest.mark.small
+    def test_exec_step_valid_without_skill(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """exec-step は skill ファイルが無くても skill 解決を skip して通る (Issue #205)。"""
+        f = tmp_path / "exec.yaml"
+        f.write_text(EXEC_STEP_YAML)
+        # skill は作成しない。exec-step は skill 解決対象ではない。
+        _create_config(tmp_path)
+        exit_code = _cmd_validate_with_args(str(f))
+        assert exit_code == 0
+        captured = capsys.readouterr()
+        assert "✓" in captured.out
+
+    @pytest.mark.small
+    def test_exec_step_with_agent_exit_1(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """exec + agent 同時指定は排他違反として fail する (Issue #205)。"""
+        f = tmp_path / "exec_agent.yaml"
+        f.write_text(EXEC_PLUS_AGENT_YAML)
+        _create_config(tmp_path)
+        exit_code = _cmd_validate_with_args(str(f))
+        assert exit_code == 1
+        captured = capsys.readouterr()
+        assert "✗" in captured.err
+        assert "must not set 'agent'" in captured.err
+
+
+# ============================================================
+# Medium tests — real file I/O integration
+# ============================================================
+
+
+class TestCmdValidateMedium:
+    """Medium: integration with real file I/O."""
+
+    @pytest.mark.medium
+    def test_real_file_pipeline(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """End-to-end: write YAML to disk, validate via cmd_validate."""
+        f = _write_valid_yaml(tmp_path)
+        exit_code = _cmd_validate_with_args(str(f))
+        assert exit_code == 0
+        captured = capsys.readouterr()
+        assert "✓" in captured.out
+
+    @pytest.mark.medium
+    def test_mixed_files_all_processed(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """All files are processed even when some fail (no early abort)."""
+        good = _write_valid_yaml(tmp_path, "good.yaml")
+        bad = tmp_path / "bad.yaml"
+        bad.write_text(INVALID_SCHEMA_YAML)
+        exit_code = _cmd_validate_with_args(str(good), str(bad))
+        assert exit_code == 1
+        captured = capsys.readouterr()
+        assert str(good) in captured.out
+        assert str(bad) in captured.err
+        assert "Validation failed: 1 of 2" in captured.err
+
+    @pytest.mark.medium
+    def test_permission_error(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """Unreadable file should produce exit 1 with error message."""
+        f = _write_valid_yaml(tmp_path, "noperm.yaml")
+        f.chmod(0o000)
+        try:
+            exit_code = _cmd_validate_with_args(str(f))
+            assert exit_code == 1
+            captured = capsys.readouterr()
+            assert "✗" in captured.err
+        finally:
+            f.chmod(0o644)  # restore for cleanup
+
+    @pytest.mark.medium
+    def test_main_validate_returns_exit_code(self, valid_yaml: Path) -> None:
+        """main(["validate", ...]) returns correct exit code."""
+        exit_code = main(["validate", str(valid_yaml)])
+        assert exit_code == 0
+
+    @pytest.mark.medium
+    def test_main_validate_invalid_returns_1(self, invalid_schema_yaml: Path) -> None:
+        exit_code = main(["validate", str(invalid_schema_yaml)])
+        assert exit_code == 1
+
+    @pytest.mark.medium
+    def test_yaml_in_subdirectory_via_main(self, tmp_path: Path) -> None:
+        """main(["validate", ...]) with YAML in an arbitrary subdirectory passes."""
+        (tmp_path / "pyproject.toml").write_text("[project]\nname = 'test'\n")
+        flows_dir = tmp_path / "flows"
+        flows_dir.mkdir()
+        f = flows_dir / "wf.yaml"
+        f.write_text(VALID_WORKFLOW_YAML)
+        _create_skill(tmp_path, "test-skill")
+        _create_config(tmp_path)
+        exit_code = main(["validate", str(f)])
+        assert exit_code == 0
+
+    @pytest.mark.medium
+    def test_path_traversal_via_main(self, tmp_path: Path) -> None:
+        """main(["validate", ...]) with path traversal returns exit 1 (no traceback)."""
+        f = tmp_path / "traversal.yaml"
+        f.write_text(PATH_TRAVERSAL_YAML)
+        exit_code = main(["validate", str(f)])
+        assert exit_code == 1
+
+    @pytest.mark.medium
+    def test_missing_skill_via_main(self, tmp_path: Path) -> None:
+        """main(["validate", ...]) with missing skill returns exit 1."""
+        f = tmp_path / "missing_skill.yaml"
+        f.write_text(MISSING_SKILL_YAML)
+        exit_code = main(["validate", str(f)])
+        assert exit_code == 1
+
+    @pytest.mark.medium
+    def test_exec_step_valid_via_main(self, tmp_path: Path) -> None:
+        """main(["validate", ...]) with an exec-step (no skill) returns exit 0 (Issue #205)."""
+        f = tmp_path / "exec.yaml"
+        f.write_text(EXEC_STEP_YAML)
+        _create_config(tmp_path)
+        exit_code = main(["validate", str(f)])
+        assert exit_code == 0
+
+    @pytest.mark.medium
+    def test_duplicate_step_id_via_cli(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A duplicated step id is rejected with exit 1 and a duplicate-id message (Issue #355)."""
+        workflow = tmp_path / "dup-repro.yaml"
+        workflow.write_text(DUPLICATE_STEP_ID_YAML)
+
+        exit_code = _cmd_validate_with_args(str(workflow))
+
+        assert exit_code == 1
+        captured = capsys.readouterr()
+        assert "Duplicate step id 'alpha' (defined 2 times)" in captured.err
+
+    @pytest.mark.medium
+    def test_non_string_step_id_via_cli(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A non-string step id is rejected with exit 1 and a type-error message,
+        never a raw TypeError (Issue #357)."""
+        workflow = tmp_path / "non-string-id-repro.yaml"
+        workflow.write_text(NON_STRING_STEP_ID_YAML)
+
+        exit_code = _cmd_validate_with_args(str(workflow))
+
+        assert exit_code == 1
+        captured = capsys.readouterr()
+        assert "Step at index 0 'id' must be a string, got list" in captured.err
+
+    @pytest.mark.medium
+    def test_new_validation_errors_are_reported_together(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Agent, PASS, and dead-step errors are visible through the CLI."""
+        workflow = tmp_path / "new-errors.yaml"
+        workflow.write_text(NEW_VALIDATION_ERRORS_YAML)
+        _create_skill(tmp_path, "test-skill")
+        _create_config(tmp_path)
+
+        exit_code = _cmd_validate_with_args(str(workflow))
+
+        assert exit_code == 1
+        captured = capsys.readouterr()
+        assert "Step 'root' has unknown agent 'cladue'" in captured.err
+        assert "Step 'root' 'on' must define a 'PASS' transition" in captured.err
+        assert "Step 'orphan' is not reachable from the first step 'root'" in captured.err
+
+    @pytest.mark.medium
+    def test_removed_inject_verdict_key_exit_1_with_migration_error(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """stale 'inject_verdict' キーは L1 parse で migration error になり exit 1（#383）。"""
+        f = tmp_path / "inject.yaml"
+        f.write_text(REMOVED_INJECT_VERDICT_YAML)
+        _create_skill(tmp_path, "test-skill")
+        _create_config(tmp_path)
+
+        exit_code = _cmd_validate_with_args(str(f))
+
+        assert exit_code == 1
+        captured = capsys.readouterr()
+        assert "✗" in captured.err
+        assert "inject_verdict" in captured.err
+        assert "was removed from the workflow step schema" in captured.err
+
+    @pytest.mark.medium
+    def test_exec_script_warning_path_with_newline_stays_single_line(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """改行を含む workflow path でも warning は 1 行のまま（review #381 Must Fix）。
+        warning producer は inject_verdict 廃止に伴い exec_script warning へ retarget する（#383）。"""
+        f = tmp_path / ("workflow" + "\n" + "name.yaml")
+        f.write_text(EXEC_SCRIPT_SKILL_YAML)
+        _create_skill_with_exec_script(tmp_path, "poll-skill")
+        _create_config(tmp_path)
+
+        exit_code = _cmd_validate_with_args(str(f))
+
+        assert exit_code == 0
+        captured = capsys.readouterr()
+        stderr_lines = captured.err.splitlines()
+        assert len(stderr_lines) == 1
+        assert "workflow" in stderr_lines[0]
+        assert "name.yaml" in stderr_lines[0]
+        assert "exec_script" in stderr_lines[0]
+
+    @pytest.mark.medium
+    def test_no_inject_verdict_no_stderr(
+        self, valid_yaml: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """inject_verdict を含まない workflow は stderr が空のまま（回帰防止）。"""
+        exit_code = _cmd_validate_with_args(str(valid_yaml))
+
+        assert exit_code == 0
+        assert capsys.readouterr().err == ""
+
+    @pytest.mark.medium
+    def test_exec_script_warning_is_visible_via_validate(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """既存 exec_script warning も validate の stderr で可視化される（Should Fix 対応）。"""
+        f = tmp_path / "poll.yaml"
+        f.write_text(EXEC_SCRIPT_SKILL_YAML)
+        _create_skill_with_exec_script(tmp_path, "poll-skill")
+        _create_config(tmp_path)
+
+        exit_code = _cmd_validate_with_args(str(f))
+
+        assert exit_code == 0
+        captured = capsys.readouterr()
+        assert "⚠" in captured.err
+        assert "exec_script" in captured.err
+
+    @pytest.mark.medium
+    def test_official_workflows_all_validate(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """Every official workflow remains compatible with validation."""
+        project_root = Path(__file__).resolve().parents[1]
+        workflows = sorted((project_root / ".kaji" / "wf" / "official").rglob("*.yaml"))
+
+        exit_code = _cmd_validate_with_args(
+            *(str(workflow) for workflow in workflows),
+            "--project-root",
+            str(project_root),
+        )
+
+        assert workflows
+        assert exit_code == 0, capsys.readouterr().err
+        captured = capsys.readouterr()
+        assert captured.out.count("✓") == len(workflows)
+
+
+# ============================================================
+# Large tests — real subprocess execution
+# ============================================================
+
+
+class TestCLIValidateLarge:
+    """Large: real subprocess execution of `kaji validate`."""
+
+    @pytest.mark.large
+    def test_kaji_validate_valid_yaml(self, tmp_path: Path) -> None:
+        f = _write_valid_yaml(tmp_path)
+        result = subprocess.run(
+            [sys.executable, "-m", "kaji_harness.cli_main", "validate", str(f)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert result.returncode == 0
+        assert "✓" in result.stdout
+
+    @pytest.mark.large
+    def test_kaji_validate_invalid_yaml(self, tmp_path: Path) -> None:
+        f = tmp_path / "bad.yaml"
+        f.write_text(INVALID_SCHEMA_YAML)
+        result = subprocess.run(
+            [sys.executable, "-m", "kaji_harness.cli_main", "validate", str(f)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert result.returncode == 1
+        assert "✗" in result.stderr
+
+    @pytest.mark.large
+    def test_kaji_validate_no_args_exit_2(self) -> None:
+        result = subprocess.run(
+            [sys.executable, "-m", "kaji_harness.cli_main", "validate"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert result.returncode == 2
+
+    @pytest.mark.large
+    def test_kaji_validate_missing_skill(self, tmp_path: Path) -> None:
+        f = tmp_path / "missing_skill.yaml"
+        f.write_text(MISSING_SKILL_YAML)
+        result = subprocess.run(
+            [sys.executable, "-m", "kaji_harness.cli_main", "validate", str(f)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert result.returncode == 1
+        assert "✗" in result.stderr
+
+    @pytest.mark.large
+    def test_kaji_validate_path_traversal(self, tmp_path: Path) -> None:
+        f = tmp_path / "traversal.yaml"
+        f.write_text(PATH_TRAVERSAL_YAML)
+        result = subprocess.run(
+            [sys.executable, "-m", "kaji_harness.cli_main", "validate", str(f)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert result.returncode == 1
+        assert "✗" in result.stderr
+
+    @pytest.mark.large
+    def test_kaji_validate_subdirectory_layout(self, tmp_path: Path) -> None:
+        (tmp_path / "pyproject.toml").write_text("[project]\nname = 'test'\n")
+        workflows_dir = tmp_path / "workflows"
+        workflows_dir.mkdir()
+        f = workflows_dir / "wf.yaml"
+        f.write_text(VALID_WORKFLOW_YAML)
+        _create_skill(tmp_path, "test-skill")
+        _create_config(tmp_path)
+        result = subprocess.run(
+            [sys.executable, "-m", "kaji_harness.cli_main", "validate", str(f)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert result.returncode == 0
+        assert "✓" in result.stdout
+
+    @pytest.mark.large
+    def test_kaji_validate_mixed_files(self, tmp_path: Path) -> None:
+        good = _write_valid_yaml(tmp_path, "good.yaml")
+        bad = tmp_path / "bad.yaml"
+        bad.write_text(INVALID_SCHEMA_YAML)
+        result = subprocess.run(
+            [sys.executable, "-m", "kaji_harness.cli_main", "validate", str(good), str(bad)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert result.returncode == 1
+        assert "✓" in result.stdout
+        assert "✗" in result.stderr
+        assert "Validation failed" in result.stderr
+
+    @pytest.mark.large
+    @pytest.mark.large_local
+    def test_kaji_validate_rejects_unknown_agent(self, tmp_path: Path) -> None:
+        """The installed CLI rejects an agent typo before execution."""
+        workflow = tmp_path / "new-errors.yaml"
+        workflow.write_text(NEW_VALIDATION_ERRORS_YAML)
+        _create_skill(tmp_path, "test-skill")
+        _create_config(tmp_path)
+
+        result = subprocess.run(
+            [sys.executable, "-m", "kaji_harness.cli_main", "validate", str(workflow)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+        assert result.returncode == 1
+        assert "Step 'root' has unknown agent 'cladue'" in result.stderr
+
+    @pytest.mark.large
+    @pytest.mark.large_local
+    def test_kaji_validate_rejects_removed_inject_verdict_key(self, tmp_path: Path) -> None:
+        """実 CLI の entry point 経由でも、stale 'inject_verdict' キーは
+        returncode 1 + stderr の migration error で止まる（#383）。"""
+        f = tmp_path / "inject.yaml"
+        f.write_text(REMOVED_INJECT_VERDICT_YAML)
+        _create_skill(tmp_path, "test-skill")
+        _create_config(tmp_path)
+
+        result = subprocess.run(
+            [sys.executable, "-m", "kaji_harness.cli_main", "validate", str(f)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+        assert result.returncode == 1
+        assert "inject_verdict" in result.stderr
+        assert "was removed from the workflow step schema" in result.stderr
+
+    @pytest.mark.large
+    @pytest.mark.large_local
+    def test_kaji_validate_exec_script_warning_path_with_newline_stays_single_line(
+        self, tmp_path: Path
+    ) -> None:
+        """実 CLI の entry point 経由でも、改行を含む path で warning が 1 行のまま
+        （review #381 Must Fix）。producer は exec_script warning へ retarget する（#383）。"""
+        f = tmp_path / ("workflow" + "\n" + "name.yaml")
+        f.write_text(EXEC_SCRIPT_SKILL_YAML)
+        _create_skill_with_exec_script(tmp_path, "poll-skill")
+        _create_config(tmp_path)
+
+        result = subprocess.run(
+            [sys.executable, "-m", "kaji_harness.cli_main", "validate", str(f)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+        assert result.returncode == 0
+        assert len(result.stderr.splitlines()) == 1
+        assert "workflow" in result.stderr
+        assert "name.yaml" in result.stderr
+        assert "exec_script" in result.stderr
+
+
+# ============================================================
+# Helpers
+# ============================================================
+
+
+def _cmd_validate_with_args(*args: str) -> int:
+    """Parse args and call cmd_validate, returning exit code."""
+    parser = create_parser()
+    parsed = parser.parse_args(["validate", *args])
+    return cmd_validate(parsed)

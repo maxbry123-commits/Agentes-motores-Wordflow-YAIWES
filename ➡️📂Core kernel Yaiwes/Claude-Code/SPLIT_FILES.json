@@ -1,0 +1,9 @@
+[
+  {
+    "repo": "Claude-Code",
+    "path": "demo.gif",
+    "chunks_dir": "Claude-Code/demo.gif.chunks",
+    "bytes": 11002760,
+    "chunk_bytes": 8388608
+  }
+]

@@ -1,0 +1,30 @@
+# The website Dockerfile builds the Astro site from the repo-root build context
+# (Railway default). Narrow that context to website/ so the monorepo isn't sent
+# to the builder. scripts/ralph/Dockerfile is a codex dev image that COPYs
+# nothing from the repo, so this doesn't affect it.
+#
+# The website build's docs:gen:ts (typedoc) step also needs the agentos SDK
+# source, which lives outside website/. Include just that package's src + config
+# (not node_modules/dist) so the API reference can be generated in the image.
+*
+!tsconfig.base.json
+!website
+!packages
+packages/*
+!packages/agentos
+packages/agentos/*
+!packages/agentos/src
+!packages/agentos/package.json
+!packages/agentos/tsconfig.json
+website/node_modules
+website/dist
+website/.astro
+
+# The docs <CodeSnippet> embeds read example source from /examples (the embed
+# root is the parent of the website). Include the example source only — never
+# their node_modules/dist/build output.
+!examples
+examples/**/node_modules
+examples/**/dist
+examples/**/.astro
+examples/**/.turbo

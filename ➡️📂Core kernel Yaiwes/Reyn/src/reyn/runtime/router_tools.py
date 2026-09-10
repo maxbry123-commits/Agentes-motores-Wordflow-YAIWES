@@ -1,0 +1,1001 @@
+"""Build the tools= argument for the native tool_use router loop (PR35).
+
+Public API
+----------
+build_tools(*, file_permissions, mcp_servers)
+    Returns 14–30 tools in fixed order for litellm.acompletion.
+
+    #5291: the leading positional ``available_agents`` parameter this
+    function used to require was removed (was never read by this
+    function's own body — its only consumer, ``delegate_to_agent``'s
+    per-call ``to`` enum injection, retired in #3978 P6; every call site
+    that supplied it was reading ``.reyn/agents/`` from disk for
+    nothing, some on every render frame). If a future capability needs
+    the caller's peer-agent list again, add a NEW, actually-read
+    parameter — reintroducing this exact name for a different purpose
+    would read as a silent revival of the dead one.
+
+Gemini-safe schema rules enforced throughout:
+- No oneOf / anyOf / additionalProperties / format keys
+- Nested objects max 1 level (input: object / args: object are untyped)
+- enum values are strings only
+- Tool order is a literal list — deterministic regardless of dict iteration order
+
+Migration note (ADR-0026)
+-------------------------
+This file is an M1 adapter shim. The ToolSpec pattern defined here will be
+progressively replaced as capabilities migrate to ToolDefinition instances in
+src/reyn/tools/ during M2/M3. The public surface (build_tools() returning
+list[dict]) is preserved unchanged throughout migration; M4 cleanup removes
+the ToolSpec literals once all capabilities have migrated.
+
+A private helper _build_tools_via_registry(registry) is available for M2/M3
+integration; build_tools() itself remains the public API.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Literal
+
+# ── FP-0024 Component D — Anthropic tool_search_tool threshold ───────────────
+#
+# When the number of MCP tools at or above this threshold, build_tools()
+# replaces inline MCP tool schemas with a single tool_search_tool meta-tool
+# (Anthropic GA 2025-11, ``type: "tool_search_tool_20251101"``).  The LLM
+# queries the meta-tool to load only the 3–5 most relevant MCP tools on
+# demand, rather than receiving all N schemas upfront.
+#
+# Spring AI experiment shows 63–64% token reduction for 40+ MCP tools.
+# #3218 / FP-0066 §7 P1a: the dead ``ReynConfig.mcp_search_threshold`` config
+# field (parsed from ``mcp.search_threshold:`` in reyn.yaml but never
+# threaded through to this parameter by either router_loop.py call site —
+# SchemeOps.present / SchemeOps.base_tools) was fold-removed (confirmed
+# no-op). ``mcp_search_threshold`` is now purely a ``build_tools()`` function
+# parameter; a caller wanting non-default behavior passes it explicitly.
+# Setting it to 0 (the default, see MCP_SEARCH_THRESHOLD below) disables the
+# switch (always inline). Full removal of tool_search_tool is tracked as
+# FP-0033.
+#
+# The exact Anthropic ``tool_search_tool`` API spec as of 2025-11:
+#   {
+#     "type": "tool_search_tool_20251101",
+#     "name": "tool_search",          # the name the LLM calls
+#     "max_results": int,             # max tools returned per query (1–10)
+#     "tools": [                      # the deferred tool list
+#       {... standard tool schema with "cache_control": ... ...}
+#     ]
+#   }
+# TODO(fp-0024-d): verify exact ``type`` string and ``tools`` element schema
+# against Anthropic SDK release notes when the SDK is available in this env.
+# The ``type`` value "tool_search_tool_20251101" is the version identifier
+# confirmed in the Anthropic docs reference for the 2025-11 GA release.
+MCP_SEARCH_THRESHOLD: int = 0
+# FP-0032: Default 0 (always inline D1–D4). The prior value of 30 activated
+# Anthropic's tool_search_tool_20251101, which is Anthropic-API-specific and
+# conflicts with Reyn's provider-agnostic posture. Set > 0 by passing
+# mcp_search_threshold explicitly to build_tools() to opt in (not a reyn.yaml
+# config key — see the #3218/FP-0066 note above). Full removal of
+# tool_search_tool is FP-0033.
+
+# ── G12 attractor mitigation (B7 finding: description verbosity trigger) ──
+#
+# Empty-stop attractor root cause: description verbosity.  B7 finding
+# B7-G12-context-root-cause.md (commit a62a9dad) confirmed that truncating
+# descriptions to ≤80 chars in listing tool_responses reduced empty-stop
+# rate from 100% → 0% (H-b verification).  B7-G12-cross-attractor-pattern.md
+# (commit a947255e) confirmed two trigger paths:
+#   Pattern A: via listing tool_response
+#   Pattern C: via system prompt inline catalog entries
+# Both paths must truncate to the same threshold.  Detail is available
+# on-demand (details-on-demand — list is summary only).
+MAX_DESC_LEN_FOR_LISTING: int = 80
+
+# ── ToolSpec — unified tool descriptor ──────────────────────────────────────
+#
+# Single source of truth for all chat-router tool metadata. Replaces the
+# prior dual representation:
+#   - dict literal in build_tools() (OpenAI schema)
+#   - sidecar _DISPATCH_KIND dict (sync/async classification)
+#
+# dispatch_kind: intrinsic dispatch posture for the tool.
+#   "sync"  — invoker awaits a result that's available in this RouterLoop
+#             turn; the LLM sees the tool_result and decides next step.
+#   "async" — invoker dispatches work whose result arrives via a separate
+#             channel in a future router invocation (the PR14 pending_chain
+#             relay — retired delegate_to_agent's own dispatch_kind, #3978
+#             P6; the substrate stays live as run_prompt(collect="async")'s
+#             own producer). The current loop cannot wait for the answer;
+#             RouterLoop must exit after dispatch and rely on the future
+#             invocation to resume.
+#
+# Future-proof for tool metadata growth (cost weight, rate-limit class,
+# per-tool budget, log redaction policy). Add fields here as those needs
+# surface; build_tools() and dispatcher consume from the same source.
+#
+# Future fields (not added yet):
+#   cost_weight: float = 1.0
+#   rate_limit_class: str | None = None
+#   log_redaction: list[str] = field(default_factory=list)
+
+# ── Exclusive-wrapper strip set (#3429) ──────────────────────────────────────
+#
+# Base tools that offer a capability the catalog also offers, but under a
+# DIFFERENT ToolDefinition, so no name comparison can pair them. They have to be
+# named, and each entry says why it is superseded rather than merely similar:
+_WRAPPER_SUPERSEDED_BASE_TOOLS: frozenset[str] = frozenset({
+    # ``mcp_call_tool`` is the catalog's own definition of the same call.
+    "call_mcp_tool",
+    # #879 shipped each tool's real ``inputSchema`` verbatim in
+    # ``list_mcp_tools``' result precisely so no describe round-trip is needed.
+    "describe_mcp_tool",
+    # #3896: ``spawn_session`` used to be listed here under a "deliberate
+    # surface reduction" framing that named a policy which never actually
+    # existed — no owner decision was ever made to withhold session-spawn
+    # under exclusive-wrapper mode; it was an oversight (no compensating
+    # catalog route existed at all, unlike this set's other two entries,
+    # which both name a real replacement). Fixed by giving it a
+    # ``multi_agent`` catalog route (``universal_dispatch._CATEGORY_ACTIONS``)
+    # instead of stripping it — it no longer belongs in this residue set.
+})
+
+
+def _wrapper_superseded_tool_names() -> "frozenset[str]":
+    """Every tool name the universal wrappers make redundant.
+
+    DERIVED from the catalog's own action set plus the small declared residue
+    above. #3429 replaced a hand-maintained 21-name frozenset here: that list
+    had to be edited by hand whenever a tool gained a catalog route, and a
+    forgotten edit would leave the tool advertised twice — under its own name
+    AND through ``invoke_action`` — in the mode whose whole contract is that
+    the wrappers are the only surface. Deriving it means the list cannot fall
+    behind the catalog.
+
+    (Measured before replacing it: with wrappers ON, ``build_tools`` emitted 0
+    catalog actions under either the old list or this derivation, i.e. the hand
+    list happened to cover everything ``build_tools`` actually emits today. The
+    drift it invites is the defect, not a live leak.)
+    """
+    from reyn.tools.universal_dispatch import KNOWN_ACTION_NAMES
+
+    return KNOWN_ACTION_NAMES | _WRAPPER_SUPERSEDED_BASE_TOOLS
+
+
+@dataclass(frozen=True)
+class ToolSpec:
+    """Unified spec for a chat-router tool exposed to the LLM.
+
+    Replaces the prior dual representation:
+      - dict literal in build_tools() (OpenAI schema)
+      - sidecar _DISPATCH_KIND dict (sync/async classification)
+
+    Future-proof for tool metadata growth (cost weight, rate-limit class,
+    per-tool budget, log redaction policy). Add fields here as those needs
+    surface; build_tools() and dispatcher consume from the same source.
+    """
+
+    name: str
+    description: str
+    parameters: dict                                  # JSON schema (object root)
+    dispatch_kind: Literal["sync", "async"] = "sync"
+    # Future fields (commented out, not added yet):
+    # cost_weight: float = 1.0
+    # rate_limit_class: str | None = None
+    # log_redaction: list[str] = field(default_factory=list)
+
+    def to_openai_dict(self) -> dict:
+        """Render to the OpenAI tools array shape that LiteLLM expects."""
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": self.parameters,
+            },
+        }
+
+
+# ── get_dispatch_kind — registry-backed (ADR-0026 M4 Phase 4) ────────────────
+#
+# Sunset: the prior sidecar ``_DISPATCH_KIND`` dict / ``_TOOL_SPECS_STATIC_ASYNC``
+# duplicate has been removed.  ``ToolDefinition.dispatch_kind`` on entries in
+# the unified ToolRegistry is now the single source of truth; this helper
+# delegates to the registry.  Default for unknown names stays ``"sync"``.
+
+
+def get_dispatch_kind(tool_name: str) -> str:
+    """Return ``"sync"`` or ``"async"`` for the given tool name.
+
+    Used by RouterLoop to decide whether to continue the loop after a
+    tool dispatch (sync — result is in the tool_result, LLM can act on
+    it) or to exit immediately and wait for a deferred result via a
+    separate channel (async — pending_chain or equivalent).
+
+    Resolves via ``get_default_registry().lookup(tool_name).dispatch_kind``.
+    Default for unknown / unregistered names is ``"sync"`` (= safe default;
+    the loop continues and the LLM sees a "no such tool" error result).
+    """
+    from reyn.tools import get_default_registry
+
+    tool = get_default_registry().lookup(tool_name)
+    if tool is None:
+        return "sync"
+    return tool.dispatch_kind
+
+
+def build_mcp_search_tool(mcp_tool_specs: list[dict]) -> dict:
+    """Build the Anthropic tool_search_tool meta-tool for deferred MCP loading.
+
+    Returns a single ``tool_search_tool_20251101`` descriptor that wraps the
+    full MCP tool catalog.  When the LLM calls ``tool_search``, Anthropic's
+    server loads only the matching subset (``max_results`` tools), dramatically
+    reducing the effective schema payload for large MCP deployments.
+
+    Parameters
+    ----------
+    mcp_tool_specs:
+        List of standard MCP tool dicts (OpenAI schema shape) to place inside
+        the ``tools`` array of the search-tool wrapper.  Each entry should
+        carry at least ``name``, ``description``, and ``parameters``.
+
+    Returns
+    -------
+    dict
+        A tool dict in the Anthropic ``tool_search_tool_20251101`` format.
+        The ``type`` field distinguishes it from ordinary ``function`` tools
+        so the Anthropic API can handle deferred-loading server-side.
+
+    TODO(fp-0024-d): Verify the exact field names (``type``, ``name``,
+    ``max_results``, ``tools``) against the published Anthropic SDK release
+    notes for the 2025-11 GA build of tool_search_tool.  The spec below
+    follows the reference at:
+      https://docs.anthropic.com/en/docs/tool-use/tool-search-tool
+    and is marked best-effort until validated against a live Anthropic
+    endpoint.
+    """
+    return {
+        "type": "tool_search_tool_20251101",
+        "name": "tool_search",
+        "max_results": 5,
+        "tools": mcp_tool_specs,
+    }
+
+
+def build_tools(
+    *,
+    file_permissions: dict | None = None,  # {"read": [paths], "write": [paths]}
+    mcp_servers: list[dict] | None = None,  # [{"name": ..., "description": ...}, ...]
+    web_fetch_allowed: bool = True,         # FP-0022: always-on; parameter kept for backward compat
+    mcp_search_threshold: int = MCP_SEARCH_THRESHOLD,  # FP-0024: override via config
+    universal_wrappers_enabled: bool = False,  # FP-0034 PR-3b-i: opt-in catalog wrappers
+    search_actions_visible: bool = False,       # FP-0034 Phase 2 step 1: D14 visibility gate
+    compact_visible: bool = False,              # #272/#1128: visibility-gate compact on window-fill
+) -> list[dict]:
+    """Build the tools= argument for litellm.acompletion.
+
+    Returns 14–30 tools in fixed order (Anthropic prompt cache compatibility).
+    Tool order matches the plan's canonical ordering:
+      A1 list_agents, A2 describe_agent,
+      A3 list_memory, A4 read_memory_body,
+      (B1 delegate_to_agent retired, #3978 P6 — numbering below kept as-is
+      rather than renumbered, to match the B2b/B2c labels still in the code)
+      B2 remember_shared, B3 remember_agent, B4 forget_memory,
+      C1 list_directory, C2 read_file (when any file scope),
+      C3 write_file, C4 delete_file (only when write scope),
+      D1 list_mcp_servers, D2 list_mcp_tools, D3 call_mcp_tool, D4 describe_mcp_tool,
+      D5 list_mcp_resources, D6 list_mcp_resource_templates, D7 read_mcp_resource,
+      D8 subscribe_mcp_resource, D9 unsubscribe_mcp_resource,
+      D10 list_mcp_prompts, D11 get_mcp_prompt (all D1–D11 when mcp configured,
+      #2597 slices ②a/②b/②c).
+
+    Internally collects ToolSpec objects (= single source of truth for name,
+    description, parameters, dispatch_kind) and returns the OpenAI dict shape
+    via ToolSpec.to_openai_dict(). The public return type stays list[dict] for
+    backward compatibility with all callers.
+
+    Parameters
+    ----------
+    file_permissions:
+        Optional dict with ``read`` and/or ``write`` lists of path strings.
+        - None or both empty → File tools omitted entirely (C1–C4).
+        - read non-empty, write empty → include C1+C2 only.
+        - write non-empty → include all 4 file tools (C1–C4).
+    mcp_servers:
+        Optional list of MCP server dicts (each with ``name`` and
+        ``description``). None or [] → MCP tools omitted. Otherwise all 3
+        MCP tools (D1–D3) are included, unless ``mcp_search_threshold`` is
+        exceeded (see below).
+    web_fetch_allowed:
+        Kept for backward compatibility. FP-0022: web_fetch is now always
+        included in the catalog; approval is handled at the handler level
+        via the 4-layer PermissionResolver._approve() flow.
+    mcp_search_threshold:
+        FP-0024 Component D. When the total MCP tool count is >= this value
+        (and > 0), the D1–D3 inline MCP tools are replaced by a single
+        tool_search_tool meta-tool that loads specific tools on demand.
+        Default: MCP_SEARCH_THRESHOLD (0) — always inline. This is a pure
+        ``build_tools()`` function parameter — #3218 / FP-0066 §7 P1a
+        fold-removed the dead ``ReynConfig.mcp_search_threshold`` config
+        field (it was parsed from ``mcp.search_threshold:`` in reyn.yaml
+        but never threaded through to this parameter by either
+        router_loop.py call site — confirmed no-op). A caller that wants
+        non-default behavior passes this kwarg explicitly.
+    """
+    # Collect ToolSpec objects in canonical order (single source of truth).
+    # Each spec carries name + description + parameters + dispatch_kind.
+    # build_tools() converts to OpenAI dict shape via to_openai_dict().
+    from reyn.tools import get_default_registry as _get_default_registry
+    _registry = _get_default_registry()
+
+    specs: list[ToolSpec] = []
+
+    # ── A3: list_agents ──────────────────────────────────────────────────
+    _list_agents_def = _registry.lookup("list_agents")
+    if _list_agents_def is not None and _list_agents_def.gates.router == "allow":
+        _list_agents_rendered = _list_agents_def.render_for_router()
+        specs.append(ToolSpec(
+            name=_list_agents_rendered["function"]["name"],
+            description=_list_agents_rendered["function"]["description"],
+            parameters=_list_agents_rendered["function"]["parameters"],
+            dispatch_kind=_list_agents_def.dispatch_kind,
+        ))
+
+    # ── A4: describe_agent ───────────────────────────────────────────────
+    _describe_agent_def = _registry.lookup("describe_agent")
+    if _describe_agent_def is not None and _describe_agent_def.gates.router == "allow":
+        _describe_agent_rendered = _describe_agent_def.render_for_router()
+        specs.append(ToolSpec(
+            name=_describe_agent_rendered["function"]["name"],
+            description=_describe_agent_rendered["function"]["description"],
+            parameters=_describe_agent_rendered["function"]["parameters"],
+            dispatch_kind=_describe_agent_def.dispatch_kind,
+        ))
+
+    # ── A5: list_memory ──────────────────────────────────────────────────
+    _list_memory_def = _registry.lookup("list_memory")
+    if _list_memory_def is not None and _list_memory_def.gates.router == "allow":
+        _list_memory_rendered = _list_memory_def.render_for_router()
+        specs.append(ToolSpec(
+            name=_list_memory_rendered["function"]["name"],
+            description=_list_memory_rendered["function"]["description"],
+            parameters=_list_memory_rendered["function"]["parameters"],
+            dispatch_kind=_list_memory_def.dispatch_kind,
+        ))
+
+    # ── A6: read_memory_body ─────────────────────────────────────────────
+    _read_memory_body_def = _registry.lookup("read_memory_body")
+    if _read_memory_body_def is not None and _read_memory_body_def.gates.router == "allow":
+        _read_memory_body_rendered = _read_memory_body_def.render_for_router()
+        specs.append(ToolSpec(
+            name=_read_memory_body_rendered["function"]["name"],
+            description=_read_memory_body_rendered["function"]["description"],
+            parameters=_read_memory_body_rendered["function"]["parameters"],
+            dispatch_kind=_read_memory_body_def.dispatch_kind,
+        ))
+
+    # ── B2b: spawn_session (#2103 S1bc / #2120 fix; renamed from session_spawn
+    # — #4004) ─────────────────────────────────────────────────────────────
+    # Router-only spawn primitive. Static schema (no schema_enricher / per-call
+    # enum) → render without state, like remember_shared. (Registered + floored in
+    # S1bc but the advertising block was missed — the #1953/#2120 router=allow-but-
+    # unadvertised drift. test_2120_session_spawn_advertised.py pins reachability
+    # here + the wrappers-mode strip pairing below; a blanket "every router=allow
+    # advertised-or-exempt" guard is mode/condition-dependent — flagged for lead.)
+    _session_spawn_def = _registry.lookup("spawn_session")
+    if _session_spawn_def is not None and _session_spawn_def.gates.router == "allow":
+        _session_spawn_rendered = _session_spawn_def.render_for_router()
+        specs.append(ToolSpec(
+            name=_session_spawn_rendered["function"]["name"],
+            description=_session_spawn_rendered["function"]["description"],
+            parameters=_session_spawn_rendered["function"]["parameters"],
+            dispatch_kind=_session_spawn_def.dispatch_kind,
+        ))
+
+    # ── B2c: spawn_agent (#2103 B-tool; renamed from agent_spawn — #4004) ──
+    # Router-only org-design spawn primitive (static schema → render without state).
+    # Advertised here alongside spawn_session so the router=allow tool is actually
+    # reachable (the #2120 advertise-drift lesson); dispatch + floor pair below.
+    _agent_spawn_def = _registry.lookup("spawn_agent")
+    if _agent_spawn_def is not None and _agent_spawn_def.gates.router == "allow":
+        _agent_spawn_rendered = _agent_spawn_def.render_for_router()
+        specs.append(ToolSpec(
+            name=_agent_spawn_rendered["function"]["name"],
+            description=_agent_spawn_rendered["function"]["description"],
+            parameters=_agent_spawn_rendered["function"]["parameters"],
+            dispatch_kind=_agent_spawn_def.dispatch_kind,
+        ))
+
+    # ── B2d: create_topology (#2103 C1; renamed from topology_create — #4004) ─
+    # Router-only org-wiring primitive (static schema → render without state).
+    # Advertised alongside spawn_agent so the router=allow tool is reachable (the
+    # #2120 advertise-drift lesson); dispatch + floor pair land with it.
+    _topology_create_def = _registry.lookup("create_topology")
+    if _topology_create_def is not None and _topology_create_def.gates.router == "allow":
+        _topology_create_rendered = _topology_create_def.render_for_router()
+        specs.append(ToolSpec(
+            name=_topology_create_rendered["function"]["name"],
+            description=_topology_create_rendered["function"]["description"],
+            parameters=_topology_create_rendered["function"]["parameters"],
+            dispatch_kind=_topology_create_def.dispatch_kind,
+        ))
+
+    # ── B2e: send_to_session (proposal 0067 P5, #3978) ─────────────────────
+    # Router-only fire-and-forget delivery primitive (static schema → render
+    # without state). Advertised alongside its delegation siblings so the
+    # router=allow tool is reachable (the #2120 advertise-drift lesson).
+    _send_to_session_def = _registry.lookup("send_to_session")
+    if _send_to_session_def is not None and _send_to_session_def.gates.router == "allow":
+        _send_to_session_rendered = _send_to_session_def.render_for_router()
+        specs.append(ToolSpec(
+            name=_send_to_session_rendered["function"]["name"],
+            description=_send_to_session_rendered["function"]["description"],
+            parameters=_send_to_session_rendered["function"]["parameters"],
+            dispatch_kind=_send_to_session_def.dispatch_kind,
+        ))
+
+    # ── B2f: run_prompt (proposal 0067 P4d, #3978) ─────────────────────────
+    # Router-only sync run+collect primitive against a live peer (static
+    # schema → render without state). Advertised alongside its delegation
+    # siblings so the router=allow tool is reachable (the #2120
+    # advertise-drift lesson — same reasoning as send_to_session above).
+    _run_prompt_def = _registry.lookup("run_prompt")
+    if _run_prompt_def is not None and _run_prompt_def.gates.router == "allow":
+        _run_prompt_rendered = _run_prompt_def.render_for_router()
+        specs.append(ToolSpec(
+            name=_run_prompt_rendered["function"]["name"],
+            description=_run_prompt_rendered["function"]["description"],
+            parameters=_run_prompt_rendered["function"]["parameters"],
+            dispatch_kind=_run_prompt_def.dispatch_kind,
+        ))
+
+    # ── B3: remember_shared ──────────────────────────────────────────────
+    _remember_shared_def = _registry.lookup("remember_shared")
+    if _remember_shared_def is not None and _remember_shared_def.gates.router == "allow":
+        _remember_shared_rendered = _remember_shared_def.render_for_router()
+        specs.append(ToolSpec(
+            name=_remember_shared_rendered["function"]["name"],
+            description=_remember_shared_rendered["function"]["description"],
+            parameters=_remember_shared_rendered["function"]["parameters"],
+            dispatch_kind=_remember_shared_def.dispatch_kind,
+        ))
+
+    # ── B4: remember_agent ───────────────────────────────────────────────
+    _remember_agent_def = _registry.lookup("remember_agent")
+    if _remember_agent_def is not None and _remember_agent_def.gates.router == "allow":
+        _remember_agent_rendered = _remember_agent_def.render_for_router()
+        specs.append(ToolSpec(
+            name=_remember_agent_rendered["function"]["name"],
+            description=_remember_agent_rendered["function"]["description"],
+            parameters=_remember_agent_rendered["function"]["parameters"],
+            dispatch_kind=_remember_agent_def.dispatch_kind,
+        ))
+
+    # ── B5: forget_memory ────────────────────────────────────────────────
+    _forget_memory_def = _registry.lookup("forget_memory")
+    if _forget_memory_def is not None and _forget_memory_def.gates.router == "allow":
+        _forget_memory_rendered = _forget_memory_def.render_for_router()
+        specs.append(ToolSpec(
+            name=_forget_memory_rendered["function"]["name"],
+            description=_forget_memory_rendered["function"]["description"],
+            parameters=_forget_memory_rendered["function"]["parameters"],
+            dispatch_kind=_forget_memory_def.dispatch_kind,
+        ))
+
+    # ── C. File tools (permission-gated) ─────────────────────────────────────
+    #
+    # #3458: file tools are exposed iff the corresponding path set is non-empty,
+    # where the set comes from `PermissionResolver.advertised_file_permissions()`
+    # — the SAME `file_scope.resolve_file_scope` answer the runtime gate
+    # enforces. The pre-#3458 gate read only the operator's literal
+    # `permissions.file.*` value while the runtime gate applied a default zone
+    # hidden inside itself, so an unconfigured project withheld `read_file` /
+    # `list_directory` from the model even though the gate would have permitted
+    # them (#3449): the model was not told about a capability it had. The set is
+    # now `deny` → empty (tools hidden), unset → the schema default
+    # (`<zone-root>` for read, `<zone-root>/.reyn` for write), a path list →
+    # exactly that list. Reyn's own source / docs are accessed via the dedicated
+    # `reyn_repo_*` tools (see section F below), which carry no
+    # permission-protected content and so don't need this gate.
+    _file_read = (file_permissions or {}).get("read") or []
+    _file_write = (file_permissions or {}).get("write") or []
+
+    if _file_read or _file_write:
+        # ── C1: list_directory ───────────────────────────────────────────
+        _list_directory_def = _registry.lookup("list_directory")
+        if _list_directory_def is not None and _list_directory_def.gates.router == "allow":
+            _list_directory_rendered = _list_directory_def.render_for_router()
+            specs.append(ToolSpec(
+                name=_list_directory_rendered["function"]["name"],
+                description=_list_directory_rendered["function"]["description"],
+                parameters=_list_directory_rendered["function"]["parameters"],
+                dispatch_kind=_list_directory_def.dispatch_kind,
+            ))
+
+        # ── C2: read_file ────────────────────────────────────────────────
+        _read_file_def = _registry.lookup("read_file")
+        if _read_file_def is not None and _read_file_def.gates.router == "allow":
+            _read_file_rendered = _read_file_def.render_for_router()
+            specs.append(ToolSpec(
+                name=_read_file_rendered["function"]["name"],
+                description=_read_file_rendered["function"]["description"],
+                parameters=_read_file_rendered["function"]["parameters"],
+                dispatch_kind=_read_file_def.dispatch_kind,
+            ))
+
+        if _file_write:
+            # C3 and C4 only when write scope is configured
+            # ── C3: write_file ───────────────────────────────────────────
+            _write_file_def = _registry.lookup("write_file")
+            if _write_file_def is not None and _write_file_def.gates.router == "allow":
+                _write_file_rendered = _write_file_def.render_for_router()
+                specs.append(ToolSpec(
+                    name=_write_file_rendered["function"]["name"],
+                    description=_write_file_rendered["function"]["description"],
+                    parameters=_write_file_rendered["function"]["parameters"],
+                    dispatch_kind=_write_file_def.dispatch_kind,
+                ))
+
+            # ── C4: delete_file ──────────────────────────────────────────
+            _delete_file_def = _registry.lookup("delete_file")
+            if _delete_file_def is not None and _delete_file_def.gates.router == "allow":
+                _delete_file_rendered = _delete_file_def.render_for_router()
+                specs.append(ToolSpec(
+                    name=_delete_file_rendered["function"]["name"],
+                    description=_delete_file_rendered["function"]["description"],
+                    parameters=_delete_file_rendered["function"]["parameters"],
+                    dispatch_kind=_delete_file_def.dispatch_kind,
+                ))
+
+    # ── E. Web tools (OS-native, backed by Control IR ops web/search +
+    #         web/fetch). E1 web_search is always exposed (read-only, public
+    #         queries — comparable security level to a logged query string).
+    #         E2 web_fetch is opt-in: arbitrary URL fetches can be misused for
+    #         data exfiltration (LLM bakes secrets into the URL and the
+    #         attacker's server logs them) or to probe internal endpoints, so
+    #         the operator enables it explicitly via `web.fetch: allow` in
+    #         reyn.yaml.
+    # ── E1: web_search (always available) — sourced from unified registry ────
+    # ADR-0026 M2: web_search is the first capability migrated to the unified
+    # ToolRegistry. build_tools() renders it via WEB_SEARCH.render_for_router()
+    # which produces byte-identical output to the prior ToolSpec literal.
+    # WEB_SEARCH is now the single source of truth. M4 cleanup removes the
+    # ToolSpec pattern here.
+    _web_search_def = _registry.lookup("web_search")
+    if _web_search_def is not None and _web_search_def.gates.router == "allow":
+        # Render via unified ToolDefinition; produces the OpenAI tools[] shape.
+        # Byte-identity with the prior ToolSpec.to_openai_dict() is verified
+        # by test_web_search_unified.py.
+        _ws_rendered = _web_search_def.render_for_router()
+        specs.append(ToolSpec(
+            name=_ws_rendered["function"]["name"],
+            description=_ws_rendered["function"]["description"],
+            parameters=_ws_rendered["function"]["parameters"],
+        ))
+
+    # ── E2: web_fetch (FP-0022: always in catalog; approval at handler level) ────
+    # ADR-0026 M3 Wave 1: rendered from unified ToolDefinition.
+    # FP-0022: removed catalog-level gate (was `if web_fetch_allowed`). The
+    # `web_fetch_allowed` parameter is kept for backward compat but ignored.
+    # Authorization is now enforced by handle_web_fetch() via the standard
+    # 4-layer PermissionResolver._approve() flow.
+    _wf = _registry.lookup("web_fetch")
+    if _wf is not None and _wf.gates.router == "allow":
+        _wf_rendered = _wf.render_for_router()
+        specs.append(ToolSpec(
+            name=_wf_rendered["function"]["name"],
+            description=_wf_rendered["function"]["description"],
+            parameters=_wf_rendered["function"]["parameters"],
+            dispatch_kind=_wf.dispatch_kind,
+        ))
+
+    # #1449: read_tool_result (the former E3 lazy-expand companion to web_fetch's
+    # preview path) is retired. Its same-host path-ref read is covered by
+    # read_file(path) — web_fetch's preview now points there — so the router
+    # catalog no longer surfaces a dedicated expand tool.
+
+    # ── F. Reyn-source tools (always present, no permission) ────────────────
+    #
+    # `reyn_repo_list` / `reyn_repo_read` give the agent read access to
+    # **Reyn's own** repository (= the project where pyproject.toml
+    # declares Reyn). They serve a single use case: when the user asks
+    # how Reyn works or wants a deep-dive into its implementation, the
+    # agent should answer from Reyn's source/docs, not web search.
+    #
+    # Why no permission gate: the resolver scopes paths to the Reyn
+    # repository tree, which is by definition public open-source content
+    # (= GitHub secret-scanning blocks credentials at push time, so
+    # nothing in the tree is sensitive). Operators don't configure this
+    # — it's an OS-internal capability, distinct from `file_*` (= which
+    # accesses the *user's* project files and IS permission-gated).
+    #
+    # Why two tools, not one: `list` lets the LLM discover the layout
+    # before reading; `read` returns the file body. Mirrors the file_*
+    # pair so the LLM's tool-use pattern is consistent across both
+    # Reyn-source and user-file access.
+
+    # ── F1: reyn_repo_list ────────────────────────────────────────────────────
+    _reyn_repo_list_def = _registry.lookup("reyn_repo_list")
+    if _reyn_repo_list_def is not None and _reyn_repo_list_def.gates.router == "allow":
+        _reyn_repo_list_rendered = _reyn_repo_list_def.render_for_router()
+        specs.append(ToolSpec(
+            name=_reyn_repo_list_rendered["function"]["name"],
+            description=_reyn_repo_list_rendered["function"]["description"],
+            parameters=_reyn_repo_list_rendered["function"]["parameters"],
+            dispatch_kind=_reyn_repo_list_def.dispatch_kind,
+        ))
+
+    # ── F2: reyn_repo_read ────────────────────────────────────────────────────
+    _reyn_repo_read_def = _registry.lookup("reyn_repo_read")
+    if _reyn_repo_read_def is not None and _reyn_repo_read_def.gates.router == "allow":
+        _reyn_repo_read_rendered = _reyn_repo_read_def.render_for_router()
+        specs.append(ToolSpec(
+            name=_reyn_repo_read_rendered["function"]["name"],
+            description=_reyn_repo_read_rendered["function"]["description"],
+            parameters=_reyn_repo_read_rendered["function"]["parameters"],
+            dispatch_kind=_reyn_repo_read_def.dispatch_kind,
+        ))
+
+    # FP-0066 P1b: the former § H (RAG tools: semantic_search / drop_source /
+    # index_update — ADR-0033 Phase 1 / FP-0057 Phase 2a / #3222) is retired.
+    # These agent-facing layer-1 in-core RAG tools were a pre-audience-split
+    # relic; see docs/deep-dives/proposals/0066-retrieval-two-groups-two-axes.md
+    # §9. The OS-internal substrate they rode (IndexUpdateIROp /
+    # SemanticSearchIROp / SqliteIndexBackend) is kept for later phases.
+
+    # ── #272/#1128: compact (voluntary history compaction) ─────────────────────
+    # Visibility-gated (like search_actions §D14): only advertised when the
+    # window is filling (compact_visible, paired with the context-size signal).
+    # Offering compact on an empty window is noise + nothing to compact; gates
+    # stay router=allow (permission), this controls when it's surfaced. Keeping
+    # it hidden on ample-window turns also leaves tools= (and LLMReplay fixtures
+    # keyed on it) byte-stable.
+    _compact_def = _registry.lookup("compact")
+    if compact_visible and _compact_def is not None and _compact_def.gates.router == "allow":
+        _compact_rendered = _compact_def.render_for_router()
+        specs.append(ToolSpec(
+            name=_compact_rendered["function"]["name"],
+            description=_compact_rendered["function"]["description"],
+            parameters=_compact_rendered["function"]["parameters"],
+            dispatch_kind=_compact_def.dispatch_kind,
+        ))
+
+    # ── #2692: present + render_template (presentation surface) ─────────────────
+    # part of the #2688 sweep. Unconditional (like compact above): present
+    # has no natural window-fill visibility gate — the agent may want to display
+    # bulk data on any turn, and read-authority is enforced at op-exec (data_ref ==
+    # file.read), not by catalog exclusion (the web_fetch posture). Registering one
+    # ToolDefinition each also opens the pipeline surface (bare-name lookup, gate-
+    # ignoring); this section is what surfaces them to the default enumerate-all
+    # chat LLM. Op handler + IR op model unchanged.
+    _present_def = _registry.lookup("present")
+    if _present_def is not None and _present_def.gates.router == "allow":
+        _present_rendered = _present_def.render_for_router()
+        specs.append(ToolSpec(
+            name=_present_rendered["function"]["name"],
+            description=_present_rendered["function"]["description"],
+            parameters=_present_rendered["function"]["parameters"],
+            dispatch_kind=_present_def.dispatch_kind,
+        ))
+
+    _render_template_def = _registry.lookup("render_template")
+    if _render_template_def is not None and _render_template_def.gates.router == "allow":
+        _render_template_rendered = _render_template_def.render_for_router()
+        specs.append(ToolSpec(
+            name=_render_template_rendered["function"]["name"],
+            description=_render_template_rendered["function"]["description"],
+            parameters=_render_template_rendered["function"]["parameters"],
+            dispatch_kind=_render_template_def.dispatch_kind,
+        ))
+
+    # ── #5012-A: describe_session (own write scope / position / auth status) ──
+    # Unconditional (like present/render_template above): no natural gating
+    # condition — cheap, read-only, relevant on any turn (e.g. before a write
+    # the model wants to know whether a path is in scope). Registering the
+    # ToolDefinition also opens the pipeline surface (bare-name lookup);
+    # this block is what surfaces it to the default enumerate-all chat LLM.
+    _describe_session_def = _registry.lookup("describe_session")
+    if _describe_session_def is not None and _describe_session_def.gates.router == "allow":
+        _describe_session_rendered = _describe_session_def.render_for_router()
+        specs.append(ToolSpec(
+            name=_describe_session_rendered["function"]["name"],
+            description=_describe_session_rendered["function"]["description"],
+            parameters=_describe_session_rendered["function"]["parameters"],
+            dispatch_kind=_describe_session_def.dispatch_kind,
+        ))
+
+    # ── D. MCP tools (permission-gated) ──────────────────────────────────────
+    #
+    # FP-0024 Component D: threshold-based switch.
+    # When the configured MCP server count >= mcp_search_threshold (and the
+    # threshold is > 0), substitute the three inline D1–D3 tools with a single
+    # Anthropic tool_search_tool meta-tool.  The LLM issues tool_search calls;
+    # Anthropic's server loads only the K most relevant MCP tool schemas on
+    # demand (Spring AI: 63–64% token reduction vs inline at 40+ servers).
+    #
+    # When below threshold: existing behavior — D1 list_mcp_servers, D2
+    # list_mcp_tools, D3 call_mcp_tool are all included inline as before.
+    #
+    # Note: mcp_servers here is a list of server config dicts (one per server).
+    # Each server can expose multiple tools, but the tool count is not known at
+    # this layer without async enumeration.  The threshold is applied against
+    # len(mcp_servers) as a proxy.  Callers may pass a higher
+    # mcp_search_threshold to keep inline mode if server-per-tool ratio is low.
+    if mcp_servers:
+        _mcp_count = len(mcp_servers)
+        _use_search_tool = (
+            mcp_search_threshold > 0
+            and _mcp_count >= mcp_search_threshold
+        )
+
+        if _use_search_tool:
+            # ── D-S: tool_search_tool (deferred-loading mode) ────────────────
+            # Build the per-server stub tool specs that the search meta-tool
+            # wraps.  Each stub carries the server's name and description so
+            # the search backend can match queries; the actual tool schemas are
+            # loaded on demand by Anthropic's infrastructure.
+            _mcp_stub_specs: list[dict] = []
+            for _srv in mcp_servers:
+                _mcp_stub_specs.append({
+                    "type": "function",
+                    "function": {
+                        "name": str(_srv.get("name", "")),
+                        "description": str(_srv.get("description", "")),
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                })
+            # Append the meta-tool directly (not wrapped in ToolSpec — its
+            # ``type`` is "tool_search_tool_20251101", not "function").
+            _search_tool = build_mcp_search_tool(_mcp_stub_specs)
+            # Emit as a raw dict; convert step at the end handles list[dict].
+            # We store it in a separate list and merge after ToolSpec conversion.
+            _mcp_search_tool_raw: list[dict] = [_search_tool]
+        else:
+            _mcp_search_tool_raw = []
+            # ── D1: list_mcp_servers ─────────────────────────────────────────
+            _list_mcp_servers_def = _registry.lookup("list_mcp_servers")
+            if _list_mcp_servers_def is not None and _list_mcp_servers_def.gates.router == "allow":
+                _list_mcp_servers_rendered = _list_mcp_servers_def.render_for_router()
+                specs.append(ToolSpec(
+                    name=_list_mcp_servers_rendered["function"]["name"],
+                    description=_list_mcp_servers_rendered["function"]["description"],
+                    parameters=_list_mcp_servers_rendered["function"]["parameters"],
+                    dispatch_kind=_list_mcp_servers_def.dispatch_kind,
+                ))
+
+            # ── D1b: list_mcp_subscriptions (#4686) ──────────────────────────
+            # Same threshold rule as D1: excluded under search-tool mode
+            # alongside it — a small, session-local (never a per-server
+            # schema, never a gateway call) discovery verb, so it rides
+            # D1's own on/off switch rather than getting a separate one.
+            _list_mcp_subscriptions_def = _registry.lookup("list_mcp_subscriptions")
+            if (
+                _list_mcp_subscriptions_def is not None
+                and _list_mcp_subscriptions_def.gates.router == "allow"
+            ):
+                _list_mcp_subscriptions_rendered = _list_mcp_subscriptions_def.render_for_router()
+                specs.append(ToolSpec(
+                    name=_list_mcp_subscriptions_rendered["function"]["name"],
+                    description=_list_mcp_subscriptions_rendered["function"]["description"],
+                    parameters=_list_mcp_subscriptions_rendered["function"]["parameters"],
+                    dispatch_kind=_list_mcp_subscriptions_def.dispatch_kind,
+                ))
+
+            # ── D2: list_mcp_tools ───────────────────────────────────────────
+            _list_mcp_tools_def = _registry.lookup("list_mcp_tools")
+            if _list_mcp_tools_def is not None and _list_mcp_tools_def.gates.router == "allow":
+                _list_mcp_tools_rendered = _list_mcp_tools_def.render_for_router()
+                specs.append(ToolSpec(
+                    name=_list_mcp_tools_rendered["function"]["name"],
+                    description=_list_mcp_tools_rendered["function"]["description"],
+                    parameters=_list_mcp_tools_rendered["function"]["parameters"],
+                    dispatch_kind=_list_mcp_tools_def.dispatch_kind,
+                ))
+
+            # ── D3: call_mcp_tool ────────────────────────────────────────────
+            # FP-0032: enum injection via _enrich_router_schema — builds a
+            # minimal RouterCallerState carrying mcp_servers so the enricher
+            # can inject server + mcp_tool_name enums (P4 alignment).
+            from reyn.tools.types import RouterCallerState as _RouterCallerState
+            _mcp_state = _RouterCallerState(mcp_servers=list(mcp_servers or []))
+            _call_mcp_tool_def = _registry.lookup("call_mcp_tool")
+            if _call_mcp_tool_def is not None and _call_mcp_tool_def.gates.router == "allow":
+                _call_mcp_tool_rendered = _call_mcp_tool_def.render_for_router(
+                    state=_mcp_state
+                )
+                specs.append(ToolSpec(
+                    name=_call_mcp_tool_rendered["function"]["name"],
+                    description=_call_mcp_tool_rendered["function"]["description"],
+                    parameters=_call_mcp_tool_rendered["function"]["parameters"],
+                    dispatch_kind=_call_mcp_tool_def.dispatch_kind,
+                ))
+
+            # ── D4: describe_mcp_tool ─────────────────────────────────────────
+            _describe_mcp_tool_def = _registry.lookup("describe_mcp_tool")
+            if _describe_mcp_tool_def is not None and _describe_mcp_tool_def.gates.router == "allow":
+                _describe_mcp_tool_rendered = _describe_mcp_tool_def.render_for_router(
+                    state=_mcp_state
+                )
+                specs.append(ToolSpec(
+                    name=_describe_mcp_tool_rendered["function"]["name"],
+                    description=_describe_mcp_tool_rendered["function"]["description"],
+                    parameters=_describe_mcp_tool_rendered["function"]["parameters"],
+                    dispatch_kind=_describe_mcp_tool_def.dispatch_kind,
+                ))
+
+            # ── #2597 slice ②a/②b/②c fix: D5–D11 resources/prompts/subscribe ──
+            #
+            # BUG: list_mcp_resources, list_mcp_resource_templates,
+            # read_mcp_resource, subscribe_mcp_resource,
+            # unsubscribe_mcp_resource, list_mcp_prompts, get_mcp_prompt were
+            # registered in get_default_registry() with gates.router="allow"
+            # and fully dispatchable, but had ZERO entries in build_tools() —
+            # the same "registered + dispatchable but never advertised" class
+            # of bug as #2589 (pipelines) and the #2120 session_spawn drift
+            # (see the B2b comment above). A real chat agent could never
+            # discover or call these seven verbs. All seven take a `server`
+            # arg (per tools/mcp.py's *_PARAMETERS dicts) and declare
+            # schema_enricher=_enrich_router_schema, so — exactly like D3/D4
+            # — they are rendered with the shared `_mcp_state` for the
+            # per-call `server` enum injection.
+
+            # ── D5: list_mcp_resources ───────────────────────────────────────
+            _list_mcp_resources_def = _registry.lookup("list_mcp_resources")
+            if _list_mcp_resources_def is not None and _list_mcp_resources_def.gates.router == "allow":
+                _list_mcp_resources_rendered = _list_mcp_resources_def.render_for_router(
+                    state=_mcp_state
+                )
+                specs.append(ToolSpec(
+                    name=_list_mcp_resources_rendered["function"]["name"],
+                    description=_list_mcp_resources_rendered["function"]["description"],
+                    parameters=_list_mcp_resources_rendered["function"]["parameters"],
+                    dispatch_kind=_list_mcp_resources_def.dispatch_kind,
+                ))
+
+            # ── D6: list_mcp_resource_templates ──────────────────────────────
+            _list_mcp_resource_templates_def = _registry.lookup("list_mcp_resource_templates")
+            if _list_mcp_resource_templates_def is not None and _list_mcp_resource_templates_def.gates.router == "allow":
+                _list_mcp_resource_templates_rendered = _list_mcp_resource_templates_def.render_for_router(
+                    state=_mcp_state
+                )
+                specs.append(ToolSpec(
+                    name=_list_mcp_resource_templates_rendered["function"]["name"],
+                    description=_list_mcp_resource_templates_rendered["function"]["description"],
+                    parameters=_list_mcp_resource_templates_rendered["function"]["parameters"],
+                    dispatch_kind=_list_mcp_resource_templates_def.dispatch_kind,
+                ))
+
+            # ── D7: read_mcp_resource ─────────────────────────────────────────
+            _read_mcp_resource_def = _registry.lookup("read_mcp_resource")
+            if _read_mcp_resource_def is not None and _read_mcp_resource_def.gates.router == "allow":
+                _read_mcp_resource_rendered = _read_mcp_resource_def.render_for_router(
+                    state=_mcp_state
+                )
+                specs.append(ToolSpec(
+                    name=_read_mcp_resource_rendered["function"]["name"],
+                    description=_read_mcp_resource_rendered["function"]["description"],
+                    parameters=_read_mcp_resource_rendered["function"]["parameters"],
+                    dispatch_kind=_read_mcp_resource_def.dispatch_kind,
+                ))
+
+            # ── D8: subscribe_mcp_resource ────────────────────────────────────
+            _subscribe_mcp_resource_def = _registry.lookup("subscribe_mcp_resource")
+            if _subscribe_mcp_resource_def is not None and _subscribe_mcp_resource_def.gates.router == "allow":
+                _subscribe_mcp_resource_rendered = _subscribe_mcp_resource_def.render_for_router(
+                    state=_mcp_state
+                )
+                specs.append(ToolSpec(
+                    name=_subscribe_mcp_resource_rendered["function"]["name"],
+                    description=_subscribe_mcp_resource_rendered["function"]["description"],
+                    parameters=_subscribe_mcp_resource_rendered["function"]["parameters"],
+                    dispatch_kind=_subscribe_mcp_resource_def.dispatch_kind,
+                ))
+
+            # ── D9: unsubscribe_mcp_resource ──────────────────────────────────
+            _unsubscribe_mcp_resource_def = _registry.lookup("unsubscribe_mcp_resource")
+            if _unsubscribe_mcp_resource_def is not None and _unsubscribe_mcp_resource_def.gates.router == "allow":
+                _unsubscribe_mcp_resource_rendered = _unsubscribe_mcp_resource_def.render_for_router(
+                    state=_mcp_state
+                )
+                specs.append(ToolSpec(
+                    name=_unsubscribe_mcp_resource_rendered["function"]["name"],
+                    description=_unsubscribe_mcp_resource_rendered["function"]["description"],
+                    parameters=_unsubscribe_mcp_resource_rendered["function"]["parameters"],
+                    dispatch_kind=_unsubscribe_mcp_resource_def.dispatch_kind,
+                ))
+
+            # ── D10: list_mcp_prompts ─────────────────────────────────────────
+            _list_mcp_prompts_def = _registry.lookup("list_mcp_prompts")
+            if _list_mcp_prompts_def is not None and _list_mcp_prompts_def.gates.router == "allow":
+                _list_mcp_prompts_rendered = _list_mcp_prompts_def.render_for_router(
+                    state=_mcp_state
+                )
+                specs.append(ToolSpec(
+                    name=_list_mcp_prompts_rendered["function"]["name"],
+                    description=_list_mcp_prompts_rendered["function"]["description"],
+                    parameters=_list_mcp_prompts_rendered["function"]["parameters"],
+                    dispatch_kind=_list_mcp_prompts_def.dispatch_kind,
+                ))
+
+            # ── D11: get_mcp_prompt ───────────────────────────────────────────
+            _get_mcp_prompt_def = _registry.lookup("get_mcp_prompt")
+            if _get_mcp_prompt_def is not None and _get_mcp_prompt_def.gates.router == "allow":
+                _get_mcp_prompt_rendered = _get_mcp_prompt_def.render_for_router(
+                    state=_mcp_state
+                )
+                specs.append(ToolSpec(
+                    name=_get_mcp_prompt_rendered["function"]["name"],
+                    description=_get_mcp_prompt_rendered["function"]["description"],
+                    parameters=_get_mcp_prompt_rendered["function"]["parameters"],
+                    dispatch_kind=_get_mcp_prompt_def.dispatch_kind,
+                ))
+    else:
+        _mcp_search_tool_raw = []
+
+    # ── I. Universal catalog wrappers (FP-0034 PR-3b-iv default-on) ──────────
+    #
+    # When universal_wrappers_enabled=True (= production default since
+    # PR-3b-iv, now reyn.yaml's tool_use.universal_wrappers_enabled per
+    # #4552 PR-3), append the 3 universal wrappers (list_actions /
+    # describe_action / invoke_action) at the END of the specs list per
+    # §D21.  The flag stays False for direct callers that don't pass it
+    # (= LLMReplay fixture-safe path).
+    #
+    # search_actions is visibility-gated per §D14: only exposed when
+    # ``embedding.enabled: true`` (FP-0066 §7 — operator opt-in, clean-break
+    # replacement for the retired ``action_retrieval.embedding_class`` gate)
+    # AND the ActionEmbeddingIndex is ready. RouterLoop computes
+    # ``search_actions_visible`` from both signals and passes it here.
+    # When not enabled the handler still degrades gracefully (returns
+    # ``{"items": [], "total": 0}``), but we don't expose the tool to
+    # avoid LLM confusion about a capability that isn't wired up.
+    if universal_wrappers_enabled:
+        # Default 3 wrappers always exposed when the flag is on.
+        # search_actions is added conditionally per §D14 only when the
+        # session has an ActionEmbeddingIndex ready AND the operator
+        # set ``embedding.enabled: true``.  Callers
+        # (= RouterLoop) compute ``search_actions_visible`` from both
+        # signals before invoking ``build_tools``.
+        _wrapper_names: tuple[str, ...] = (
+            ("list_actions", "search_actions", "describe_action", "invoke_action")
+            if search_actions_visible
+            else ("list_actions", "describe_action", "invoke_action")
+        )
+        for _wrapper_name in _wrapper_names:
+            _wrapper_def = _registry.lookup(_wrapper_name)
+            if _wrapper_def is None or _wrapper_def.gates.router != "allow":
+                continue
+            _wrapper_rendered = _wrapper_def.render_for_router()
+            specs.append(ToolSpec(
+                name=_wrapper_rendered["function"]["name"],
+                description=_wrapper_rendered["function"]["description"],
+                parameters=_wrapper_rendered["function"]["parameters"],
+                dispatch_kind=_wrapper_def.dispatch_kind,
+            ))
+
+    # ── J. Exclusive-wrapper mode: strip per-kind tools when wrappers on ──
+    #
+    # When universal_wrappers_enabled=True, strip every tool the wrappers already
+    # address so the LLM surface is the universal wrappers only.  Safety: only
+    # takes effect when the wrappers are also enabled (= the LLM still has *some*
+    # addressing path).
+    if universal_wrappers_enabled:
+        specs = [s for s in specs if s.name not in _wrapper_superseded_tool_names()]
+
+    # Convert ToolSpec list → OpenAI dict list (backward-compat return type).
+    # Append tool_search_tool raw dict last (D-S deferred mode only; empty
+    # list otherwise — no-op for the inline path).
+    return [spec.to_openai_dict() for spec in specs] + _mcp_search_tool_raw
+
+
+def _build_tools_via_registry(registry) -> list[dict]:
+    """Private helper for M2/M3 registry-driven tool building.
+
+    Produces the OpenAI tools[] list from a ToolRegistry's router-allowed
+    entries via ToolDefinition.render_for_router(). Used by M2/M3 capability
+    migrations; the public build_tools() function is unchanged.
+
+    Per ADR-0026 M1 adapter shim pattern: this helper exists so M2/M3 can
+    wire registry entries into the router surface without touching the
+    public API surface.
+    """
+    return [tool.render_for_router() for tool in registry.for_router()]

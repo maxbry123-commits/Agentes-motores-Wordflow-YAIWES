@@ -1,0 +1,93 @@
+---
+type: tutorial
+topic: getting-started
+audience: [human]
+---
+
+# 01 — インストール
+
+5 分以内に Reyn をインストールして動かします。
+
+## 前提条件
+
+- Python 3.11+
+- LiteLLM 互換のモデルエンドポイント（OpenAI、Google AI 経由の Gemini、Anthropic、または LiteLLM Proxy のようなローカルプロキシ）
+
+## インストール
+
+```bash
+git clone https://github.com/tya5/reyn.git
+cd reyn
+python -m venv venv
+source venv/bin/activate
+pip install -e '.[dev]'
+```
+
+`reyn` CLI が PATH に追加されます。
+
+## モデルを設定する
+
+Reyn は `reyn.yaml` からモデルを選択します。デフォルトは LiteLLM プロキシ経由の Gemini です。別のプロバイダーを使用するには、`llm.models` マップを編集します:
+
+```yaml
+# reyn.yaml
+llm:
+  model: standard
+  models:
+    light:    openai/gpt-4o-mini
+    standard: openai/gpt-4o
+    strong:   anthropic/claude-3-5-sonnet-20241022
+```
+
+上記の shorthand `<value>` は literal な model string (= `/` を含む) です。Reyn は
+built-in model catalog を ship していません — `light`/`standard`/`strong` は reyn 自身の
+tier 名ですが、それぞれが何を指すかはこのマッピング次第です。cost variant 用の dict form
+`extends` も利用できます。詳細は `reference/config/reyn-yaml.md` を参照。
+
+あなたの provider の API キーをエクスポートします。例:
+
+```bash
+export OPENAI_API_KEY=sk-...
+```
+
+litellm が provider ごとの変数を自動で解決します — あなたの provider が
+どの変数名を使うかは [litellm の provider docs](https://docs.litellm.ai/docs/providers)
+を参照してください。
+
+!!! warning "API キーは絶対にコミットしない"
+    キーは環境変数にのみ保存します。`reyn.yaml` はチェックインします。プロキシ URL は `reyn.local.yaml` や `~/.reyn/config.yaml`（gitignored）に書きます。
+
+## プロジェクトを初期化する
+
+作業ディレクトリで:
+
+```bash
+reyn init
+```
+
+これで `reyn.yaml` と `reyn.local.yaml.example` が存在しない場合に作成されます。
+
+## プロジェクトコンテキスト（任意）
+
+プロジェクトルートに `AGENTS.md` を置くと、Reyn がそれを毎セッションに
+プロジェクト固有のコンテキスト（規約、アーキテクチャのメモ、やること / 避けること）
+として注入します。`AGENTS.md` は Claude Code・Codex・opencode 等も読む cross-tool
+標準なので、それらツールと既に共有しているプロジェクトが Reyn 専用ファイルなしで
+そのまま動きます（legacy の `REYN.md` も fallback として有効）。別ファイルに固定
+したり無効化するには [`project_context_path`](../../reference/config/reyn-yaml.md) を
+参照してください。
+
+## 確認する
+
+```bash
+reyn skills          # stdlib + project + local のワークフローを一覧表示
+reyn run direct_llm "reyn is a workflow OS for LLMs."
+```
+
+2 番目のコマンドがサマリーを生成してクリーンに終了すれば、[02 — Chat モード](02-chat-mode.md) に進む準備ができています。
+
+## トラブルシューティング
+
+- **`reyn: command not found`** — venv がアクティブになっていません。`source venv/bin/activate` を実行してください。
+- **`AuthenticationError`** — API キーの環境変数が設定されていないか、`reyn.yaml` のモデルと一致していません。
+- **Proxy connection refused** — LiteLLM プロキシを起動するか、`reyn.local.yaml` から `api_base` を削除してください。

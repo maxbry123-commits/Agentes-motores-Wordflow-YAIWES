@@ -1,0 +1,291 @@
+# SEA release: build per-target Node SEA CLI, sign+notarize macOS, sign Windows, upload draft GitHub Release.
+# macOS secrets (match openclaw / electron-desktop): MACOS_CSC_LINK, MACOS_CSC_KEY_PASSWORD,
+# NOTARYTOOL_KEY, NOTARYTOOL_KEY_ID, NOTARYTOOL_ISSUER
+# Windows code-signing secrets (DigiCert KeyLocker, match electron-desktop): SM_API_KEY,
+# SM_CLIENT_CERT_FILE_B64, SM_CLIENT_CERT_PASSWORD, SM_CODE_SIGNING_CERT_SHA1_HASH
+
+name: Release (SEA)
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Create draft GitHub Release and upload artifacts"
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build (${{ matrix.slug }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { slug: darwin-arm64, os: macos-14 }
+          - { slug: linux-x64, os: ubuntu-22.04 }
+          # win32-x64 re-enabled after the Windows path bug in the build
+          # scripts (`new URL(...).pathname` → `fileURLToPath`) was fixed.
+          # windows-2022 ships MSVC build tools so `better-sqlite3` rebuilds
+          # natively during `npm ci`.
+          - { slug: win32-x64, os: windows-2022 }
+          # linux-arm64 re-enabled (#43): GitHub-hosted ubuntu-24.04-arm is
+          # available; BUNDLE_TARGETS / install.sh / fetch-assets already know
+          # the slug. Without this job the one-line installer 404s on ARM Linux.
+          - { slug: linux-arm64, os: ubuntu-24.04-arm }
+          # Still disabled (runner-availability / cost; out of scope for #43):
+          # - { slug: darwin-x64, os: macos-13 }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          # Node >= 25.7 introduced `"mainFormat": "module"` for Node SEA
+          # (#61813). Our CLI bundle is ESM due to top-level await in `ink`
+          # and other deps, so SEA must run it as an ES module. Node 22/24
+          # LTS would crash at boot with `SyntaxError: Cannot use import
+          # statement outside a module`.
+          node-version: "25.7"
+          check-latest: true
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck and build
+        run: npm run build
+
+      - name: Bundle CLI for SEA
+        env:
+          # Enables Sentry sourcemap upload in scripts/bundle-sea.ts; absent
+          # on forked-PR runs (no secrets access), which is the intended
+          # local/dev-parity fallback (build succeeds, upload just skips).
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+        run: npm run bundle:sea
+
+      - name: Fetch runtime assets (ripgrep for host)
+        run: npm run bundle:fetch-assets
+
+      - name: Build Node SEA binary
+        run: npm run bundle:build-binary
+
+      - name: Raise file descriptor limit (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          echo "Before: soft=$(ulimit -Sn) hard=$(ulimit -Hn)"
+          sudo launchctl limit maxfiles 524288 524288 2>/dev/null || true
+          ulimit -n 524288
+          echo "After: soft=$(ulimit -Sn) hard=$(ulimit -Hn)"
+
+      - name: Write notary API key to file (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          if [[ -n "${NOTARYTOOL_KEY_CONTENT}" ]]; then
+            KEY_PATH="${RUNNER_TEMP}/notary-key.p8"
+            echo "$NOTARYTOOL_KEY_CONTENT" > "$KEY_PATH"
+            chmod 600 "$KEY_PATH"
+            echo "NOTARYTOOL_KEY=$KEY_PATH" >> "$GITHUB_ENV"
+          fi
+        env:
+          NOTARYTOOL_KEY_CONTENT: ${{ secrets.NOTARYTOOL_KEY }}
+
+      - name: Sign (macOS)
+        if: runner.os == 'macOS'
+        env:
+          MACOS_CSC_LINK: ${{ secrets.MACOS_CSC_LINK }}
+          MACOS_CSC_KEY_PASSWORD: ${{ secrets.MACOS_CSC_KEY_PASSWORD }}
+        run: |
+          chmod +x scripts/sign-mac-binary.sh
+          ulimit -n 524288 2>/dev/null || true
+          "./scripts/sign-mac-binary.sh" "bundle/${{ matrix.slug }}/atomic-agent"
+
+      - name: Notarize (macOS)
+        if: runner.os == 'macOS'
+        env:
+          # NOTARYTOOL_KEY path (file) is appended to GITHUB_ENV in the write step
+          NOTARIZE: ${{ secrets.NOTARYTOOL_KEY != '' && secrets.MACOS_CSC_LINK != '' && '1' || '0' }}
+          NOTARYTOOL_KEY_ID: ${{ secrets.NOTARYTOOL_KEY_ID }}
+          NOTARYTOOL_ISSUER: ${{ secrets.NOTARYTOOL_ISSUER }}
+        run: |
+          chmod +x scripts/notarize-mac-binary.sh
+          if [[ "${NOTARIZE}" != "1" ]]; then
+            echo "Skipping notarization (missing notary and/or Apple signing secrets)"
+            exit 0
+          fi
+          if [[ -z "${NOTARYTOOL_KEY:-}" ]]; then
+            echo "NOTARYTOOL_KEY not set; skipping notarization"
+            exit 0
+          fi
+          "./scripts/notarize-mac-binary.sh" "bundle/${{ matrix.slug }}/atomic-agent"
+
+      # --- Windows code signing (DigiCert KeyLocker) -----------------------------
+      # We sign the SOURCE files BEFORE `Package bundle` copies them into the zip.
+      # PE Authenticode signatures live inside the file and survive a plain copy,
+      # so signing here yields a fully signed archive without splitting the
+      # stage/archive step. Targets: the SEA binary (already at bundle/<slug>/),
+      # plus the ripgrep and better-sqlite3 sources that package-bundle.ts pulls
+      # into vendor/ and node_modules/ later.
+      - name: Setup DigiCert KeyLocker (Windows)
+        if: matrix.slug == 'win32-x64'
+        shell: pwsh
+        env:
+          SM_API_KEY: ${{ secrets.SM_API_KEY }}
+          SM_CLIENT_CERT_FILE_B64: ${{ secrets.SM_CLIENT_CERT_FILE_B64 }}
+        run: |
+          $headers = @{ "x-api-key" = $env:SM_API_KEY }
+          $smctlUrl = "https://one.digicert.com/signingmanager/api-ui/v1/releases/smtools-windows-x64.msi/download"
+          Invoke-WebRequest -Uri $smctlUrl -Headers $headers -OutFile smtools.msi
+          Start-Process msiexec.exe -ArgumentList "/i", "smtools.msi", "/quiet", "/norestart" -Wait
+
+          $smctlPath = "C:\Program Files\DigiCert\DigiCert One Signing Manager Tools"
+          echo "$smctlPath" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+          $certBytes = [Convert]::FromBase64String($env:SM_CLIENT_CERT_FILE_B64)
+          $certPath = "$env:RUNNER_TEMP\digicert_client_cert.p12"
+          [IO.File]::WriteAllBytes($certPath, $certBytes)
+          echo "SM_CLIENT_CERT_FILE=$certPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Verify DigiCert KeyLocker setup (Windows)
+        if: matrix.slug == 'win32-x64'
+        shell: pwsh
+        env:
+          SM_API_KEY: ${{ secrets.SM_API_KEY }}
+          SM_CLIENT_CERT_PASSWORD: ${{ secrets.SM_CLIENT_CERT_PASSWORD }}
+          SM_HOST: https://clientauth.one.digicert.com
+        run: smctl healthcheck
+
+      - name: Sync certificates to Windows Store (Windows)
+        if: matrix.slug == 'win32-x64'
+        shell: pwsh
+        env:
+          SM_API_KEY: ${{ secrets.SM_API_KEY }}
+          SM_CLIENT_CERT_PASSWORD: ${{ secrets.SM_CLIENT_CERT_PASSWORD }}
+          SM_HOST: https://clientauth.one.digicert.com
+        run: smctl windows certsync
+
+      - name: Setup Windows SDK signtool (Windows)
+        if: matrix.slug == 'win32-x64'
+        shell: pwsh
+        run: |
+          $signtoolPath = Get-ChildItem -Path "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter "signtool.exe" -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -like "*\x64\*" } |
+            Sort-Object { [version]($_.FullName -replace '.*\\(\d+\.\d+\.\d+\.\d+)\\.*', '$1') } -Descending |
+            Select-Object -First 1
+
+          if ($signtoolPath) {
+            $signtoolDir = $signtoolPath.DirectoryName
+            Write-Host "Found signtool at: $signtoolDir"
+            echo "$signtoolDir" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          } else {
+            Write-Error "signtool.exe not found in Windows SDK"
+            exit 1
+          }
+
+      - name: Sign Windows binaries with DigiCert KeyLocker
+        if: matrix.slug == 'win32-x64'
+        shell: pwsh
+        env:
+          SM_API_KEY: ${{ secrets.SM_API_KEY }}
+          SM_CLIENT_CERT_PASSWORD: ${{ secrets.SM_CLIENT_CERT_PASSWORD }}
+          SM_CODE_SIGNING_CERT_SHA1_HASH: ${{ secrets.SM_CODE_SIGNING_CERT_SHA1_HASH }}
+          SM_HOST: https://clientauth.one.digicert.com
+        run: |
+          $ErrorActionPreference = "Stop"
+          $targets = @()
+
+          # SEA binary — signed in place; package-bundle.ts archives this dir as-is.
+          $sea = "bundle\win32-x64\atomic-agent.exe"
+          if (-not (Test-Path $sea)) {
+            Write-Error "SEA binary not found at $sea"
+            exit 1
+          }
+          $targets += (Get-Item $sea).FullName
+
+          # ripgrep source — package-bundle copies it into vendor/rg.exe later.
+          $rg = "assets\ripgrep\win32-x64\rg.exe"
+          if (Test-Path $rg) { $targets += (Get-Item $rg).FullName }
+
+          # better-sqlite3 native addon source — copied into node_modules/ later.
+          $sqlite = Get-ChildItem -Path "node_modules\better-sqlite3\build\Release" -Filter "*.node" -ErrorAction SilentlyContinue
+          foreach ($f in $sqlite) { $targets += $f.FullName }
+
+          Write-Host "Signing $($targets.Count) binaries"
+          foreach ($t in $targets) {
+            Write-Host "Signing: $t"
+            signtool sign /sha1 $env:SM_CODE_SIGNING_CERT_SHA1_HASH /tr http://timestamp.digicert.com /td SHA256 /fd SHA256 "$t"
+            signtool verify /pa "$t"
+          }
+      # --- end Windows code signing ---------------------------------------------
+
+      - name: Package bundle
+        run: npx tsx scripts/package-bundle.ts "${{ matrix.slug }}"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.slug }}
+          path: bundle/atomic-agent-${{ matrix.slug }}*
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: publish draft release
+    needs: build
+    if: success() && (github.ref_type == 'tag' || (github.event_name == 'workflow_dispatch' && inputs.publish == true))
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          pattern: release-*
+          merge-multiple: true
+
+      - name: Determine tag
+        id: tag
+        run: |
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=v$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create draft release and upload assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.tag.outputs.tag }}"
+          cd release-assets
+          ls -la
+          gh release create "$TAG" --draft --title "$TAG" --generate-notes 2>/dev/null || true
+          for f in *; do
+            if [[ -f "$f" ]]; then
+              echo "Uploading: $f"
+              gh release upload "$TAG" "$f" --clobber
+            fi
+          done
+          echo "Draft release: $TAG (review and publish on GitHub)"

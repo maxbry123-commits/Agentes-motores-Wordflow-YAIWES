@@ -1,0 +1,28 @@
+# Sample pipeline — the minimal end-to-end example.
+#
+# This file is NOT registered by merely sitting in this directory — pipelines
+# are registered only via an explicit `pipelines.entries.<key>` declaration
+# in config (see docs/concepts/runtime/pipeline-registration.md). To make
+# this one live, either add:
+#
+#     pipelines:
+#       entries:
+#         greetings:              # the entry KEY is a pure namespace label
+#           path: pipelines/hello.yaml
+#
+#   to reyn.yaml, or call `pipeline_install_local` with this
+#   file's path. Namespacing is always on (#2722): every pipeline registers
+#   as `{entry-key}.{pipeline-name}`, so the `pipeline: hello` doc below
+#   registers as `greetings.hello`. The entry key does NOT need to equal the
+#   declared name — it is just the namespace. Live immediately via hot-reload
+#   (no session restart needed).
+#
+# An agent can then launch it by its fully-qualified name:
+#     run_pipeline(name="greetings.hello", input={name: "Reyn"})
+#
+# It is a single pure `transform` step so it runs with no external tools —
+# safe to keep as a live smoke/dogfood pipeline.
+pipeline: hello
+description: Minimal greeting pipeline — concatenates the seed `name` into a greeting.
+steps:
+  - transform: {value: "'Hello, ' + ctx.name + '!'", output: greeting}

@@ -1,0 +1,59 @@
+name: zizmor (workflow static analysis)
+
+# zizmor performs static analysis on GitHub Actions workflows to surface
+# supply-chain and configuration risks (unpinned actions, command injection
+# vectors, excessive permissions, etc.). Findings are surfaced to GitHub
+# Code Scanning as SARIF.
+#
+# Ref: #1273
+
+on:
+  push:
+    branches: [main]
+    # Same scope as the pull_request trigger: a merge that touches no
+    # workflow or action file has nothing for zizmor to re-analyze.
+    paths:
+      - ".github/workflows/**"
+      - ".github/actions/**"
+  pull_request:
+    paths:
+      - ".github/workflows/**"
+      - ".github/actions/**"
+  schedule:
+    - cron: "55 4 * * 0"  # Weekly, Sunday 04:55 UTC
+  workflow_dispatch:
+
+concurrency:
+  group: zizmor-${{ github.ref }}
+  # Cancel superseded runs only for PRs. A push-to-main scan must never be
+  # cancelled by the next merge landing seconds later: a cancelled run shows
+  # grey, not red, so the earlier commit would silently lose its scan.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  zizmor:
+    name: zizmor static analysis
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      security-events: write
+      contents: read
+      actions: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run zizmor
+        uses: zizmorcore/zizmor-action@3dc1ecc9bcb9e94e9b2c709687979e1298497054  # v0.6.2
+        with:
+          # Upload SARIF to Code Scanning even on findings; CI does not fail
+          # the build on findings, GH Security tab is the source of truth.
+          advanced-security: true
+          # The default repository token can be rejected by external action
+          # tag lookups. Keep this required workflow on offline audits.
+          online-audits: false

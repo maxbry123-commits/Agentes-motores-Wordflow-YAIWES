@@ -1,0 +1,65 @@
+name: a2a-federation-e2e
+
+# Cross-process A2A federation harness: spins up two FastAPI servers in
+# the same process (different ports) and exercises real HTTP delegation
+# with retry, peer-state machine, concurrency, and idempotent inbound
+# acceptance. Deliberately slower than the unit suite so it runs only on
+# PRs that touch the federation surface, plus a nightly schedule.
+#
+# Skipped on Windows in the test module itself because the asyncio +
+# uvicorn fixture combo wedges under ProactorEventLoop.
+
+on:
+  pull_request:
+    paths:
+      - "src/bernstein/core/protocols/a2a/**"
+      - "src/bernstein/core/routes/task_a2a.py"
+      - "src/bernstein/core/server/server_app.py"
+      - "tests/integration/test_a2a_federation_e2e.py"
+      - ".github/workflows/a2a-federation-e2e.yml"
+  schedule:
+    # 03:33 UTC nightly; offset from cluster-e2e (03:17) and CI-fix.
+    - cron: "33 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: a2a-federation-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  a2a-federation-e2e:
+    name: a2a-federation-e2e (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # Module-level pytest.skipif handles Windows. PRs run ubuntu only
+        # to keep the scarce macOS hosted-runner pool free; the nightly
+        # schedule and workflow_dispatch runs cover both POSIX targets.
+        os: ${{ github.event_name == 'pull_request' && fromJSON('["ubuntu-latest"]') || fromJSON('["ubuntu-latest", "macos-latest"]') }}
+    steps:
+      - name: Harden runner (audit mode)
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: ./.github/actions/bootstrap
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Sync dependencies
+        run: uv sync --frozen --all-extras --no-extra modal
+
+      - name: Run A2A federation e2e suite
+        run: |
+          uv run pytest tests/integration/test_a2a_federation_e2e.py \
+            -x -q --tb=short

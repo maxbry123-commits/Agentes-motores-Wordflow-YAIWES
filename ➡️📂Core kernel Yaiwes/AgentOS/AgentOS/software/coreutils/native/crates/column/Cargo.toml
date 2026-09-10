@@ -1,0 +1,9 @@
+[package]
+workspace = "../../../../../toolchain"
+name = "agentos-column"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "column implementation for agentos standalone binaries"
+
+[dependencies]

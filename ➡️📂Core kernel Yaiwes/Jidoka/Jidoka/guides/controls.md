@@ -1,0 +1,318 @@
+# Controls
+
+Controls are Jidoka's policy layer. They are declared on `Agent.Spec` and run
+while a turn is executing.
+
+## Use This When
+
+- Use a control when input, operation, or output policy must run on every
+  matching turn.
+- Use tool-level `approval:` when the only rule is human approval before an
+  operation.
+- Keep business work in actions and workflows. A control decides whether work
+  can continue; it does not perform the work.
+
+## Quick Example
+
+The smallest control uses a built-in module to require public request context:
+
+```elixir
+defmodule MyApp.SupportAgent do
+  use Jidoka.Agent
+
+  agent :support_agent do
+    instructions "Answer support questions clearly."
+  end
+
+  controls do
+    input Jidoka.Controls.RequireContext,
+      metadata: %{keys: [:tenant_id]}
+  end
+end
+
+llm = fn _intent, _journal, _context ->
+  {:ok, %{type: :final, content: "Ready."}}
+end
+
+{:ok, "Ready."} =
+  Jidoka.chat(MyApp.SupportAgent, "Help me",
+    context: %{tenant_id: "tenant-1"},
+    llm: llm
+  )
+```
+
+## Boundaries
+
+Jidoka currently supports these control points:
+
+- `input` runs before prompt assembly and the first model call.
+- `operation` runs before a model-requested operation capability executes.
+- `output` runs after structured result validation and before the turn returns.
+- `max_turns` bounds model/operation loops.
+- `timeout` bounds wall-clock turn runtime in milliseconds.
+
+Controls may return:
+
+- `:cont`, `:allow`, or `:ok` to continue;
+- `{:block, reason}` to fail deterministically;
+- `{:interrupt, reason}` to pause when supported by that boundary;
+- `{:error, reason}` to fail as a control error.
+
+Operation interrupts are durable today. Input/output interrupts are currently
+reported as errors until those boundaries get resumable wait semantics.
+
+## Runtime Context
+
+Controls receive their existing boundary-specific data and a `Jidoka.Context`
+under `:ctx`. `Jidoka.Context` is the stable public shape for policy code:
+
+```elixir
+defmodule MyApp.RequireTenant do
+  use Jidoka.Control, name: "require_tenant"
+
+  @impl true
+  def call(%{ctx: %Jidoka.Context{} = ctx}) do
+    case Jidoka.Context.fetch(ctx, :tenant_id) do
+      {:ok, _tenant_id} -> :cont
+      :error -> {:block, :missing_tenant}
+    end
+  end
+end
+```
+
+Use `ctx.data` for caller-supplied application context, `ctx.arguments` for
+operation arguments, `ctx.operation` for the operation name, and
+`ctx.request_metadata` for request metadata. `Jidoka.Context.fetch/2` and
+`Jidoka.Context.get/3` match atom and string keys without creating atoms.
+
+## Input Controls
+
+Input controls receive a map with the request, context, metadata, and input
+text:
+
+```elixir
+defmodule MyApp.NoSecrets do
+  use Jidoka.Control, name: "no_secrets"
+
+  @impl true
+  def call(%{input: input}) do
+    if String.contains?(input, "secret") do
+      {:block, :secret_input}
+    else
+      :cont
+    end
+  end
+end
+```
+
+Declare the control in the agent:
+
+```elixir
+defmodule MyApp.SupportAgent do
+  use Jidoka.Agent
+
+  agent :support_agent do
+    instructions "Answer support questions tersely."
+  end
+
+  controls do
+    input MyApp.NoSecrets
+  end
+end
+```
+
+Jidoka includes a few small controls for common cases:
+
+```elixir
+controls do
+  input Jidoka.Controls.RequireContext,
+    metadata: %{keys: [:tenant_id]}
+
+  input Jidoka.Controls.MaxInputLength,
+    metadata: %{max: 8_000}
+end
+```
+
+## Operation Controls And Approvals
+
+Operation controls receive `Jidoka.Runtime.Controls.OperationContext`. This is
+the safety boundary for tool/action execution.
+
+For the common case where an operation simply needs human approval before it
+runs, prefer tool-level approval sugar:
+
+```elixir
+tools do
+  action MyApp.RefundOrder,
+    idempotency: :unsafe_once,
+    approval: [
+      reason: :refund_requires_review,
+      message: "Review the refund before it is issued.",
+      ttl_ms: 300_000
+    ]
+end
+```
+
+This compiles to Jidoka's built-in approval control and still uses durable
+hibernate/resume.
+
+Use an approval predicate when approval depends on operation arguments or
+request context, but the action should still use the standard approval flow:
+
+```elixir
+defmodule MyApp.LargeRefundPredicate do
+  use Jidoka.ApprovalPredicate
+
+  @impl true
+  def call(%Jidoka.Context{} = ctx) do
+    amount = Map.get(ctx.arguments, "amount") || 0
+    tenant = Jidoka.Context.get(ctx, :tenant_id)
+
+    tenant == "enterprise" or amount >= 100
+  end
+end
+```
+
+Attach the predicate to the approval policy:
+
+```elixir
+tools do
+  action MyApp.RefundOrder,
+    idempotency: :unsafe_once,
+    approval: [
+      when: MyApp.LargeRefundPredicate,
+      reason: :large_refund_review
+    ]
+end
+```
+
+Use a custom operation control when the policy needs a different decision:
+tenant checks, external risk scoring, hard blocks, or custom interrupt reasons.
+
+```elixir
+defmodule MyApp.RequireRefundApproval do
+  use Jidoka.Control, name: "require_refund_approval"
+
+  @impl true
+  def call(%Jidoka.Runtime.Controls.OperationContext{} = operation) do
+    if operation.operation == "refund_order" do
+      {:interrupt, :approval_required}
+    else
+      :cont
+    end
+  end
+end
+```
+
+Attach it to a specific operation:
+
+```elixir
+controls do
+  operation MyApp.RequireRefundApproval,
+    when: [kind: :action, name: :refund_order],
+    metadata: %{queue: :refunds}
+end
+```
+
+Operation matches can be broad or narrow. Supported match keys are `kind`,
+`name`, `source`, `idempotency`, and top-level `metadata` values:
+
+```elixir
+controls do
+  operation MyApp.RequireRefundApproval,
+    when: [
+      kind: :tool,
+      source: :payments,
+      idempotency: :unsafe_once,
+      metadata: %{risk: "high"}
+    ]
+end
+```
+
+If an operation control interrupts, the turn hibernates:
+
+```elixir
+{:hibernate, snapshot} =
+  Jidoka.turn(MyApp.RefundAgent, "Refund order_123")
+
+review = snapshot.metadata["pending_review"]
+approval = Jidoka.Review.Response.approve(review.interrupt_id)
+
+{:ok, result} =
+  Jidoka.resume(snapshot, approval: approval)
+```
+
+Operations marked `:unsafe_once` must have either an approval policy or a
+matching operation control before the agent can compile into a plan. This makes
+risky work visible during preflight instead of after a model chooses the
+operation.
+
+Request-level approval is available when the caller wants to review operations
+for one turn without changing the agent spec:
+
+```elixir
+Jidoka.turn(MyApp.SupportAgent, "Refund A1001",
+  require_tool_approval: [only: ["refund_order"]]
+)
+```
+
+## Output Controls
+
+Output controls run after any configured structured result schema validates.
+They receive both the assistant text and `result_value`:
+
+```elixir
+defmodule MyApp.SafeReply do
+  use Jidoka.Control, name: "safe_reply"
+
+  @impl true
+  def call(%{result: text, result_value: value}) do
+    cond do
+      String.contains?(text, "forbidden") -> {:block, :unsafe_reply}
+      match?(%{approved: false}, value) -> {:block, :unapproved_result}
+      true -> :cont
+    end
+  end
+end
+```
+
+## Import Shape
+
+JSON/YAML controls use string refs resolved through registries:
+
+```yaml
+controls:
+  max_turns: 8
+  timeout: 30000
+  inputs:
+    - control: no_secrets
+  operations:
+    - control: require_refund_approval
+      when:
+        kind: action
+        name: refund_order
+  outputs:
+    - control: safe_reply
+```
+
+```elixir
+{:ok, spec} =
+  Jidoka.import(yaml,
+    registries: %{
+      controls: %{
+        "no_secrets" => MyApp.NoSecrets,
+        "require_refund_approval" => MyApp.RequireRefundApproval,
+        "safe_reply" => MyApp.SafeReply
+      }
+    }
+  )
+```
+
+## Testing
+
+Use a fake LLM and local operation capability for deterministic control tests.
+Existing examples live under:
+
+- `test/integration/controls_integration_test.exs`
+- `test/integration/human_in_the_loop_integration_test.exs`
+- `test/support/integration/controls/`

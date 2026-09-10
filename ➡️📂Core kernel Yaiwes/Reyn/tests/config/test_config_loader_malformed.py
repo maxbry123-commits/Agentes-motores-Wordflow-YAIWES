@@ -1,0 +1,100 @@
+"""Tier 2: load_config survives a malformed top-level value (no uncaught crash).
+
+Found via bug-mining (2026-06-20). `models:` or `permissions:` written as a
+scalar/list in reyn.yaml (a user typo) crashed `load_config` with an uncaught
+`AttributeError` (`.items()` on a str) / `ValueError` (`dict()` on a non-pair
+list) — `(merged.get("models") or {})` guards None but not a truthy non-dict.
+
+A config loader must degrade gracefully on operator misconfiguration: the
+malformed block defaults to empty (with a warning), and a valid config in the
+same file still loads.
+
+Falsification: pre-fix each malformed case raised; the valid-config test proves
+the guard doesn't swallow good config.
+"""
+from __future__ import annotations
+
+from pathlib import Path
+
+from reyn.config import load_config
+
+
+def _load(tmp_path: Path, yaml_text: str):
+    (tmp_path / "reyn.yaml").write_text(yaml_text, encoding="utf-8")
+    return load_config(tmp_path)
+
+
+def test_models_as_string_does_not_crash(tmp_path) -> None:
+    """Tier 2: `llm.models: <string>` defaults to empty instead of crashing.
+
+    #4174 T3: `models:` moved under `llm:`."""
+    cfg = _load(tmp_path, "llm:\n  models: not-a-dict\n")
+    assert dict(cfg.llm.models) == {}
+
+
+def test_models_as_list_does_not_crash(tmp_path) -> None:
+    """Tier 2: `llm.models: [..]` defaults to empty instead of crashing."""
+    cfg = _load(tmp_path, "llm:\n  models: [1, 2, 3]\n")
+    assert dict(cfg.llm.models) == {}
+
+
+def test_permissions_as_list_does_not_crash(tmp_path) -> None:
+    """Tier 2: `permissions: [..]` defaults to empty instead of crashing.
+
+    Falsification: pre-fix `dict([a, b])` raised ValueError (non-pair list).
+    """
+    cfg = _load(tmp_path, "permissions: [a, b]\n")
+    assert cfg.permissions == {}
+
+
+def test_mcp_as_string_does_not_crash(tmp_path) -> None:
+    """Tier 2: `mcp: <string>` defaults to empty instead of an unclear crash.
+
+    Falsification: pre-fix `dict("str")` raised ValueError (non-pair sequence).
+    """
+    cfg = _load(tmp_path, "mcp: not-a-dict\n")
+    assert cfg.mcp == {}
+
+
+def test_mcp_as_list_does_not_crash(tmp_path) -> None:
+    """Tier 2: `mcp: [..]` defaults to empty instead of crashing."""
+    cfg = _load(tmp_path, "mcp: [1, 2, 3]\n")
+    assert cfg.mcp == {}
+
+
+def test_valid_models_still_loads(tmp_path) -> None:
+    """Tier 2: a well-formed models block is unaffected by the guard (regression)."""
+    cfg = _load(tmp_path, "llm:\n  models:\n    light: openai/gpt-4o\n    standard: claude-sonnet\n")
+    assert dict(cfg.llm.models) == {"light": "openai/gpt-4o", "standard": "claude-sonnet"}
+
+
+def test_fail_loud_sections_still_raise_clear_error(tmp_path) -> None:
+    """Tier 2: the intentional fail-loud sections are NOT made lenient.
+
+    `tool_use` (a behavior-selecting block) deliberately raises a clear
+    'must be a mapping' ValueError on a malformed value — the resilience guard
+    must not silence that distinct convention. Falsification: if the guard were
+    over-applied to the builders, this would load instead of raising.
+    """
+    import pytest
+    (tmp_path / "reyn.yaml").write_text("tool_use: not-a-dict\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="must be a mapping"):
+        load_config(tmp_path)
+
+
+def test_yaml_parse_error_logs_warning_and_falls_back(tmp_path, caplog) -> None:
+    """Tier 2: an unparseable reyn.yaml logs a warning naming the file (#3368).
+
+    Found via bug-mining (2026-07-26): `_load_yaml`'s `except Exception:
+    return {}` swallowed parse failures with zero signal, indistinguishable
+    from the file not existing at all — an operator's malformed
+    reyn.yaml/reyn.local.yaml silently lost its entire `models:`/`permissions:`
+    section. Falsification: pre-fix, no log record was emitted here.
+    """
+    import logging
+
+    (tmp_path / "reyn.yaml").write_text("models: [unterminated\n", encoding="utf-8")
+    with caplog.at_level(logging.WARNING, logger="reyn.config.loader"):
+        cfg = load_config(tmp_path)
+    assert dict(cfg.llm.models) == {}
+    assert any("reyn.yaml" in r.message for r in caplog.records)

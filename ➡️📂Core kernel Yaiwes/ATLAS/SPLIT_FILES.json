@@ -1,0 +1,9 @@
+[
+  {
+    "repo": "ATLAS",
+    "path": "geometric-lens/geometric_lens/models/gx_weights.json",
+    "chunks_dir": "ATLAS/geometric-lens/geometric_lens/models/gx_weights.json.chunks",
+    "bytes": 11121217,
+    "chunk_bytes": 8388608
+  }
+]

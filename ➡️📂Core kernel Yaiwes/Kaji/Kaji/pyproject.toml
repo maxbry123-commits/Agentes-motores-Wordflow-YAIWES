@@ -1,0 +1,86 @@
+[project]
+name = "kaji"
+version = "0.20.1"
+description = "AI-driven software development workflow orchestrator"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [
+    {name = "apokamo"}
+]
+maintainers = [
+    {name = "apokamo"}
+]
+keywords = ["ai", "agent", "workflow", "orchestrator", "claude", "codex"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+dependencies = [
+    "pyyaml>=6.0",
+    "jq>=1.6",
+    "pydantic>=2",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-cov>=4.0.0",
+    "pytest-xdist>=3.0.0",
+    "ruff>=0.4.0",
+    "mypy>=1.10.0",
+    "setuptools>=77.0.0",
+    "types-PyYAML>=6.0",
+    "markdown-it-py>=3.0",
+]
+
+[project.scripts]
+kaji = "kaji_harness.cli_main:main"
+
+[project.urls]
+Homepage = "https://github.com/apokamo/kaji"
+Repository = "https://github.com/apokamo/kaji"
+Issues = "https://github.com/apokamo/kaji/issues"
+Changelog = "https://github.com/apokamo/kaji/blob/main/CHANGELOG.md"
+
+[build-system]
+requires = ["setuptools>=77.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["kaji_harness*"]
+
+[tool.setuptools.package-data]
+kaji_harness = ["assets/interactive-terminal/wrapper.sh"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "B", "UP"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_return_any = true
+warn_unused_ignores = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short -n auto"
+markers = [
+    "small: Small tests - no external dependencies",
+    "medium: Medium tests - file I/O, mock processes",
+    "large: Large tests - real CLI, E2E",
+    "large_local: Large tests with subprocess but no external network (Phase 3-e+)",
+    "large_forge: Large tests requiring real GitHub API (post-recovery)",
+    "gh_version_probe: opt out of the autouse GitHubProvider._detect_gh_version stub (Issue #372)",
+]

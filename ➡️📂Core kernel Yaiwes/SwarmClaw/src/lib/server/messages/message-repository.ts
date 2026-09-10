@@ -1,0 +1,422 @@
+import type { Message, Session } from '@/types'
+import { perf } from '@/lib/server/runtime/perf'
+import { log } from '@/lib/server/logger'
+import { getDb, withTransaction, loadSession, patchSession } from '@/lib/server/storage'
+import { notify } from '@/lib/server/ws-hub'
+
+const TAG = 'message-repo'
+const MAX_SUMMARY_TEXT = 280
+
+// ---------------------------------------------------------------------------
+// Prepared statements — lazily created so the db is fully initialised first
+// ---------------------------------------------------------------------------
+
+type Stmts = ReturnType<typeof buildStatements>
+let _stmts: Stmts | null = null
+
+function stmts(): Stmts {
+  if (!_stmts) _stmts = buildStatements()
+  return _stmts
+}
+
+function buildStatements() {
+  const db = getDb()
+  return {
+    selectAll: db.prepare(
+      'SELECT data FROM session_messages WHERE session_id = ? ORDER BY seq ASC',
+    ),
+    selectCount: db.prepare(
+      'SELECT COUNT(*) as count FROM session_messages WHERE session_id = ?',
+    ),
+    selectLast: db.prepare(
+      'SELECT data FROM session_messages WHERE session_id = ? ORDER BY seq DESC LIMIT 1',
+    ),
+    selectRecent: db.prepare(
+      'SELECT data FROM session_messages WHERE session_id = ? ORDER BY seq DESC LIMIT ?',
+    ),
+    selectMaxSeq: db.prepare(
+      'SELECT MAX(seq) as maxSeq FROM session_messages WHERE session_id = ?',
+    ),
+    insert: db.prepare(
+      'INSERT INTO session_messages (session_id, seq, data) VALUES (?, ?, ?)',
+    ),
+    update: db.prepare(
+      'UPDATE session_messages SET data = ? WHERE session_id = ? AND seq = ?',
+    ),
+    deleteAfter: db.prepare(
+      'DELETE FROM session_messages WHERE session_id = ? AND seq > ?',
+    ),
+    deleteAll: db.prepare(
+      'DELETE FROM session_messages WHERE session_id = ?',
+    ),
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+function nextSeq(sessionId: string): number {
+  const row = stmts().selectMaxSeq.get(sessionId) as { maxSeq: number | null } | undefined
+  return (row?.maxSeq ?? -1) + 1
+}
+
+function rowCount(sessionId: string): number {
+  return (stmts().selectCount.get(sessionId) as { count: number }).count
+}
+
+function parseMsg(raw: string): Message | null {
+  try {
+    return JSON.parse(raw) as Message
+  } catch {
+    return null
+  }
+}
+
+function summarizeForMeta(message: Message): Message {
+  return {
+    role: message.role,
+    text: typeof message.text === 'string' ? message.text.slice(0, MAX_SUMMARY_TEXT) : '',
+    time: message.time,
+    kind: message.kind,
+    source: message.source,
+    suppressed: message.suppressed,
+    streaming: message.streaming,
+    bookmarked: message.bookmarked,
+  }
+}
+
+function getLastAssistantAt(messages: Message[]): number | null {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === 'assistant' && typeof messages[i].time === 'number') {
+      return messages[i].time
+    }
+  }
+  return null
+}
+
+function compactDeprecatedBlobMessages(
+  sessionId: string,
+  persistedCount: number,
+  lastMsg: Message | null,
+  lastAssistantAt: number | null,
+): boolean {
+  let compacted = false
+  patchSession(sessionId, (current) => {
+    if (!current) return null
+    const blobCount = Array.isArray(current.messages) ? current.messages.length : 0
+    if (blobCount === 0) return current
+    if (persistedCount < blobCount) return current
+
+    current.messages = []
+    current.messageCount = persistedCount
+    current.lastMessageSummary = lastMsg ? summarizeForMeta(lastMsg) : null
+    if (lastAssistantAt !== null) current.lastAssistantAt = lastAssistantAt
+    compacted = true
+    return current
+  })
+  return compacted
+}
+
+// ---------------------------------------------------------------------------
+// Session metadata sync — keeps messageCount / lastMessageSummary on the blob
+// ---------------------------------------------------------------------------
+
+function syncSessionMeta(sessionId: string): void {
+  const count = rowCount(sessionId)
+  const lastRow = stmts().selectLast.get(sessionId) as { data: string } | undefined
+  const lastMsg = lastRow ? parseMsg(lastRow.data) : null
+
+  patchSession(sessionId, (current) => {
+    if (!current) return null
+    current.messageCount = count
+    current.lastMessageSummary = lastMsg ? summarizeForMeta(lastMsg) : null
+    if (lastMsg?.role === 'assistant' && typeof lastMsg.time === 'number') {
+      current.lastAssistantAt = lastMsg.time
+    }
+    current.lastActiveAt = Date.now()
+    return current
+  })
+}
+
+function notifyMessageTopics(sessionId: string, action: string): void {
+  notify('messages', action, sessionId)
+  notify(`messages:${sessionId}`, action)
+}
+
+// ---------------------------------------------------------------------------
+// Lazy migration — copies blob messages → table on first access
+// ---------------------------------------------------------------------------
+
+function ensureMigrated(sessionId: string): void {
+  if (rowCount(sessionId) > 0) return
+  lazyMigrateSession(sessionId)
+}
+
+function lazyMigrateSession(sessionId: string): Message[] | null {
+  const session = loadSession(sessionId)
+  if (!session || !Array.isArray(session.messages) || session.messages.length === 0) {
+    return null
+  }
+
+  const messages = session.messages
+  log.info(TAG, `Lazy-migrating ${messages.length} messages for session ${sessionId}`)
+
+  withTransaction(() => {
+    // Double-check inside transaction to prevent duplicate migration
+    if (rowCount(sessionId) > 0) return
+
+    const ins = stmts().insert
+    for (let i = 0; i < messages.length; i++) {
+      ins.run(sessionId, i, JSON.stringify(messages[i]))
+    }
+
+    // Compute metadata before compacting deprecated blob storage.
+    const lastMsg = messages[messages.length - 1]
+    const lastAssistantAt = getLastAssistantAt(messages)
+    const persistedCount = rowCount(sessionId)
+
+    patchSession(sessionId, (current) => {
+      if (!current) return null
+      current.messages = persistedCount >= messages.length ? [] : current.messages
+      current.messageCount = messages.length
+      current.lastMessageSummary = lastMsg ? summarizeForMeta(lastMsg) : null
+      if (lastAssistantAt !== null && typeof current.lastAssistantAt !== 'number') {
+        current.lastAssistantAt = lastAssistantAt
+      }
+      return current
+    })
+  })
+
+  return messages
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/** Return all messages for a session, ordered by sequence. */
+export function getMessages(sessionId: string): Message[] {
+  return perf.measureSync('message-repo', 'getMessages', () => {
+    const rows = stmts().selectAll.all(sessionId) as Array<{ data: string }>
+
+    // Lazy migration: populate table from session blob on first read
+    if (rows.length === 0) {
+      const migrated = lazyMigrateSession(sessionId)
+      if (migrated) return migrated
+    }
+
+    const out: Message[] = []
+    for (const row of rows) {
+      const m = parseMsg(row.data)
+      if (m) out.push(m)
+    }
+    compactDeprecatedBlobMessages(sessionId, out.length, out[out.length - 1] || null, getLastAssistantAt(out))
+    return out
+  }, { sessionId })
+}
+
+/** Return message count (from table, with blob fallback pre-migration). */
+export function getMessageCount(sessionId: string): number {
+  return perf.measureSync('message-repo', 'getMessageCount', () => {
+    const count = rowCount(sessionId)
+    if (count > 0) return count
+    // Pre-migration fallback
+    const session = loadSession(sessionId)
+    return Array.isArray(session?.messages) ? session.messages.length : 0
+  }, { sessionId })
+}
+
+/** Return the last message (from table, with blob fallback). */
+export function getLastMessage(sessionId: string): Message | null {
+  return perf.measureSync('message-repo', 'getLastMessage', () => {
+    const row = stmts().selectLast.get(sessionId) as { data: string } | undefined
+    if (row) return parseMsg(row.data)
+    const session = loadSession(sessionId)
+    const msgs = session?.messages
+    return Array.isArray(msgs) && msgs.length > 0 ? msgs[msgs.length - 1] : null
+  }, { sessionId })
+}
+
+/** Return the last N messages in chronological order. */
+export function getRecentMessages(sessionId: string, n: number): Message[] {
+  return perf.measureSync('message-repo', 'getRecentMessages', () => {
+    const rows = stmts().selectRecent.all(sessionId, n) as Array<{ data: string }>
+    if (rows.length > 0) {
+      const out: Message[] = []
+      for (const row of rows) {
+        const m = parseMsg(row.data)
+        if (m) out.push(m)
+      }
+      return out.reverse() // DESC → ASC
+    }
+    // Pre-migration fallback
+    const session = loadSession(sessionId)
+    return Array.isArray(session?.messages) ? session.messages.slice(-n) : []
+  }, { sessionId, n })
+}
+
+/** Append a single message. Returns the assigned sequence number. */
+export function appendMessage(sessionId: string, message: Message): number {
+  return perf.measureSync('message-repo', 'appendMessage', () => {
+    ensureMigrated(sessionId)
+    const seq = nextSeq(sessionId)
+    stmts().insert.run(sessionId, seq, JSON.stringify(message))
+    syncSessionMeta(sessionId)
+    notifyMessageTopics(sessionId, 'append')
+    return seq
+  }, { sessionId })
+}
+
+/** Append multiple messages in a single transaction. */
+export function appendMessages(sessionId: string, messages: Message[]): void {
+  if (!messages.length) return
+  perf.measureSync('message-repo', 'appendMessages', () => {
+    ensureMigrated(sessionId)
+    withTransaction(() => {
+      let seq = nextSeq(sessionId)
+      const ins = stmts().insert
+      for (const msg of messages) {
+        ins.run(sessionId, seq++, JSON.stringify(msg))
+      }
+    })
+    syncSessionMeta(sessionId)
+    notifyMessageTopics(sessionId, 'append')
+  }, { sessionId, count: messages.length })
+}
+
+/** Replace the message at a given sequence number (e.g. replace-last-assistant). */
+export function replaceMessageAt(sessionId: string, seq: number, message: Message): void {
+  perf.measureSync('message-repo', 'replaceMessageAt', () => {
+    stmts().update.run(JSON.stringify(message), sessionId, seq)
+    syncSessionMeta(sessionId)
+    notifyMessageTopics(sessionId, 'update')
+  }, { sessionId, seq })
+}
+
+/** Delete all messages with seq > the given value (edit-and-resend). */
+export function truncateAfter(sessionId: string, seq: number): void {
+  perf.measureSync('message-repo', 'truncateAfter', () => {
+    stmts().deleteAfter.run(sessionId, seq)
+    syncSessionMeta(sessionId)
+    notifyMessageTopics(sessionId, 'truncate')
+  }, { sessionId, seq })
+}
+
+/** Remove all messages for a session. */
+export function clearMessages(sessionId: string): void {
+  perf.measureSync('message-repo', 'clearMessages', () => {
+    stmts().deleteAll.run(sessionId)
+    syncSessionMeta(sessionId)
+    notifyMessageTopics(sessionId, 'clear')
+  }, { sessionId })
+}
+
+/** Replace the entire message list (used after in-memory prune operations). */
+export function replaceAllMessages(sessionId: string, messages: Message[]): void {
+  perf.measureSync('message-repo', 'replaceAllMessages', () => {
+    // Safety guard: reload current user messages from DB and ensure none are
+    // dropped by the replacement. This prevents races where partial persistence
+    // or finalization load a stale snapshot that's missing recently-appended
+    // user messages.
+    const currentRows = stmts().selectAll.all(sessionId) as Array<{ data: string }>
+    const currentUserMessages: Message[] = []
+    for (const row of currentRows) {
+      const m = parseMsg(row.data)
+      if (m && m.role === 'user') currentUserMessages.push(m)
+    }
+    const replacementUserTimes = new Set(
+      messages.filter(m => m.role === 'user' && typeof m.time === 'number').map(m => m.time),
+    )
+    const missingUsers = currentUserMessages.filter(
+      m => typeof m.time === 'number' && !replacementUserTimes.has(m.time),
+    )
+    if (missingUsers.length > 0) {
+      // Re-insert missing user messages at their correct position (before the
+      // first assistant message that follows them chronologically).
+      for (const user of missingUsers) {
+        let insertIdx = messages.length
+        for (let i = 0; i < messages.length; i++) {
+          if (messages[i].role === 'assistant' && typeof messages[i].time === 'number'
+              && (messages[i].time as number) >= (user.time as number)) {
+            insertIdx = i
+            break
+          }
+        }
+        messages.splice(insertIdx, 0, user)
+      }
+    }
+    withTransaction(() => {
+      stmts().deleteAll.run(sessionId)
+      const ins = stmts().insert
+      for (let i = 0; i < messages.length; i++) {
+        ins.run(sessionId, i, JSON.stringify(messages[i]))
+      }
+    })
+    syncSessionMeta(sessionId)
+    notifyMessageTopics(sessionId, 'replace')
+  }, { sessionId, count: messages.length })
+}
+
+/** Cleanup: delete all rows for a session (called on session delete). */
+export function deleteSessionMessages(sessionId: string): void {
+  stmts().deleteAll.run(sessionId)
+}
+
+// ---------------------------------------------------------------------------
+// Bulk migration (for CLI / admin endpoint)
+// ---------------------------------------------------------------------------
+
+export function migrateAllSessions(): {
+  migrated: number
+  compacted: number
+  skipped: number
+  total: number
+} {
+  const db = getDb()
+  const rows = db.prepare('SELECT id, data FROM sessions').all() as Array<{ id: string; data: string }>
+  let migrated = 0
+  let compacted = 0
+  let skipped = 0
+
+  for (const row of rows) {
+    try {
+      const session = JSON.parse(row.data) as Session
+      if (!Array.isArray(session.messages) || session.messages.length === 0) {
+        skipped++
+        continue
+      }
+
+      const persistedCount = rowCount(row.id)
+      if (persistedCount > 0) {
+        const persistedRows = stmts().selectAll.all(row.id) as Array<{ data: string }>
+        const persistedMessages: Message[] = []
+        for (const persistedRow of persistedRows) {
+          const message = parseMsg(persistedRow.data)
+          if (message) persistedMessages.push(message)
+        }
+        if (compactDeprecatedBlobMessages(
+          row.id,
+          persistedCount,
+          persistedMessages[persistedMessages.length - 1] || null,
+          getLastAssistantAt(persistedMessages),
+        )) {
+          compacted++
+        }
+        skipped++
+        continue
+      }
+
+      lazyMigrateSession(row.id)
+      migrated++
+      const stored = loadSession(row.id)
+      if (!Array.isArray(stored?.messages) || stored.messages.length === 0) {
+        compacted++
+      }
+    } catch {
+      skipped++
+    }
+  }
+
+  return { migrated, compacted, skipped, total: rows.length }
+}

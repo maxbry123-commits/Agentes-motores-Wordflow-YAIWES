@@ -1,0 +1,26 @@
+cff-version: 1.2.0
+message: "Please cite Agent Handoff using this metadata."
+title: "Agent Handoff: GitHub-native context handoff for AI coding agents"
+authors:
+  - family-names: "Boyko"
+    given-names: "Artyom"
+version: "1.5.1"
+date-released: 2026-07-27
+url: "https://github.com/artyomboyko/Agent_Handoff"
+repository-code: "https://github.com/artyomboyko/Agent_Handoff"
+license: "GPL-3.0-only"
+keywords:
+  - "ai-agents"
+  - "coding-agents"
+  - "agent-handoff"
+  - "github-workflow"
+  - "agent-memory"
+  - "multi-agent-system"
+  - "handoff-protocol"
+  - "outcome-oriented-execution"
+  - "bounded-supporting-work"
+  - "actionable-review-handoff"
+  - "review-correction"
+  - "proportionate-security"
+  - "docker-compose"
+  - "containerization"

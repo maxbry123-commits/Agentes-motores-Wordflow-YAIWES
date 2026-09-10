@@ -1,0 +1,16 @@
+[
+  {
+    "repo": "Atomic-Chat",
+    "path": "demo.gif",
+    "chunks_dir": "Atomic-Chat/demo.gif.chunks",
+    "bytes": 10350070,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "Atomic-Chat",
+    "path": "docs/src/pages/docs/desktop/_assets/jan-v2-vl-demo.gif",
+    "chunks_dir": "Atomic-Chat/docs/src/pages/docs/desktop/_assets/jan-v2-vl-demo.gif.chunks",
+    "bytes": 48031758,
+    "chunk_bytes": 8388608
+  }
+]

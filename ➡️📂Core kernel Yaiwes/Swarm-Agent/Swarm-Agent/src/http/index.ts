@@ -1,0 +1,727 @@
+import {
+  createServer as createHttpServer,
+  type IncomingMessage,
+  type Server,
+  type ServerResponse,
+} from "node:http";
+import { ensure, initialize } from "@desplega.ai/business-use";
+import type { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { getEnabledCapabilities, hasCapability } from "@/server";
+import { initAgentMail } from "../agentmail";
+import { closeDb, getSwarmConfigs, upsertSwarmConfig } from "../be/db";
+import {
+  enqueueAuditRow,
+  flushAuditBuffer,
+  startAuditGc,
+  startAuditWriter,
+  stopAuditGc,
+  stopAuditWriter,
+} from "../be/rbac-audit";
+import { startScratchScriptGc, stopScratchScriptGc } from "../be/scripts/retention";
+import { seedLegacyCapabilitiesConfig } from "../be/seed-capabilities";
+import { initGitHub } from "../github";
+import { initGitLab } from "../gitlab";
+import { stopHeartbeat } from "../heartbeat";
+import { initJira } from "../jira";
+import { initLinear } from "../linear";
+import {
+  initOtel,
+  isPollTracingEnabled,
+  startSpan,
+  withRemoteContext,
+  withSpanContext,
+} from "../otel";
+import { startQueueStallAlarm, stopQueueStallAlarm } from "../queue-stall-alarm";
+import { clearAuditSink, isRbacEnabled, setAuditSink } from "../rbac";
+import { startScriptRunSupervisor, stopScriptRunSupervisor } from "../script-workflows/supervisor";
+import { getServerSessionsProcessed } from "../server-runtime-counters";
+import { startSlackApp, stopSlackApp } from "../slack";
+import { initTelemetry, telemetry } from "../telemetry";
+import { getApiKey } from "../utils/api-key";
+import { getMcpBaseUrl } from "../utils/constants";
+import { isEnvFlagEnabled } from "../utils/env-flag";
+import { scrubSecrets } from "../utils/secret-scrubber";
+import { initWorkflows } from "../workflows";
+import { handleActiveSessions } from "./active-sessions";
+import { handleAgentRegister, handleAgentsRest } from "./agents";
+import { handleApiKeys } from "./api-keys";
+import { handleApprovalRequests } from "./approval-requests";
+import { handleApps } from "./apps";
+import { handleAssets } from "./assets";
+import { handleBudgets } from "./budgets";
+import { handleCodexOAuthKeepWarm } from "./codex-oauth-keep-warm";
+import { handleConfig } from "./config";
+import { handleContext } from "./context";
+import { handleCore, loadGlobalConfigsIntoEnv } from "./core";
+import { handleDbQuery } from "./db-query";
+import { handleEcosystem } from "./ecosystem";
+import { handleEvents } from "./events";
+import { handleFavorites } from "./favorites";
+import { handleFs } from "./fs";
+import { handleHeartbeat } from "./heartbeat";
+import { handleInboxState } from "./inbox-state";
+import { handleIntegrations } from "./integrations";
+import { handleKv } from "./kv";
+import {
+  closeIdleMcpTransports,
+  DEFAULT_MCP_TRANSPORT_IDLE_TIMEOUT_MS,
+  handleMcp,
+  type McpSessionAgents,
+  type McpTransportActivity,
+} from "./mcp";
+import { handleMcpBridge } from "./mcp-bridge";
+import { handleMcpOAuth } from "./mcp-oauth";
+import { handleMcpServers } from "./mcp-servers";
+import { closeIdleMcpUserTransports, handleMcpUser } from "./mcp-user";
+import { handleMemory, startMemoryGc, stopMemoryGc } from "./memory";
+import { handleMetrics } from "./metrics";
+import { handleModelsCatalog } from "./models-catalog";
+import { handleOAuthCallback, startOAuthPendingGc, stopOAuthPendingGc } from "./oauth-callback";
+import { handleGenericOAuth } from "./oauth-generic";
+import { handleOAuthLocks } from "./oauth-locks";
+import { handlePageProxy } from "./page-proxy";
+import { handlePages } from "./pages";
+import { handlePagesPublic } from "./pages-public";
+import { handlePoll } from "./poll";
+import { handlePricing } from "./pricing";
+import { handlePromptTemplates } from "./prompt-templates";
+import { handleRepos } from "./repos";
+import { describeRequestRoute } from "./route-def";
+import { handleSchedules } from "./schedules";
+import { handleScriptConnectionProxy } from "./script-connection-proxy";
+import { handleScriptConnections } from "./script-connections";
+import { handleScriptRuns } from "./script-runs";
+import { handleScripts } from "./scripts";
+import { handleSessionData } from "./session-data";
+import { handleSessions } from "./sessions";
+import { handleSkills } from "./skills";
+import { handleStats } from "./stats";
+import { handleStatus } from "./status";
+import { handleTaskTemplates } from "./task-templates";
+import { handleTasks } from "./tasks";
+import { handleTrackers } from "./trackers";
+import { handleUsers } from "./users";
+import {
+  getPathSegments,
+  httpServerSemconvAttributes,
+  parseQueryParams,
+  safeRequestUrlForLog,
+  setCorsHeaders,
+} from "./utils";
+import { handleWebhooks } from "./webhooks";
+import { handleWorkflowEvents } from "./workflow-events";
+import { handleWorkflows } from "./workflows";
+import { handleX } from "./x";
+
+// Last-line-of-defense: never let a single bad request (e.g. a SQLITE_BUSY
+// thrown out of a transaction callback) kill the API process. Log and keep going.
+process.on("uncaughtException", (err) => {
+  console.error("[fatal] uncaughtException:", err);
+});
+process.on("unhandledRejection", (reason) => {
+  console.error("[fatal] unhandledRejection:", reason);
+});
+
+const port = parseInt(process.env.PORT || process.argv[2] || "3013", 10);
+const apiKey = getApiKey();
+
+// Use globalThis to persist state across hot reloads
+const globalState = globalThis as typeof globalThis & {
+  __httpServer?: Server<typeof IncomingMessage, typeof ServerResponse>;
+  __transports?: Record<string, StreamableHTTPServerTransport>;
+  __mcpSessionAgents?: McpSessionAgents;
+  __transportsUser?: Record<string, StreamableHTTPServerTransport>;
+  __sessionUsers?: Record<string, string>;
+  __transportActivity?: McpTransportActivity;
+  __transportActivityUser?: McpTransportActivity;
+  __sigintRegistered?: boolean;
+  __apiGcInterval?: ReturnType<typeof setInterval>;
+  __runId?: string;
+};
+
+const API_GC_INTERVAL_MS = 5 * 60 * 1000;
+const MCP_TRANSPORT_IDLE_TIMEOUT_MS = DEFAULT_MCP_TRANSPORT_IDLE_TIMEOUT_MS;
+const serverStartedAt = Date.now();
+let shutdownSignal = "unknown";
+
+type GcCapableGlobal = typeof globalThis & { gc?: () => void };
+
+function scheduleApiGc(reason: string): boolean {
+  const gc = (globalThis as GcCapableGlobal).gc;
+  if (typeof gc !== "function") return false;
+
+  const timer = setTimeout(() => {
+    const startedAt = Date.now();
+    try {
+      gc();
+      console.log(`[HTTP] Explicit GC completed after ${reason} in ${Date.now() - startedAt}ms`);
+    } catch (err) {
+      console.warn(`[HTTP] Explicit GC failed after ${reason}: ${err}`);
+    }
+  }, 0);
+  timer.unref?.();
+  return true;
+}
+
+function startApiGcInterval() {
+  if (globalState.__apiGcInterval) return;
+
+  const gc = (globalThis as GcCapableGlobal).gc;
+  if (typeof gc !== "function") {
+    console.log("[HTTP] Explicit GC unavailable; idle MCP transport sweeps remain enabled");
+  }
+
+  const interval = setInterval(() => {
+    const closedOwnerTransports = closeIdleMcpTransports(transports, transportActivity, {
+      idleTimeoutMs: MCP_TRANSPORT_IDLE_TIMEOUT_MS,
+      label: "MCP",
+      onClose: (id) => {
+        delete mcpSessionAgents[id];
+      },
+    });
+    const closedUserTransports = closeIdleMcpUserTransports(
+      transportsUser,
+      sessionUsers,
+      transportActivityUser,
+      { idleTimeoutMs: MCP_TRANSPORT_IDLE_TIMEOUT_MS },
+    );
+    if (closedOwnerTransports > 0 || closedUserTransports > 0) {
+      console.log(
+        `[HTTP] Closed ${closedOwnerTransports} owner MCP and ${closedUserTransports} user MCP idle transport(s)`,
+      );
+    }
+    scheduleApiGc("periodic API sweep");
+  }, API_GC_INTERVAL_MS);
+  interval.unref?.();
+  globalState.__apiGcInterval = interval;
+}
+
+// Clean up previous server on hot reload
+if (globalState.__httpServer) {
+  console.log("[HTTP] Hot reload detected, closing previous server...");
+  globalState.__httpServer.close();
+}
+
+const transports: Record<string, StreamableHTTPServerTransport> = globalState.__transports ?? {};
+const mcpSessionAgents: McpSessionAgents = globalState.__mcpSessionAgents ?? {};
+const transportsUser: Record<string, StreamableHTTPServerTransport> =
+  globalState.__transportsUser ?? {};
+const sessionUsers: Record<string, string> = globalState.__sessionUsers ?? {};
+const transportActivity: McpTransportActivity = globalState.__transportActivity ?? {};
+const transportActivityUser: McpTransportActivity = globalState.__transportActivityUser ?? {};
+
+const httpServer = createHttpServer(async (req, res) => {
+  const startTime = performance.now();
+  let statusCode = 200;
+  let spanEnded = false;
+
+  // Wrap writeHead to capture status code
+  const originalWriteHead = res.writeHead.bind(res);
+  res.writeHead = (code: number, ...args: unknown[]) => {
+    statusCode = code;
+    // @ts-expect-error - writeHead has multiple overloads
+    return originalWriteHead(code, ...args);
+  };
+
+  // Log request completion
+  const logRequest = () => {
+    const elapsed = (performance.now() - startTime).toFixed(1);
+    const statusEmoji = statusCode >= 400 ? "⚠️" : "✓";
+    console.log(
+      `[HTTP] ${statusEmoji} ${req.method} ${safeRequestUrlForLog(req.url)} → ${statusCode} (${elapsed}ms)`,
+    );
+  };
+
+  // Ensure we log on response finish
+  res.on("finish", logRequest);
+
+  // Log errors
+  res.on("error", (err) => {
+    console.error(
+      `[HTTP] ❌ ${req.method} ${safeRequestUrlForLog(req.url)} → Error: ${scrubSecrets(err.message)}`,
+    );
+  });
+
+  await withRemoteContext(req.headers as Record<string, unknown>, async () => {
+    const reqPath = req.url?.split("?")[0] ?? "";
+    const pathSegments = getPathSegments(req.url || "");
+    const skipSpan = reqPath === "/api/poll" && !isPollTracingEnabled();
+    // Per OTel HTTP semantic conventions: span name is `{METHOD} {route-template}`
+    // and `http.route` carries the bounded-cardinality template so SigNoz can
+    // group/filter/aggregate by endpoint as a first-class field. `http.route` is
+    // omitted (not fabricated) for unmatched core/MCP/404 paths. Raw path stays
+    // on `url.path`.
+    const { spanName, httpRoute } = describeRequestRoute(req.method, pathSegments);
+    // Standard OTel HTTP server semconv attributes — host, scheme, protocol
+    // version, user-agent (the method/path/route/status are set inline below).
+    const semconv = httpServerSemconvAttributes(req);
+    const span = skipSpan
+      ? null
+      : startSpan(spanName, {
+          "http.request.method": req.method ?? "",
+          "url.path": reqPath,
+          "url.scheme": semconv["url.scheme"],
+          "http.route": httpRoute,
+          "server.address": semconv["server.address"],
+          "network.protocol.version": semconv["network.protocol.version"],
+          "user_agent.original": semconv["user_agent.original"],
+          "agent.id": req.headers["x-agent-id"] as string | undefined,
+          "agentswarm.component": "api",
+        });
+
+    if (span) {
+      res.on("finish", () => {
+        if (spanEnded) return;
+        spanEnded = true;
+        span.setAttributes({
+          "http.response.status_code": statusCode,
+          "agentswarm.http.duration_ms": Math.round((performance.now() - startTime) * 10) / 10,
+        });
+        if (statusCode >= 500) {
+          span.setStatus({ code: 2, message: `HTTP ${statusCode}` });
+        }
+        span.end();
+      });
+
+      res.on("error", (err) => {
+        if (spanEnded) return;
+        spanEnded = true;
+        span.recordException(err);
+        span.setStatus({ code: 2, message: err.message });
+        span.end();
+      });
+    }
+
+    // Run request handling inside the HTTP span's active context so any spans
+    // created downstream (MCP `mcp.tool` spans, future DB/auto-instrumentation)
+    // nest under it instead of attaching to the root with no parent.
+    const handleRequest = async () => {
+      setCorsHeaders(req, res);
+
+      const queryParams = parseQueryParams(req.url || "");
+      const myAgentId = req.headers["x-agent-id"] as string | undefined;
+
+      // ── Route handlers (order matters — first match wins) ──
+      const handlers: (() => Promise<boolean>)[] = [
+        () => handleAgentRegister(req, res, pathSegments, myAgentId),
+        () => handlePoll(req, res, pathSegments, queryParams, myAgentId),
+        () => handleSessionData(req, res, pathSegments, queryParams, myAgentId),
+        () => handleEcosystem(req, res, pathSegments, myAgentId),
+        () => handleTrackers(req, res, pathSegments),
+        () => handleWebhooks(req, res, pathSegments),
+        () => handleAgentsRest(req, res, pathSegments, queryParams, myAgentId),
+        () => handleBudgets(req, res, pathSegments, queryParams, myAgentId),
+        () => handleContext(req, res, pathSegments, queryParams, myAgentId),
+        () => handleAssets(req, res, pathSegments, queryParams, myAgentId),
+        () => handleTasks(req, res, pathSegments, queryParams, myAgentId),
+        () => handleStats(req, res, pathSegments, queryParams, myAgentId),
+        () => handleStatus(req, res, pathSegments, queryParams),
+        () => handleActiveSessions(req, res, pathSegments, queryParams, myAgentId),
+        () => handlePricing(req, res, pathSegments, queryParams, myAgentId),
+        () => handleSchedules(req, res, pathSegments, queryParams, myAgentId),
+        () => handleWorkflows(req, res, pathSegments, queryParams, myAgentId),
+        () => handleWorkflowEvents(req, res, pathSegments, queryParams),
+        () => handleApprovalRequests(req, res, pathSegments, queryParams),
+        () => handleApps(req, res, pathSegments, queryParams, myAgentId),
+        () => handleConfig(req, res, pathSegments, queryParams),
+        () => handleFs(req, res, pathSegments, queryParams, myAgentId),
+        () => handleKv(req, res, pathSegments, queryParams),
+        () => handleIntegrations(req, res, pathSegments),
+        () => handlePromptTemplates(req, res, pathSegments, queryParams),
+        () => handleDbQuery(req, res, pathSegments, queryParams),
+        () => handleMetrics(req, res, pathSegments, queryParams, myAgentId),
+        () => handleModelsCatalog(req, res, pathSegments, queryParams),
+        () => handleRepos(req, res, pathSegments, queryParams),
+        () => handleSkills(req, res, pathSegments, queryParams, myAgentId),
+        () => handleScriptConnections(req, res, pathSegments, queryParams, myAgentId),
+        () => handleScriptConnectionProxy(req, res, pathSegments, queryParams, myAgentId),
+        () => handleScriptRuns(req, res, pathSegments, queryParams, myAgentId),
+        () => handleScripts(req, res, pathSegments, queryParams, myAgentId),
+        () => handleX(req, res, pathSegments),
+        () => handleMcpBridge(req, res, pathSegments, queryParams, myAgentId),
+        () => handleMcpServers(req, res, pathSegments, queryParams),
+        () => handleMcpOAuth(req, res, pathSegments, queryParams),
+        () => handleMemory(req, res, pathSegments, myAgentId),
+        () => handleOAuthLocks(req, res, pathSegments, queryParams),
+        () => handleOAuthCallback(req, res, pathSegments, queryParams),
+        () => handleGenericOAuth(req, res, pathSegments, queryParams),
+        () => handleCodexOAuthKeepWarm(req, res, pathSegments),
+        () => handlePagesPublic(req, res, pathSegments, queryParams),
+        () => handlePageProxy(req, res),
+        () => handlePages(req, res, pathSegments, queryParams, myAgentId),
+        () => handleApiKeys(req, res, pathSegments, queryParams),
+        () => handleHeartbeat(req, res, pathSegments),
+        () => handleEvents(req, res, pathSegments, queryParams, myAgentId),
+        () => handleFavorites(req, res, pathSegments, queryParams, myAgentId),
+        () => handleUsers(req, res, pathSegments, queryParams),
+        () => handleSessions(req, res, pathSegments, queryParams),
+        () => handleInboxState(req, res, pathSegments, queryParams),
+        () => handleTaskTemplates(req, res, pathSegments, queryParams),
+        () => handleMcp(req, res, transports, transportActivity, mcpSessionAgents),
+        () => handleMcpUser(req, res, transportsUser, sessionUsers, transportActivityUser),
+      ];
+
+      try {
+        // ── Core routes (OPTIONS, health, auth, /me, /cancelled-tasks, /ping, /close) ──
+        // Inside the try: handleCore used to run before it, so a throw there
+        // (observed in prod: a BUSY_SNAPSHOT from updateAgentStatus) escaped
+        // the async listener as an unhandled rejection and the client got a
+        // dropped connection instead of a 500.
+        if (await handleCore(req, res, myAgentId, apiKey)) return;
+
+        for (const handler of handlers) {
+          if (await handler()) return;
+        }
+
+        // ── 404 ──
+        res.writeHead(404);
+        res.end("Not Found");
+      } catch (err) {
+        if (span) {
+          span.recordException(err);
+          span.setStatus({ code: 2, message: err instanceof Error ? err.message : String(err) });
+        }
+        const message = err instanceof Error ? err.message : String(err);
+        console.error(
+          `[HTTP] ❌ ${req.method} ${safeRequestUrlForLog(req.url)} → ${scrubSecrets(message)}`,
+        );
+        if (!res.headersSent) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: message }));
+        } else if (!res.writableEnded) {
+          res.end();
+        }
+      }
+    };
+
+    if (span) {
+      await withSpanContext(span, handleRequest);
+    } else {
+      await handleRequest();
+    }
+  });
+});
+
+// Store references in globalThis for hot reload persistence
+globalState.__httpServer = httpServer;
+globalState.__transports = transports;
+globalState.__transportsUser = transportsUser;
+globalState.__mcpSessionAgents = mcpSessionAgents;
+globalState.__sessionUsers = sessionUsers;
+globalState.__transportActivity = transportActivity;
+globalState.__transportActivityUser = transportActivityUser;
+
+async function shutdown() {
+  console.log("Shutting down HTTP server...");
+  telemetry.server("shutdown", {
+    signal: shutdownSignal,
+    uptimeMs: Date.now() - serverStartedAt,
+    sessionsProcessed: getServerSessionsProcessed(),
+  });
+
+  // Stop scheduler (if enabled)
+  if (hasCapability("scheduling")) {
+    const { stopScheduler } = await import("../scheduler");
+    stopScheduler();
+  }
+
+  // Stop heartbeat triage
+  stopHeartbeat();
+
+  // Stop the out-of-band queue alarm before disconnecting its Slack notifier.
+  stopQueueStallAlarm();
+
+  // Stop durable script workflow subprocesses
+  await stopScriptRunSupervisor();
+
+  // Stop Slack bot
+  await stopSlackApp();
+
+  // Stop OAuth keepalive
+  if (process.env.OAUTH_KEEPALIVE_DISABLE !== "true") {
+    const { stopOAuthKeepalive } = await import("../oauth/keepalive");
+    await stopOAuthKeepalive();
+  }
+
+  // Stop the unified OAuth pending-session garbage collector (all flows)
+  stopOAuthPendingGc();
+
+  // Stop memory expired-row garbage collector
+  stopMemoryGc();
+
+  // Stop scratch-script retention garbage collector
+  stopScratchScriptGc();
+
+  // Stop RBAC audit: retention GC, flush interval, final drain, detach sink
+  stopAuditGc();
+  stopAuditWriter();
+  await flushAuditBuffer();
+  clearAuditSink();
+
+  if (globalState.__apiGcInterval) {
+    clearInterval(globalState.__apiGcInterval);
+    delete globalState.__apiGcInterval;
+  }
+
+  // Close all active transports (SSE connections, etc.)
+  for (const [id, transport] of Object.entries(transports)) {
+    console.log(`[HTTP] Closing transport ${id}`);
+    void transport.close();
+    delete transports[id];
+    delete mcpSessionAgents[id];
+    delete transportActivity[id];
+  }
+
+  for (const [id, transport] of Object.entries(transportsUser)) {
+    console.log(`[HTTP] Closing user transport ${id}`);
+    void transport.close();
+    delete transportsUser[id];
+    delete sessionUsers[id];
+    delete transportActivityUser[id];
+  }
+
+  // Close all active connections forcefully
+  httpServer.closeAllConnections();
+  httpServer.close(() => {
+    closeDb();
+    console.log("MCP HTTP server closed, and database connection closed");
+    process.exit(0);
+  });
+}
+
+// Only register signal handlers once (avoid duplicates on hot reload)
+if (!globalState.__sigintRegistered) {
+  globalState.__sigintRegistered = true;
+  // A rejected shutdown must not become an unhandled rejection: the signal
+  // handler is the last code that runs, so an error here is the only chance to
+  // learn why the process failed to exit cleanly.
+  process.on("SIGINT", () => {
+    shutdownSignal = "SIGINT";
+    shutdown().catch((err) =>
+      console.error(
+        "[shutdown] SIGINT shutdown failed:",
+        scrubSecrets(err instanceof Error ? err.message : String(err)),
+      ),
+    );
+  });
+  process.on("SIGTERM", () => {
+    shutdownSignal = "SIGTERM";
+    shutdown().catch((err) =>
+      console.error(
+        "[shutdown] SIGTERM shutdown failed:",
+        scrubSecrets(err instanceof Error ? err.message : String(err)),
+      ),
+    );
+  });
+}
+
+if (!globalState.__runId) {
+  globalState.__runId = `run_${Date.now()}`;
+}
+
+startApiGcInterval();
+
+// Load global swarm configs before the server starts listening so decrypt/key
+// failures fail closed instead of leaving the runtime half-initialized.
+let startupConfigsInjected: string[] = [];
+try {
+  startupConfigsInjected = await loadGlobalConfigsIntoEnv(false);
+} catch (err) {
+  console.error("[startup] Failed to load global swarm configs before listen:", err);
+  process.exitCode = 1;
+  throw err;
+}
+
+// Upgrade seed: explicit CAPABILITIES env values that predate capability
+// gating get the previously always-registered groups backfilled into a
+// global swarm_config row (operator-editable; skipped when a row exists).
+// Non-fatal — a seed failure must not brick boot.
+try {
+  await seedLegacyCapabilitiesConfig();
+} catch (err) {
+  console.warn("[startup] CAPABILITIES upgrade seed failed (non-fatal):", err);
+}
+
+// Phase 2 of the cost-tracking plan: project the vendored models.dev snapshot
+// into pricing rows at boot. Lazy `getDb()` would also work, but doing it
+// here surfaces the count in the boot log and makes the API ready to recompute
+// USD before the first POST /api/session-costs lands.
+try {
+  const { seedPricingFromModelsDev } = await import("../be/seed-pricing");
+  seedPricingFromModelsDev();
+  const { startPricingRefreshLoop } = await import("../be/pricing-refresh");
+  startPricingRefreshLoop();
+} catch (err) {
+  console.error("[startup] Failed to seed pricing rows:", err);
+}
+
+try {
+  const { ensureRbacSeedsSynced } = await import("../be/rbac-roles");
+  ensureRbacSeedsSynced();
+} catch (err) {
+  console.error("[startup] Failed to sync RBAC seed rows:", err);
+  // RBAC flag-on must fail closed; flag-off deployments should not be bricked
+  // by role-catalog drift for a disabled security feature.
+  if (isRbacEnabled()) throw err;
+}
+
+// Seed the built-in entity catalog (scripts today; more kinds later) so
+// `script-search` & co. return useful hits from a fresh DB. Idempotent and
+// version-aware: a pristine entity updates when its source changes, a
+// user-modified one is preserved. Script embeddings are deferred to a
+// post-listen backfill so boot doesn't block on embedding provider calls.
+// See src/be/seed for the framework.
+try {
+  const { runAllSeeders } = await import("../be/seed");
+  await runAllSeeders({ scriptEmbeddingMode: "skip" });
+} catch (err) {
+  console.error("[startup] Failed to seed built-in entities:", err);
+}
+
+// Wire the RBAC permission-audit sink into can() and start the batched writer
+// (2s flush) + retention GC (daily tick) BEFORE the server accepts traffic —
+// installing it inside the listen callback would leave an unaudited startup
+// window (requests can land while telemetry/Slack init awaits are pending).
+// RBAC_AUDIT_DISABLED=true makes the sink a no-op inside enqueueAuditRow.
+setAuditSink(enqueueAuditRow);
+startAuditWriter();
+await startAuditGc();
+startScratchScriptGc();
+
+// business-use initialization (no-op if envs not set)
+initialize();
+
+await initOtel("api");
+
+httpServer
+  .listen(port, async () => {
+    console.log(`MCP HTTP server running on http://localhost:${port}/mcp`);
+
+    ensure({
+      id: "listen",
+      flow: "api",
+      runId: globalState.__runId!,
+      data: {
+        capabilities: getEnabledCapabilities(),
+      },
+    });
+
+    if (startupConfigsInjected.length > 0) {
+      console.log(
+        `Injected ${startupConfigsInjected.length} swarm_config value(s) into process.env`,
+      );
+    }
+
+    // Initialize anonymized telemetry (opt-out via ANONYMIZED_TELEMETRY=false).
+    // The api-server is the sole authority for the install identity — pass
+    // generateIfMissing so it mints a new install ID on first boot. Workers
+    // must NOT mint (see src/commands/runner.ts).
+    await initTelemetry(
+      "api-server",
+      async (key) => (await getSwarmConfigs({ scope: "global", key }))?.[0]?.value,
+      async (key, value) => {
+        await upsertSwarmConfig({ scope: "global", key, value });
+      },
+      { generateIfMissing: true },
+    );
+    telemetry.server("started", { port });
+
+    // Start Slack bot (if configured)
+    await startSlackApp();
+
+    // Independent of workers, scheduler targets, and heartbeat agent tasks.
+    startQueueStallAlarm();
+
+    // Initialize GitHub webhook handler (if configured)
+    initGitHub();
+
+    // Initialize GitLab webhook handler (if configured)
+    initGitLab();
+
+    // Initialize AgentMail webhook handler (if configured)
+    initAgentMail();
+
+    // Initialize Linear tracker integration (if configured)
+    await initLinear();
+
+    // Initialize Jira tracker integration (if configured)
+    await initJira();
+
+    // Initialize workflow engine (trigger subscriptions + resume listener)
+    await initWorkflows();
+
+    // Reconcile durable script workflow subprocesses
+    await startScriptRunSupervisor(getMcpBaseUrl());
+
+    // Start scheduler (if enabled)
+    if (hasCapability("scheduling")) {
+      const { startScheduler } = await import("../scheduler");
+      const { getExecutorRegistry } = await import("../workflows");
+      const intervalMs = Number(process.env.SCHEDULER_INTERVAL_MS) || 10000;
+      startScheduler(getExecutorRegistry(), intervalMs, {
+        runId: globalState.__runId!,
+      });
+    }
+
+    // Start heartbeat triage (unless disabled). Read post-hydration (this block
+    // runs after `loadGlobalConfigsIntoEnv`), so a DB-saved value applies on
+    // restart — which is what the Configuration page's "Restart required"
+    // badge promises for HEARTBEAT_DISABLE / HEARTBEAT_INTERVAL_MS.
+    if (!isEnvFlagEnabled("HEARTBEAT_DISABLE", false)) {
+      const { startHeartbeat } = await import("../heartbeat");
+      const heartbeatMs = Number(process.env.HEARTBEAT_INTERVAL_MS) || 90000;
+      startHeartbeat(heartbeatMs);
+    }
+
+    // Start OAuth token keepalive (proactive refresh to prevent expiry)
+    if (process.env.OAUTH_KEEPALIVE_DISABLE !== "true") {
+      const { startOAuthKeepalive } = await import("../oauth/keepalive");
+      startOAuthKeepalive();
+    }
+
+    // Start generic OAuth token refresh sweep (all oauth_apps providers,
+    // 15-min tick, first run ~1 min after boot). Complements the tracker-only
+    // keepalive above — see src/be/oauth-refresh-sweep.ts.
+    if (process.env.OAUTH_REFRESH_SWEEP_DISABLE !== "true") {
+      const { startOAuthRefreshSweep } = await import("../be/oauth-refresh-sweep");
+      startOAuthRefreshSweep();
+    }
+
+    // Start the unified OAuth pending-session garbage collector (5-min tick, all flows)
+    startOAuthPendingGc();
+
+    // Start expired-memory garbage collector (1-hour tick, immediate first run)
+    await startMemoryGc();
+
+    // (RBAC audit sink is wired pre-listen — see above httpServer.listen.)
+
+    // Background backfill: re-embed any agent_memory rows with wrong-dimension
+    // embeddings (e.g. 1536d instead of 512d). Non-blocking, idempotent, no-op
+    // when the DB is clean. See src/be/memory/boot-reembed.ts.
+    import("../be/memory/boot-reembed")
+      .then(({ runBootReembed }) => runBootReembed())
+      .catch((err) => {
+        console.error("[boot-reembed] startup backfill failed (non-fatal):", err);
+      });
+
+    // Background backfill: embed any scripts that were seeded without embeddings
+    // (scriptEmbeddingMode: "skip" during boot). Non-blocking, idempotent, no-op
+    // when every non-scratch script already has an embedding.
+    import("../be/scripts/boot-reembed")
+      .then(({ runBootReembedScripts }) => runBootReembedScripts())
+      .catch((err) => {
+        console.error("[boot-reembed-scripts] startup backfill failed (non-fatal):", err);
+      });
+
+    // One-time scrub: retroactively redact any session_logs rows containing
+    // sensitive patterns that pre-date the defense-in-depth scrub layer.
+    // Idempotent, tracked via seed_state.
+    import("../be/boot-scrub-logs")
+      .then(({ runBootScrubLogs }) => runBootScrubLogs())
+      .catch((err) => {
+        console.error("[boot-scrub-logs] startup scrub failed (non-fatal):", err);
+      });
+  })
+  .on("error", (err) => {
+    console.error("HTTP Server Error:", err);
+  });

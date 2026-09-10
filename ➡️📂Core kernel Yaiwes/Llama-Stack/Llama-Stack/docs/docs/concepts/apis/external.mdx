@@ -1,0 +1,350 @@
+---
+title: External APIs
+description: Understanding external APIs in OGX
+sidebar_label: External APIs
+sidebar_position: 3
+---
+# External APIs
+
+OGX supports external APIs that live outside of the main codebase. This allows you to:
+- Create and maintain your own APIs independently
+- Share APIs with others without contributing to the main codebase
+- Keep API-specific code separate from the core OGX code
+
+## Configuration
+
+To enable external APIs, you need to configure the `external_apis_dir` in your OGX configuration. This directory should contain your external API specifications:
+
+```yaml
+external_apis_dir: ~/.ogx/apis.d/
+```
+
+## Directory Structure
+
+The external APIs directory should follow this structure:
+
+```
+apis.d/
+  custom_api1.yaml
+  custom_api2.yaml
+```
+
+Each YAML file in these directories defines an API specification.
+
+## API Specification
+
+Here's an example of an external API specification for a weather API:
+
+```yaml
+module: weather
+api_dependencies:
+  - inference
+protocol: WeatherAPI
+name: weather
+pip_packages:
+  - ogx-api-weather
+```
+
+### API Specification Fields
+
+- `module`: Python module containing the API implementation
+- `protocol`: Name of the protocol class for the API
+- `name`: Name of the API
+- `pip_packages`: List of pip packages to install the API, typically a single package
+
+## Required Implementation
+
+External API modules must expose three things:
+
+1. **`available_providers()`** - returns a list of provider specs
+2. **A Protocol class** - defines the API contract
+3. **`create_router()`** - returns a FastAPI router that maps HTTP endpoints to the protocol methods
+
+```python
+# ogx_api_weather/weather.py
+from typing import Protocol
+
+from fastapi import APIRouter
+
+from ogx_api import Api, ProviderSpec, RemoteProviderSpec
+
+
+def available_providers() -> list[ProviderSpec]:
+    return [
+        RemoteProviderSpec(
+            api=Api.weather,
+            provider_type="remote::kaze",
+            adapter_type="kaze",
+            module="ogx_provider_kaze",
+            pip_packages=["ogx_provider_kaze"],
+            config_class="ogx_provider_kaze.KazeProviderConfig",
+        ),
+    ]
+
+
+class WeatherProvider(Protocol):
+    """A protocol for the Weather API."""
+
+    async def get_available_locations() -> dict[str, list[str]]:
+        """Get the available locations."""
+        ...
+
+
+def create_router(impl: WeatherProvider) -> APIRouter:
+    router = APIRouter()
+
+    @router.get("/v1/weather/locations")
+    async def get_available_locations() -> dict[str, list[str]]:
+        return await impl.get_available_locations()
+
+    return router
+```
+
+The `__init__.py` must re-export these:
+
+```python
+# ogx_api_weather/__init__.py
+"""Weather API for OGX."""
+
+from .weather import WeatherProvider, available_providers, create_router
+
+__all__ = ["WeatherProvider", "available_providers", "create_router"]
+```
+
+## Example: Custom API
+
+Using the weather API shown above, here's the full setup:
+
+1. Create the API package:
+
+```bash
+mkdir -p ogx-api-weather/src/ogx_api_weather
+cd ogx-api-weather
+uv init
+```
+
+2. Edit `pyproject.toml`:
+
+```toml
+[project]
+name = "ogx-api-weather"
+version = "0.1.0"
+description = "Weather API for OGX"
+requires-python = ">=3.12"
+dependencies = ["ogx-api", "fastapi"]
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["ogx_api_weather", "ogx_api_weather.*"]
+```
+
+3. Add the `weather.py` and `__init__.py` files shown in the [Required Implementation](#required-implementation) section above.
+
+4. Create the API specification:
+
+```yaml
+# ~/.ogx/apis.d/weather.yaml
+module: ogx_api_weather
+name: weather
+pip_packages: ["ogx-api-weather"]
+protocol: WeatherProvider
+```
+
+5. Install and configure:
+
+```bash
+uv pip install -e .
+```
+
+```yaml
+# run config
+version: "2"
+distro_name: "weather-demo"
+apis:
+  - weather
+providers: {}
+external_apis_dir: ~/.ogx/apis.d
+```
+
+The API is now available at `/v1/weather/locations`.
+
+## Example: custom provider for the weather API
+
+1. Create the provider package:
+
+```bash
+mkdir -p ogx-provider-kaze
+cd ogx-provider-kaze
+uv init
+```
+
+2. Edit `pyproject.toml`:
+
+```toml
+[project]
+name = "ogx-provider-kaze"
+version = "0.1.0"
+description = "Kaze weather provider for OGX"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = ["ogx", "pydantic", "aiohttp"]
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["ogx_provider_kaze", "ogx_provider_kaze.*"]
+```
+
+3. Create the initial files:
+
+```bash
+touch src/ogx_provider_kaze/__init__.py
+touch src/ogx_provider_kaze/kaze.py
+```
+
+4. Create the provider implementation:
+
+
+Initialization function:
+
+```python
+# ogx-provider-kaze/src/ogx_provider_kaze/__init__.py
+"""Kaze weather provider for OGX."""
+
+from .config import KazeProviderConfig
+from .kaze import WeatherKazeAdapter
+
+__all__ = ["KazeProviderConfig", "WeatherKazeAdapter"]
+
+
+async def get_adapter_impl(config: KazeProviderConfig, _deps):
+    from .kaze import WeatherKazeAdapter
+
+    impl = WeatherKazeAdapter(config)
+    await impl.initialize()
+    return impl
+```
+
+Configuration:
+
+```python
+# ogx-provider-kaze/src/ogx_provider_kaze/config.py
+from pydantic import BaseModel, Field
+
+
+class KazeProviderConfig(BaseModel):
+    """Configuration for the Kaze weather provider."""
+
+    base_url: str = Field(
+        "https://api.kaze.io/v1",
+        description="Base URL for the Kaze weather API",
+    )
+```
+
+Main implementation:
+
+```python
+# ogx-provider-kaze/src/ogx_provider_kaze/kaze.py
+from ogx_api_weather.api import WeatherProvider
+
+from .config import KazeProviderConfig
+
+
+class WeatherKazeAdapter(WeatherProvider):
+    """Kaze weather provider implementation."""
+
+    def __init__(
+        self,
+        config: KazeProviderConfig,
+    ) -> None:
+        self.config = config
+
+    async def initialize(self) -> None:
+        pass
+
+    async def get_available_locations(self) -> dict[str, list[str]]:
+        """Get available weather locations."""
+        return {"locations": ["Paris", "Tokyo"]}
+```
+
+5. Create the provider specification:
+
+```yaml
+# ~/.ogx/providers.d/remote/weather/kaze.yaml
+adapter_type: kaze
+pip_packages: ["ogx_provider_kaze"]
+config_class: ogx_provider_kaze.config.KazeProviderConfig
+module: ogx_provider_kaze
+optional_api_dependencies: []
+```
+
+6. Install the provider package:
+
+```bash
+uv pip install -e .
+```
+
+7. Configure OGX to use the provider:
+
+```yaml
+# ~/.ogx/config.yaml
+version: "2"
+distro_name: "ogx-api-weather"
+apis:
+  - weather
+providers:
+  weather:
+  - provider_id: kaze
+    provider_type: remote::kaze
+    config: {}
+external_apis_dir: ~/.ogx/apis.d
+external_providers_dir: ~/.ogx/providers.d
+server:
+  port: 8321
+```
+
+8. Run the server:
+
+```bash
+ogx stack run ~/.ogx/config.yaml
+```
+
+9. Test the API:
+
+```bash
+curl -sSf http://127.0.0.1:8321/v1/weather/locations
+{"locations":["Paris","Tokyo"]}%
+```
+
+## Best Practices
+
+1. **Package Naming**: Use a clear and descriptive name for your API package.
+
+2. **Version Management**: Keep your API package versioned and compatible with the OGX version you're using.
+
+3. **Dependencies**: Only include the minimum required dependencies in your API package.
+
+4. **Documentation**: Include clear documentation in your API package about:
+   - Installation requirements
+   - Configuration options
+   - API endpoints and usage
+   - Any limitations or known issues
+
+5. **Testing**: Include tests in your API package to ensure it works correctly with OGX.
+
+## Troubleshooting
+
+If your external API isn't being loaded:
+
+1. Check that the `external_apis_dir` path is correct and accessible.
+2. Verify that the YAML files are properly formatted.
+3. Ensure all required Python packages are installed.
+4. Check the OGX server logs for any error messages - turn on debug logging to get more information using `OGX_LOGGING=all=debug`.
+5. Verify that the API package is installed in your Python environment.

@@ -1,0 +1,622 @@
+"""Adapter registry - look up CLI adapters by name."""
+
+from __future__ import annotations
+
+import inspect
+import logging
+from importlib.metadata import entry_points
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+from bernstein.adapters.agy import AgyAdapter
+from bernstein.adapters.aichat import AIChatAdapter
+from bernstein.adapters.aider import AiderAdapter
+from bernstein.adapters.amp import AmpAdapter
+from bernstein.adapters.auggie import AuggieAdapter
+from bernstein.adapters.autohand import AutohandAdapter
+from bernstein.adapters.base import CLIAdapter
+from bernstein.adapters.capability_profile import profile_built_adapter_classes
+from bernstein.adapters.charm import CharmAdapter
+from bernstein.adapters.claude import ClaudeCodeAdapter
+from bernstein.adapters.cline import ClineAdapter
+from bernstein.adapters.clm import ClmAdapter
+from bernstein.adapters.codebuff import CodebuffAdapter
+from bernstein.adapters.codex import CodexAdapter
+from bernstein.adapters.cody import CodyAdapter
+from bernstein.adapters.composio import ComposioAdapter
+from bernstein.adapters.computer_use import ReferenceComputerUseAdapter
+from bernstein.adapters.continue_dev import ContinueDevAdapter
+from bernstein.adapters.copilot import CopilotAdapter
+from bernstein.adapters.cursor import CursorAdapter
+from bernstein.adapters.devin_terminal import DevinTerminalAdapter
+from bernstein.adapters.droid import DroidAdapter
+from bernstein.adapters.forge import ForgeAdapter
+from bernstein.adapters.gemini import GeminiAdapter
+from bernstein.adapters.generic import GenericAdapter
+from bernstein.adapters.goose import GooseAdapter
+from bernstein.adapters.gptme import GptmeAdapter
+from bernstein.adapters.hermes import HermesAdapter
+from bernstein.adapters.iac import IaCAdapter
+from bernstein.adapters.junie import JunieAdapter
+from bernstein.adapters.kilo import KiloAdapter
+from bernstein.adapters.kimchi import KimchiAdapter
+from bernstein.adapters.kimi import KimiAdapter
+from bernstein.adapters.kiro import KiroAdapter
+from bernstein.adapters.letta_code import LettaCodeAdapter
+from bernstein.adapters.mistral import MistralAdapter
+from bernstein.adapters.mock import MockAgentAdapter
+from bernstein.adapters.muse import MuseAdapter
+from bernstein.adapters.ollama import OllamaAdapter
+from bernstein.adapters.open_interpreter import OpenInterpreterAdapter
+from bernstein.adapters.openai_agents import OpenAIAgentsAdapter
+from bernstein.adapters.opencode import OpenCodeAdapter
+from bernstein.adapters.openhands import OpenHandsAdapter
+from bernstein.adapters.pi import PiAdapter
+from bernstein.adapters.plandex import PlandexAdapter
+from bernstein.adapters.python_runtime import PythonRuntimeAdapter
+from bernstein.adapters.q_dev import QDevAdapter
+from bernstein.adapters.qwen import QwenAdapter
+from bernstein.adapters.ralphex import RalphexAdapter
+from bernstein.adapters.rovo import RovoAdapter
+
+logger = logging.getLogger(__name__)
+
+
+@runtime_checkable
+class AdmissionGateLike(Protocol):
+    """Structural type of the receipt-gated admission check (issue #2610).
+
+    Declared structurally rather than imported so the registry keeps no
+    dependency on :mod:`bernstein.adapters.admission`: the registry is what
+    every adapter module resolves through, and a concrete import here would
+    put the admission machinery on the import path of the whole catalogue.
+    The concrete gate is :class:`bernstein.adapters.admission.AdmissionGate`.
+    """
+
+    def admit(self, adapter: str) -> object | None:
+        """Raise when *adapter* cannot prove admission; return the decision."""
+        ...
+
+
+_ADAPTERS: dict[str, type[CLIAdapter] | CLIAdapter] = {
+    # Successor CLI for the discontinued non-enterprise hosted gemini
+    # backend. Separate registry entry from "gemini"/"antigravity" (which
+    # stay on the dual-binary GeminiAdapter for the enterprise / API-key
+    # lane); see docs/adapters/agy.md for the split.
+    "agy": AgyAdapter,
+    "aichat": AIChatAdapter,
+    "aider": AiderAdapter,
+    "amp": AmpAdapter,
+    "auggie": AuggieAdapter,
+    "autohand": AutohandAdapter,
+    "charm": CharmAdapter,
+    "claude": ClaudeCodeAdapter,
+    "cline": ClineAdapter,
+    "clm": ClmAdapter,
+    "codebuff": CodebuffAdapter,
+    "codex": CodexAdapter,
+    "cody": CodyAdapter,
+    "composio": ComposioAdapter,
+    # Fronts a third-party autonomous browser / computer-use agent; per-action
+    # lineage anchoring lives in the boundary layer (issue #2606).
+    "computer_use": ReferenceComputerUseAdapter,
+    "continue": ContinueDevAdapter,
+    "copilot": CopilotAdapter,
+    "cursor": CursorAdapter,
+    "devin_terminal": DevinTerminalAdapter,
+    "droid": DroidAdapter,
+    "forge": ForgeAdapter,
+    # The Google CLI ships under two binary names during the 2026-06-18
+    # transition. Both registry keys resolve to the same dual-binary aware
+    # adapter; the adapter discovers ``antigravity`` first on PATH and falls
+    # back to ``gemini`` (or honours BERNSTEIN_GEMINI_BINARY) at spawn time.
+    "antigravity": GeminiAdapter,
+    "gemini": GeminiAdapter,
+    "generic": GenericAdapter,
+    "goose": GooseAdapter,
+    "gptme": GptmeAdapter,
+    "hermes": HermesAdapter,
+    "iac": IaCAdapter,
+    "junie": JunieAdapter,
+    "kilo": KiloAdapter,
+    "kimchi": KimchiAdapter,
+    "kimi": KimiAdapter,
+    "kiro": KiroAdapter,
+    "letta_code": LettaCodeAdapter,
+    "mistral": MistralAdapter,
+    "mock": MockAgentAdapter,
+    "muse": MuseAdapter,
+    "ollama": OllamaAdapter,
+    "open_interpreter": OpenInterpreterAdapter,
+    "openai_agents": OpenAIAgentsAdapter,
+    "opencode": OpenCodeAdapter,
+    "openhands": OpenHandsAdapter,
+    "pi": PiAdapter,
+    "plandex": PlandexAdapter,
+    "python_runtime": PythonRuntimeAdapter,
+    "q_dev": QDevAdapter,
+    "qwen": QwenAdapter,
+    "ralphex": RalphexAdapter,
+    "rovo": RovoAdapter,
+}
+
+# Agents tracked as declarative capability profiles rather than as
+# hand-written modules (see
+# :mod:`bernstein.adapters.capability_profile`). The factory returns one
+# generated CLIAdapter subclass per profile, so a profile-built agent is
+# an ordinary registry citizen: it resolves through ``get_adapter``, is
+# enumerated by ``iter_adapter_specs``, and faces the same conformance
+# suite, strategy declaration and contract gate as a hand-written
+# adapter. Declaration-only profiles are not merged here - their
+# hand-written module keeps owning the spawn path.
+_ADAPTERS.update(profile_built_adapter_classes())
+
+#: Registry names that no longer resolve to an adapter, mapped to the guidance
+#: an operator needs to move off them. A removed name stays listed here so a
+#: config that still pins it fails with a pointer to the supported path rather
+#: than a bare "Unknown adapter" listing or an ``ImportError`` from a module
+#: that is gone. Selection surfaces (``--cli`` choices, the seed ``cli:``
+#: allowlist) derive from :data:`_ADAPTERS`, so a removed name is not offered
+#: anywhere; this table only shapes the error when someone supplies it anyway.
+#: An entry is dropped once a stale config pinning it is no longer plausible.
+_REMOVED_ADAPTERS: dict[str, str] = {
+    "cloudflare": (
+        "Adapter 'cloudflare' (Cloudflare Agents SDK) has been removed. It "
+        "refused every spawn and had no path to a working one: the Agents SDK "
+        "dispatches to a Worker the operator writes rather than exposing an "
+        "invocation contract to implement against, and it does not execute "
+        "shell, so running a CLI agent under it means calling the Sandbox SDK "
+        "anyway. To run an agent on Cloudflare, use the Codex-on-Cloudflare "
+        "sandbox adapter (bernstein.adapters.codex_cloudflare, issue #2969). "
+        "To drive a Worker you deployed yourself, use "
+        "bernstein.bridges.cloudflare.CloudflareBridge. To run locally, pick a "
+        "local adapter such as 'claude', 'codex', or 'aider'."
+    ),
+}
+
+_entrypoints_loaded = False
+
+#: provider-alias (lower-cased) -> adapter registry name. Built lazily from
+#: each adapter's ``provides`` class attribute the first time
+#: :func:`adapter_name_for_provider` is called. This is the structural
+#: replacement for the old hand-ordered substring `if`/`elif` chain that
+#: used to live in ``spawner_core._infer_adapter_name_for_provider`` -- see
+#: PR1 of the provider/adapter routing fix ladder.
+_PROVIDER_ALIAS_TABLE: dict[str, str] = {}
+_provider_aliases_built = False
+
+#: Substring-fallback exclusions, keyed by alias. If the alias matches as a
+#: substring of the combined provider/model text but the text ALSO contains
+#: one of the excluded substrings, the match is rejected -- e.g. the bare
+#: "gpt" alias (registered by the Codex adapter's ``provides``) would
+#: otherwise substring-match "gpt-oss:20b", misrouting that distinct model
+#: family to Codex even though it is not an OpenAI GPT model.
+_ALIAS_SUBSTRING_EXCLUSIONS: dict[str, tuple[str, ...]] = {
+    "gpt": ("gpt-oss",),
+}
+
+
+def _load_entrypoint_adapters() -> None:
+    """Discover and register adapters from the ``bernstein.adapters`` entry-point group.
+
+    Called once on first use. Silently skips malformed plugins.
+    """
+    global _entrypoints_loaded
+    if _entrypoints_loaded:
+        return
+    _entrypoints_loaded = True
+    for ep in entry_points(group="bernstein.adapters"):
+        try:
+            loaded = ep.load()
+            name = ep.name
+            if (inspect.isclass(loaded) and issubclass(loaded, CLIAdapter)) or isinstance(loaded, CLIAdapter):
+                _ADAPTERS[name] = loaded
+            else:
+                logger.warning(
+                    "Ignoring entry-point adapter %r: expected CLIAdapter subclass or instance, got %r",
+                    name,
+                    loaded,
+                )
+        except Exception as exc:  # pragma: no cover
+            logger.warning("Failed to load entry-point adapter %r: %s", ep.name, exc)
+
+
+def get_adapter(cli_name: str, *, admission_gate: AdmissionGateLike | None = None) -> CLIAdapter:
+    """Get adapter by name, e.g. 'aider', 'claude', 'cody', 'codex', 'continue', 'gemini', or 'generic'.
+
+    For 'generic', returns a GenericAdapter with default settings.
+    For known adapters, instantiates the corresponding class.
+    Third-party adapters are discovered from the ``bernstein.adapters`` entry-point group.
+
+    Resolution is name-based by default, which is what the enumeration
+    surfaces need: ``bernstein adapters list``, the conformance report and
+    ``bernstein doctor`` all have to inspect adapters they would never be
+    allowed to spawn. Passing ``admission_gate`` makes resolution proof-based
+    instead (issue #2610): the adapter is handed back only when it can present
+    a fresh admission receipt whose replay fingerprint still matches the
+    installed binary and the pinned contract. The spawn path supplies a gate;
+    nothing else does.
+
+    Args:
+        cli_name: Adapter name to look up.
+        admission_gate: Optional :class:`~bernstein.adapters.admission.
+            AdmissionGate` (structurally, an :class:`AdmissionGateLike`).
+            When supplied, the adapter must clear receipt-gated admission
+            before it is returned.
+
+    Returns:
+        An instantiated CLIAdapter.
+
+    Raises:
+        ValueError: If the adapter name is not recognized, or if it names an
+            adapter that has been removed (the message then carries the
+            replacement guidance from :data:`_REMOVED_ADAPTERS`).
+        bernstein.adapters.admission.AdapterAdmissionRefusal: When a gate is
+            supplied under the enforce policy and the adapter cannot prove
+            admission.
+    """
+    if cli_name == "generic":
+        if admission_gate is not None:
+            admission_gate.admit(cli_name)
+        return GenericAdapter(cli_command="generic-cli", display_name="Generic CLI")
+
+    _load_entrypoint_adapters()
+
+    adapter_cls = _ADAPTERS.get(cli_name)
+    if adapter_cls is None:
+        # A removed name resolves to its replacement guidance. Checked after
+        # entry-point discovery so a third-party plugin that registers the
+        # name for itself keeps working.
+        removed = removed_adapter_message(cli_name)
+        if removed is not None:
+            raise ValueError(removed)
+        available = ", ".join(sorted([*_ADAPTERS.keys(), "generic"]))
+        raise ValueError(f"Unknown adapter '{cli_name}'. Available: {available}")
+
+    # The gate runs after the name resolves so an unknown adapter still gets
+    # the plain "unknown adapter" message rather than a refusal receipt for a
+    # name that was never registered.
+    if admission_gate is not None:
+        admission_gate.admit(cli_name)
+
+    if isinstance(adapter_cls, CLIAdapter):
+        return adapter_cls
+    return adapter_cls()
+
+
+def removed_adapter_message(cli_name: str) -> str | None:
+    """Return replacement guidance for a removed adapter name.
+
+    Selection surfaces call this before reporting a name as unknown so an
+    operator whose config still pins a removed adapter is told what to use
+    instead. Names that were never registered return ``None``; those are
+    plain typos and get the generic "unknown adapter" treatment.
+
+    Args:
+        cli_name: The adapter name supplied by config or the CLI.
+
+    Returns:
+        The guidance string for a removed adapter, or ``None`` when the name
+        is not a removed adapter.
+    """
+    return _REMOVED_ADAPTERS.get(cli_name)
+
+
+def registry_name_for(adapter: CLIAdapter) -> str | None:
+    """Return the registry key an adapter instance is registered under.
+
+    Resolves the canonical registry name (e.g. ``"claude"``) for a live
+    adapter so callers can key per-adapter tables (such as the strategy
+    matrix in :mod:`bernstein.adapters._contract`) without each adapter
+    having to restate its own key.
+
+    Resolution prefers an explicit :attr:`CLIAdapter.registry_name`, then
+    falls back to a reverse lookup over the registered classes/instances.
+    Entry-point discovery runs first so third-party adapters resolve too.
+
+    Args:
+        adapter: A live :class:`CLIAdapter` instance.
+
+    Returns:
+        The registry key, or ``None`` when the adapter is not registered.
+    """
+    explicit = getattr(adapter, "registry_name", "") or ""
+    if explicit and explicit in _ADAPTERS:
+        return explicit
+
+    _load_entrypoint_adapters()
+    adapter_type = type(adapter)
+    for name, entry in _ADAPTERS.items():
+        if entry is adapter:
+            return name
+        if inspect.isclass(entry) and entry is adapter_type:
+            return name
+    return None
+
+
+def register_adapter(name: str, adapter: type[CLIAdapter] | CLIAdapter) -> None:
+    """Register a custom adapter by name.
+
+    Args:
+        name: Name to register under.
+        adapter: Adapter class or instance.
+    """
+    _ADAPTERS[name] = adapter
+
+
+def iter_adapter_specs() -> Iterator[tuple[str, type[CLIAdapter] | CLIAdapter]]:
+    """Yield every registered adapter as ``(name, class-or-instance)`` pairs.
+
+    The iterator triggers entry-point discovery on first use so third-
+    party adapters are surfaced alongside the built-ins. Pairs are
+    emitted in alphabetic order by name so downstream consumers can
+    rely on a deterministic enumeration.
+
+    The values are the raw registry entries (either a class or a
+    pre-built instance). Callers that need a live adapter should pass
+    each one through :func:`get_adapter` or instantiate themselves.
+    """
+    _load_entrypoint_adapters()
+    for name in sorted(_ADAPTERS.keys()):
+        yield name, _ADAPTERS[name]
+
+
+#: Registry names that are not user-selectable coding agents. ``mock`` is the
+#: test-only stub adapter (zero-API-key demos, fixtures, and the conformance
+#: harness): it lives in the registry so ``bernstein adapters list`` and the
+#: conformance suite can see it, but it is never a real target an operator
+#: pins a run to. Excluded from :func:`selectable_adapter_names` so selection
+#: surfaces reject it while enumeration surfaces still show it.
+_NON_AGENT_STUBS: frozenset[str] = frozenset({"mock"})
+
+
+def selectable_adapter_names() -> frozenset[str]:
+    """Return the adapter registry names an operator may select for a run.
+
+    The set is the live adapter registry - the same source
+    :func:`iter_adapter_specs` and ``bernstein adapters list`` enumerate -
+    minus the non-agent stubs in :data:`_NON_AGENT_STUBS`. It is the single
+    source of truth the seed ``cli:`` allowlist and every ``--cli``
+    ``click.Choice`` derive from, so a newly registered adapter becomes
+    selectable on every surface at once instead of being rejected by a
+    stale hardcoded list (issue #2781).
+
+    The ``auto`` sentinel (auto-detection, not a registered adapter) is not
+    included; callers that accept it add it themselves.
+
+    Returns:
+        Frozen set of selectable adapter registry names.
+    """
+    return frozenset(name for name, _ in iter_adapter_specs() if name not in _NON_AGENT_STUBS)
+
+
+def _register_provider_alias(alias: str, adapter_name: str) -> None:
+    """Register a single provider-name alias into the provider alias table.
+
+    Raises ``ValueError`` immediately if ``alias`` is already claimed by a
+    *different* adapter. This is PR1's collision policy: an ambiguous alias
+    fails loudly at table-build time (import/first-use time), never
+    silently at spawn time. This is what actually forecloses the
+    042bcbd0 class of bug (``openai_agents`` silently swallowed by a
+    broader ``openai`` substring match) for good -- a future adapter that
+    tries to claim an alias someone else already owns cannot ship at all.
+
+    Args:
+        alias: Lower-cased provider-name alias, e.g. ``"openai_agents"``.
+        adapter_name: Registry name of the adapter claiming the alias, e.g.
+            ``"openai_agents"``.
+
+    Raises:
+        ValueError: If ``alias`` is already registered to a different
+            adapter name.
+    """
+    existing = _PROVIDER_ALIAS_TABLE.get(alias)
+    if existing is not None and existing != adapter_name:
+        raise ValueError(
+            f"Provider alias {alias!r} is claimed by both adapter {existing!r} "
+            f"and adapter {adapter_name!r}. Provider aliases (the `provides` "
+            "class attribute on each CLIAdapter) must be unique across the "
+            "whole adapter catalog -- rename or narrow one of the "
+            "conflicting `provides` entries before this can load."
+        )
+    _PROVIDER_ALIAS_TABLE[alias] = adapter_name
+    logger.debug("registry: registered provider alias %r -> adapter %r", alias, adapter_name)
+
+
+def _build_provider_alias_table() -> None:
+    """Populate :data:`_PROVIDER_ALIAS_TABLE` from every adapter's ``provides``.
+
+    Idempotent: runs once, guarded by :data:`_provider_aliases_built`.
+    Entry-point adapters are discovered first so third-party adapters'
+    ``provides`` declarations participate in collision detection too.
+
+    Some adapters are registered under more than one ``_ADAPTERS`` key for
+    the *same* underlying class (for example ``GeminiAdapter`` is keyed as
+    both ``"gemini"`` and ``"antigravity"`` during the 2026-06-18
+    dual-binary transition -- see the comment in ``_ADAPTERS`` above). Each
+    distinct adapter object/class must contribute its ``provides`` aliases
+    exactly once, or the second registration would collide with the first
+    under a *different* adapter name and trip the collision guard on a
+    false positive. Entries are grouped by identity first; when a group
+    has more than one registry key, the key that is itself one of the
+    declared aliases (self-referencing / canonical, e.g. ``"gemini"``) is
+    preferred, matching what the old hardcoded substring branch used to
+    return literally.
+    """
+    global _provider_aliases_built
+    if _provider_aliases_built:
+        return
+    logger.info("registry: building provider alias table from %d registered adapters", len(_ADAPTERS))
+    _load_entrypoint_adapters()
+
+    names_by_entry_id: dict[int, list[str]] = {}
+    entry_by_id: dict[int, type[CLIAdapter] | CLIAdapter] = {}
+    for name, entry in _ADAPTERS.items():
+        eid = id(entry)
+        names_by_entry_id.setdefault(eid, []).append(name)
+        entry_by_id[eid] = entry
+
+    for eid, names in names_by_entry_id.items():
+        entry = entry_by_id[eid]
+        provides = getattr(entry, "provides", ()) or ()
+        if not provides:
+            continue
+        canonical = next((n for n in names if n in provides), names[0])
+        if len(names) > 1:
+            logger.debug(
+                "registry: adapter registered under multiple keys %s; using canonical name %r for provides=%s",
+                names,
+                canonical,
+                provides,
+            )
+        for alias in provides:
+            _register_provider_alias(alias.strip().lower(), canonical)
+    _provider_aliases_built = True
+    logger.info(
+        "registry: provider alias table built -- %d aliases across %d adapters: %s",
+        len(_PROVIDER_ALIAS_TABLE),
+        len({v for v in _PROVIDER_ALIAS_TABLE.values()}),
+        _PROVIDER_ALIAS_TABLE,
+    )
+
+
+def _registered_adapter_name(name: str) -> str | None:
+    """Return *name* if it is an adapter registry key, else ``None``.
+
+    The comparison is against exactly what :func:`get_adapter` accepts --
+    the live ``_ADAPTERS`` table plus the ``generic`` pseudo-adapter -- so
+    a name that resolves here is guaranteed to instantiate. Entry-point
+    adapters are discovered first; the callers of this helper have already
+    triggered discovery via :func:`_build_provider_alias_table`, but the
+    call is idempotent and keeps the helper correct in isolation.
+
+    Args:
+        name: Candidate adapter registry name, already lower-cased and
+            stripped by the caller.
+
+    Returns:
+        The registry name, or ``None`` when nothing is registered under it.
+    """
+    _load_entrypoint_adapters()
+    if name == "generic" or name in _ADAPTERS:
+        return name
+    return None
+
+
+def adapter_name_for_provider(provider_name: str | None, model: str) -> str | None:
+    """Resolve an adapter registry name from a provider name and/or model string.
+
+    This is the structural replacement for the old
+    ``spawner_core._infer_adapter_name_for_provider`` substring `if`/`elif`
+    chain (Root Cause A: no canonical provider -> adapter table, so any new
+    provider name that happened to be a substring of another's would
+    misroute silently until someone noticed and reordered the branches).
+
+    Resolution order:
+
+    1. **Exact alias match.** ``provider_name`` (case-insensitive,
+       stripped) is looked up directly against the alias table built from
+       every adapter's ``provides`` declaration. Because
+       :func:`_register_provider_alias` refuses ambiguous aliases at
+       build time, an exact hit here is guaranteed unambiguous.
+    2. **Exact registry-name match.** ``provides`` is optional and most
+       adapters declare none: only 7 of the ~49 selectable adapters carry
+       aliases. An operator selecting one of the other 42 by its registry
+       name -- which is what ``cli:`` accepts, and what
+       :func:`selectable_adapter_names` enumerates -- must resolve, or the
+       selection is silently dropped and the spawn lands on some other
+       adapter (issue #4134: ``cli: ollama`` spawned Claude Code and died
+       with ``command not found: claude``). A registry name is checked
+       after the alias table so an adapter registered under a second key
+       (``antigravity``) never shadows another adapter's declared alias.
+    3. **Substring fallback, longest-alias-first -- model text only.**
+       Some call sites (for example the sampling-capability probe in
+       ``spawner_core.py``) pass ``provider_name=None`` and have only a
+       bare model string like ``"gpt-4.1"`` or ``"claude-opus-4"`` to go
+       on. For that case every registered alias is checked as a substring
+       of the model string, longest alias first. Longest-first guarantees
+       a more specific alias (``"openai_agents"``) always wins over a
+       shorter alias it textually contains (``"openai"``) without
+       requiring any hand-maintained ordering -- this is what forecloses
+       the 042bcbd0 bug class structurally rather than only patching the
+       one instance of it.
+
+       This step runs **only** when no provider name was supplied. A
+       supplied provider name is an explicit selection: either it resolves
+       by name (steps 1-2) or it does not resolve at all. Searching the
+       model text underneath it matched aliases across the provider/model
+       boundary -- ``provider='ollama'`` with ``model='qwen2.5:1.5b'``
+       resolved to the Qwen CLI off the concatenated text ``"ollama
+       qwen2.5:1.5b"`` (issue #4134), so the same misconfiguration failed
+       two different ways depending on whether the model name happened to
+       contain another adapter's alias.
+
+    Returns:
+        The resolved adapter registry name, or ``None`` if nothing
+        matches. Callers apply their own handling (the spawn path refuses
+        an unresolvable operator ``cli:`` by name; probe call sites fall
+        back to the currently-active adapter) when ``None`` is returned.
+    """
+    logger.debug("registry.adapter_name_for_provider: provider_name=%r model=%r", provider_name, model)
+    _build_provider_alias_table()
+
+    if provider_name:
+        key = provider_name.strip().lower()
+        exact = _PROVIDER_ALIAS_TABLE.get(key)
+        if exact is not None:
+            logger.info(
+                "registry.adapter_name_for_provider: EXACT match provider_name=%r -> adapter=%r",
+                provider_name,
+                exact,
+            )
+            return exact
+        registered = _registered_adapter_name(key)
+        if registered is not None:
+            logger.info(
+                "registry.adapter_name_for_provider: REGISTRY-NAME match provider_name=%r -> adapter=%r "
+                "(adapter declares no `provides` aliases)",
+                provider_name,
+                registered,
+            )
+            return registered
+        logger.info(
+            "registry.adapter_name_for_provider: NO MATCH for provider_name=%r (model=%r not consulted -- "
+            "an explicitly named provider resolves by name or not at all); caller must apply its own handling",
+            provider_name,
+            model,
+        )
+        return None
+
+    text = model.lower()
+    for alias in sorted(_PROVIDER_ALIAS_TABLE, key=len, reverse=True):
+        if alias in text:
+            excluded = _ALIAS_SUBSTRING_EXCLUSIONS.get(alias, ())
+            if any(excl in text for excl in excluded):
+                logger.info(
+                    "registry.adapter_name_for_provider: SUBSTRING fallback SKIPPED "
+                    "alias=%r in text=%r -- text matches an exclusion pattern for "
+                    "this alias (e.g. 'gpt-oss' is a distinct model family, not an "
+                    "OpenAI GPT model, despite containing the substring 'gpt')",
+                    alias,
+                    text,
+                )
+                continue
+            adapter_name = _PROVIDER_ALIAS_TABLE[alias]
+            logger.info(
+                "registry.adapter_name_for_provider: SUBSTRING fallback matched "
+                "alias=%r in text=%r -> adapter=%r (provider_name=%r had no exact hit)",
+                alias,
+                text,
+                adapter_name,
+                provider_name,
+            )
+            return adapter_name
+
+    logger.info(
+        "registry.adapter_name_for_provider: NO MATCH for model=%r (no provider_name given); "
+        "caller must apply its own fallback",
+        model,
+    )
+    return None

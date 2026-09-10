@@ -1,0 +1,121 @@
+"""index_query op handler — semantic search over a single source (ADR-0033 Phase 1).
+
+Inline-only I/O (top-K is small, ~30KB).
+
+When query_vector is None: fallback enumerate (ADR-0033 §2.1 — returns empty
+list for phase 1, mode="fallback").
+
+UX gap fix E: SQLite read errors wrapped with actionable hint message.
+"""
+from __future__ import annotations
+
+import sqlite3
+
+from reyn.data.index import SqliteIndexBackend
+from reyn.schemas.models import IndexQueryIROp
+
+from . import register
+from .context import OpContext, sandbox_policy_from_ctx
+
+# ---------------------------------------------------------------------------
+# Errors
+# ---------------------------------------------------------------------------
+
+class IndexCorruptionError(Exception):
+    """Raised when SQLite read fails — UX gap fix E hint included in message."""
+
+
+# ---------------------------------------------------------------------------
+# Fallback enumerate
+# ---------------------------------------------------------------------------
+
+async def _fallback_enumerate(op: IndexQueryIROp, ctx: OpContext) -> dict:
+    """Phase 1 fallback: return empty list with mode='fallback'.
+
+    Phase 2 will read source file glob, return chunks up to fallback_size_cap tokens.
+    """
+    return {"chunks": [], "mode": "fallback"}
+
+
+# ---------------------------------------------------------------------------
+# Main handler
+# ---------------------------------------------------------------------------
+
+async def handle(
+    op: IndexQueryIROp,
+    ctx: OpContext,
+) -> dict:
+    """Execute an index_query op (ADR-0033 §2.1).
+
+    Returns:
+      {chunks: list[ChunkRecord], mode: "semantic" | "fallback"}
+    """
+    if op.query_vector is None:
+        return await _fallback_enumerate(op, ctx)
+
+    # B48-NF-W2-S7 fix (2026-05-22): ctx.workspace may be None when the
+    # caller (= semantic_search tool or similar router-side path) propagates a
+    # workspace-less ToolContext. Raise a clear ValueError instead of the
+    # opaque ``AttributeError: 'NoneType' object has no attribute 'base_dir'``
+    # so the failure is actionable to the LLM and to operators reading the
+    # control_ir_failed event. Observed B48 W2-S7 (= chained_find_then_index)
+    # 4x consecutive failures with the AttributeError noise.
+    if ctx.workspace is None:
+        raise ValueError(
+            "index_query: op_runtime context has no workspace. Index ops "
+            "require a workspace to locate the SQLite backend; pass an "
+            "OpContext with a populated `workspace` field. This typically "
+            "indicates the caller (e.g. the semantic_search macro op) was "
+            "dispatched from a path that carries no workspace."
+        )
+
+    workspace_root = ctx.workspace.base_dir
+
+    sandbox_policy = sandbox_policy_from_ctx(ctx)
+
+    # #1199 S3.4 Part1: route the index FS-op through the permission gate (the
+    # SQLite I/O itself stays host-direct — random-access/lock can't go on the
+    # read_file abstraction — so we gate the DB path BEFORE the backend opens
+    # it, with the phase sandbox_policy ∩, same shape as S3.1c-2). Closes the
+    # hole where a sandbox read_paths cap could not constrain index reads.
+    if ctx.permission_resolver is not None:
+        db_path = workspace_root / ".reyn" / "cache" / "index" / op.source / "index.db"
+        await ctx.permission_resolver.require_file_read(
+            ctx.permission_decl, str(db_path), ctx.actor,
+            sandbox_policy=sandbox_policy,
+        )
+
+    # #2856 Part B: forward the same cap-resolution seam into the backend as
+    # the other 3 index ops (uniform construction site — even though `query`
+    # is read-only and the backend has no write self-gate to trip here, this
+    # keeps `SqliteIndexBackend(...)` construction identical in shape across
+    # all 4 ops, so a future read-path self-gate has one seam to land on, not
+    # three-out-of-four).
+    backend = SqliteIndexBackend(
+        workspace_root=workspace_root,
+        sandbox_write_paths=sandbox_policy.write_paths if sandbox_policy is not None else None,
+    )
+
+    try:
+        chunks = await backend.query(
+            op.source,
+            op.query_vector,
+            op.top_k,
+            op.filters,
+        )
+    except sqlite3.DatabaseError as exc:
+        raise IndexCorruptionError(
+            f"Source '{op.source}' index appears corrupted: {exc}. "
+            f"Dispatch index_drop on source '{op.source}' to clear it, then "
+            f"re-run the ingest that populates it (the in-core index is "
+            f"OS-internal; there is no user-facing CLI/tool for this)."
+        ) from exc
+
+    mode = "semantic" if chunks else "fallback"
+    # #2425 案B: ``kind`` drives the canonical mapper (chunks → structured attachment).
+    return {"kind": "index_query", "chunks": [dict(c) for c in chunks], "mode": mode}
+
+
+from reyn.core.offload.canonical import chunks_to_canonical  # noqa: E402
+
+register("index_query", handle, canonical=chunks_to_canonical)

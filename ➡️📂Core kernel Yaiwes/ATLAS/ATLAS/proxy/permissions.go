@@ -1,0 +1,447 @@
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
+
+// ---------------------------------------------------------------------------
+// Permission system — controls which tool calls require user confirmation
+// ---------------------------------------------------------------------------
+
+// extractMatchValue extracts the path/command value from a tool call's
+// args for the built-in safety deny-list below.
+func extractMatchValue(toolName string, args json.RawMessage) string {
+	switch toolName {
+	case "run_command":
+		var input RunCommandInput
+		if err := json.Unmarshal(args, &input); err == nil {
+			return input.Command
+		}
+	case "write_file":
+		var input WriteFileInput
+		if err := json.Unmarshal(args, &input); err == nil {
+			return input.Path
+		}
+	case "edit_file":
+		var input EditFileInput
+		if err := json.Unmarshal(args, &input); err == nil {
+			return input.Path
+		}
+	case "structural_edit":
+		var input StructuralEditInput
+		if err := json.Unmarshal(args, &input); err == nil {
+			return input.Path
+		}
+	}
+	return ""
+}
+
+// shellSegmentSplitter marks the boundaries between commands in a shell line
+// (operators and grouping/substitution punctuation) so each segment's leading
+// word can be inspected. Redirect targets (> file) are not command positions,
+// so `>`/`<` are deliberately excluded.
+var shellSegmentSplitter = strings.NewReplacer(
+	";", "\n", "|", "\n", "&", "\n", "(", "\n", ")", "\n", "`", "\n",
+)
+
+// commandPrefixWords are leading words that wrap the real command word.
+var commandPrefixWords = map[string]bool{
+	"sudo": true, "doas": true, "env": true, "command": true, "nice": true,
+	"nohup": true, "time": true, "exec": true, "builtin": true,
+}
+
+// denyCommandReason reports why a shell command is blocked, or "" if allowed.
+// Matching is anchored to the command position of each shell segment so only
+// the destructive form is blocked — `rm -rf /` but not `rm -rf /workspace`,
+// `mkfs.ext4 /dev/sda` but not `grep mkfs notes.txt`, `dd of=/dev/sda` but not
+// `dd of=out.bin`.
+func denyCommandReason(cmd string) string {
+	for _, seg := range strings.Split(shellSegmentSplitter.Replace(cmd), "\n") {
+		fields := strings.Fields(seg)
+		i := 0
+		for i < len(fields) && commandPrefixWords[fields[i]] {
+			i++
+		}
+		if i >= len(fields) {
+			continue
+		}
+		head := fields[i]
+		rest := fields[i+1:]
+		switch {
+		case head == "rm" && rmTargetsRoot(rest):
+			return "blocked by safety rule: recursive removal of /"
+		case head == "mkfs" || strings.HasPrefix(head, "mkfs."):
+			return "blocked by safety rule: mkfs"
+		case head == "dd":
+			for _, a := range rest {
+				if strings.HasPrefix(a, "of=/dev/") {
+					return "blocked by safety rule: dd to a device"
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// rmTargetsRoot reports whether an `rm` argument list recursively targets the
+// filesystem root (`/` or `/*`).
+func rmTargetsRoot(args []string) bool {
+	recursive, rootTarget := false, false
+	for _, a := range args {
+		if strings.HasPrefix(a, "-") {
+			if a == "--recursive" || (!strings.HasPrefix(a, "--") && strings.ContainsAny(a, "rR")) {
+				recursive = true
+			}
+			continue
+		}
+		if a == "/" || a == "/*" {
+			rootTarget = true
+		}
+	}
+	return recursive && rootTarget
+}
+
+// denyWritePathReason reports why writing to a path is blocked, or "" if
+// allowed. Matching is on the base name so nested paths (certs/server.pem) are
+// caught, while template files (.env.example) and unrelated names (staging.env)
+// are not.
+func denyWritePathReason(path string) string {
+	if path == "" {
+		return ""
+	}
+	base := filepath.Base(filepath.Clean(path))
+	switch {
+	case base == ".env":
+		return "blocked by safety rule: writing .env"
+	case strings.HasSuffix(base, ".pem"):
+		return "blocked by safety rule: writing a .pem key"
+	case strings.HasSuffix(base, ".key"):
+		return "blocked by safety rule: writing a .key file"
+	case strings.Contains(base, "credentials"):
+		return "blocked by safety rule: writing a credentials file"
+	}
+	return ""
+}
+
+// denyReadPathReason reports why READING a path into model context is
+// blocked, or "" if allowed. Credential stores are excluded from model
+// context by default: their contents would otherwise flow into prompts,
+// logs, session files, and lens training samples. Matching is on base
+// name (plus the .ssh/.aws/.kube parent-dir cases) so templates
+// (.env.example) and unrelated names stay readable. Explicit override:
+// ATLAS_ALLOW_CREDENTIAL_READS=1 (the refusal message says so).
+func denyReadPathReason(path string) string {
+	if path == "" || os.Getenv("ATLAS_ALLOW_CREDENTIAL_READS") == "1" {
+		return ""
+	}
+	clean := filepath.Clean(path)
+	base := filepath.Base(clean)
+	parent := filepath.Base(filepath.Dir(clean))
+	blocked := ""
+	switch {
+	case base == ".env" || (strings.HasPrefix(base, ".env.") && base != ".env.example"):
+		blocked = base
+	case base == ".netrc" || base == "_netrc":
+		blocked = base
+	case base == ".npmrc" || base == ".pypirc":
+		blocked = base
+	case strings.HasSuffix(base, ".pem") || strings.HasSuffix(base, ".key"):
+		blocked = base
+	case base == "id_rsa" || base == "id_ecdsa" || base == "id_ed25519" || base == "id_dsa":
+		blocked = base
+	case parent == ".ssh" && !strings.HasSuffix(base, ".pub"):
+		blocked = ".ssh/" + base
+	case parent == ".aws" && (base == "credentials" || base == "config"):
+		blocked = ".aws/" + base
+	case parent == ".kube" && base == "config":
+		blocked = ".kube/" + base
+	case parent == ".docker" && base == "config.json":
+		blocked = ".docker/" + base
+	case base == "service-token" && parent == "secrets":
+		blocked = "secrets/" + base
+	case base == "api-keys.json" && parent == "secrets":
+		blocked = "secrets/" + base
+	case strings.Contains(base, "credentials"):
+		blocked = base
+	}
+	if blocked == "" {
+		return ""
+	}
+	return fmt.Sprintf("blocked by safety rule: reading %s into model "+
+		"context (credential file). If this file is intentionally "+
+		"non-sensitive, set ATLAS_ALLOW_CREDENTIAL_READS=1 on the proxy "+
+		"and retry.", blocked)
+}
+
+// shouldDenyToolCall checks if a tool call is blocked by the built-in safety
+// rules. These apply in every permission mode.
+func shouldDenyToolCall(toolName string, args json.RawMessage) (bool, string) {
+	switch toolName {
+	case "run_command":
+		var input RunCommandInput
+		if json.Unmarshal(args, &input) != nil {
+			return false, ""
+		}
+		if reason := denyCommandReason(input.Command); reason != "" {
+			return true, reason
+		}
+	case "write_file", "edit_file", "structural_edit":
+		if reason := denyWritePathReason(extractMatchValue(toolName, args)); reason != "" {
+			return true, reason
+		}
+	case "read_file", "outline_file":
+		var input struct {
+			Path string `json:"path"`
+		}
+		if json.Unmarshal(args, &input) != nil {
+			return false, ""
+		}
+		if reason := denyReadPathReason(input.Path); reason != "" {
+			return true, reason
+		}
+	case "move_file":
+		var input MoveFileInput
+		if json.Unmarshal(args, &input) != nil {
+			return false, ""
+		}
+		if reason := denyWritePathReason(input.Destination); reason != "" {
+			return true, reason
+		}
+	}
+	return false, ""
+}
+
+// describeToolCall generates a human-readable description of a tool call.
+func describeToolCall(toolName string, args json.RawMessage) string {
+	switch toolName {
+	case "run_command":
+		var input RunCommandInput
+		if json.Unmarshal(args, &input) == nil {
+			return "Run command: " + truncateStr(input.Command, 100)
+		}
+	case "write_file":
+		var input WriteFileInput
+		if json.Unmarshal(args, &input) == nil {
+			return "Write file: " + input.Path + " (" + formatSize(len(input.Content)) + ")"
+		}
+	case "edit_file":
+		var input EditFileInput
+		if json.Unmarshal(args, &input) == nil {
+			return "Edit file: " + input.Path
+		}
+	}
+	return toolName
+}
+
+// formatSize formats byte count as human-readable.
+func formatSize(bytes int) string {
+	if bytes < 1024 {
+		return fmt.Sprintf("%d bytes", bytes)
+	}
+	return fmt.Sprintf("%.1f KB", float64(bytes)/1024)
+}
+
+// Interactive permission approval.
+//
+// In default and accept-edits modes a destructive tool call pauses the agent
+// loop, emits a "permission_request" SSE event, and blocks until the client
+// POSTs a decision to /v1/permission. This mirrors the /cancel topology: the
+// agent loop is mid-turn on one HTTP request while the decision arrives on a
+// separate request, correlated through a package-level sync.Map keyed by
+// session id + tool-call id.
+
+// permDecision is the client's answer to a permission_request.
+type permDecision struct {
+	allow bool
+	// scope "session" (from the client's "allow for the rest of the session"
+	// choice) additionally whitelists the tool for the remainder of the
+	// current turn so a repeated call does not prompt again.
+	scope string
+}
+
+// pendingPermission is the pendingPermissions map value.
+type pendingPermission struct {
+	decision chan permDecision
+}
+
+// pendingPermissions correlates an in-flight permission_request with the
+// /v1/permission POST that answers it. Keyed by permKey(sessionID, callID).
+var pendingPermissions sync.Map
+
+func permKey(sessionID, callID string) string {
+	return sessionID + "|" + callID
+}
+
+// permissionTimeout is the fail-safe: if no decision arrives (and the client
+// neither disconnects nor cancels), the tool call is denied rather than
+// hanging the turn forever. Overridable via ATLAS_PERMISSION_TIMEOUT_SEC.
+func permissionTimeout() time.Duration {
+	if v := os.Getenv("ATLAS_PERMISSION_TIMEOUT_SEC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return time.Duration(n) * time.Second
+		}
+	}
+	return 10 * time.Minute
+}
+
+// awaitPermission emits a permission_request for a destructive tool call and
+// blocks until the client answers, the request context is cancelled (client
+// disconnect or /cancel), or the fail-safe timeout elapses. It returns true if
+// the call is allowed. On an allow with session scope the tool is added to the
+// turn's in-context allowlist so subsequent calls in this turn skip the prompt.
+func awaitPermission(ctx *AgentContext, toolName, callID string, args json.RawMessage) bool {
+	// No session id means no channel back from the client to answer a
+	// prompt. Failing open here would make mode:"default" silently
+	// yolo-equivalent for any client that omits session_id — deny
+	// instead. Clients that want unattended destructive tools opt in
+	// explicitly with mode:"yolo" (or pre-approve via
+	// session_allowed_tools); interactive clients pass session_id and
+	// answer /v1/permission.
+	if ctx.PassID == "" {
+		log.Printf("[permission] %s requires approval but the request has no session_id — denying. Pass session_id and answer POST /v1/permission, pre-approve via session_allowed_tools, or use mode \"yolo\".", toolName)
+		return false
+	}
+
+	entry := &pendingPermission{decision: make(chan permDecision, 1)}
+	key := permKey(ctx.PassID, callID)
+	pendingPermissions.Store(key, entry)
+	defer pendingPermissions.CompareAndDelete(key, entry)
+
+	ctx.Stream("permission_request", PermissionRequest{
+		ToolName:   toolName,
+		Args:       args,
+		Message:    describeToolCall(toolName, args),
+		ToolCallID: callID,
+	})
+
+	select {
+	case d := <-entry.decision:
+		if d.allow && d.scope == "session" {
+			ctx.allowToolForTurn(toolName)
+		}
+		return d.allow
+	case <-ctx.Ctx.Done():
+		return false
+	case <-time.After(permissionTimeout()):
+		log.Printf("[permission] %s timed out for session %q — denying", toolName, ctx.PassID)
+		return false
+	}
+}
+
+// handlePermission receives a client's approve/deny decision and signals the
+// blocked agent loop. Idempotent: a decision for an unknown/already-answered
+// key returns 404, mirroring /cancel.
+func handlePermission(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, ErrUnsupported, "method not allowed")
+		return
+	}
+	var req struct {
+		SessionID  string `json:"session_id"`
+		ToolCallID string `json:"tool_call_id"`
+		Decision   string `json:"decision"` // "allow" or "deny"
+		Scope      string `json:"scope"`    // "once" (default) or "session"
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, ErrInvalidInput, "invalid request body")
+		return
+	}
+	if req.SessionID == "" || req.ToolCallID == "" {
+		writeError(w, http.StatusBadRequest, ErrInvalidInput, "session_id and tool_call_id required")
+		return
+	}
+
+	v, ok := pendingPermissions.LoadAndDelete(permKey(req.SessionID, req.ToolCallID))
+	w.Header().Set("Content-Type", "application/json")
+	if !ok {
+		w.WriteHeader(http.StatusNotFound)
+		_ = json.NewEncoder(w).Encode(map[string]bool{"delivered": false})
+		return
+	}
+	entry, ok := v.(*pendingPermission)
+	if !ok {
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "bad permission entry"})
+		return
+	}
+	// Buffered channel (cap 1) + LoadAndDelete guarantees exactly one send.
+	entry.decision <- permDecision{allow: req.Decision == "allow", scope: req.Scope}
+	log.Printf("[permission] %q %q for session %q (scope %q)",
+		req.ToolCallID, req.Decision, req.SessionID, req.Scope)
+	_ = json.NewEncoder(w).Encode(map[string]bool{"delivered": true})
+}
+
+// permCallID is the tool-call identifier used to correlate a permission
+// request with its decision. It matches the ToolCallID the loop assigns to
+// tool messages so the ids line up across the turn.
+func permCallID(turn int) string {
+	return fmt.Sprintf("call_%d", turn)
+}
+
+// Trust modes govern whether — and where — model-authored commands may
+// execute. A newly-opened repository is untrusted content; running its
+// build/test commands is a decision the operator makes explicitly.
+//
+//   untrusted     — no command execution at all (run_command refused).
+//   trusted       — commands run in the isolated sandbox container
+//                   (the default; host execution is downgraded to sandbox).
+//   fully-trusted — advanced: host execution (ATLAS_VERIFY_IN=host) is
+//                   honored, dropping the container backstop.
+//
+// Set via ATLAS_TRUST_MODE. The default is "trusted": commands run, but
+// only in the sandbox. This keeps the out-of-box behavior safe (isolated
+// execution) while making "run nothing" and "run on the host" both
+// explicit, deliberate choices.
+
+type trustMode string
+
+const (
+	trustUntrusted    trustMode = "untrusted"
+	trustTrusted      trustMode = "trusted"
+	trustFullyTrusted trustMode = "fully-trusted"
+)
+
+// resolveTrustMode reads ATLAS_TRUST_MODE, defaulting to trusted. An
+// unrecognized value falls back to the safe default rather than failing
+// open to host execution.
+func resolveTrustMode() trustMode {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("ATLAS_TRUST_MODE"))) {
+	case "untrusted":
+		return trustUntrusted
+	case "fully-trusted", "fully_trusted":
+		return trustFullyTrusted
+	case "trusted", "":
+		return trustTrusted
+	default:
+		return trustTrusted
+	}
+}
+
+// commandsAllowed reports whether run_command may execute at all.
+func (m trustMode) commandsAllowed() bool {
+	return m != trustUntrusted
+}
+
+// hostExecutionAllowed reports whether host execution (bypassing the
+// sandbox) is permitted. Only fully-trusted honors it; trusted downgrades
+// a host request to sandbox execution so an ATLAS_VERIFY_IN=host setting
+// can't quietly escalate below the intended trust level.
+func (m trustMode) hostExecutionAllowed() bool {
+	return m == trustFullyTrusted
+}
+
+// untrustedRefusal is the message returned when run_command is called
+// under the untrusted mode.
+const untrustedRefusal = "command execution is disabled: ATLAS_TRUST_MODE=untrusted. " +
+	"This repository's commands are treated as untrusted content. Set " +
+	"ATLAS_TRUST_MODE=trusted to run them in the isolated sandbox, or " +
+	"fully-trusted to allow host execution."

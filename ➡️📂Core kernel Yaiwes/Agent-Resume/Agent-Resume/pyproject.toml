@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-resume"
+version = "0.1.0"
+description = "Checkpoint and resume long-running AI agent jobs. Crash on item 47, resume from item 48. JSONL store, zero deps."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Mukunda Katta", email = "mukunda.vjcs6@gmail.com" },
+]
+keywords = ["llm", "agent", "checkpoint", "resume", "fault-tolerance", "jsonl"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7",
+]
+
+[project.urls]
+Homepage = "https://github.com/MukundaKatta/agent-resume"
+Repository = "https://github.com/MukundaKatta/agent-resume"
+Issues = "https://github.com/MukundaKatta/agent-resume/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

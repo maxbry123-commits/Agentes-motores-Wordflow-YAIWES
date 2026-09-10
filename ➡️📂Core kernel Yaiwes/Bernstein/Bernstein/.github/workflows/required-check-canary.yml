@@ -1,0 +1,212 @@
+name: Required-check name canary
+
+# Branch protection on `main` requires two contexts: `CI gate` and
+# `shipped bundle matches the lockfile`. This workflow verifies the in-tree
+# `CI gate` emitters. The scheduled branch-protection audit reads
+# `BRANCH_PROTECTION_CONTEXTS_JSON` below and compares it with live
+# repository settings, so that line is the tree's record of what protection
+# demands - it has to be updated in the same change as the setting itself.
+#
+# This canary fails the PR (and the weekly scheduled run) if any of the
+# locked invariants drifts. It is intentionally narrow: it does not try
+# to read live branch-protection state, only the in-tree workflow files
+# the operator has aligned protection against.
+#
+# Invariants asserted:
+#   1. `.github/workflows/ci.yml` has a job whose key is `ci-gate`.
+#   2. That job's `name:` is exactly `CI gate`.
+#   3. Exactly two workflow files emit a check-run named `CI gate`:
+#      `ci.yml::ci-gate` (real aggregator) and
+#      `ci-gate-stub.yml::ci-gate` (synthetic emitter for PRs whose diff
+#      is entirely paths-ignored by ci.yml). No other emitter allowed.
+#      The stub resolves its name from a guard verdict, so a quoted
+#      `CI gate` branch inside a `${{ ... }}` name counts as an emitter
+#      too - otherwise a third one could hide behind a template.
+#
+# This canary used to also lock the `test-macos` job's `name:` to a
+# literal (non-templated) string, on the assumption that branch
+# protection's required context depended on it. It does not - the required
+# contexts are the ones listed above, and `test-macos` is not among them -
+# so `test-macos` is free to template its name the same
+# way the `test` matrix job already does (e.g. to carry a shard index).
+#
+# Run modes:
+#   * pull_request -- only when a workflow file under `.github/workflows/`
+#     changes. Catches the regression at PR-review time.
+#   * schedule -- weekly safety net for indirect drift.
+#   * workflow_dispatch -- manual operator verification.
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/**"
+  schedule:
+    - cron: "23 7 * * 1"  # Weekly, Monday 07:23 UTC
+  workflow_dispatch:
+
+concurrency:
+  group: required-check-canary-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  verify:
+    name: Required-check name canary
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions:
+      contents: read
+    steps:
+      - name: Harden runner (audit mode)
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Verify required-check invariants
+        env:
+          REQUIRED_CONTEXT: "CI gate"
+          BRANCH_PROTECTION_CONTEXTS_JSON: '["CI gate", "shipped bundle matches the lockfile"]'
+          REQUIRED_JOB_KEY: "ci-gate"
+          STUB_WORKFLOW: ".github/workflows/ci-gate-stub.yml"
+        run: |
+          python3 - <<'PY'
+          """Assert that the in-tree workflow files still match the single
+          required context the operator has pinned in branch protection.
+
+          Prints a structured report; exits non-zero on any invariant break.
+          """
+          from __future__ import annotations
+
+          import os
+          import re
+          import sys
+          from pathlib import Path
+
+          try:
+              import yaml
+          except ModuleNotFoundError:
+              print("::error::pyyaml is not available on this runner")
+              sys.exit(2)
+
+          REQUIRED_CONTEXT = os.environ["REQUIRED_CONTEXT"]
+          REQUIRED_JOB_KEY = os.environ["REQUIRED_JOB_KEY"]
+          STUB_WORKFLOW = os.environ["STUB_WORKFLOW"]
+
+          CI = Path(".github/workflows/ci.yml")
+          STUB = Path(STUB_WORKFLOW)
+          WORKFLOWS_DIR = Path(".github/workflows")
+
+          # Allow-listed (file, job-key) pairs that may emit the
+          # `CI gate` check. See workflow header for rationale.
+          ALLOWED_EMITTERS = {
+              (CI, REQUIRED_JOB_KEY),
+              (STUB, REQUIRED_JOB_KEY),
+          }
+
+          failures: list[str] = []
+
+          if not CI.exists():
+              print(f"::error file={CI}::ci.yml not found")
+              sys.exit(2)
+
+          ci_doc = yaml.safe_load(CI.read_text(encoding="utf-8"))
+          jobs = ci_doc.get("jobs") if isinstance(ci_doc, dict) else None
+          if not isinstance(jobs, dict):
+              failures.append("ci.yml has no `jobs:` mapping")
+              jobs = {}
+
+          # Invariant 1: ci-gate job exists.
+          ci_gate = jobs.get(REQUIRED_JOB_KEY)
+          if not isinstance(ci_gate, dict):
+              failures.append(
+                  f"ci.yml: job key `{REQUIRED_JOB_KEY}` missing. "
+                  "Branch protection requires this job to emit the "
+                  f"`{REQUIRED_CONTEXT}` check."
+              )
+              ci_gate = {}
+
+          # Invariant 2: ci-gate.name == "CI gate".
+          ci_gate_name = ci_gate.get("name")
+          if ci_gate_name != REQUIRED_CONTEXT:
+              failures.append(
+                  f"ci.yml: job `{REQUIRED_JOB_KEY}` has name={ci_gate_name!r}; "
+                  f"required-context drift if not {REQUIRED_CONTEXT!r}."
+              )
+
+          # NOTE: the GitHub Actions expression markers are reconstructed
+          # via string concatenation so the YAML parser does not try to
+          # interpret the Python literals as workflow expressions.
+          TEMPLATE_OPEN = "$" "{{"
+
+          # Invariant 3: only allow-listed workflow files emit a job
+          # named "CI gate". Two emitters are intentional: ci.yml (real
+          # aggregator) and ci-gate-stub.yml (synthetic success for
+          # paths-ignored-only PRs).
+          #
+          # The stub resolves its check-run name from a guard verdict, so
+          # a job also counts as an emitter when `CI gate` appears as a
+          # quoted branch of a templated name (the expression markers are
+          # spelled via TEMPLATE_OPEN above so this file stays parseable).
+          # Matching only the bare literal would let a third emitter hide
+          # behind a template.
+          def emits_required_context(name: object) -> bool:
+              if not isinstance(name, str):
+                  return False
+              if name == REQUIRED_CONTEXT:
+                  return True
+              if TEMPLATE_OPEN not in name:
+                  return False
+              return REQUIRED_CONTEXT in re.findall(r"'([^']*)'", name)
+
+          seen_emitters: set[tuple[Path, str]] = set()
+          for wf_path in sorted(WORKFLOWS_DIR.glob("*.yml")):
+              try:
+                  wf = yaml.safe_load(wf_path.read_text(encoding="utf-8"))
+              except yaml.YAMLError:
+                  continue
+              wf_jobs = wf.get("jobs") if isinstance(wf, dict) else None
+              if not isinstance(wf_jobs, dict):
+                  continue
+              for key, body in wf_jobs.items():
+                  if not isinstance(body, dict):
+                      continue
+                  if not emits_required_context(body.get("name")):
+                      continue
+                  seen_emitters.add((wf_path, key))
+
+          unexpected = seen_emitters - ALLOWED_EMITTERS
+          missing = ALLOWED_EMITTERS - seen_emitters
+          if unexpected:
+              failures.append(
+                  f"Unexpected emitters of `{REQUIRED_CONTEXT}` check: "
+                  + ", ".join(f"{p}:{k}" for p, k in sorted(unexpected))
+                  + ". Allow-list is "
+                  + ", ".join(f"{p}:{k}" for p, k in sorted(ALLOWED_EMITTERS))
+                  + "."
+              )
+          if missing:
+              failures.append(
+                  f"Missing required emitters of `{REQUIRED_CONTEXT}` check: "
+                  + ", ".join(f"{p}:{k}" for p, k in sorted(missing))
+                  + ". Both ci.yml and ci-gate-stub.yml must keep their `ci-gate` job."
+              )
+
+          # Report.
+          print("Required-check name canary")
+          print(f"  required context : {REQUIRED_CONTEXT!r}")
+          print(f"  ci-gate job key  : {REQUIRED_JOB_KEY!r}")
+          print(f"  ci-gate.name     : {ci_gate_name!r}")
+
+          if failures:
+              print("::error::Required-check name canary FAILED")
+              for line in failures:
+                  print(f"::error::{line}")
+              sys.exit(1)
+
+          print("All invariants hold. Branch protection alignment intact.")
+          PY

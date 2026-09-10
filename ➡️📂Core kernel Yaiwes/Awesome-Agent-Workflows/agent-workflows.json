@@ -1,0 +1,723 @@
+[
+  {
+    "id": "spec-to-plan",
+    "title": "Spec → Plan → Implementation",
+    "path": "workflows/01-spec-to-plan.md",
+    "category": "planning",
+    "risk_level": "medium",
+    "trigger": "The request is vague or multi-step.",
+    "goal": "Turn a fuzzy idea into a spec, plan, and implementation checklist.",
+    "tools": [
+      "all coding agents"
+    ],
+    "tags": [
+      "spec",
+      "plan",
+      "implementation"
+    ],
+    "verification": "Run the workflow checklist and record command/output evidence before claiming success."
+  },
+  {
+    "id": "parallel-agent-development",
+    "title": "Parallel Agent Development",
+    "path": "workflows/02-parallel-agent-development.md",
+    "category": "execution",
+    "risk_level": "medium",
+    "trigger": "Multiple independent tasks can run at once.",
+    "goal": "Split work safely and integrate results.",
+    "tools": [
+      "all coding agents"
+    ],
+    "tags": [
+      "parallel-agents",
+      "delegation",
+      "integration"
+    ],
+    "verification": "Run the workflow checklist and record command/output evidence before claiming success."
+  },
+  {
+    "id": "bug-root-cause",
+    "title": "Root-Cause Debugging",
+    "path": "workflows/03-bug-root-cause.md",
+    "category": "debugging",
+    "risk_level": "medium",
+    "trigger": "A bug is unclear or recurring.",
+    "goal": "Reproduce, isolate, fix, and verify root cause.",
+    "tools": [
+      "all coding agents"
+    ],
+    "tags": [
+      "debugging",
+      "reproduction",
+      "fix"
+    ],
+    "verification": "Run the workflow checklist and record command/output evidence before claiming success."
+  },
+  {
+    "id": "fresh-context-code-review",
+    "title": "Fresh-Context Code Review",
+    "path": "workflows/04-fresh-context-code-review.md",
+    "category": "review",
+    "risk_level": "medium",
+    "trigger": "Before merging or trusting agent-authored code.",
+    "goal": "Review without author-context contamination.",
+    "tools": [
+      "all coding agents"
+    ],
+    "tags": [
+      "code-review",
+      "quality",
+      "security"
+    ],
+    "verification": "Run the workflow checklist and record command/output evidence before claiming success."
+  },
+  {
+    "id": "security-review",
+    "title": "Security Review Sprint",
+    "path": "workflows/05-security-review.md",
+    "category": "security",
+    "risk_level": "high",
+    "trigger": "Code touches auth, secrets, network, parsers, permissions, or public release.",
+    "goal": "Find reachable issues with evidence and false-positive notes.",
+    "tools": [
+      "all coding agents"
+    ],
+    "tags": [
+      "security",
+      "threat-model",
+      "audit"
+    ],
+    "verification": "Run the workflow checklist and record command/output evidence before claiming success."
+  },
+  {
+    "id": "browser-runtime-qa",
+    "title": "Browser Runtime QA",
+    "path": "workflows/06-browser-qa.md",
+    "category": "qa",
+    "risk_level": "medium",
+    "trigger": "A browser app, page, or automation flow needs validation.",
+    "goal": "Verify real runtime behavior, console, network, and accessibility where relevant.",
+    "tools": [
+      "browser-capable agents"
+    ],
+    "tags": [
+      "browser",
+      "qa",
+      "runtime"
+    ],
+    "verification": "Run the workflow checklist and record command/output evidence before claiming success."
+  },
+  {
+    "id": "release-runbook",
+    "title": "Release Runbook",
+    "path": "workflows/07-release-runbook.md",
+    "category": "release",
+    "risk_level": "high",
+    "trigger": "A change is ready to publish, deploy, or announce.",
+    "goal": "Stage rollout with readiness evidence and rollback criteria.",
+    "tools": [
+      "all agents"
+    ],
+    "tags": [
+      "release",
+      "rollback",
+      "launch"
+    ],
+    "verification": "Run the workflow checklist and record command/output evidence before claiming success."
+  },
+  {
+    "id": "research-brief",
+    "title": "Research Brief",
+    "path": "workflows/08-research-brief.md",
+    "category": "research",
+    "risk_level": "low",
+    "trigger": "A decision depends on current facts or external sources.",
+    "goal": "Produce a source-backed recommendation and uncertainty list.",
+    "tools": [
+      "web-capable agents"
+    ],
+    "tags": [
+      "research",
+      "sources",
+      "decision"
+    ],
+    "verification": "Run the workflow checklist and record command/output evidence before claiming success."
+  },
+  {
+    "id": "local-ai-stack",
+    "title": "Local AI Stack Setup",
+    "path": "workflows/09-local-ai-stack.md",
+    "category": "infrastructure",
+    "risk_level": "medium",
+    "trigger": "A local or self-hosted AI stack is needed.",
+    "goal": "Install and verify a private/local agent stack safely.",
+    "tools": [
+      "local/self-hosted agents"
+    ],
+    "tags": [
+      "local-ai",
+      "self-hosted",
+      "setup"
+    ],
+    "verification": "Run the workflow checklist and record command/output evidence before claiming success."
+  },
+  {
+    "id": "repo-growth-launch",
+    "title": "Repo Growth Launch",
+    "path": "workflows/10-repo-growth-launch.md",
+    "category": "growth",
+    "risk_level": "medium",
+    "trigger": "A public repository needs useful packaging and launch readiness.",
+    "goal": "Make a repo discoverable without fake engagement or spam.",
+    "tools": [
+      "all agents"
+    ],
+    "tags": [
+      "github",
+      "launch",
+      "growth"
+    ],
+    "verification": "Run the workflow checklist and record command/output evidence before claiming success."
+  },
+  {
+    "id": "change-impact-map",
+    "title": "Change Impact Map",
+    "path": "workflows/11-change-impact-map.md",
+    "category": "planning",
+    "risk_level": "medium",
+    "trigger": "Before an agent edits unfamiliar code or a risky area.",
+    "goal": "Map the blast radius before implementation starts.",
+    "tools": [
+      "all coding agents"
+    ],
+    "tags": [
+      "impact-analysis",
+      "planning",
+      "tests"
+    ],
+    "verification": "Run the workflow checklist and record command/output evidence before claiming success."
+  },
+  {
+    "id": "agent-task-contract",
+    "title": "Agent Task Contract and Scope Box",
+    "path": "workflows/12-agent-task-contract.md",
+    "category": "planning",
+    "risk_level": "medium",
+    "trigger": "Before delegating a task to an AI agent.",
+    "goal": "Give the agent a contract that prevents drive-by edits and unsupported success claims.",
+    "tools": [
+      "all coding agents"
+    ],
+    "tags": [
+      "delegation",
+      "scope",
+      "safety"
+    ],
+    "verification": "Run the workflow checklist and record command/output evidence before claiming success."
+  },
+  {
+    "id": "regression-test-first-bugfix",
+    "title": "Regression-Test-First Bug Fix",
+    "path": "workflows/13-regression-test-first-bugfix.md",
+    "category": "debugging",
+    "risk_level": "medium",
+    "trigger": "A bug has a concrete symptom or user report.",
+    "goal": "Capture the bug as a failing test before changing production code.",
+    "tools": [
+      "all coding agents"
+    ],
+    "tags": [
+      "bugfix",
+      "tests",
+      "tdd"
+    ],
+    "verification": "Run the workflow checklist and record command/output evidence before claiming success."
+  },
+  {
+    "id": "minimized-reproducer-factory",
+    "title": "Minimized Reproducer Factory",
+    "path": "workflows/14-minimized-reproducer-factory.md",
+    "category": "debugging",
+    "risk_level": "medium",
+    "trigger": "A bug is vague, flaky, environment-specific, or reported only in logs.",
+    "goal": "Turn a symptom into the smallest runnable reproduction.",
+    "tools": [
+      "all coding agents"
+    ],
+    "tags": [
+      "reproducer",
+      "flaky",
+      "debugging"
+    ],
+    "verification": "Run the workflow checklist and record command/output evidence before claiming success."
+  },
+  {
+    "id": "golden-master-refactor",
+    "title": "Golden Master Refactor",
+    "path": "workflows/15-golden-master-refactor.md",
+    "category": "refactoring",
+    "risk_level": "high",
+    "trigger": "Refactoring legacy or under-tested code where behavior must stay stable.",
+    "goal": "Lock current behavior with characterization tests before changing structure.",
+    "tools": [
+      "all coding agents"
+    ],
+    "tags": [
+      "refactor",
+      "characterization-tests",
+      "legacy-code"
+    ],
+    "verification": "Run the workflow checklist and record command/output evidence before claiming success."
+  },
+  {
+    "id": "patch-intake-triage",
+    "title": "Agent Patch Intake Triage",
+    "path": "workflows/16-patch-intake-triage.md",
+    "category": "review",
+    "risk_level": "medium",
+    "trigger": "An agent returns a diff, branch, patch, or pull request.",
+    "goal": "Separate useful changes from scope creep before deeper review.",
+    "tools": [
+      "all coding agents"
+    ],
+    "tags": [
+      "review",
+      "diff",
+      "triage"
+    ],
+    "verification": "Run the workflow checklist and record command/output evidence before claiming success."
+  },
+  {
+    "id": "review-feedback-loop",
+    "title": "Review Feedback Application Loop",
+    "path": "workflows/17-review-feedback-loop.md",
+    "category": "review",
+    "risk_level": "low",
+    "trigger": "A reviewer left comments on an agent-authored PR.",
+    "goal": "Classify feedback, apply minimal fixes, and verify each resolved thread.",
+    "tools": [
+      "all coding agents"
+    ],
+    "tags": [
+      "code-review",
+      "feedback",
+      "pr"
+    ],
+    "verification": "Run the workflow checklist and record command/output evidence before claiming success."
+  },
+  {
+    "id": "api-contract-lockstep",
+    "title": "API Contract Change Lockstep",
+    "path": "workflows/18-api-contract-lockstep.md",
+    "category": "implementation",
+    "risk_level": "high",
+    "trigger": "Changing public APIs, schemas, events, CLI flags, or config formats.",
+    "goal": "Update producers, consumers, docs, fixtures, and contract tests together.",
+    "tools": [
+      "all coding agents"
+    ],
+    "tags": [
+      "api",
+      "schema",
+      "contracts"
+    ],
+    "verification": "Run the workflow checklist and record command/output evidence before claiming success."
+  },
+  {
+    "id": "ci-red-to-green",
+    "title": "CI Red-to-Green Reproducer",
+    "path": "workflows/19-ci-red-to-green.md",
+    "category": "ci",
+    "risk_level": "medium",
+    "trigger": "CI fails after an agent change.",
+    "goal": "Reproduce or explain CI failure before pushing fixes.",
+    "tools": [
+      "all coding agents"
+    ],
+    "tags": [
+      "ci",
+      "debugging",
+      "reproducer"
+    ],
+    "verification": "Run the workflow checklist and record command/output evidence before claiming success."
+  },
+  {
+    "id": "flaky-test-burndown",
+    "title": "Flaky Test Burn-Down",
+    "path": "workflows/20-flaky-test-burndown.md",
+    "category": "testing",
+    "risk_level": "medium",
+    "trigger": "A test passes on rerun but fails intermittently.",
+    "goal": "Capture nondeterminism and fix the root cause instead of rerunning to green.",
+    "tools": [
+      "all coding agents"
+    ],
+    "tags": [
+      "flaky-tests",
+      "nondeterminism",
+      "testing"
+    ],
+    "verification": "Run the workflow checklist and record command/output evidence before claiming success."
+  },
+  {
+    "id": "dependency-upgrade-shepherd",
+    "title": "Dependency Upgrade Shepherd",
+    "path": "workflows/21-dependency-upgrade-shepherd.md",
+    "category": "maintenance",
+    "risk_level": "high",
+    "trigger": "Bumping libraries, frameworks, runtimes, lockfiles, or build tools.",
+    "goal": "Upgrade with changelog context, tests, and rollback notes.",
+    "tools": [
+      "all coding agents"
+    ],
+    "tags": [
+      "dependencies",
+      "security",
+      "upgrade"
+    ],
+    "verification": "Run the workflow checklist and record command/output evidence before claiming success."
+  },
+  {
+    "id": "urgent-hotfix-fast-path",
+    "title": "Urgent Hotfix Fast Path",
+    "path": "workflows/22-urgent-hotfix-fast-path.md",
+    "category": "release",
+    "risk_level": "high",
+    "trigger": "A production-impacting regression needs a fast patch.",
+    "goal": "Constrain work to reproduce, fix, smoke, and decide rollback or roll-forward.",
+    "tools": [
+      "all coding agents"
+    ],
+    "tags": [
+      "hotfix",
+      "incident",
+      "release"
+    ],
+    "verification": "Run the workflow checklist and record command/output evidence before claiming success."
+  },
+  {
+    "id": "incident-command-center",
+    "title": "Incident Command Center",
+    "path": "workflows/23-incident-command-center.md",
+    "category": "operations",
+    "risk_level": "high",
+    "trigger": "A pager alert, customer-impacting incident, or severe degradation is active.",
+    "goal": "Assemble evidence, owners, mitigations, and status updates without letting the agent take unsafe action.",
+    "tools": [
+      "all agents"
+    ],
+    "tags": [
+      "incident",
+      "ops",
+      "communication"
+    ],
+    "verification": "Run the workflow checklist and record command/output evidence before claiming success."
+  },
+  {
+    "id": "blameless-postmortem-ledger",
+    "title": "Blameless Postmortem and Action Ledger",
+    "path": "workflows/24-blameless-postmortem-ledger.md",
+    "category": "operations",
+    "risk_level": "medium",
+    "trigger": "An incident is stabilized or closed.",
+    "goal": "Produce an evidence-backed timeline, contributing factors, and follow-up ledger.",
+    "tools": [
+      "all agents"
+    ],
+    "tags": [
+      "postmortem",
+      "incident",
+      "process"
+    ],
+    "verification": "Run the workflow checklist and record command/output evidence before claiming success."
+  },
+  {
+    "id": "migration-cutover-planner",
+    "title": "Migration Readiness and Cutover Planner",
+    "path": "workflows/25-migration-cutover-planner.md",
+    "category": "release",
+    "risk_level": "high",
+    "trigger": "A schema, API, platform, vendor, or data migration is proposed.",
+    "goal": "Plan phases, dual-run checks, canaries, rollback, and go/no-go criteria.",
+    "tools": [
+      "all coding agents"
+    ],
+    "tags": [
+      "migration",
+      "cutover",
+      "rollback"
+    ],
+    "verification": "Run the workflow checklist and record command/output evidence before claiming success."
+  },
+  {
+    "id": "documentation-drift-audit",
+    "title": "Documentation Drift Audit",
+    "path": "workflows/26-documentation-drift-audit.md",
+    "category": "documentation",
+    "risk_level": "low",
+    "trigger": "Docs may be stale after feature, process, or dependency changes.",
+    "goal": "Compare docs against source behavior and fix contradictions with evidence.",
+    "tools": [
+      "all agents"
+    ],
+    "tags": [
+      "docs",
+      "audit",
+      "stale-docs"
+    ],
+    "verification": "Run the workflow checklist and record command/output evidence before claiming success."
+  },
+  {
+    "id": "adr-decision-capture",
+    "title": "ADR Decision Capture from Threads",
+    "path": "workflows/27-adr-decision-capture.md",
+    "category": "documentation",
+    "risk_level": "low",
+    "trigger": "A decision happened in chat, meeting notes, issue comments, or PR discussion.",
+    "goal": "Convert messy discussion into context, options, decision, consequences, and owners.",
+    "tools": [
+      "all agents"
+    ],
+    "tags": [
+      "adr",
+      "architecture",
+      "decision-records"
+    ],
+    "verification": "Run the workflow checklist and record command/output evidence before claiming success."
+  },
+  {
+    "id": "role-based-onboarding-trail",
+    "title": "Role-Based Onboarding Trail",
+    "path": "workflows/28-role-based-onboarding-trail.md",
+    "category": "team",
+    "risk_level": "low",
+    "trigger": "A new hire, transfer, contractor, or agent needs to ramp into a repo or system.",
+    "goal": "Create a role-specific path with starter tasks and verification checkpoints.",
+    "tools": [
+      "all agents"
+    ],
+    "tags": [
+      "onboarding",
+      "team",
+      "docs"
+    ],
+    "verification": "Run the workflow checklist and record command/output evidence before claiming success."
+  },
+  {
+    "id": "bus-factor-reduction",
+    "title": "Knowledge Transfer and Bus-Factor Reduction",
+    "path": "workflows/29-bus-factor-reduction.md",
+    "category": "team",
+    "risk_level": "medium",
+    "trigger": "A system depends on one person, a rotation is coming, or ownership is changing.",
+    "goal": "Create ownership maps, runbooks, glossary, and a Q&A backlog.",
+    "tools": [
+      "all agents"
+    ],
+    "tags": [
+      "handoff",
+      "runbook",
+      "ownership"
+    ],
+    "verification": "Run the workflow checklist and record command/output evidence before claiming success."
+  },
+  {
+    "id": "workflow-evaluation-harness",
+    "title": "Workflow Evaluation Harness",
+    "path": "workflows/30-workflow-evaluation-harness.md",
+    "category": "evaluation",
+    "risk_level": "medium",
+    "trigger": "A new agent workflow, prompt, or automation needs repeatable quality checks.",
+    "goal": "Define golden tasks, rubric, thresholds, and regression checks.",
+    "tools": [
+      "all agents"
+    ],
+    "tags": [
+      "evals",
+      "quality",
+      "regression"
+    ],
+    "verification": "Run the workflow checklist and record command/output evidence before claiming success."
+  },
+  {
+    "id": "prompt-policy-change-control",
+    "title": "Prompt and Policy Change Control",
+    "path": "workflows/31-prompt-policy-change-control.md",
+    "category": "evaluation",
+    "risk_level": "high",
+    "trigger": "Changing system prompts, guardrails, tool permissions, routing, or memory policy.",
+    "goal": "Review intent, risk, before-after behavior, rollout, and rollback.",
+    "tools": [
+      "all agents"
+    ],
+    "tags": [
+      "prompts",
+      "policy",
+      "evals"
+    ],
+    "verification": "Run the workflow checklist and record command/output evidence before claiming success."
+  },
+  {
+    "id": "agent-memory-hygiene-review",
+    "title": "Agent Memory Hygiene Review",
+    "path": "workflows/32-agent-memory-hygiene-review.md",
+    "category": "safety",
+    "risk_level": "high",
+    "trigger": "Memory feels wrong, stale, conflicting, too full, or privacy-sensitive.",
+    "goal": "Deduplicate, expire, redact, and scope memories without losing useful preferences.",
+    "tools": [
+      "memory-enabled agents"
+    ],
+    "tags": [
+      "memory",
+      "privacy",
+      "safety"
+    ],
+    "verification": "Run the workflow checklist and record command/output evidence before claiming success."
+  },
+  {
+    "id": "customer-signal-roadmap-triage",
+    "title": "Customer Signal to Roadmap Triage",
+    "path": "workflows/33-customer-signal-roadmap-triage.md",
+    "category": "product",
+    "risk_level": "medium",
+    "trigger": "Support tickets, interviews, reviews, sales notes, or churn reasons accumulate.",
+    "goal": "Cluster evidence into themes, impact, and candidate roadmap items.",
+    "tools": [
+      "all agents"
+    ],
+    "tags": [
+      "roadmap",
+      "support",
+      "product"
+    ],
+    "verification": "Run the workflow checklist and record command/output evidence before claiming success."
+  },
+  {
+    "id": "multi-repo-change-coordinator",
+    "title": "Multi-Repo Change Coordinator",
+    "path": "workflows/34-multi-repo-change-coordinator.md",
+    "category": "implementation",
+    "risk_level": "high",
+    "trigger": "A change spans multiple repositories, packages, services, docs, or deployment units.",
+    "goal": "Sequence changes, compatibility shims, branch/PR mapping, and verification across repos.",
+    "tools": [
+      "all coding agents"
+    ],
+    "tags": [
+      "multi-repo",
+      "coordination",
+      "contracts"
+    ],
+    "verification": "Run the workflow checklist and record command/output evidence before claiming success."
+  },
+  {
+    "id": "git-worktree-agent-lanes",
+    "title": "Git Worktree Agent Lanes",
+    "path": "workflows/35-git-worktree-agent-lanes.md",
+    "category": "execution",
+    "risk_level": "medium",
+    "trigger": "Multiple agents or humans need to work in the same repo concurrently.",
+    "goal": "Use worktrees and branch naming to isolate lanes and avoid stomping shared state.",
+    "tools": [
+      "coding agents with git"
+    ],
+    "tags": [
+      "git",
+      "worktrees",
+      "parallel-agents"
+    ],
+    "verification": "Run the workflow checklist and record command/output evidence before claiming success."
+  },
+  {
+    "id": "context-compaction-handoff",
+    "title": "Context Compaction and Handoff",
+    "path": "workflows/36-context-compaction-handoff.md",
+    "category": "execution",
+    "risk_level": "medium",
+    "trigger": "A long agent session is about to compact, hand off, or restart.",
+    "goal": "Preserve the minimum operational state needed for the next agent to continue safely.",
+    "tools": [
+      "long-context agents"
+    ],
+    "tags": [
+      "handoff",
+      "context",
+      "continuity"
+    ],
+    "verification": "Run the workflow checklist and record command/output evidence before claiming success."
+  },
+  {
+    "id": "mcp-tool-integration-review",
+    "title": "MCP and Tool Integration Review",
+    "path": "workflows/37-mcp-tool-integration-review.md",
+    "category": "safety",
+    "risk_level": "high",
+    "trigger": "Adding or changing an MCP server, tool, plugin, or external integration.",
+    "goal": "Review permissions, data flow, failure modes, and least-privilege configuration.",
+    "tools": [
+      "tool-using agents",
+      "MCP"
+    ],
+    "tags": [
+      "mcp",
+      "tools",
+      "permissions"
+    ],
+    "verification": "Run the workflow checklist and record command/output evidence before claiming success."
+  },
+  {
+    "id": "secrets-config-audit",
+    "title": "Secrets and Config Audit",
+    "path": "workflows/38-secrets-config-audit.md",
+    "category": "security",
+    "risk_level": "high",
+    "trigger": "Before public release, CI setup, deployment, or repository handoff.",
+    "goal": "Find exposed secrets, unsafe defaults, config drift, and docs that request secrets insecurely.",
+    "tools": [
+      "all coding agents"
+    ],
+    "tags": [
+      "secrets",
+      "configuration",
+      "security"
+    ],
+    "verification": "Run the workflow checklist and record command/output evidence before claiming success."
+  },
+  {
+    "id": "agent-written-docs-review",
+    "title": "Agent-Written Docs Review",
+    "path": "workflows/39-agent-written-docs-review.md",
+    "category": "documentation",
+    "risk_level": "low",
+    "trigger": "An agent produced README, API docs, changelog, tutorial, or launch copy.",
+    "goal": "Check claims, dependency order, examples, and stale or exaggerated statements.",
+    "tools": [
+      "all agents"
+    ],
+    "tags": [
+      "docs",
+      "review",
+      "accuracy"
+    ],
+    "verification": "Run the workflow checklist and record command/output evidence before claiming success."
+  },
+  {
+    "id": "long-running-task-checkpoint",
+    "title": "Long-Running Task Checkpoint",
+    "path": "workflows/40-long-running-task-checkpoint.md",
+    "category": "execution",
+    "risk_level": "medium",
+    "trigger": "A build, migration, scrape, benchmark, agent run, or batch job will run for a while.",
+    "goal": "Track progress, logs, exit conditions, and recovery without losing the process.",
+    "tools": [
+      "all agents"
+    ],
+    "tags": [
+      "checkpoint",
+      "monitoring",
+      "long-running-tasks"
+    ],
+    "verification": "Run the workflow checklist and record command/output evidence before claiming success."
+  }
+]

@@ -1,0 +1,93 @@
+# Root-level dockerignore. Applies to any build that uses the repo root as
+# context — currently just `v3-service` (per docker-compose.yml). Per-service
+# Dockerfiles in proxy/, geometric-lens/, sandbox/, inference/ use
+# their own subdirectory as context and are unaffected by this file.
+#
+# Goal: keep the v3 build context to just the `v3-service/` Python modules
+# (what its Dockerfile actually COPYs), so CI doesn't ship docs/ + tests/ +
+# proxy sources / etc. across the wire on every build.
+
+# VCS + CI
+.git/
+.github/
+
+# Other services' source trees (v3 doesn't need them)
+proxy/
+tui/
+geometric-lens/
+sandbox/
+inference/
+templates/
+docs/
+tests/
+
+# Local-only state
+.atlas/
+.claude/
+*claude*
+*Claude*
+CLAUDE.md
+ISSUES.md
+
+# Heavy artifacts
+models/
+data/
+projects/
+docs/reports/ablation/
+# Not COPY'd by the v3 image (stages/ ships from v3-service/); also holds
+# heavy runtime output (results/, datasets/.cache/).
+benchmark/
+
+# Build / cache / Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.egg-info/
+dist/
+build/
+node_modules/
+
+# Models & weights (huge, never go in any image)
+*.gguf
+*.bin
+*.safetensors
+*.pt
+*.pth
+
+# Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+secrets/
+*secret*
+atlas.conf
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Logs / tmp / archives
+*.log
+logs/
+tmp/
+temp/
+*.tmp
+*.bak
+*.backup
+*.tar
+*.tar.gz
+*.zip

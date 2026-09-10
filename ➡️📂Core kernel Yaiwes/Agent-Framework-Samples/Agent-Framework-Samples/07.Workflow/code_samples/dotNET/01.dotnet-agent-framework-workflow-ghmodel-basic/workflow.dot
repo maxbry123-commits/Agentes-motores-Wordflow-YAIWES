@@ -1,0 +1,9 @@
+digraph Workflow {
+  rankdir=TD;
+  node [shape=box, style=filled, fillcolor=lightblue];
+  edge [color=black, arrowhead=vee];
+
+  "FrontDesk_e4e9a0ca66f040e3a825eee54af2f51a" [fillcolor=lightgreen, label="FrontDesk_e4e9a0ca66f040e3a825eee54af2f51a\n(Start)"];
+  "Concierge_08664f16f9794eaea15b51aaae66b361" [label="Concierge_08664f16f9794eaea15b51aaae66b361"];
+  "FrontDesk_e4e9a0ca66f040e3a825eee54af2f51a" -> "Concierge_08664f16f9794eaea15b51aaae66b361";
+}

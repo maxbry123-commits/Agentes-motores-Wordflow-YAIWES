@@ -1,0 +1,74 @@
+defmodule Jidoka.Cancellation do
+  @moduledoc """
+  Typed evidence that an asynchronous Jidoka request was cancelled.
+
+  Cancellation is request-scoped runtime data. It is not a turn snapshot and it
+  does not imply that an external side effect was rolled back.
+  """
+
+  alias __MODULE__.Token
+  alias Jidoka.Context
+  alias Jidoka.Schema
+
+  @schema Zoi.struct(
+            __MODULE__,
+            %{
+              request_id: Schema.non_empty_string(),
+              forced?: Zoi.boolean() |> Zoi.default(false),
+              cancelled_at_ms: Zoi.integer() |> Zoi.gte(0),
+              reason: Schema.atom_enum([:cancelled]) |> Zoi.default(:cancelled)
+            },
+            coerce: true
+          )
+
+  @type t :: unquote(Zoi.type_spec(@schema))
+  @typedoc "Opaque request-scoped cancellation signal used by the runtime."
+  @opaque token :: %{required(:ref) => :atomics.atomics_ref(), required(:owner) => pid()}
+  @enforce_keys Zoi.Struct.enforce_keys(@schema)
+  defstruct Zoi.Struct.struct_fields(@schema)
+
+  @doc "Returns the schema for typed cancellation evidence."
+  @spec schema() :: Zoi.schema()
+  def schema, do: @schema
+
+  @doc "Builds typed cancellation evidence."
+  @spec new(keyword() | map()) :: {:ok, t()} | {:error, term()}
+  def new(attrs), do: Schema.parse(@schema, attrs)
+
+  @doc "Builds typed cancellation evidence or raises."
+  @spec new!(keyword() | map()) :: t()
+  def new!(attrs), do: Schema.parse!(@schema, attrs, "cancellation")
+
+  @doc "Returns true when a runtime context or token has a cancellation request."
+  @spec requested?(Context.t() | token()) :: boolean()
+  def requested?(%Context{} = context) do
+    context
+    |> Context.get_runtime(:cancellation)
+    |> requested?()
+  end
+
+  def requested?(%Token{} = token), do: Token.requested?(token)
+  def requested?(_value), do: false
+
+  @doc false
+  @spec check(keyword() | token() | nil) :: :ok | {:error, :cancelled}
+  def check(opts) when is_list(opts) do
+    opts
+    |> Keyword.get(:cancellation)
+    |> check()
+  end
+
+  def check(%Token{} = token) do
+    if Token.requested?(token), do: {:error, :cancelled}, else: :ok
+  end
+
+  def check(nil), do: :ok
+
+  @doc false
+  @spec cancelled_reason?(term()) :: boolean()
+  def cancelled_reason?(:cancelled), do: true
+  def cancelled_reason?({:error, reason}), do: cancelled_reason?(reason)
+  def cancelled_reason?(%{details: %{cause: :cancelled}}), do: true
+  def cancelled_reason?(%{error: reason}), do: cancelled_reason?(reason)
+  def cancelled_reason?(_reason), do: false
+end

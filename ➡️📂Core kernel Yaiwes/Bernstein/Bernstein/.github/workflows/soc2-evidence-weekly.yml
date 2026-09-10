@@ -1,0 +1,156 @@
+name: soc2-evidence-weekly
+
+# Weekly SOC 2 evidence-pack generator.
+#
+# Runs `bernstein audit pack --soc2` against the checked-out repo and
+# uploads the resulting Markdown checklist + JSON manifest as a CI
+# artefact. Gated by the `SOC2_EVIDENCE_ENABLED` repository secret so
+# upstream forks don't accidentally publish empty evidence packs.
+#
+# Deliverable: a per-control Markdown row pointing at the artefact (or
+# sha256 hash) that proves the control. Auditors download the artefact
+# and walk the checklist without round-tripping back to engineering.
+
+on:
+  schedule:
+    # 03:47 UTC every Monday. Offset to avoid colliding with eval-weekly
+    # (04:23) and cluster-e2e (03:17 nightly).
+    - cron: "47 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      include_runs:
+        description: "ISO-8601 lower bound for the run-log evidence row."
+        required: false
+        default: ""
+      period_label:
+        description: "Period label rendered into the markdown header."
+        required: false
+        default: "weekly"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: soc2-evidence-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    name: preflight (gate)
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    outputs:
+      enabled: ${{ steps.gate.outputs.enabled }}
+    steps:
+      - name: Harden runner (audit mode)
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+      - id: gate
+        env:
+          SOC2_EVIDENCE_ENABLED: ${{ secrets.SOC2_EVIDENCE_ENABLED }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${SOC2_EVIDENCE_ENABLED:-}" ]]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "SOC2_EVIDENCE_ENABLED detected - running pack generator."
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            # A dormant lane is not a failure, so this run still concludes
+            # green - but it must not look identical to a real evidence
+            # pack. Say so where an operator actually looks: the run
+            # annotation and the step summary, not just a plain log line.
+            echo "::warning::SOC2_EVIDENCE_ENABLED is unset - this run produced no SOC 2 evidence pack. Provision the repository secret to enable the pack job."
+            {
+              echo "## SOC 2 evidence pack: dormant"
+              echo ""
+              echo "\`SOC2_EVIDENCE_ENABLED\` is unset, so the \`pack\` job did not run and no evidence was generated this run."
+              echo "Provision the \`SOC2_EVIDENCE_ENABLED\` repository secret to enable it."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  pack:
+    name: generate evidence pack
+    needs: preflight
+    if: needs.preflight.outputs.enabled == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Harden runner (audit mode)
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: ./.github/actions/bootstrap
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Sync dependencies
+        run: uv sync --frozen
+
+      - name: Generate SOC 2 evidence pack
+        env:
+          INCLUDE_RUNS: ${{ github.event.inputs.include_runs }}
+          PERIOD_LABEL: ${{ github.event.inputs.period_label || 'weekly' }}
+        run: |
+          set -euo pipefail
+          INCLUDE_FLAG=()
+          if [[ -n "${INCLUDE_RUNS:-}" ]]; then
+            INCLUDE_FLAG=(--include-runs "${INCLUDE_RUNS}")
+          fi
+          uv run bernstein audit pack \
+            --soc2 \
+            --period-label "${PERIOD_LABEL}" \
+            --output .sdd/evidence/soc2 \
+            "${INCLUDE_FLAG[@]}"
+
+      - name: Upload evidence pack
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: soc2-evidence-${{ github.run_id }}
+          path: |
+            .sdd/evidence/soc2/*.md
+            .sdd/evidence/soc2/*.json
+          if-no-files-found: error
+          # 90 is GitHub's hard ceiling on artifact retention for public
+          # repositories - this is already the maximum, not a conservative
+          # default to raise. At a weekly cadence that holds ~13 packs,
+          # short of a typical 6-12 month audit window. Durable export
+          # beyond this ceiling is tracked separately: issue #3966.
+          retention-days: 90
+
+      - name: Export evidence pack to sink
+        # Access control & retention policy:
+        # - Write access: Restricted to the automated CI workflow runner via
+        #   the configured storage sink (e.g. S3/GCS/R2 credentials in repository secrets).
+        # - Read access: Restricted to compliance officers, security auditors,
+        #   and automated GRC ingest pipelines.
+        # - Retention policy: Managed by destination sink bucket lifecycle rules
+        #   (e.g., 7-year immutable archive for SOC 2 / ISO 27001 audit trails).
+        env:
+          SOC2_EVIDENCE_SINK: ${{ secrets.SOC2_EVIDENCE_SINK }}
+          PERIOD_LABEL: ${{ github.event.inputs.period_label || 'weekly' }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${SOC2_EVIDENCE_SINK:-}" ]]; then
+            echo "SOC2_EVIDENCE_SINK detected - exporting evidence pack."
+            uv run python -c "import os; from pathlib import Path; from bernstein.core.storage.soc2_export import export_soc2_evidence_pack; p = os.environ.get('PERIOD_LABEL', 'weekly'); r = os.environ.get('RUN_ID', ''); s = os.environ.get('SOC2_EVIDENCE_SINK', ''); d = Path('.sdd/evidence/soc2'); md = next(d.glob(f'soc2-evidence-{p}.md'), None); js = next(d.glob(f'soc2-evidence-{p}.json'), None); export_soc2_evidence_pack(md, js, sink_name=s, period_label=p, run_id=r)"
+          else
+            # A dormant export lane is not a failure, but must never look identical
+            # to an active export. Warn loudly and record to step summary.
+            echo "::warning::SOC2_EVIDENCE_SINK is unset - evidence pack was not exported to remote sink. Configure the SOC2_EVIDENCE_SINK repository secret to enable remote export."
+            {
+              echo "## SOC 2 evidence export: dormant"
+              echo ""
+              echo "\`SOC2_EVIDENCE_SINK\` is unset, so the evidence pack was stored only as a GitHub Actions artifact (90-day ceiling)."
+              echo "Configure the \`SOC2_EVIDENCE_SINK\` repository secret to export packs to durable remote storage."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+

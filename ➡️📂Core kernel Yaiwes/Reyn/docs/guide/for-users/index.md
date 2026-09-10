@@ -1,0 +1,77 @@
+---
+type: landing
+topic: using-reyn
+audience: [human]
+---
+
+# For users
+
+Everything you need to use Reyn day-to-day — no skill authoring, no server management.
+
+If you haven't installed Reyn yet, start with [Getting started: Installation](../getting-started/01-installation.md).
+
+---
+
+## The one command you need
+
+```bash
+reyn chat
+```
+
+This opens a TUI session. Type a request, get a response. That's it.
+Reyn routes your request to the right built-in skill automatically — you don't choose which one.
+
+---
+
+## What you can do in chat
+
+| Task | Example input |
+|---|---|
+| Ask questions | `"What's the capital of France?"` |
+| Summarize files | `"Summarize README.md"` |
+| Work on local files | `"What functions are in src/reyn/skill_runtime.py?"` |
+| Search the web | `"What's the latest release of Python?"` |
+| Run multi-step tasks | `"Research X and write a report"` |
+
+No configuration required for any of these. Reyn has the skills for them out of the box.
+
+---
+
+## How-tos
+
+### Interface
+
+- **[Chat and Web UI](chat-and-web-ui.md)** — start the web interface, use it alongside the TUI.
+
+### Files and tools
+
+- **[Work with local files](work-with-files.md)** — reference files and directories in your requests.
+
+- **[Enable semantic search](enable-semantic-search.md)** — index your own docs so Reyn can search them by meaning.
+- **[Build a RAG corpus](build-a-rag-corpus.md)** — turn a folder of PDFs / Office docs into a sqlite vector store you own, then query it.
+- **[Log in to an OAuth provider](oauth-login.md)** — authorize GitHub / Google / etc. via the browser device flow.
+- **[Inspect and manage memory](manage-memory.md)** — review, edit, back up, or restore what Reyn remembers.
+
+### Control and safety
+
+- **[Manage permissions](manage-permissions.md)** — approve or deny what Reyn is allowed to do.
+- **[Rewind a session](time-travel.md)** — jump back to an earlier point with `/rewind` and branch from there.
+- **[Cap your spending](cap-spending.md)** — set token / dollar limits so a run can't overspend.
+
+---
+
+## Things Reyn handles for you
+
+**Memory** — Reyn remembers facts across sessions automatically. No setup needed. To review or curate what it has stored, see [Inspect and manage memory](manage-memory.md).
+
+**Crash recovery** — if a long task is interrupted, re-run `reyn chat` and it resumes from where it left off.
+
+**Cleanup** — when you close the TUI, the session ends cleanly. No background processes left behind.
+
+---
+
+## Where to go from here
+
+Once you're comfortable with chat mode:
+
+- **[Reference: CLI / chat](../../reference/cli/chat.md)** — full list of slash commands and flags.

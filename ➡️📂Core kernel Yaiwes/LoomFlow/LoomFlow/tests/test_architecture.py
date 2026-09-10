@@ -1,0 +1,295 @@
+"""Architecture layer surface tests.
+
+Verifies:
+
+* The :class:`Architecture` protocol is satisfied by :class:`ReAct`.
+* :class:`AgentSession` and :class:`Dependencies` are constructable.
+* :func:`resolve_architecture` accepts ``None``, ``"react"``, and an
+  instance; rejects unknown strings with :class:`ConfigError`.
+* :class:`Agent` defaults to :class:`ReAct` when ``architecture=`` is
+  omitted, and forwards ``architecture=`` to the public
+  ``.architecture`` property.
+* A minimal custom architecture (single text response, no tools)
+  drives an end-to-end ``Agent.run()`` correctly — proves the
+  Protocol shape is what the framework expects.
+"""
+
+from __future__ import annotations
+
+from collections.abc import AsyncIterator
+
+import pytest
+
+from loomflow import Agent, ScriptedModel, ScriptedTurn
+from loomflow.architecture import (
+    AgentSession,
+    Architecture,
+    Dependencies,
+    ReAct,
+    resolve_architecture,
+)
+from loomflow.core.errors import ConfigError
+from loomflow.core.types import Event
+
+pytestmark = pytest.mark.anyio
+
+
+# ---------------------------------------------------------------------------
+# Protocol satisfaction
+# ---------------------------------------------------------------------------
+
+
+def test_react_satisfies_architecture_protocol() -> None:
+    """``isinstance(ReAct(), Architecture)`` must be True — the
+    protocol is ``runtime_checkable`` precisely so users can verify
+    custom architectures against it."""
+    assert isinstance(ReAct(), Architecture)
+
+
+def test_react_declares_no_workers() -> None:
+    """ReAct is single-agent — ``declared_workers`` returns empty."""
+    assert ReAct().declared_workers() == {}
+
+
+def test_react_has_name() -> None:
+    assert ReAct().name == "react"
+
+
+# ---------------------------------------------------------------------------
+# resolve_architecture
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_architecture_none_returns_react_default() -> None:
+    arch = resolve_architecture(None)
+    assert isinstance(arch, ReAct)
+
+
+def test_resolve_architecture_string_react() -> None:
+    arch = resolve_architecture("react")
+    assert isinstance(arch, ReAct)
+
+
+def test_resolve_architecture_passes_through_instance() -> None:
+    instance = ReAct(max_turns=7)
+    assert resolve_architecture(instance) is instance
+
+
+def test_resolve_architecture_unknown_string_raises_configerror() -> None:
+    with pytest.raises(ConfigError, match="unknown architecture"):
+        resolve_architecture("nonexistent-arch")
+
+
+# ---------------------------------------------------------------------------
+# Entry-point discovery — third-party architectures
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_architecture_finds_third_party_entry_point(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A package that ships an entry point in the
+    ``loomflow.architecture`` group becomes resolvable by string
+    without an explicit import on the caller side."""
+
+    from loomflow.architecture import resolver as resolver_mod
+
+    class _PluginArchitecture(_NoopArchitecture):  # type: ignore[misc, valid-type]
+        name = "plugin"
+
+    class _FakeEntryPoint:
+        name = "plugin"
+
+        def load(self) -> type:
+            return _PluginArchitecture
+
+    def _fake_entry_points(*, group: str):  # type: ignore[no-untyped-def]
+        assert group == resolver_mod.ENTRY_POINT_GROUP
+        return [_FakeEntryPoint()]
+
+    monkeypatch.setattr(resolver_mod, "entry_points", _fake_entry_points)
+    resolver_mod.clear_arch_cache()
+    try:
+        arch = resolve_architecture("plugin")
+        assert isinstance(arch, _PluginArchitecture)
+    finally:
+        resolver_mod.clear_arch_cache()
+
+
+def test_builtin_arch_name_beats_entry_point(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A third-party entry point named ``react`` must not shadow
+    the built-in ReAct — protects users from typo-squatting."""
+
+    from loomflow.architecture import resolver as resolver_mod
+
+    class _ImposterReact:
+        name = "react"
+
+    class _FakeEntryPoint:
+        name = "react"
+
+        def load(self) -> type:
+            return _ImposterReact
+
+    monkeypatch.setattr(
+        resolver_mod, "entry_points", lambda *, group: [_FakeEntryPoint()]
+    )
+    resolver_mod.clear_arch_cache()
+    try:
+        arch = resolve_architecture("react")
+        assert isinstance(arch, ReAct)
+    finally:
+        resolver_mod.clear_arch_cache()
+
+
+def test_broken_entry_point_does_not_kill_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A plugin whose ``ep.load()`` raises must not prevent the
+    rest of the resolver from working — known names still resolve,
+    unknown names still produce the usual ConfigError."""
+
+    from loomflow.architecture import resolver as resolver_mod
+
+    class _BrokenEntryPoint:
+        name = "broken-thing"
+
+        def load(self) -> type:
+            raise RuntimeError("import boom")
+
+    monkeypatch.setattr(
+        resolver_mod, "entry_points", lambda *, group: [_BrokenEntryPoint()]
+    )
+    resolver_mod.clear_arch_cache()
+    try:
+        assert isinstance(resolve_architecture("react"), ReAct)
+        with pytest.raises(ConfigError, match="unknown architecture"):
+            resolve_architecture("broken-thing")
+    finally:
+        resolver_mod.clear_arch_cache()
+
+
+# ---------------------------------------------------------------------------
+# Agent integration
+# ---------------------------------------------------------------------------
+
+
+def test_agent_default_architecture_is_react() -> None:
+    agent = Agent("hi", model="echo")
+    assert isinstance(agent.architecture, ReAct)
+
+
+def test_agent_accepts_architecture_string() -> None:
+    agent = Agent("hi", model="echo", architecture="react")
+    assert isinstance(agent.architecture, ReAct)
+
+
+def test_agent_accepts_architecture_instance() -> None:
+    instance = ReAct(max_turns=3)
+    agent = Agent("hi", model="echo", architecture=instance)
+    assert agent.architecture is instance
+
+
+def test_agent_unknown_architecture_string_raises_configerror() -> None:
+    with pytest.raises(ConfigError, match="unknown architecture"):
+        Agent("hi", model="echo", architecture="nope")
+
+
+# ---------------------------------------------------------------------------
+# Custom architecture — end-to-end
+# ---------------------------------------------------------------------------
+
+
+class _NoopArchitecture:
+    """Minimal architecture that emits one synthetic event and stops.
+
+    Proves the Protocol contract: implementations don't need to
+    inherit from anything, just implement ``name``, ``run``, and
+    ``declared_workers``.
+    """
+
+    name = "noop"
+
+    def declared_workers(self) -> dict[str, Agent]:
+        return {}
+
+    async def run(
+        self,
+        session: AgentSession,
+        deps: Dependencies,
+        prompt: str,
+    ) -> AsyncIterator[Event]:
+        session.output = f"[noop processed: {prompt}]"
+        session.turns = 1
+        # No model / tool calls; just structurally yield one event.
+        yield Event.budget_warning(
+            session.id,
+            __import__("loomflow.core.types", fromlist=["BudgetStatus"])
+            .BudgetStatus.warn_("noop arch warns once"),
+        )
+
+
+def test_noop_arch_satisfies_protocol() -> None:
+    assert isinstance(_NoopArchitecture(), Architecture)
+
+
+async def test_custom_architecture_drives_agent_run_to_completion() -> None:
+    """A custom architecture without a model still lets the Agent
+    emit STARTED / COMPLETED, persist an episode, and return a
+    populated :class:`RunResult`."""
+    agent = Agent(
+        "hi",
+        model="echo",  # not actually called by NoopArchitecture
+        architecture=_NoopArchitecture(),
+    )
+    result = await agent.run("hello world")
+    assert "[noop processed: hello world]" in result.output
+    assert result.turns == 1
+    assert result.session_id.startswith("sess_")
+
+
+async def test_custom_architecture_events_visible_via_stream() -> None:
+    """Events the architecture yields show up in the public stream
+    surface, sandwiched between STARTED and COMPLETED."""
+    agent = Agent(
+        "hi", model="echo", architecture=_NoopArchitecture()
+    )
+    events = [event async for event in agent.stream("ping")]
+    kinds = [e.kind for e in events]
+    assert kinds[0] == "started"
+    assert kinds[-1] == "completed"
+    assert "budget_warning" in kinds
+
+
+# ---------------------------------------------------------------------------
+# ReAct end-to-end via Agent — sanity check the refactored loop
+# ---------------------------------------------------------------------------
+
+
+async def test_react_drives_a_scripted_two_turn_run() -> None:
+    """One tool call, one final text response — the canonical ReAct
+    shape. Ensures the extracted iteration matches v0.1.x behaviour."""
+    from loomflow import tool
+    from loomflow.core.types import ToolCall
+
+    @tool
+    async def echo_back(msg: str) -> str:
+        """Echo back the message."""
+        return f"echoed:{msg}"
+
+    model = ScriptedModel(
+        [
+            ScriptedTurn(
+                tool_calls=[
+                    ToolCall(id="c1", tool="echo_back", args={"msg": "hi"})
+                ]
+            ),
+            ScriptedTurn(text="all done"),
+        ]
+    )
+    agent = Agent("test", model=model, tools=[echo_back])
+    result = await agent.run("go")
+    assert "all done" in result.output
+    assert result.turns == 2

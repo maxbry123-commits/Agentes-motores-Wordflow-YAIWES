@@ -1,0 +1,116 @@
+import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { ChatUpdateArguments } from "@slack/web-api";
+import * as z from "zod";
+import { getAgentById } from "@/be/db";
+import { can } from "@/rbac";
+import { getSlackApp } from "@/slack/app";
+import { parseSlackTs } from "@/slack/message-text";
+import { markdownToSlack } from "@/slack/responses";
+import { createToolRegistrar, swarmToolOutputSchema, toolErr, toolOk } from "@/tools/utils";
+
+type ChatUpdatePayload = ChatUpdateArguments & {
+  unfurl_links: false;
+  unfurl_media: false;
+};
+
+export const registerSlackUpdateTool = (server: McpServer) => {
+  createToolRegistrar(server)(
+    "slack-update",
+    {
+      title: "Edit a Slack message",
+      description:
+        "Edits (in place) the text of a Slack message that THIS bot authored — use it to post corrections to your own messages. Cannot edit messages authored by humans or other apps. Note: editing may reset the message's display name/icon to the app default (Slack's chat.update cannot set the crown persona). Requires lead privileges.",
+      annotations: { openWorldHint: true },
+
+      inputSchema: z.object({
+        channelId: z.string().min(1).describe("The Slack channel ID the message is in."),
+        messageTs: z
+          .string()
+          .min(1)
+          .describe(
+            "Timestamp of the message to edit (dotted, 'p' deep-link, or full permalink URL).",
+          ),
+        message: z.string().min(1).max(4000).describe("The new message content."),
+      }),
+      outputSchema: swarmToolOutputSchema({
+        messageTs: z.string().optional(),
+      }),
+    },
+    async ({ channelId, messageTs, message }, requestInfo, _meta) => {
+      if (!requestInfo.agentId) {
+        return toolErr("Agent ID not found.");
+      }
+
+      const agent = await getAgentById(requestInfo.agentId);
+      if (!agent) {
+        return toolErr("Agent not found.");
+      }
+
+      const decision = can({
+        principal: { kind: "agent", agentId: agent.id, isLead: agent.isLead },
+        verb: "integration.slack.update",
+        resource: { kind: "none" },
+        source: "mcp",
+      });
+      if (!decision.allow) {
+        return toolErr("Editing Slack messages requires lead privileges.");
+      }
+
+      const app = getSlackApp();
+      if (!app) {
+        return toolErr("Slack not configured.");
+      }
+
+      try {
+        const ts = parseSlackTs(messageTs);
+        const slackMessage = markdownToSlack(message);
+
+        const updatePayload = {
+          channel: channelId,
+          ts,
+          text: slackMessage,
+          unfurl_links: false,
+          unfurl_media: false,
+          blocks: [
+            {
+              type: "section",
+              text: {
+                type: "mrkdwn",
+                text: slackMessage,
+              },
+            },
+          ],
+        } satisfies ChatUpdatePayload;
+        const result = await app.client.chat.update(updatePayload);
+
+        return toolOk("Message updated successfully.", { data: { messageTs: result.ts } });
+      } catch (error) {
+        const errorCode = (error as { data?: { error?: string } } | undefined)?.data?.error;
+        const errorMsg = error instanceof Error ? error.message : String(error);
+
+        let message: string;
+        switch (errorCode) {
+          case "message_not_found":
+            message = "No message found at that timestamp in this channel.";
+            break;
+          case "cant_update_message":
+            message = "Cannot edit this message — the bot can only edit messages it authored.";
+            break;
+          case "edit_window_closed":
+            message = "The edit window for this message has closed.";
+            break;
+          case "channel_not_found":
+            message = "Channel not found or the bot has no access.";
+            break;
+          case "not_in_channel":
+            message = "The bot is not in that channel.";
+            break;
+          default:
+            message = `Failed to update message: ${errorMsg}`;
+        }
+
+        return toolErr(message);
+      }
+    },
+  );
+};

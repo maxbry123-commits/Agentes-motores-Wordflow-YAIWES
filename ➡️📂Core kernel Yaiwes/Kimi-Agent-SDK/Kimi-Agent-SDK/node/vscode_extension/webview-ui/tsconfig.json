@@ -1,0 +1,28 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["DOM", "DOM.Iterable", "ES2024"],
+    "module": "ESNext",
+    "skipLibCheck": true,
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "jsx": "react-jsx",
+    "strict": true,
+    "noUnusedLocals": false,
+    "noUnusedParameters": false,
+    "noFallthroughCasesInSwitch": true,
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["src/*"],
+      "shared/*": ["../shared/*"],
+      "@moonshot-ai/kimi-agent-sdk": ["../../agent_sdk/index.ts"],
+      "@moonshot-ai/kimi-agent-sdk/schema": ["../../agent_sdk/schema.ts"],
+      "@moonshot-ai/kimi-agent-sdk/errors": ["../../agent_sdk/errors.ts"],
+      "@moonshot-ai/kimi-agent-sdk/utils": ["../../agent_sdk/utils.ts"]
+    }
+  },
+  "include": ["src"]
+}

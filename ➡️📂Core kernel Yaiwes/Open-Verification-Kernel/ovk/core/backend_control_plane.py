@@ -1,0 +1,458 @@
+"""Backend control plane for compiling, executing, and aggregating obligations.
+
+By default the control plane uses ``ControlPlaneResultCache`` for backend
+results. Authoritative adapters must execute behind a ``BackendWorker``; the
+production local worker is budget-bound so requested isolation controls are
+either enforced or the subprocess is rejected.
+"""
+
+from __future__ import annotations
+
+import inspect
+import time
+from datetime import datetime, timezone
+from typing import Any, Protocol
+
+from ovk.core.backend_aggregation import aggregate_results
+from ovk.core.backend_registry import BackendRegistry, BackendRegistryError
+from ovk.core.execution_budget import BackendWorker, BudgetBoundWorker, LocalSubprocessWorker
+from ovk.core.execution_models import (
+    BackendEnvironmentFingerprint,
+    BackendObligation,
+    CachedBackendExecution,
+    ExecutionAttempt,
+    ExecutionBudget,
+    NormalizedBackendResult,
+    ObligationExecutionRecord,
+    RawBackendExecution,
+    RoutingDecision,
+    VerificationObligation,
+    compute_attempt_id,
+    compute_raw_execution_digests,
+)
+from ovk.core.models import VerificationStatus
+from ovk.core.result_cache import ControlPlaneResultCache
+
+
+class ResultCache(Protocol):
+    def get(self, key: str) -> CachedBackendExecution | None: ...
+    def put(self, key: str, value: CachedBackendExecution, *, meta: dict[str, Any]) -> None: ...
+
+
+_CACHE_UNSET = object()
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def control_plane_cache_key(
+    *,
+    obligation: VerificationObligation,
+    routing: RoutingDecision,
+    backend_obligation: BackendObligation,
+    fingerprint: BackendEnvironmentFingerprint,
+    input_format: str = "json",
+) -> str:
+    from ovk.core.result_cache import build_backend_result_key_components, digest_key_components
+
+    return digest_key_components(
+        build_backend_result_key_components(
+            obligation=obligation,
+            routing=routing,
+            backend_obligation=backend_obligation,
+            fingerprint=fingerprint,
+            input_format=input_format,
+        )
+    )
+
+
+def control_plane_cache_components(
+    *,
+    obligation: VerificationObligation,
+    routing: RoutingDecision,
+    backend_obligation: BackendObligation,
+    fingerprint: BackendEnvironmentFingerprint,
+    input_format: str = "json",
+) -> dict[str, Any]:
+    from ovk.core.result_cache import build_backend_result_key_components
+
+    return build_backend_result_key_components(
+        obligation=obligation,
+        routing=routing,
+        backend_obligation=backend_obligation,
+        fingerprint=fingerprint,
+        input_format=input_format,
+    )
+
+
+def _error_raw(
+    *,
+    backend: str,
+    backend_obligation_id: str,
+    stage: str,
+    exc: BaseException,
+    started_at: str,
+    started_perf: float,
+) -> RawBackendExecution:
+    finished_at = _utc_now_iso()
+    raw = RawBackendExecution(
+        backend=backend,
+        backend_obligation_id=backend_obligation_id,
+        termination="tool_error",
+        native_execution=False,
+        exit_code=1,
+        stderr=f"{type(exc).__name__}: {exc}",
+        raw_result={
+            "status": "error",
+            "error": {
+                "category": type(exc).__name__,
+                "message": str(exc),
+                "stage": stage,
+            },
+        },
+        started_at=started_at,
+        finished_at=finished_at,
+        duration_ms=(time.perf_counter() - started_perf) * 1000.0,
+    )
+    return raw.model_copy(update=compute_raw_execution_digests(raw))
+
+
+def _compiler_contract_error_raw(
+    *,
+    backend: str,
+    backend_obligation_id: str,
+    message: str,
+    started_at: str,
+    started_perf: float,
+) -> RawBackendExecution:
+    finished_at = _utc_now_iso()
+    raw = RawBackendExecution(
+        backend=backend,
+        backend_obligation_id=backend_obligation_id,
+        termination="invalid_output",
+        native_execution=False,
+        exit_code=1,
+        stderr=message,
+        raw_result={
+            "status": "error",
+            "error": {
+                "category": "compiler_contract",
+                "message": message,
+                "stage": "compile",
+            },
+        },
+        started_at=started_at,
+        finished_at=finished_at,
+        duration_ms=(time.perf_counter() - started_perf) * 1000.0,
+    )
+    return raw.model_copy(update=compute_raw_execution_digests(raw))
+
+
+def _attempt_from_raw(*, raw: RawBackendExecution, required: bool) -> ExecutionAttempt:
+    provisional = ExecutionAttempt(
+        attempt_id="pending",
+        backend_obligation_id=raw.backend_obligation_id,
+        backend=raw.backend,
+        required=required,
+        started_at=raw.started_at or _utc_now_iso(),
+        finished_at=raw.finished_at or _utc_now_iso(),
+        duration_ms=float(raw.duration_ms or 0.0),
+        termination=raw.termination,
+        native_execution=raw.native_execution,
+        tool_version=raw.tool_version,
+        tool_digest=raw.tool_digest,
+        worker_image_digest=raw.worker_image_digest,
+        exit_code=raw.exit_code,
+        stdout_digest=raw.stdout_digest,
+        stderr_digest=raw.stderr_digest,
+        raw_result_digest=raw.raw_result_digest,
+    )
+    return provisional.model_copy(update={"attempt_id": compute_attempt_id(provisional)})
+
+
+class BackendControlPlane:
+    """Execute selected backends for one obligation under an explicit budget."""
+
+    def __init__(
+        self,
+        *,
+        cache: ResultCache | None = None,
+        worker: BackendWorker | None = None,
+        use_hardened_cache: bool = True,
+    ) -> None:
+        if cache is not None:
+            self._default_cache: ResultCache | None = cache
+        elif use_hardened_cache:
+            self._default_cache = ControlPlaneResultCache()
+        else:
+            self._default_cache = None
+        self._worker = worker or LocalSubprocessWorker()
+
+    @property
+    def worker(self) -> BackendWorker:
+        return self._worker
+
+    def execute(
+        self,
+        obligation: VerificationObligation,
+        routing: RoutingDecision,
+        *,
+        registry: BackendRegistry,
+        cache: Any = _CACHE_UNSET,
+    ) -> ObligationExecutionRecord:
+        active_cache: ResultCache | None
+        if cache is _CACHE_UNSET:
+            active_cache = self._default_cache
+        else:
+            active_cache = cache
+        budget = routing.budget
+        backend_obligations: list[BackendObligation] = []
+        attempts: list[ExecutionAttempt] = []
+        results: list[NormalizedBackendResult] = []
+
+        selected = sorted(routing.selected, key=lambda item: (not item.required, item.backend))
+        for selection in selected:
+            attempt, result, compiled = self._execute_one(
+                obligation=obligation,
+                routing=routing,
+                selection_backend=selection.backend,
+                required=selection.required,
+                expected_guarantee=selection.expected_guarantee,
+                registry=registry,
+                budget=budget,
+                cache=active_cache,
+            )
+            if compiled is not None:
+                backend_obligations.append(compiled)
+            attempts.append(attempt)
+            results.append(result)
+
+        attempts = sorted(attempts, key=lambda item: item.backend)
+        results = sorted(results, key=lambda item: item.backend)
+        backend_obligations = sorted(backend_obligations, key=lambda item: item.backend)
+
+        outcome = aggregate_results(
+            obligation_id=obligation.obligation_id,
+            selected=routing.selected,
+            results=results,
+            policy=routing.aggregation_policy,
+            acceptable_guarantees=obligation.acceptable_guarantees,
+            fallback_policy=routing.fallback_policy,
+            attempts=attempts,
+        )
+        open_obligations: list[dict[str, Any]] = []
+        if outcome.disagreement is not None:
+            open_obligations.append(outcome.disagreement)
+        if outcome.quality_error:
+            open_obligations.append(
+                {
+                    "kind": "quality_error",
+                    "obligation_id": obligation.obligation_id,
+                    "reason": outcome.reason,
+                }
+            )
+        for warning in outcome.warnings:
+            open_obligations.append({"kind": "aggregation_warning", "message": warning})
+
+        return ObligationExecutionRecord(
+            obligation=obligation,
+            routing=routing,
+            backend_obligations=backend_obligations,
+            attempts=attempts,
+            results=results,
+            aggregate_status=outcome.status,
+            decision_state=outcome.decision_state,
+            original_decision_state=outcome.original_decision_state,
+            merge_recommendation=outcome.merge_recommendation,
+            aggregation_reason=outcome.reason,
+            open_obligations=open_obligations,
+            fallback_used=outcome.fallback_used,
+            fallback_accepted=outcome.fallback_accepted,
+            fallback_cause=outcome.fallback_cause,
+            controlling_finding_ids=list(outcome.controlling_finding_ids),
+        )
+
+    def _execute_one(
+        self,
+        *,
+        obligation: VerificationObligation,
+        routing: RoutingDecision,
+        selection_backend: str,
+        required: bool,
+        expected_guarantee: str,
+        registry: BackendRegistry,
+        budget: ExecutionBudget,
+        cache: ResultCache | None,
+    ) -> tuple[ExecutionAttempt, NormalizedBackendResult, BackendObligation | None]:
+        started_perf = time.perf_counter()
+        started_at = _utc_now_iso()
+        compiled: BackendObligation | None = None
+        try:
+            adapter = registry.require(selection_backend)
+            if adapter.backend_id != selection_backend:
+                raise BackendRegistryError(
+                    f"adapter identity mismatch: expected {selection_backend}, got {adapter.backend_id}"
+                )
+            compiled = adapter.compile(obligation, routing)
+            if compiled.backend != selection_backend:
+                raise BackendRegistryError(
+                    f"compiled backend {compiled.backend!r} does not match selection {selection_backend!r}"
+                )
+            if compiled.expected_guarantee != expected_guarantee and expected_guarantee:
+                message = (
+                    "compiler contract violation: compiled guarantee "
+                    f"{compiled.expected_guarantee!r} does not match routing "
+                    f"expected guarantee {expected_guarantee!r}"
+                )
+                raw = _compiler_contract_error_raw(
+                    backend=selection_backend,
+                    backend_obligation_id=compiled.backend_obligation_id,
+                    message=message,
+                    started_at=started_at,
+                    started_perf=started_perf,
+                )
+                attempt = _attempt_from_raw(raw=raw, required=required)
+                result = NormalizedBackendResult(
+                    attempt_id=attempt.attempt_id,
+                    backend=selection_backend,
+                    status=VerificationStatus.UNKNOWN,
+                    guarantee_type=expected_guarantee,
+                    assumptions=[],
+                    limits=["compiler guarantee mismatch; execution skipped"],
+                    counterexamples=[
+                        {"summary": message, "failure_mode": "compiler_contract_violation"}
+                    ],
+                    generated_artifacts=[],
+                )
+                return attempt, result, compiled
+
+            fingerprint = adapter.fingerprint(compiled)
+            components = control_plane_cache_components(
+                obligation=obligation,
+                routing=routing,
+                backend_obligation=compiled,
+                fingerprint=fingerprint,
+            )
+            key = control_plane_cache_key(
+                obligation=obligation,
+                routing=routing,
+                backend_obligation=compiled,
+                fingerprint=fingerprint,
+            )
+            if cache is not None:
+                bind = getattr(cache, "bind_components", None)
+                if callable(bind):
+                    bind(key, components)
+                cached = cache.get(key)
+                if cached is not None:
+                    stored_attempt = cached.attempt
+                    result = cached.normalized_result.model_copy(update={"attempt_id": stored_attempt.attempt_id})
+                    return stored_attempt, result, compiled
+
+            raw = self._run_adapter(adapter, compiled, budget)
+            normalized = adapter.normalize(raw, compiled)
+            attempt = _attempt_from_raw(raw=raw, required=required)
+            result = normalized.model_copy(update={"attempt_id": attempt.attempt_id})
+            if cache is not None and raw.envelope_produced:
+                cached_exec = CachedBackendExecution(
+                    attempt=attempt,
+                    native_execution=attempt.native_execution,
+                    tool_version=attempt.tool_version,
+                    tool_digest=attempt.tool_digest,
+                    termination=attempt.termination,
+                    exit_code=attempt.exit_code,
+                    raw_result_digest=attempt.raw_result_digest,
+                    environment_fingerprint=fingerprint.environment_digest,
+                    normalized_result=result,
+                )
+                cache.put(
+                    key,
+                    cached_exec,
+                    meta={
+                        "environment_digest": fingerprint.environment_digest,
+                        "raw_result_digest": raw.raw_result_digest,
+                        "created_at": _utc_now_iso(),
+                        "cache_schema_version": "ovk.cache.v3",
+                    },
+                )
+            return attempt, result, compiled
+        except Exception as exc:  # noqa: BLE001 - isolate failures at backend boundary
+            raw = _error_raw(
+                backend=selection_backend,
+                backend_obligation_id=(compiled.backend_obligation_id if compiled is not None else "uncompiled"),
+                stage="execute",
+                exc=exc,
+                started_at=started_at,
+                started_perf=started_perf,
+            )
+            attempt = _attempt_from_raw(raw=raw, required=required)
+            result = NormalizedBackendResult(
+                attempt_id=attempt.attempt_id,
+                backend=selection_backend,
+                status=VerificationStatus.ERROR,
+                guarantee_type=expected_guarantee or "unknown",
+                assumptions=[],
+                limits=["backend execution failed at the control-plane boundary"],
+                counterexamples=[
+                    {
+                        "summary": f"{type(exc).__name__}: {exc}",
+                        "failure_mode": "backend_execution_error",
+                    }
+                ],
+                generated_artifacts=[],
+            )
+            return attempt, result, compiled
+
+    def _run_adapter(
+        self,
+        adapter: Any,
+        compiled: BackendObligation,
+        budget: ExecutionBudget,
+    ) -> RawBackendExecution:
+        """Run an authoritative adapter only through a budget-bound worker."""
+        run = adapter.run
+        try:
+            parameters = inspect.signature(run).parameters
+        except (TypeError, ValueError) as exc:
+            raise BackendRegistryError(
+                f"cannot inspect authoritative adapter {adapter.backend_id!r} run() signature"
+            ) from exc
+        if "worker" not in parameters:
+            raise BackendRegistryError(
+                f"authoritative adapter {adapter.backend_id!r} must accept BackendWorker; "
+                "in-process execution is forbidden"
+            )
+        worker = BudgetBoundWorker(self._worker, budget)
+        return run(compiled, budget, worker=worker)
+
+
+def compare_shadow_to_legacy(
+    *,
+    shadow: ObligationExecutionRecord,
+    legacy_status: str,
+    legacy_recommendation: str,
+) -> dict[str, Any]:
+    shadow_status = shadow.aggregate_status.value
+    shadow_recommendation = shadow.merge_recommendation.value
+    agree_status = shadow_status == legacy_status
+    agree_recommendation = shadow_recommendation == legacy_recommendation
+    return {
+        "kind": "shadow_comparison",
+        "agreement": agree_status and agree_recommendation,
+        "status_agreement": agree_status,
+        "recommendation_agreement": agree_recommendation,
+        "legacy": {
+            "status": legacy_status,
+            "merge_recommendation": legacy_recommendation,
+            "authoritative": True,
+        },
+        "shadow": {
+            "status": shadow_status,
+            "merge_recommendation": shadow_recommendation,
+            "authoritative": False,
+            "routing_id": shadow.routing.routing_id,
+            "obligation_id": shadow.obligation.obligation_id,
+            "aggregation_reason": shadow.aggregation_reason,
+        },
+    }

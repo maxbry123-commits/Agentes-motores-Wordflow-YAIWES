@@ -1,0 +1,116 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "binex"
+version = "0.7.5"
+description = "Debuggable runtime for AI agent pipelines"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.11"
+authors = [
+    {name = "Alex Li", email = "alexli18@users.noreply.github.com"},
+]
+keywords = ["ai", "agents", "workflow", "orchestration", "debugging", "llm", "dag", "pipeline"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "a2a-sdk",
+    "litellm",
+    "fastapi",
+    "uvicorn",
+    "httpx",
+    "pydantic>=2.0",
+    "pyyaml",
+    "click",
+    "aiosqlite",
+    "python-dotenv",
+    "jsonschema>=4.0",
+    "jsonpath-ng>=1.8",
+    "croniter>=1.3",
+    "mcp>=1.0,<2",  # 2.0.0 removed mcp.server.fastmcp (binex.mcp_server.server depends on it)
+]
+
+[project.urls]
+Homepage = "https://github.com/Alexli18/binex"
+Documentation = "https://alexli18.github.io/binex/"
+Repository = "https://github.com/Alexli18/binex"
+Issues = "https://github.com/Alexli18/binex/issues"
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "pytest-timeout",
+    "ruff",
+    "mypy",
+    "mkdocs-material",
+    "mkdocs-glightbox",
+    "pytest-playwright",
+    "pytest-xdist",
+    "pytest-cov",
+    "respx",
+    "pre-commit"
+]
+rich = ["rich"]
+langchain = ["langchain-core>=0.2"]
+crewai = ["crewai>=0.41"]
+autogen = ["autogen-agentchat>=0.4"]
+telemetry = [
+    "opentelemetry-api>=1.20",
+    "opentelemetry-sdk>=1.20",
+    "opentelemetry-exporter-otlp>=1.20",
+]
+
+[tool.hatch.build]
+include = ["src/binex"]
+# Include built frontend static files (gitignored but needed in wheel)
+artifacts = ["src/binex/ui/static"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/binex"]
+
+[project.scripts]
+binex = "binex.cli.main:main"
+
+[project.entry-points."binex.plugins"]
+langchain = "binex.adapters.langchain_adapter:LangChainPlugin"
+crewai = "binex.adapters.crewai_adapter:CrewAIPlugin"
+autogen = "binex.adapters.autogen_adapter:AutoGenPlugin"
+
+[tool.ruff]
+target-version = "py311"
+src = ["src"]
+line-length = 99
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests keep QA-plan case IDs in class names (TestAGT003_...) and the
+# MockClient-style capitalisation idiom for patched classes.
+"tests/**" = ["N801", "N806"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+mypy_path = "src"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-m 'not e2e' --strict-markers"
+timeout = 30
+markers = [
+    "e2e: end-to-end browser tests (require the UI server running on :8420)",
+]

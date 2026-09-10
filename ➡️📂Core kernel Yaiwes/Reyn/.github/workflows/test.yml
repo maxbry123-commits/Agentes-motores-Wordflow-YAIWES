@@ -1,0 +1,391 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    # #4239 (owner ruling, 2026-08-11): opening a PR and spending CI on it
+    # are DIFFERENT decisions with different costs — "review this" is cheap
+    # and wanted immediately; "verify this against today's main" is expensive
+    # and has to take its turn. They were coupled: every open ran the full
+    # matrix, the PR then sat BEHIND for an hour, and the front-of-queue push
+    # ran it again (measured 2026-08-11: agent.py 5 CI runs, audit.py 4).
+    # `ready_for_review` is NOT in the default type set, so it has to be
+    # listed explicitly for the draft -> ready promotion to start CI at all.
+    types: [opened, synchronize, reopened, ready_for_review]
+  # #4239: the merge queue evaluates required checks on a synthetic
+  # `merge_group` ref (main + the queued PRs), NOT on the PR branch — a
+  # required check that never fires there leaves every queued PR waiting
+  # forever. Only the 4 REQUIRED contexts live in this workflow (pytest
+  # 3.11/3.12, ruff, test-tier audit), so this trigger is the whole of what
+  # the queue needs. The steps that branch on `github.event_name ==
+  # "pull_request"` fall through to their full-tree arm here, which is the
+  # correct behaviour for a merge group: there is no single "base" PR to
+  # scope a changed-files diff against.
+  merge_group:
+
+jobs:
+  test:
+    name: pytest (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    # #4239: a draft PR is 'not yet asking for CI' — the guard is what
+    #        separates PR creation from CI spend. Promotion (gh pr ready)
+    #        fires `ready_for_review` above and runs this once, near the
+    #        front of the queue, instead of once at open + once per rebase.
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    timeout-minutes: 15
+
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        # Install all optional extras the test suite touches:
+        #   dev  — pytest + pytest-asyncio + ruff + mypy
+        #   mcp  — #4302: now a no-op back-compat alias (empty extra); reyn's own
+        #     MCP client path runs on the `mcp` SDK directly (core dependency,
+        #     `mcp>=1.24,<2.0`), not `fastmcp`. Kept in this list only so a stale
+        #     `[mcp]` reference here doesn't start erroring.
+        #   web  — #5051: now a no-op back-compat alias (empty extra); fastapi +
+        #     starlette + uvicorn + websockets (used by tests/web/) are core
+        #     dependencies. Kept in this list only so a stale `[web]` reference
+        #     here doesn't start erroring.
+        #   fs-watch — `watchdog` (#2608 H4), used by tests/runtime/test_2608_h4_fs_watcher.py
+        #   observability — opentelemetry SDK, used by tests/observability/
+        #   builtin-rag — sqlite-vec + apsw + chonkie (FP-0063 P2), used by
+        #     tests/builtin/test_fp0063_p2_builtin_mcp_rag.py. Load-bearing: that file
+        #     `pytest.importorskip`s all three, so WITHOUT this extra the whole
+        #     module silently SKIPS and CI goes green having verified nothing.
+        run: pip install -e ".[dev,mcp,web,fs-watch,observability,builtin-rag]"
+
+      - name: Run tests
+        # --timeout=120: a per-test wall-clock cap (pytest-timeout). Without it a
+        # single hung test (e.g. a stuck subprocess/asyncio test under Linux-3.12)
+        # hangs the whole -n auto job to the 15-min job timeout → cancel, with no
+        # name. The cap interrupts the hung test (signal method on Linux) and
+        # NAMES it. Permanent CI hardening (#1800-7 diagnostic).
+        #
+        # -rs: prints each SKIPPED test's file:line and reason in the summary
+        # (verified to survive -n auto/xdist — xdist merges the per-worker
+        # reports before the summary is rendered). Without it, `-q` + a green
+        # `rc=0` only proves "everything that ran passed" — it says nothing
+        # about *what ran*. #2999: a docker-daemon-driven skip (or a missing
+        # optional extra, #2952) is indistinguishable from "ran and passed" in
+        # plain `-q` output; `N passed, M skipped` is a census, not evidence
+        # any specific test executed. -rs makes "what didn't run, and why"
+        # permanently legible in the CI log instead of requiring a rerun with
+        # extra flags to find out after the fact.
+        #
+        # `timeout 12m` (#3670): a GitHub Actions job/step hitting its own
+        # `timeout-minutes` reports conclusion `cancelled`, which every
+        # monitoring query built around `conclusion == "failure"` (the
+        # obvious, common form) silently treats as "not red" — #3670 found
+        # main's audit job cancelled on 4 of 5 consecutive pushes with NO
+        # monitoring trigger ever firing, because "cancelled" isn't
+        # "failure". Self-timing out via the coreutils `timeout` command
+        # BEFORE the platform's own job-level kill fires converts a would-be
+        # `cancelled` into an ordinary nonzero-exit step `failure` — legible
+        # to every `conclusion == "failure"` query without changing what
+        # they query for. `12m` (job budget 15m) leaves ~3m headroom for
+        # checkout/setup/pip-install (which run before this step and also
+        # count against the job's 15m) plus post-job cleanup.
+        # `--durations=25` (#4239): where the 5m23s actually goes has never
+        # been measured — "delete unneeded tests to speed CI" is only true if
+        # the time is proportional to the count, and a handful of real
+        # sleeps / real subprocesses would make it false. Printed by every
+        # run that was going to happen anyway, so the measurement costs no
+        # extra CI cycle; it is also the exact input a duration-balanced
+        # shard split would need.
+        #
+        # `set -o pipefail` + `| tee /tmp/pytest-output.log` (#4331): the
+        # census step below needs this run's own `-rs` output to parse —
+        # `tee` gives it a file without changing what prints to the CI log.
+        # `set -o pipefail` is explicit (not relied on as a shell default)
+        # so this step's pass/fail still reflects pytest's own exit code,
+        # not `tee`'s (which always succeeds) — this step must keep failing
+        # the job exactly as before; only the informational step below is
+        # allowed to be silent about failure.
+        #
+        # REYN_REPLAY_UNCONSUMED_CHECK=1 (#5283): this step is the one place
+        # that always collects the WHOLE tests/ tree with no -k/-x narrowing
+        # — the explicit, positive "this is a full run" signal
+        # replay_unconsumed.py's own fail-open design requires (never
+        # inferred from the absence of a filter flag — that inference is
+        # the exact unprovable-closure mistake #5283 rejected for the
+        # excluded-injected-tokens fix option). -n auto is xdist; the gate
+        # aggregates cross-worker via a shared events file (same mechanism
+        # network_gate already uses here) before judging.
+        # REYN_STALL_TRACE_CI=600 (#4986): a session-spanning stack dump if
+        # the pytest process itself does not finish within 600s — 120s of
+        # margin below this step's own `timeout 12m` (720s) kill, comfortably
+        # above this suite's own normal completion (~7-8 min measured). Exists
+        # because neither `--timeout=120` (pytest-timeout) nor pytest's own
+        # builtin faulthandler_timeout can ever see a hang in SESSION
+        # teardown — both wrap only `pytest_runtest_protocol` per item and
+        # cancel their own watchdog the instant the last item's protocol
+        # returns (`_pytest/faulthandler.py`'s own source, confirmed, not
+        # guessed). See `reyn/dev/testing/stall_dump.py`'s own docstring.
+        run: |
+          set -o pipefail
+          REYN_REPLAY_UNCONSUMED_CHECK=1 REYN_STALL_TRACE_CI=600 timeout 12m python -m pytest -q -n auto --timeout=120 -rs --durations=25 | tee /tmp/pytest-output.log
+
+      # #4986: surface the stall dump above if (and only if) it fired. The
+      # log file is opened (empty) the moment the watchdog is armed —
+      # faulthandler needs an already-open file object — so a healthy run
+      # leaves an EMPTY file behind, not a missing one; `-s` (non-empty)
+      # is the actual "did it fire" test, not `-f`. `if: always()` + a
+      # non-firing no-op costs nothing on every healthy run. Without this
+      # step the dump would sit on the ephemeral runner's disk, unread by
+      # anyone — the whole point of #4986's fix is a diagnostic that
+      # SURVIVES to be read, not merely one that gets written.
+      - name: Stall-trace dump (#4986 — only non-empty if the session hung)
+        if: always()
+        run: |
+          if [ -s .reyn-ci-stall-trace.log ]; then
+            echo "::warning::#4986 stall-trace fired — pytest's own teardown did not finish within REYN_STALL_TRACE_CI seconds"
+            cat .reyn-ci-stall-trace.log
+          else
+            echo "no stall-trace dump (pytest session finished normally)"
+          fi
+
+      # #4331: what a green run above does NOT say — the skip census (count
+      # + reason breakdown) and the collection-error count, on the SAME
+      # surface (this job's own summary page) a human reads the green
+      # result on. Lead-coder's #4331 ruling explicitly rejected a doc line
+      # instead: a hardcoded count goes stale the moment the population
+      # shifts, and nobody opens a doc at the moment they're reading a
+      # green check — the fix has to live where the green already is.
+      #
+      # `if: always()`: the census must appear whether the run above passed
+      # or failed — visibility here does not depend on the gate's own
+      # result. `scripts/pytest_skip_census.py` never exits nonzero (see its
+      # own module docstring "Not a gate") — condition 3 from the issue:
+      # this step must never turn red over a skip count, or "reduce skips"
+      # becomes a pressure that eats correct-by-design optional-extra skips.
+      - name: Test-coverage census (#4331 — informational, not a gate)
+        if: always()
+        run: python scripts/pytest_skip_census.py /tmp/pytest-output.log >> "$GITHUB_STEP_SUMMARY"
+
+  lint:
+    name: ruff
+    runs-on: ubuntu-latest
+    # #4239: a draft PR is 'not yet asking for CI' — the guard is what
+    #        separates PR creation from CI spend. Promotion (gh pr ready)
+    #        fires `ready_for_review` above and runs this once, near the
+    #        front of the queue, instead of once at open + once per rebase.
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dev dependencies
+        run: pip install -e ".[dev]"
+
+      # `timeout 4m` (#3670): see the "Run tests" step above for why —
+      # converts a would-be `cancelled` job-timeout into a legible `failure`.
+      - name: Run ruff
+        run: timeout 4m ruff check .
+
+  mypy-ratchet:
+    name: mypy (ratchet)
+    runs-on: ubuntu-latest
+    # #4239: a draft PR is 'not yet asking for CI' — the guard is what
+    #        separates PR creation from CI spend. Promotion (gh pr ready)
+    #        fires `ready_for_review` above and runs this once, near the
+    #        front of the queue, instead of once at open + once per rebase.
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dev dependencies
+        run: pip install -e ".[dev]"
+
+      # #3726: mypy is configured (pyproject.toml [tool.mypy]) but was never
+      # run in CI — a declared check with no execution. scripts/mypy_ratchet.py
+      # only fails on a (file, error-code) pair NOT already in the committed
+      # baseline (scripts/mypy_ratchet_baseline.json); see that script's module
+      # docstring for why this is a ratchet (same skeleton as
+      # tests/interfaces/test_3595_s4_slash_handler_seam.py's residue gate) rather than a
+      # blocking full-adoption gate or a report-only job nobody's decision
+      # depends on.
+      #
+      # `timeout 8m` (#3670): see the "Run tests" job's comment for why —
+      # converts a would-be `cancelled` job-timeout into a legible `failure`.
+      - name: Run mypy ratchet
+        run: timeout 8m python scripts/mypy_ratchet.py
+
+  docs:
+    name: docs build (strict)
+    runs-on: ubuntu-latest
+    # #4239: a draft PR is 'not yet asking for CI' — the guard is what
+    #        separates PR creation from CI spend. Promotion (gh pr ready)
+    #        fires `ready_for_review` above and runs this once, near the
+    #        front of the queue, instead of once at open + once per rebase.
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install docs dependencies
+        run: pip install -e ".[docs]"
+
+      # Mirrors the "Build documentation" step in pages.yml so broken links
+      # and missing nav targets fail at PR time, not post-merge on the Pages
+      # deploy — which was previously the only place --strict ran (a broken
+      # link could pass PR review and then turn the main Pages job red).
+      #
+      # `timeout 6m` (#3670): see the "Run tests" job's comment for why —
+      # converts a would-be `cancelled` job-timeout into a legible `failure`.
+      - name: Build docs (strict)
+        run: timeout 6m mkdocs build --strict -f .mkdocs/mkdocs.yml
+
+      # --strict catches a dangling *file* reference but never checks
+      # whether `#anchor` actually exists on the target page — that's this
+      # script's job, against the site/ this same job just built (no
+      # second build, no new dependency). See scripts/check_doc_anchors.py
+      # for the incident this closes (#3557/#3592: 42/42 line-number
+      # citations in charter.md had drifted, silently).
+      #
+      # `timeout 2m` (#3670): same reasoning as the step above. The two
+      # step budgets (6m + 2m) plus checkout/setup/pip-install leave margin
+      # under the job's 10m total.
+      - name: Check doc anchors
+        run: timeout 2m python scripts/check_doc_anchors.py
+
+      # #4327: a retired top-level reyn.yaml key (renamed via #4174 T1-T7)
+      # must not appear, at YAML top level, in operator-facing docs or the
+      # shipped reyn.local.yaml.example — see
+      # scripts/check_retired_config_keys_denylist.py's module docstring
+      # for the full design (denylist sourced from
+      # reyn.config.config_schema._RENAMED_CONFIG_KEYS, column-0 anchoring,
+      # the two exclusion classes). Needs `reyn` importable (this job's
+      # `pip install -e ".[docs]"` above already provides that), unlike the
+      # stdlib-only tests-path-literal-reference gate.
+      - name: Check retired config keys denylist
+        run: timeout 2m python scripts/check_retired_config_keys_denylist.py
+
+  audit:
+    name: test-tier audit
+    runs-on: ubuntu-latest
+    # #4239: a draft PR is 'not yet asking for CI' — the guard is what
+    #        separates PR creation from CI spend. Promotion (gh pr ready)
+    #        fires `ready_for_review` above and runs this once, near the
+    #        front of the queue, instead of once at open + once per rebase.
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    # PR events: audit only changed test files — 0.194s/file vs 5-9min
+    # for the full 652-file corpus.  main push: full run is preserved
+    # as the invariant safety net.
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # git diff needs full history to resolve the base SHA on PRs.
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      # scripts/test_tier_audit.py is stdlib-only (argparse / ast / re
+      # / json / pathlib). No pip install needed — keeps the job fast
+      # and decoupled from src/ install state.
+      #
+      # `timeout 3m` (#3670, retightened): converts a would-be `cancelled`
+      # job-timeout into a legible `failure` — see the "Run tests" job's
+      # comment for the full rationale. This specific job is what #3670
+      # actually measured cancelling (4 of 5 consecutive main pushes,
+      # always at the 15-minute signature); #3670's own fix (a real
+      # algorithmic hotspot in test_tier_audit.py) took the full-tree run
+      # from 915s to a MEASURED 21s in real CI (this step's own share: ~7s
+      # of that, per a real run's per-step timestamps). Landed initially at
+      # a generous `10m` before that fix was confirmed in CI; a budget that
+      # loose says nothing when this step gets slow again — the exact
+      # defect #3670 exists to close — so it's retightened now that real
+      # numbers exist. `3m` is a ~25x margin over the measured ~7s, not a
+      # guess.
+      - name: Run test-tier audit
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            # PR event: audit only test files changed in this PR.
+            # Tier audit is per-file self-contained (Tier declaration /
+            # Tier-4 / mock detection are all in-file), so changed-files
+            # scope is sufficient.  Full invariant net is preserved on
+            # main push below.
+            CHANGED=$(git diff --name-only \
+              "${{ github.event.pull_request.base.sha }}"...HEAD \
+              -- 'tests/**.py')
+            if [ -z "$CHANGED" ]; then
+              echo "No test files changed — audit skipped."
+              exit 0
+            fi
+            echo "Auditing changed test files:"
+            echo "$CHANGED"
+            # shellcheck disable=SC2086
+            timeout 3m python scripts/test_tier_audit.py --strict $CHANGED
+          else
+            # push to main (or any non-PR trigger): full audit over the
+            # entire test suite — invariant safety net, unchanged.
+            timeout 3m python scripts/test_tier_audit.py --strict tests/
+          fi
+
+      # scripts/verify_module_docstrings.py is stdlib-only. PR events: scoped
+      # to changed src files (fast). main push: full-tree run — the
+      # regress-proof invariant net, now that the tree is clean (#1802). Blocks
+      # moved-module refactor-narrative docstrings (the C-series discipline).
+      #
+      # `timeout 1m` (#3670, retightened): same reasoning as the step
+      # above — measured real share of this specific step: ~2.3s, so `1m`
+      # is a ~25x margin, matching the audit step's own retightened ratio.
+      - name: Run module-docstring narrative check
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            CHANGED=$(git diff --name-only \
+              "${{ github.event.pull_request.base.sha }}"...HEAD \
+              -- 'src/**.py')
+            if [ -z "$CHANGED" ]; then
+              echo "No src files changed — docstring check skipped."
+              exit 0
+            fi
+            echo "Checking changed src files:"
+            echo "$CHANGED"
+            # shellcheck disable=SC2086
+            timeout 1m python scripts/verify_module_docstrings.py $CHANGED
+          else
+            # push to main (or any non-PR trigger): full-tree gate.
+            timeout 1m python scripts/verify_module_docstrings.py src/reyn
+          fi

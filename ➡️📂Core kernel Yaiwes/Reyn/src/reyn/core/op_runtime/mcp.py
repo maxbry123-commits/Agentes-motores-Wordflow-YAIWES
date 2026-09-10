@@ -1,0 +1,252 @@
+"""mcp kind handler — call a tool on a configured MCP server.
+
+Supports stdio + Streamable HTTP transports (sse deferred). The transport
+is selected per-server via the ``type:`` field in ``mcp.servers.<name>``;
+configs that omit ``type`` default to ``streamable-http`` (#4604 renamed
+from ``http``) for backward compatibility with pre-PR32 reyn.yaml files.
+"""
+from __future__ import annotations
+
+from reyn.schemas.models import MCPIROp
+
+from . import register
+from .context import OpContext
+
+# #2421: the per-call MCP timeout ([4]) now lives in the MCPGateway seam (``resolve_call_timeout``),
+# applied to every MCP op in one place. The op handler delegates to the gateway.
+
+
+async def _execute(op: MCPIROp, ctx: OpContext) -> dict:
+    from reyn.core.cancellable import Cancelled
+    from reyn.mcp.client import expand_env
+    from reyn.mcp.gateway import MCPFault, MCPGateway
+
+    server_cfg = ctx.mcp_servers.get(op.server)
+    if not server_cfg:
+        return {
+            "kind": "mcp", "status": "error",
+            "error": f"MCP server '{op.server}' is not configured. "
+                     f"Add it under mcp.servers in reyn.yaml or reyn.local.yaml.",
+        }
+
+    expanded = expand_env(server_cfg)
+    if not isinstance(expanded, dict):
+        return {"kind": "mcp", "status": "error",
+                "error": f"MCP server '{op.server}' config must be a dict."}
+
+    # Backward compat: a config with `url` but no `type` is treated as streamable-http.
+    if "type" not in expanded:
+        if expanded.get("url"):
+            expanded = {**expanded, "type": "streamable-http"}
+
+    # #2597 S2a: prefer the session-owned held-open connection service (Option C) when wired —
+    # it replaces the per-turn pool on the live (non-ephemeral) session path with one persistent
+    # connection per server, reused across turns/tasks. Falls back to the #a359 P2 per-turn
+    # structured pool (opened + closed in the pool's owning task) for the ephemeral-session /
+    # one-shot path. Neither wired = no MCP context wired on this ctx (a non-MCP OpContext should
+    # never reach the mcp handler; guard defensively).
+    if ctx.mcp_connection_service is None and ctx.mcp_pool is None:
+        return {"kind": "mcp", "status": "error", "server": op.server,
+                "tool": op.tool, "error": "no MCP client pool on this context"}
+
+    # issue #264 — wire MCP SDK progress + per-call timeout:
+    #
+    #   progress: forward server-emitted notifications/progress as
+    #   ``mcp_progress`` events on the run's EventLog so
+    #   ChatLifecycleForwarder.on_mcp_progress can surface them in the
+    #   sticky status bar (= long-running MCP call visibility, the A2A
+    #   PR #253 analogue for the client side).
+    #
+    #   timeout: per-server ``call_timeout_seconds`` from the raw config
+    #   dict; absent → SDK default applies (= no behaviour change for
+    #   existing configs that omit the key).
+    server_name = op.server
+    tool_name = op.tool
+
+    async def _on_progress(
+        progress: float, total: float | None, message: str | None,
+    ) -> None:
+        ctx.events.emit(
+            "mcp_progress",
+            server=server_name,
+            tool=tool_name,
+            progress=progress,
+            total=total,
+            message=message,
+        )
+
+    ctx.events.emit("mcp_called", server=op.server, tool=op.tool, args=op.args)
+    # #2421: the open+call+teardown fault boundary + per-call timeout + task-affine lifecycle all live
+    # in the ONE MCPGateway seam (reusing this turn's pool). The gateway raises only MCPFault (an
+    # Exception) or genuine control flow — never a bare BaseExceptionGroup — so a server that dies on
+    # connect, a bad config, a malformed response, or a transport group all surface here as a clean
+    # MCPFault → contained error tool-result (owner req: MCP misbehavior must not crash the router
+    # loop). Cancellation is never swallowed (is_real_control_flow re-raises genuine cancel/KI/SE).
+    # #2813: cancel_event races the whole open+call — a Ctrl-C now interrupts an in-flight MCP
+    # call immediately instead of waiting out its own call_timeout_seconds.
+    gateway = MCPGateway(
+        pool=ctx.mcp_connection_service or ctx.mcp_pool, agent_id=ctx.agent_id,
+        cancel_event=ctx.cancel_event,
+    )
+    try:
+        result = await gateway.call_tool(
+            op.server, op.tool, op.args, expanded, progress_cb=_on_progress,
+        )
+    except Cancelled:
+        # #2813: distinct from a transport fault (P6 audit) — mirrors sandboxed_exec_cancelled.
+        ctx.events.emit("mcp_cancelled", server=op.server, tool=op.tool)
+        return {"kind": "mcp", "status": "cancelled", "server": op.server, "tool": op.tool}
+    except MCPFault as fault_exc:
+        # Owner req: feed the fault CONTENT back to the LLM (type + message, group members
+        # aggregated) via the standard op-error result — so it can retry/adapt, not a silent error.
+        fault = str(fault_exc)
+        ctx.events.emit("mcp_failed", server=op.server, tool=op.tool, error=fault)
+        return {"kind": "mcp", "status": "error", "server": op.server,
+                "tool": op.tool, "error": fault}
+
+    content_items = result.get("content", [])
+    if isinstance(content_items, list):
+        text = "\n".join(
+            item.get("text", "") for item in content_items
+            if isinstance(item, dict) and item.get("type") == "text"
+        )
+        # Issue #362: preserve non-text content blocks (images, etc.) so the
+        # chat router can forward them to vision-capable models.
+        raw_media_blocks = [
+            item for item in content_items
+            if isinstance(item, dict) and item.get("type") != "text"
+        ]
+    else:
+        text = str(content_items)
+        raw_media_blocks = []
+
+    # Issue #383 PR-C: when MediaStore is available, persist image media
+    # blocks as flat files under ``.reyn/media/`` and emit path-ref blocks
+    # instead of inline base64. Non-image media blocks (= resource, etc.)
+    # pass through unchanged for now (= future #385 scope expansion).
+    #
+    # #4946: apply the SAME multi-modal size gate (``require_media_load``)
+    # web_fetch (web.py) / read_file (file.py) / user `/image` (image.py)
+    # already apply before persisting any image bytes — MCP was the one
+    # producer named in the gate's own docstring that never actually
+    # called it (measured, #4944's Angle 3 byproduct: 0 call sites). An
+    # MCP tool response is UNTRUSTED input reaching this exact same
+    # ingest boundary; skipping the gate here left it as a second,
+    # unguarded entry point alongside the missing-aggregate-byte-check
+    # #4944 found — this closes the per-item one.
+    #
+    # Gated PER IMAGE, not per op-call: unlike the other 3 producers
+    # (always exactly one image), one MCP tool call can return several.
+    # Rejecting the WHOLE result (including any text and every other,
+    # correctly-sized image) for one oversized image among many would be
+    # a strictly worse outcome than the other 3 producers' single-image
+    # case ever has to consider — so an oversized image is dropped
+    # individually (replaced with a denial note, the same "surface the
+    # loss, never hide it" shape ``router_loop.py``'s own
+    # ``_overflow_ref_text``/tail-preview machinery already uses for a
+    # DIFFERENT over-budget reason), while the rest of the result
+    # (text + correctly-sized images) still reaches the caller.
+    media_blocks: list[dict] = []
+    # #4946: a denied image is dropped from `media_blocks` (that list's own
+    # consumer, router_loop.py's `_build_media_followup_message`, filters
+    # to `type == "image"` ONLY — a text block placed there would be
+    # silently discarded, the exact "model sees one fewer image with no
+    # sign anything was lost" shape lead-coder's review flagged). Fold the
+    # denial into `text` (== `out["content"]`, the ONE field guaranteed to
+    # reach the model) instead, appended after the join below.
+    denial_notes: list[str] = []
+    for idx, item in enumerate(raw_media_blocks, start=1):
+        if (
+            isinstance(item, dict)
+            and item.get("type") == "image"
+            and isinstance(item.get("data"), str)
+        ):
+            import base64
+            try:
+                raw_bytes = base64.b64decode(item["data"])
+            except (ValueError, TypeError):
+                # Fall through to legacy inline shape on bad b64
+                media_blocks.append(item)
+                continue
+            mime = item.get("mimeType") or item.get("mime_type") or "image/png"
+            if ctx.permission_resolver is not None and ctx.multimodal_config is not None:
+                if ctx.intervention_bus is None:
+                    raise RuntimeError(
+                        "mcp op requires intervention_bus when loading "
+                        "binary media (multimodal gate)"
+                    )
+                try:
+                    await ctx.permission_resolver.require_media_load(
+                        size_bytes=len(raw_bytes),
+                        source=f"mcp {op.server}.{op.tool}",
+                        mime_type=mime,
+                        max_bytes=ctx.multimodal_config.max_bytes,
+                        on_oversize=ctx.multimodal_config.on_oversize,
+                        bus=ctx.intervention_bus,
+                    )
+                except PermissionError as exc:
+                    ctx.events.emit(
+                        "mcp_media_denied",
+                        server=op.server, tool=op.tool,
+                        size_bytes=len(raw_bytes), mime_type=mime,
+                    )
+                    denial_notes.append(f"[image {idx}: {exc}]")
+                    continue
+            if ctx.media_store is None:
+                media_blocks.append(item)
+                continue
+            media_blocks.append(ctx.media_store.save_media(
+                raw_bytes, mime_type=mime,
+                chain_id=ctx.run_id or "",
+                tool=f"mcp_{op.server}_{op.tool}",
+                seq=idx,
+            ))
+        else:
+            media_blocks.append(item)
+    if denial_notes:
+        text = "\n".join([text, *denial_notes]) if text else "\n".join(denial_notes)
+
+    is_error = bool(result.get("isError"))
+    # #3070: an errored tool call previously logged ONLY the boolean — the tool's
+    # own error text (e.g. "Error calling tool 'list_metadata': No module named
+    # 'apsw'") lived in `text` above but was never audited, so a probe failure
+    # was indistinguishable, from the P6 audit log alone, from any other error.
+    # `mcp_failed` (the transport-fault branch above) already carries `error`
+    # in full — this mirrors it for the "handshake ok, tool call itself errored"
+    # case, which is a DIFFERENT failure than a transport fault and was
+    # previously undiagnosable without re-running the call under a debugger.
+    ctx.events.emit(
+        "mcp_completed", server=op.server, tool=op.tool, is_error=is_error,
+        media_block_count=len(media_blocks),
+        error=text if is_error else None,
+    )
+    out = {
+        "kind": "mcp",
+        "status": "error" if is_error else "ok",
+        "server": op.server,
+        "tool": op.tool,
+        "content": text,
+        "media_blocks": media_blocks,
+    }
+    # Preserve a real MCP structured-output only when the tool actually returned one (None by
+    # default) — absent → no field (clean end-state, no shim); present → the LLM keeps the data.
+    structured = result.get("structuredContent")
+    if structured is not None:
+        out["structured"] = structured
+    return out
+
+
+async def handle(op: MCPIROp, ctx: OpContext) -> dict:
+    if ctx.permission_resolver is not None:
+        if ctx.intervention_bus is None:
+            raise RuntimeError("mcp op requires intervention_bus on OpContext")
+        await ctx.permission_resolver.require_mcp(
+            ctx.permission_decl, op.server, ctx.intervention_bus,
+            contextual=ctx.contextual_permission,  # #2074 S4a/S4b (OpContext field)
+        )
+    return await _execute(op, ctx)
+
+
+from reyn.core.offload.canonical import mcp_to_canonical  # noqa: E402
+
+register("mcp", handle, canonical=mcp_to_canonical)

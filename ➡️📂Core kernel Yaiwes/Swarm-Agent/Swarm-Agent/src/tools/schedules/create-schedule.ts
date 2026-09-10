@@ -1,0 +1,319 @@
+import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { CronExpressionParser } from "cron-parser";
+import * as z from "zod";
+import { authorizeAssetKeyWrite } from "@/be/asset-key-auth";
+import { resolveTaskAuditUserId } from "@/be/audit-user";
+import { createScheduledTask, getAgentById, getScheduledTaskByName, getWorkflow } from "@/be/db";
+import { getScript } from "@/be/scripts/db";
+import { calculateNextRun } from "@/scheduler";
+import { createToolRegistrar, swarmToolOutputSchema, toolErr, toolOk } from "@/tools/utils";
+import {
+  AssetKeySchema,
+  ModelTierSchema,
+  ScheduledTaskTargetTypeSchema,
+  splitLegacyModelAlias,
+} from "../../types";
+
+export const createScheduleInputSchema = z.object({
+  key: AssetKeySchema.optional().describe(
+    "Logical namespace. Defaults to a shared/schedule:<id>/ resource key.",
+  ),
+  name: z.string().min(1).max(100).describe("Unique name for the schedule (e.g., 'daily-cleanup')"),
+  taskTemplate: z
+    .string()
+    .min(1)
+    .optional()
+    .describe(
+      "The task description that will be created each time. Required when targetType is 'agent-task' (the default).",
+    ),
+  targetType: ScheduledTaskTargetTypeSchema.default("agent-task")
+    .optional()
+    .describe(
+      "Execution target. Use 'workflow' + workflowId when the schedule only starts a workflow; " +
+        "use 'script' + scriptName/scriptArgs when it only runs a catalog script; " +
+        "use 'agent-task' only when a reasoning agent genuinely needs to be in the loop. " +
+        "Do not create an agent-task whose taskTemplate just tells an agent to trigger a workflow or script.",
+    ),
+  workflowId: z
+    .string()
+    .uuid()
+    .optional()
+    .describe("Workflow ID to trigger. Required when targetType is 'workflow'."),
+  scriptName: z
+    .string()
+    .optional()
+    .describe("Catalog script name (global scope). Required when targetType is 'script'."),
+  scriptArgs: z
+    .record(z.string(), z.unknown())
+    .optional()
+    .describe("JSON args passed to the script. Used when targetType is 'script'."),
+  scheduleType: z
+    .enum(["recurring", "one_time"])
+    .default("recurring")
+    .optional()
+    .describe("Schedule type: 'recurring' (default) or 'one_time'"),
+  cronExpression: z
+    .string()
+    .optional()
+    .describe("Cron expression for recurring schedules (e.g., '0 9 * * *')"),
+  intervalMs: z
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .describe("Interval in milliseconds for recurring schedules (e.g., 3600000 for hourly)"),
+  delayMs: z
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .describe("Delay in milliseconds for one-time schedules (e.g., 1800000 for 30 min)"),
+  runAt: z
+    .string()
+    .datetime()
+    .optional()
+    .describe("ISO datetime for one-time schedules (e.g., '2026-03-06T15:00:00Z')"),
+  description: z.string().optional().describe("Human-readable description of the schedule"),
+  taskType: z.string().max(50).optional().describe("Task type (e.g., 'maintenance', 'report')"),
+  tags: z.array(z.string()).optional().describe("Tags to apply to created tasks"),
+  priority: z
+    .number()
+    .int()
+    .min(0)
+    .max(100)
+    .default(50)
+    .optional()
+    .describe("Task priority 0-100 (default: 50)"),
+  targetAgentId: z.string().optional().describe("Agent to assign tasks to (omit for task pool)"),
+  timezone: z.string().default("UTC").optional().describe("Timezone for cron schedules"),
+  enabled: z
+    .boolean()
+    .default(true)
+    .optional()
+    .describe("Whether the schedule is enabled (default: true)"),
+  model: z
+    .string()
+    .trim()
+    .min(1)
+    .optional()
+    .describe(
+      "Concrete model override for tasks created by this schedule. Interpreted by each assignee's harness/provider and does not switch providers. Prefer modelTier for portable intent.",
+    ),
+  modelTier: ModelTierSchema.optional().describe(
+    "Portable model tier for tasks created by this schedule: 'smol', 'regular', 'smart', or 'ultra'. Resolved by each assignee's harness/provider at run time.",
+  ),
+});
+
+const scheduleDataShape = {
+  id: z.string().optional(),
+  key: AssetKeySchema.optional(),
+  name: z.string().optional(),
+  description: z.string().optional(),
+  cronExpression: z.string().optional(),
+  intervalMs: z.number().optional(),
+  taskTemplate: z.string().optional(),
+  taskType: z.string().optional(),
+  tags: z.array(z.string()).optional(),
+  priority: z.number().optional(),
+  targetAgentId: z.string().optional(),
+  enabled: z.boolean().optional(),
+  lastRunAt: z.string().optional(),
+  nextRunAt: z.string().optional(),
+  createdByAgentId: z.string().optional(),
+  timezone: z.string().optional(),
+  model: z.string().optional(),
+  modelTier: ModelTierSchema.optional(),
+  scheduleType: z.string().optional(),
+  targetType: ScheduledTaskTargetTypeSchema.optional(),
+  workflowId: z.string().optional(),
+  scriptName: z.string().optional(),
+  scriptArgs: z.record(z.string(), z.unknown()).optional(),
+  createdAt: z.string().optional(),
+  lastUpdatedAt: z.string().optional(),
+};
+
+export const registerCreateScheduleTool = (server: McpServer) => {
+  createToolRegistrar(server)(
+    "create-schedule",
+    {
+      title: "Create Scheduled Task",
+      annotations: { destructiveHint: false },
+      description:
+        "Create a new scheduled task. For recurring: provide cronExpression or intervalMs. For one-time: provide delayMs or runAt with scheduleType 'one_time'.",
+      inputSchema: createScheduleInputSchema,
+      outputSchema: swarmToolOutputSchema({
+        yourAgentId: z.string().optional(),
+        schedule: z.looseObject(scheduleDataShape).optional(),
+      }),
+    },
+    async (
+      {
+        key,
+        name,
+        taskTemplate,
+        targetType,
+        workflowId,
+        scriptName,
+        scriptArgs,
+        scheduleType,
+        cronExpression,
+        intervalMs,
+        delayMs,
+        runAt,
+        description,
+        taskType,
+        tags,
+        priority,
+        targetAgentId,
+        timezone,
+        enabled,
+        model,
+        modelTier,
+      },
+      requestInfo,
+      _meta,
+    ) => {
+      if (!requestInfo.agentId) {
+        return toolErr('Agent ID not found. Set the "X-Agent-ID" header.');
+      }
+
+      const isOneTime = scheduleType === "one_time";
+
+      // Validate params based on schedule type
+      if (isOneTime) {
+        if (cronExpression || intervalMs) {
+          return toolErr(
+            "One-time schedules cannot use cronExpression or intervalMs. Use delayMs or runAt instead.",
+          );
+        }
+        if (!delayMs && !runAt) {
+          return toolErr("One-time schedules require either delayMs or runAt.");
+        }
+        if (delayMs && runAt) {
+          return toolErr("Provide either delayMs or runAt, not both.");
+        }
+        if (runAt && new Date(runAt).getTime() <= Date.now()) {
+          return toolErr("runAt must be in the future.");
+        }
+      } else {
+        if (delayMs || runAt) {
+          return toolErr(
+            "delayMs and runAt are only for one-time schedules. Set scheduleType to 'one_time'.",
+          );
+        }
+        if (!cronExpression && !intervalMs) {
+          return toolErr("Either cronExpression or intervalMs must be provided.");
+        }
+      }
+
+      // Validate cron expression syntax
+      if (cronExpression) {
+        try {
+          CronExpressionParser.parse(cronExpression, { tz: timezone || "UTC" });
+        } catch (err) {
+          const message = err instanceof Error ? err.message : "Invalid cron expression";
+          return toolErr(`Invalid cron expression: ${message}`);
+        }
+      }
+
+      // Check for duplicate name
+      const existing = await getScheduledTaskByName(name);
+      if (existing) {
+        return toolErr(`Schedule with name "${name}" already exists.`);
+      }
+
+      // Validate targetAgentId if provided
+      if (targetAgentId) {
+        const agent = await getAgentById(targetAgentId);
+        if (!agent) {
+          return toolErr(`Target agent not found: ${targetAgentId}`);
+        }
+      }
+
+      // Cross-field targetType validation
+      const resolvedTargetType = targetType ?? "agent-task";
+      if (resolvedTargetType === "agent-task" && !taskTemplate) {
+        return toolErr("taskTemplate is required when targetType is 'agent-task'.");
+      }
+      if (resolvedTargetType === "workflow") {
+        if (!workflowId) {
+          return toolErr("workflowId is required when targetType is 'workflow'.");
+        }
+        if (!(await getWorkflow(workflowId))) {
+          return toolErr(`Workflow not found: ${workflowId}`);
+        }
+      }
+      if (resolvedTargetType === "script") {
+        if (!scriptName) {
+          return toolErr("scriptName is required when targetType is 'script'.");
+        }
+        if (!(await getScript({ name: scriptName, scope: "global" }))) {
+          return toolErr(`Script not found: ${scriptName}`);
+        }
+      }
+
+      try {
+        const normalizedModel = splitLegacyModelAlias({ model, modelTier });
+        // Calculate initial nextRunAt
+        let nextRunAt: string | undefined;
+        if (enabled === false) {
+          nextRunAt = undefined;
+        } else if (isOneTime) {
+          nextRunAt = delayMs ? new Date(Date.now() + delayMs).toISOString() : runAt!;
+        } else {
+          const tempSchedule = {
+            cronExpression,
+            intervalMs,
+            timezone: timezone || "UTC",
+          } as Parameters<typeof calculateNextRun>[0];
+          nextRunAt = calculateNextRun(tempSchedule, new Date());
+        }
+
+        const createdBy =
+          (await resolveTaskAuditUserId(requestInfo.sourceTaskId, requestInfo.agentId)) ??
+          undefined;
+        const assetKey = key ? await authorizeAssetKeyWrite(key, createdBy) : undefined;
+
+        const schedule = await createScheduledTask({
+          key: assetKey,
+          name,
+          taskTemplate,
+          targetType,
+          workflowId,
+          scriptName,
+          scriptArgs,
+          cronExpression,
+          intervalMs,
+          description,
+          taskType,
+          tags,
+          priority,
+          targetAgentId,
+          timezone,
+          enabled,
+          nextRunAt,
+          createdByAgentId: requestInfo.agentId,
+          model: normalizedModel.model,
+          modelTier: normalizedModel.modelTier,
+          scheduleType: scheduleType ?? "recurring",
+          createdBy,
+        });
+
+        const scheduleDesc = isOneTime
+          ? `one-time at ${schedule.nextRunAt}`
+          : cronExpression || `every ${intervalMs}ms`;
+        return toolOk(
+          `Created schedule "${name}" (${scheduleDesc}). Next run: ${schedule.nextRunAt || "disabled"}`,
+          {
+            data: { yourAgentId: requestInfo.agentId, schedule },
+          },
+        );
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Unknown error";
+        return toolErr(`Failed to create schedule: ${message}`, {
+          data: { yourAgentId: requestInfo.agentId },
+        });
+      }
+    },
+  );
+};

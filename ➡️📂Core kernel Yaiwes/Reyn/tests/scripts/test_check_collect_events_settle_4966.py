@@ -1,0 +1,180 @@
+"""Tier 2: #4966 — the collect-events-without-settle gate.
+
+Real filesystem fixtures throughout (a real `tmp_path` tree of `.py`
+files) — the function under test reads real file content and parses real
+ASTs, so faking the filesystem would test nothing real. Mirrors
+`tests/scripts/test_check_fastmcp_import_boundary_3698.py`'s own shape
+(reject variants / accept variants / a final "real tree is currently
+clean" check against the gate's own live scope).
+
+#4990: this gate's own starting population was zero (all 31 found
+instances were fixed in the same PR that added it, #4966) but had NO
+covering test of its own — "0 hits" cannot distinguish "nothing to find"
+from "the gate never actually runs its detection logic" (CLAUDE.md's
+pre-conclusion checklist: an absence needs a positive witness, not a
+green run). Every fixture below asserts a SHAPE the gate must detect (or
+must NOT), never a bare hit-count.
+"""
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from scripts.check_collect_events_settle import offending_files
+
+
+def test_a_read_with_no_settle_before_it_is_flagged(tmp_path: Path) -> None:
+    """Tier 2: the exact class #4965/#4966 exists to close — an `async
+    def` test binds `collect_events(log)`'s result and reads it back with
+    no yield point (settle/drain/polling helper) anywhere earlier in the
+    same function, so the read can race the background consumer."""
+    (tmp_path / "test_x.py").write_text(
+        "async def test_something(log):\n"
+        "    collected = collect_events(log)\n"
+        "    await trigger(log)\n"
+        "    assert not any(e.type == 'denied' for e in collected)\n",
+        encoding="utf-8",
+    )
+    offenders = offending_files(tmp_path)
+    assert [p for p, _hits in offenders] == [tmp_path / "test_x.py"]
+    assert offenders[0][1] == [(4, "collected")]
+
+
+def test_a_one_level_derived_name_is_also_flagged(tmp_path: Path) -> None:
+    """Tier 2: a name derived one level from an already-tracked name
+    (a comprehension filtering `collected`) is tracked too — the real
+    shape most of the 31-site audit's instances used (`blocked =
+    [e for e in collected if ...]`, not a bare re-read of `collected`
+    itself)."""
+    (tmp_path / "test_y.py").write_text(
+        "async def test_something(log):\n"
+        "    collected = collect_events(log)\n"
+        "    await trigger(log)\n"
+        "    denied = [e for e in collected if e.type == 'denied']\n"
+        "    assert denied == []\n",
+        encoding="utf-8",
+    )
+    offenders = offending_files(tmp_path)
+    assert [p for p, _hits in offenders] == [tmp_path / "test_y.py"]
+
+
+def test_a_hand_rolled_add_subscriber_read_is_also_flagged(tmp_path: Path) -> None:
+    """Tier 2: the SECOND discriminator this gate closes (found the same
+    night, #4966's own docstring) — a hand-rolled
+    `log.add_subscriber(collected.append)` list, never touching
+    `collect_events()` at all, needs the identical settle()-before-read
+    treatment and must be tracked the same way."""
+    (tmp_path / "test_z.py").write_text(
+        "async def test_something(log):\n"
+        "    collected = []\n"
+        "    log.add_subscriber(collected.append)\n"
+        "    await trigger(log)\n"
+        "    assert not any(e.type == 'denied' for e in collected)\n",
+        encoding="utf-8",
+    )
+    offenders = offending_files(tmp_path)
+    assert [p for p, _hits in offenders] == [tmp_path / "test_z.py"]
+
+
+def test_a_settle_before_the_read_is_not_flagged(tmp_path: Path) -> None:
+    """Tier 2: accept side — the actual fix (`await settle(log)`
+    immediately before the read) must not false-positive. This is the
+    consumer #4990 itself names: an author who did the fix correctly
+    must never see this gate fire on them (six-questions ③)."""
+    (tmp_path / "test_ok.py").write_text(
+        "async def test_something(log):\n"
+        "    collected = collect_events(log)\n"
+        "    await trigger(log)\n"
+        "    await settle(log)\n"
+        "    assert not any(e.type == 'denied' for e in collected)\n",
+        encoding="utf-8",
+    )
+    offenders = offending_files(tmp_path)
+    assert offenders == []
+
+
+def test_unrelated_code_with_no_tracked_name_is_not_flagged(tmp_path: Path) -> None:
+    """Tier 2: non-vacuity — an ordinary async test with no
+    `collect_events()`/`add_subscriber()` anywhere must not be touched by
+    this gate at all."""
+    (tmp_path / "test_unrelated.py").write_text(
+        "async def test_something():\n"
+        "    result = await do_a_thing()\n"
+        "    assert result == 'ok'\n",
+        encoding="utf-8",
+    )
+    offenders = offending_files(tmp_path)
+    assert offenders == []
+
+
+def test_the_real_repo_tree_is_currently_clean() -> None:
+    """Tier 2: the gate's own starting population — verified against the
+    real, current `tests/` tree (not assumed), matching the sibling
+    gates' own "run it before shipping it" discipline. #4966 fixed every
+    found instance in the same PR that added this gate, so this asserts
+    it stayed at zero, not that it started there."""
+    from scripts.check_collect_events_settle import _TESTS_DIR
+
+    offenders = offending_files(_TESTS_DIR)
+    assert offenders == [], (
+        f"real regression(s) found: {offenders} — this gate's baseline is "
+        "zero, so any hit here is new, not inherited debt"
+    )
+
+
+def test_a_raw_subscriber_only_offender_is_not_misreported_as_collect_events(
+    tmp_path: Path, capsys: "pytest.CaptureFixture[str]",
+) -> None:
+    """Tier 2: #5485 — `main()`'s failure output must not claim a file
+    read a "collect_events()-derived list" when that file never called
+    `collect_events()` at all (caught only via the raw
+    `add_subscriber(...)` path). That claim would be FALSE for this exact
+    file: an operator who greps it for `collect_events` finds nothing and
+    reasonably reads the gate as broken (the real #5484 confusion this
+    issue traces back to) — the gate's own real coverage (module
+    docstring, unchanged by this fix) always tracked both forms; only the
+    3 human-read surfaces (this one, the success message, and the
+    workflow step name) named just one.
+
+    Tier answer, in my own words (§1): this pins an invariant of the
+    gate's OWN reporting surface — the printed message is itself an
+    OS-facing contract an operator reads to pick their next action, same
+    category of invariant as "does the detector catch this AST shape"
+    (the existing 6 tests above). Restated for §6: those 6 pin "does it
+    catch" and this one pins "does it describe what it caught
+    correctly" — two different invariants of the same file, not one
+    borrowing the other's Tier because they're neighbors.
+
+    §3 (who would miss this test if it were gone): the consumer is the
+    OPERATOR reading `main()`'s stderr on a real gate failure, not this
+    synthetic file itself — the file is the stage built to reproduce
+    that operator's exact view. `offending_files()`'s own return value
+    (exercised by `test_a_hand_rolled_add_subscriber_read_is_also_
+    flagged` above) carries no wording at all to assert on, so nothing
+    else in this suite would catch a silent regression back to the
+    collect_events()-only phrasing.
+
+    Uses `main()`'s own `tests_dir=`/`root=` keywords (#5485,
+    lead-coder BLOCKING) rather than monkeypatching this module's
+    private `_TESTS_DIR`/`_ROOT` globals — those two params exist
+    specifically so a caller can point the real CLI entry point at a
+    fixture tree through a public seam, mirroring
+    `offending_files(tests_dir=...)`'s own established shape."""
+    import scripts.check_collect_events_settle as gate
+
+    (tmp_path / "test_only_subscriber.py").write_text(
+        "async def test_something(log):\n"
+        "    collected = []\n"
+        "    log.add_subscriber(collected.append)\n"
+        "    await trigger(log)\n"
+        "    assert not any(e.type == 'denied' for e in collected)\n",
+        encoding="utf-8",
+    )
+
+    exit_code = gate.main([], tests_dir=tmp_path, root=tmp_path)
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "a collect_events()-derived list" not in captured.err
+    assert "collect_events()- or subscriber-derived" in captured.err

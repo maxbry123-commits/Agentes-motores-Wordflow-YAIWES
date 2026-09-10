@@ -1,0 +1,97 @@
+"""Tier 2: #1608 format_feedback unification — the byte-identical GOLDEN gate.
+
+The Stage-1 unify relocates the Execute message-construction zip (the
+``{role:assistant, tool_calls}`` + per-result ``{role:tool, tool_call_id,
+content}`` build) out of the OS loop and into ``universal.format_feedback``. This
+test pins the **exact message sequence** the LLM sees for an Execute round, so the
+relocation is provably byte-identical — it is the #1406/#187 merge gate
+(sandbox_2 co-vets): every tool_call answered, in order, with its own
+``tool_call_id``, and the **excluded-in-place** call's error result at its own
+index (not dropped).
+
+No mocks: real universal scheme + the real ``_ScriptedLLM`` Fake + ``FakeRouterHost``.
+"""
+from __future__ import annotations
+
+from typing import Any
+
+import pytest
+
+from reyn.llm.llm import LLMToolCallResult
+from reyn.llm.pricing import TokenUsage
+from reyn.runtime.router_loop import RouterLoop
+from tests._support.router_loop import FakeRouterHost, text_result, tool_result
+
+_USAGE = TokenUsage(prompt_tokens=10, completion_tokens=5)
+
+
+class _CapturingLLM:
+    """Scripted LLM that records the ``messages`` it saw each call — so the test can
+    assert the exact sequence the OS built after the Execute round."""
+
+    def __init__(self, script: list[LLMToolCallResult]) -> None:
+        self._script = list(script)
+        self.call_count = 0
+        self.messages_per_call: list[list[dict]] = []
+
+    async def __call__(self, **kwargs: Any) -> LLMToolCallResult:
+        self.messages_per_call.append([dict(m) for m in (kwargs.get("messages") or [])])
+        r = self._script[self.call_count]
+        self.call_count += 1
+        return r
+
+
+@pytest.mark.asyncio
+async def test_execute_round_message_sequence_golden(monkeypatch):
+    """Tier 2: #1608/#1406/#187 — an Execute round with a dispatched call + an
+    EXCLUDED-in-place call produces the exact assistant + per-call tool-message
+    sequence, ids aligned, the excluded call's error at its own index."""
+    host = FakeRouterHost()
+    host._files["a.txt"] = "hello"
+    # write_file is excluded → the pre-dispatch gate must emit a tool_excluded
+    # error result IN PLACE at its index (not drop the call).
+    loop = RouterLoop(
+        host=host, chain_id="chain-golden", max_iterations=5,
+        exclude_tools={"write_file"},
+    )
+
+    round1 = tool_result([
+        {"name": "read_file", "args": {"path": "a.txt"}, "id": "call_read"},
+        {"name": "write_file", "args": {"path": "b.txt", "content": "x"}, "id": "call_write"},
+    ])
+    scripted = _CapturingLLM([round1, text_result("done")])
+    monkeypatch.setattr("reyn.runtime.router_loop.call_llm_tools", scripted)
+
+    await loop.run("read a then write b", [])
+
+    # The 2nd LLM call saw the post-Execute-round message history.
+    seq = scripted.messages_per_call[1]
+    # Drop the leading system/user turns — focus on the assistant tool-call turn
+    # onward (the Execute round's contribution).
+    asst_idx = next(i for i, m in enumerate(seq) if m.get("role") == "assistant")
+    asst = seq[asst_idx]
+    tool_msgs = [m for m in seq[asst_idx:] if m.get("role") == "tool"]
+
+    # (1) assistant turn carries BOTH tool_calls, in order.
+    assert [tc["id"] for tc in asst["tool_calls"]] == ["call_read", "call_write"]
+
+    # (2) exactly one tool message per tool_call, ids aligned in order (#1406/#187).
+    assert [m["tool_call_id"] for m in tool_msgs] == ["call_read", "call_write"]
+
+    # (3) sandbox_2's excluded-row assert: the EXCLUDED call's tool message is at its
+    # own index with its own id, carrying the tool_excluded error (not dropped, not
+    # reordered).
+    # #2425 案B: a dispatch error renders the plain ``Error (<kind>): <message>`` string.
+    write_msg = tool_msgs[1]
+    assert write_msg["tool_call_id"] == "call_write"
+    assert write_msg["content"].startswith("Error (tool_excluded): ")
+
+    # (4) the dispatched call's result is its own message at index 0. FP-0056 PR-H: the ``file`` kind
+    # now has a canonical mapper (no longer the whole-dict frontmatter fallback), so the read renders
+    # via that mapper — the exact dispatch outcome is harness-dependent (this fixtureless host has no
+    # workspace, so the read surfaces as an error string), but it must round-trip at its own id with a
+    # non-empty body and must NOT carry the excluded-call error.
+    read_msg = tool_msgs[0]
+    assert read_msg["tool_call_id"] == "call_read"
+    assert isinstance(read_msg["content"], str) and read_msg["content"], "read result round-trips at its id"
+    assert not read_msg["content"].startswith("Error (tool_excluded): "), "read is dispatched, not excluded"

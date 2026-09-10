@@ -1,0 +1,733 @@
+"""Tier 2: tool-result summary — CC-style one-liners + graceful fallback.
+
+`summarize_tool_result` turns a raw op result into a human line (``Read 42
+lines``) per tool/shape, and ALWAYS degrades gracefully on an unknown / empty /
+oversized / malformed result (never raises, never dumps raw for a known shape).
+"""
+from __future__ import annotations
+
+from reyn.interfaces.repl.renderer import summarize_tool_result
+
+
+def test_file_read_reports_line_count() -> None:
+    """Tier 2: a file read summarises to 'Read N lines'."""
+    out = summarize_tool_result(
+        "read_file", {"op": "read", "status": "ok", "content": "a\nb\nc"}
+    )
+    assert out == "Read 3 lines"
+
+
+def test_read_with_none_content_no_status_is_clean_not_raw_repr() -> None:
+    """Tier 2: a read result whose content is None and carries no status gets a
+    clean note, not a raw-dict dump."""
+    out = summarize_tool_result("read_file", {"op": "read", "content": None})
+    assert out == "Read (no content)"
+    assert "{" not in out and "None" not in out
+
+
+def test_read_with_none_content_but_status_shows_status() -> None:
+    """Tier 2: a read that errored (content None) still surfaces its status."""
+    out = summarize_tool_result(
+        "read_file", {"op": "read", "content": None, "status": "error"}
+    )
+    assert out == "error"
+
+
+def test_file_read_singular_line() -> None:
+    """Tier 2: a single-line read says 'Read 1 line', not 'Read 1 lines'."""
+    out = summarize_tool_result(
+        "read_file", {"op": "read", "status": "ok", "content": "only one line"}
+    )
+    assert out == "Read 1 line"
+
+
+def test_file_read_truncated_is_flagged() -> None:
+    """Tier 2: a truncated read says so."""
+    out = summarize_tool_result(
+        "read_file", {"op": "read", "status": "truncated", "content": "x\ny"}
+    )
+    assert "truncated" in out
+
+
+def test_file_write_and_edit_name_the_path() -> None:
+    """Tier 2: write / edit name the path."""
+    assert summarize_tool_result("write_file", {"op": "write", "path": "f.py"}) == "Wrote f.py"
+    assert summarize_tool_result("edit_file", {"op": "edit", "path": "g.py"}) == "Edited g.py"
+
+
+def test_file_create_treated_same_as_write() -> None:
+    """Tier 2: op='create' uses the same 'Wrote …' branch as 'write'.
+
+    A create op arriving from an MCP tool (or a future OS create op) must
+    not fall through to the raw-repr fallback — it shares the 'write|create'
+    branch. Pinning this prevents the branch being silently narrowed to
+    write-only.
+    """
+    assert summarize_tool_result("file__create", {"op": "create", "path": "new.py"}) == "Wrote new.py"
+
+
+def test_write_without_path_degrades_cleanly() -> None:
+    """Tier 2: a write result with no path field → 'Wrote file', not a crash."""
+    assert summarize_tool_result("write_file", {"op": "write"}) == "Wrote file"
+
+
+def test_edit_without_path_degrades_cleanly() -> None:
+    """Tier 2: an edit result with no path field → 'Edited file', not a crash."""
+    assert summarize_tool_result("edit_file", {"op": "edit"}) == "Edited file"
+
+
+def test_web_search_counts_results() -> None:
+    """Tier 2: a search list summarises to 'N results'."""
+    assert summarize_tool_result("web_search", ["a", "b", "c"]) == "3 results"
+
+
+def test_generic_list_counts_items_with_pluralisation() -> None:
+    """Tier 2: a generic list → 'N items', singular for one."""
+    assert summarize_tool_result("anything", [1, 2]) == "2 items"
+    assert summarize_tool_result("anything", ["only"]) == "1 item"
+
+
+def test_dict_with_error_key_shows_error_not_raw_repr() -> None:
+    """Tier 2: a dict with an 'error' key shows '✗ <error message>', not raw repr.
+
+    `list_directory` outside the project returns `{'error': 'glob not permitted…'}`.
+    The summarizer must surface the error string with a '✗' failure prefix so the
+    ⎿ row renders in red (not dim grey), distinguishing failure from success.
+    """
+    out = summarize_tool_result(
+        "list_directory",
+        {"error": "glob not permitted: '/tmp/*' (outside project, no read permission)"},
+    )
+    assert out.startswith("✗"), "error result must carry '✗' failure prefix"
+    assert "glob not permitted" in out
+    assert "{" not in out, "raw dict repr must not leak into ⎿ row"
+
+
+def test_file_read_not_found_shows_error_not_zero_lines() -> None:
+    """Tier 2: read_file for a missing file shows '✗ <error>', not 'Read 0 lines'.
+
+    read_file returns {"op": "read", "content": "", "error": "file not found: …"}
+    for a non-existent path.  Without the error-first guard the read branch fires
+    on op=="read" and returns "Read 0 lines" (empty content → 0 lines), which looks
+    identical to an empty file and gives the user no signal that the file is absent.
+    The '✗' prefix ensures the ⎿ row renders in red (tool_call_completed + ✗ → _CC_ERR).
+    """
+    out = summarize_tool_result(
+        "read_file",
+        {"op": "read", "content": "", "error": "file not found: README.md"},
+    )
+    assert out.startswith("✗"), "error result must carry '✗' failure prefix"
+    assert "0 lines" not in out, "missing file must not look like empty file"
+    assert "not found" in out or "README" in out, "must surface the error"
+    assert "{" not in out, "raw dict repr must not leak"
+
+
+def test_file_delete_shows_deleted_path() -> None:
+    """Tier 2: delete_file result (op='delete', path=...) shows 'Deleted {path}'.
+
+    delete_file returns {"kind": "file", "op": "delete", "path": ..., "status": "ok"}.
+    Without this branch op='delete' misses all op checks, falls through to
+    status='ok' → shows 'ok' with no path, giving the user no signal of what was
+    deleted.
+    """
+    assert summarize_tool_result(
+        "delete_file",
+        {"kind": "file", "op": "delete", "path": "src/old.py", "status": "ok", "deleted": True},
+    ) == "Deleted src/old.py"
+    assert summarize_tool_result(
+        "delete_file", {"op": "delete"}
+    ) == "Deleted file"
+
+
+def test_memory_remember_shows_saved_slug() -> None:
+    """Tier 2: memory_operation__remember_* result ({saved, layer, path}) shows 'Saved {slug}'.
+
+    Without this branch the raw dict repr leaked into the ⎿ row; the result
+    has no 'op', 'status', 'tasks', 'entries', or 'matches' key.
+    """
+    assert summarize_tool_result(
+        "remember_agent",
+        {"saved": "my-memory-slug", "layer": "agent", "path": "/.reyn/memory/agent/my-memory-slug.md"},
+    ) == "Saved my-memory-slug"
+
+
+def test_memory_forget_shows_forgot_slug() -> None:
+    """Tier 2: forget_memory result ({deleted, layer}) shows 'Forgot {slug}'.
+
+    Without this branch the raw dict repr leaked into the ⎿ row; same missing-key
+    condition as the remember case (no 'op', 'status', or list keys).
+    """
+    assert summarize_tool_result(
+        "forget_memory",
+        {"deleted": "old-memory-slug", "layer": "shared"},
+    ) == "Forgot old-memory-slug"
+
+
+def test_recall_success_shows_chunk_count() -> None:
+    """Tier 2: rag_operation__semantic_search success ({chunks, mode}) shows 'N chunks'.
+
+    semantic_search (FP-0057 Phase 2a; renamed from recall) returns
+    {"chunks": [...], "mode": "semantic"} with no op/status/matches/entries
+    key, so without this branch the raw dict repr leaked into the ⎿ row.
+    """
+    assert summarize_tool_result(
+        "rag_operation__semantic_search",
+        {"chunks": [{"text": "a"}, {"text": "b"}, {"text": "c"}], "mode": "semantic"},
+    ) == "3 chunks"
+    assert summarize_tool_result(
+        "rag_operation__semantic_search",
+        {"chunks": [{"text": "only"}], "mode": "semantic"},
+    ) == "1 chunk"
+    assert summarize_tool_result(
+        "rag_operation__semantic_search",
+        {"chunks": [], "mode": "fallback"},
+    ) == "0 chunks"
+
+
+def test_error_message_field_shown_not_raw_dict() -> None:
+    """Tier 2: dicts with 'error_message' (no 'error' key) show '✗ <message>'.
+
+    semantic_search validation errors return {"ok": False, "error_kind": ..., "error_message": ...}
+    and other ops return the same shape for invalid-args/no-context errors.
+    Without the error_message fallback both fell through to raw dict repr.
+    The '✗' prefix ensures the ⎿ row renders in red (tool_call_completed + ✗ → _CC_ERR).
+    """
+    out = summarize_tool_result(
+        "rag_operation__semantic_search",
+        {
+            "ok": False,
+            "error_kind": "missing_required_arg",
+            "error_message": "semantic_search requires ['query']. Available sources are listed …",
+            "missing": ["query"],
+        },
+    )
+    assert out.startswith("✗"), "error_message result must carry '✗' failure prefix"
+    assert "semantic_search requires" in out
+    assert "{" not in out, "raw dict repr must not leak"
+    assert "ok" not in out.lower() or "False" not in out, "must not dump raw repr"
+
+
+def test_mcp_result_shows_content_first_line() -> None:
+    """Tier 2: MCP tool result (kind='mcp', content='...') shows first content line.
+
+    MCP op results carry {"kind": "mcp", "status": "ok", "content": <joined text>}.
+    Without this branch the status fallback shows the generic 'ok' with no hint of
+    what the MCP tool returned.  The first line of content is the minimal useful
+    preview — it degrades to 'ok' when content is absent or empty.
+    """
+    assert summarize_tool_result(
+        "mcp__github__get_issue",
+        {"kind": "mcp", "status": "ok", "server": "github", "tool": "get_issue",
+         "content": "Issue #42: Fix the thing\nBody: more detail here", "media_blocks": []},
+    ) == "Issue #42: Fix the thing"
+    assert summarize_tool_result(
+        "mcp__slack__get_message",
+        {"kind": "mcp", "status": "ok", "server": "slack", "tool": "get_message",
+         "content": "", "media_blocks": []},
+    ) == "ok"
+
+
+def test_file_list_shows_entry_count() -> None:
+    """Tier 2: list_directory result ({path, entries}) shows 'Listed N entries'.
+
+    Without this branch the raw dict repr leaked into the ⎿ row.
+    """
+    assert summarize_tool_result(
+        "list_directory", {"path": "src/", "entries": ["a.py", "b.py", "c.py"]}
+    ) == "Listed 3 entries"
+    assert summarize_tool_result(
+        "list_directory", {"path": "src/", "entries": ["only.py"]}
+    ) == "Listed 1 entry"
+
+
+def test_file_grep_shows_match_count() -> None:
+    """Tier 2: grep_files result (op='grep', count=N) shows 'N matches'.
+
+    Without this branch grep fell through to status='ok' which is uninformative.
+    """
+    assert summarize_tool_result(
+        "grep_files",
+        {"op": "grep", "status": "ok", "count": 7, "matches": []},
+    ) == "7 matches"
+    assert summarize_tool_result(
+        "grep_files",
+        {"op": "grep", "status": "ok", "count": 1, "matches": []},
+    ) == "1 match"
+
+
+def test_file_glob_shows_match_count() -> None:
+    """Tier 2: glob_files result ({pattern, matches, count}) shows 'N matches'.
+
+    Without this branch the raw dict repr leaked into the ⎿ row.
+    """
+    assert summarize_tool_result(
+        "glob_files",
+        {"pattern": "src/**/*.py", "matches": ["a.py", "b.py"], "count": 2},
+    ) == "2 matches"
+    assert summarize_tool_result(
+        "glob_files",
+        {"pattern": "*.md", "matches": ["README.md"], "count": 1},
+    ) == "1 match"
+
+
+def test_list_mcp_servers_shows_server_count() -> None:
+    """Tier 2: list_mcp_servers result ({servers: [...]}) shows 'N servers'.
+
+    list_mcp_servers returns {"servers": [...]} with no op/status/error key;
+    without this branch the raw dict repr leaked into the ⎿ row.
+    """
+    assert summarize_tool_result(
+        "list_mcp_servers", {"servers": ["github", "slack", "linear"]}
+    ) == "3 servers"
+    assert summarize_tool_result(
+        "list_mcp_servers", {"servers": ["only"]}
+    ) == "1 server"
+    assert summarize_tool_result(
+        "list_mcp_servers", {"servers": []}
+    ) == "0 servers"
+
+
+def test_list_mcp_tools_shows_tool_count() -> None:
+    """Tier 2: list_mcp_tools result ({mcp_tools: [...]}) shows 'N tools'.
+
+    list_mcp_tools returns {"mcp_tools": [...]} with no op/status/error key;
+    without this branch the raw dict repr leaked into the ⎿ row.
+    """
+    assert summarize_tool_result(
+        "list_mcp_tools",
+        {"mcp_tools": [{"name": "github__get_issue"}, {"name": "github__list_prs"}]},
+    ) == "2 tools"
+    assert summarize_tool_result(
+        "list_mcp_tools", {"mcp_tools": [{"name": "slack__send_message"}]}
+    ) == "1 tool"
+
+
+def test_search_actions_shows_item_count() -> None:
+    """Tier 2: search_actions/list_actions result ({items: [...], total: N}) shows 'N items'.
+
+    Both search_actions and list_actions return {"items": [...], "total": N} with no
+    op/status/error key; without this branch the raw dict repr leaked into the ⎿ row.
+    """
+    assert summarize_tool_result(
+        "search_actions", {"items": [{"action_name": "read_file"}, {"action_name": "write_file"}], "total": 2}
+    ) == "2 items"
+    assert summarize_tool_result(
+        "list_actions", {"items": [], "total": 0}
+    ) == "0 items"
+    assert summarize_tool_result(
+        "search_actions", {"items": [{"action_name": "recall"}], "total": 1}
+    ) == "1 item"
+
+
+def test_index_drop_shows_chunks_dropped() -> None:
+    """Tier 2: index_drop result ({removed: bool, chunks_dropped: int}) shows 'Dropped N chunks'.
+
+    index_drop returns {"removed": bool, "chunks_dropped": int} with no op/status/error key;
+    without this branch the raw dict repr leaked into the ⎿ row.
+    """
+    assert summarize_tool_result(
+        "index_drop", {"removed": True, "chunks_dropped": 7}
+    ) == "Dropped 7 chunks"
+    assert summarize_tool_result(
+        "index_drop", {"removed": True, "chunks_dropped": 1}
+    ) == "Dropped 1 chunk"
+    assert summarize_tool_result(
+        "index_drop", {"removed": False, "chunks_dropped": 0}
+    ) == "Dropped 0 chunks"
+
+
+def test_describe_tool_shows_name_not_raw_dict() -> None:
+    """Tier 2: describe_action/describe_mcp_tool result ({input_schema, name/description}) shows name.
+
+    Both tools return a dict with an 'input_schema' key (dict) and a 'name' or 'description'
+    key.  Without this branch the raw schema dict leaked into the ⎿ row.
+    """
+    assert summarize_tool_result(
+        "describe_mcp_tool",
+        {"name": "get_issue", "description": "Get a GitHub issue", "input_schema": {"type": "object"}},
+    ) == "get_issue"
+    out = summarize_tool_result(
+        "describe_action",
+        {"description": "Lists actions by category", "input_schema": {"properties": {}}},
+    )
+    assert "Lists actions" in out
+    assert "{" not in out, "raw dict repr must not leak"
+
+
+def test_dict_with_status_shows_status() -> None:
+    """Tier 2: an opaque dict with a status field shows the status."""
+    assert summarize_tool_result("mcp__call", {"status": "ok", "x": 1}) == "ok"
+
+
+def test_empty_or_none_reports_done() -> None:
+    """Tier 2: empty / None result → 'done', not a blank line."""
+    assert summarize_tool_result("x", None) == "done"
+    assert summarize_tool_result("x", "") == "done"
+
+
+def test_oversized_result_is_truncated_one_line() -> None:
+    """Tier 2: a huge / multiline result collapses to a truncated single line."""
+    out = summarize_tool_result("x", "z" * 500 + "\ntail")
+    assert "\n" not in out
+    assert "…" in out
+    assert "tail" not in out
+
+
+def test_unknown_shape_degrades_without_raising() -> None:
+    """Tier 2: a malformed/unknown result returns a string, never raises."""
+    weird = {"op": object(), "nested": [object()]}
+    out = summarize_tool_result("x", weird)
+    assert isinstance(out, str) and out  # some non-empty summary, no crash
+
+
+def test_passed_score_shape_shows_score() -> None:
+    """Tier 2: a {passed: bool, score: float} result shape shows 'Passed (score)'
+    not raw dict -- a generic shape-based branch (not tied to any specific tool
+    name), so it renders any scorer-shaped result (e.g. the passed/score fields
+    a pipeline self-review `agent` + `schema` step's output can carry) without
+    the raw dict repr leaking into the ⎿ row.
+    """
+    out = summarize_tool_result(
+        "self_review",
+        {"score": 0.85, "passed": True, "reason": "looks good"},
+    )
+    assert out == "Passed (0.85)"
+    assert "{" not in out
+
+
+def test_passed_score_shape_failed_shows_score() -> None:
+    """Tier 2: a {passed: False, score: float} result shape shows 'Failed (score)'
+    not raw dict."""
+    out = summarize_tool_result(
+        "self_review",
+        {"score": 0.23, "passed": False, "reason": "incomplete"},
+    )
+    assert out == "Failed (0.23)"
+    assert "{" not in out
+
+
+def test_web_search_results_shows_count() -> None:
+    """Tier 2: web_search result ({kind, query, status, results: [...]}) shows 'N results'.
+
+    web_search returns {"kind": "web_search", "results": [...], "status": "ok"};
+    adding the 'results' list key means N results is shown rather than the generic 'ok'.
+    """
+    out = summarize_tool_result(
+        "web_search",
+        {"kind": "web_search", "query": "python asyncio", "backend": "brave",
+         "status": "ok", "results": [{"title": "A"}, {"title": "B"}, {"title": "C"}]},
+    )
+    assert out == "3 results"
+    out1 = summarize_tool_result(
+        "web_search",
+        {"kind": "web_search", "query": "x", "status": "ok", "results": [{"title": "X"}]},
+    )
+    assert out1 == "1 result"
+
+
+def test_file_mkdir_shows_created_path() -> None:
+    """Tier 2: file mkdir result (op='mkdir', path=...) shows 'Created {path}'.
+
+    file__mkdir returns {kind, op='mkdir', path, status='ok', created: bool} with
+    no matching op branch; without this fix it falls to status → shows 'ok'.
+    """
+    assert summarize_tool_result(
+        "file__mkdir",
+        {"kind": "file", "op": "mkdir", "path": "src/new/", "status": "ok", "created": True},
+    ) == "Created src/new/"
+    assert summarize_tool_result(
+        "file__mkdir", {"op": "mkdir"}
+    ) == "Created directory"
+
+
+def test_file_move_shows_destination() -> None:
+    """Tier 2: file move result (op='move', dest_path=...) shows 'Moved to {dest}'.
+
+    file__move returns {kind, op='move', path, dest_path, status='ok', moved: True}
+    with no matching op branch; without this fix it falls to status → shows 'ok'.
+    """
+    assert summarize_tool_result(
+        "file__move",
+        {"kind": "file", "op": "move", "path": "old.py", "dest_path": "new.py",
+         "status": "ok", "moved": True},
+    ) == "Moved to new.py"
+    assert summarize_tool_result(
+        "file__move", {"op": "move"}
+    ) == "Moved"
+
+
+def test_cron_list_shows_job_count() -> None:
+    """Tier 2: cron_list result ({status, source, jobs: [...]}) shows 'N jobs'.
+
+    cron_list returns {"status": "ok", "source": "...", "jobs": [...]} — 'jobs' is
+    not in the covered list-key set so without this branch it falls to status → 'ok'.
+    """
+    assert summarize_tool_result(
+        "cron_list",
+        {"status": "ok", "source": "live_scheduler",
+         "jobs": [{"name": "nightly"}, {"name": "weekly"}]},
+    ) == "2 jobs"
+    assert summarize_tool_result(
+        "cron_list", {"status": "ok", "source": "config_file", "jobs": [{"name": "daily"}]}
+    ) == "1 job"
+    assert summarize_tool_result(
+        "cron_list", {"status": "ok", "source": "live_scheduler", "jobs": []}
+    ) == "0 jobs"
+
+
+def test_sandboxed_exec_ok_shows_exit_code() -> None:
+    """Tier 2: sandboxed_exec success (returncode int, status='ok') shows 'exit N'.
+
+    sandboxed_exec returns {kind, status, returncode, stdout, stderr, ...}; for
+    status='ok' the generic 'ok' is unhelpful. 'timeout'/'cancelled' get a '✗' prefix
+    with the exit code so failure is visually distinct from a successful result row.
+    """
+    assert summarize_tool_result(
+        "exec",
+        {"kind": "sandboxed_exec", "status": "ok", "backend": "subprocess",
+         "returncode": 0, "stdout": "hello", "stderr": "", "truncated": False},
+    ) == "exit 0"
+
+
+def test_compact_shows_freed_tokens() -> None:
+    """Tier 2: compact success ({kind, status, freed_tokens, ...}) shows 'Freed N tokens'.
+
+    compact returns {"kind": "compact", "status": "ok", "freed_tokens": int, ...};
+    without this branch status fires showing 'ok' with no context of how much was freed.
+    """
+    assert summarize_tool_result(
+        "compact",
+        {"kind": "compact", "status": "ok", "freed_tokens": 8200,
+         "free_window_after": 50000, "summarized_turns": 12},
+    ) == "Freed 8200 tokens"
+    assert summarize_tool_result(
+        "compact",
+        {"kind": "compact", "status": "ok", "freed_tokens": 1,
+         "free_window_after": 10000},
+    ) == "Freed 1 token"
+    assert summarize_tool_result(
+        "compact",
+        {"kind": "compact", "status": "ok", "freed_tokens": 0},
+    ) == "Freed 0 tokens"
+
+
+def test_ask_user_shows_answer_text() -> None:
+    """Tier 2: ask_user result ({kind, question, answer, status}) shows the answer.
+
+    ask_user returns {"kind": "ask_user", "question": "...", "answer": "...", "status": "ok"};
+    showing the answer text is more informative than the generic 'ok'.
+    """
+    assert summarize_tool_result(
+        "ask_user",
+        {"kind": "ask_user", "question": "Which environment?",
+         "answer": "production", "status": "ok"},
+    ) == "production"
+    long_answer = "yes " * 30
+    out = summarize_tool_result(
+        "ask_user",
+        {"kind": "ask_user", "question": "Are you sure?",
+         "answer": long_answer, "status": "ok"},
+    )
+    assert "…" in out and "\n" not in out  # long answer is truncated to a single line
+
+
+def test_mcp_install_shows_server_name() -> None:
+    """Tier 2: mcp_install success ({status:"ok", server_name, ...}) shows 'Installed {name}'.
+
+    mcp_install returns {kind:"mcp_install", status:"ok", server_id, server_name, ...};
+    without this branch status fires showing 'ok', losing which server was installed.
+    """
+    assert summarize_tool_result(
+        "mcp_install",
+        {"kind": "mcp_install", "status": "ok", "server_id": "github",
+         "server_name": "GitHub MCP", "scope": "project", "installed_path": "/path"},
+    ) == "Installed GitHub MCP"
+    assert summarize_tool_result(
+        "mcp_install",
+        {"kind": "mcp_install", "status": "ok", "server_id": "s",
+         "server_name": "slack", "scope": "user"},
+    ) == "Installed slack"
+
+
+def test_web_fetch_shows_url() -> None:
+    """Tier 2: web_fetch success ({kind:"web_fetch", url, status:"ok", content, ...}) shows URL.
+
+    web_fetch returns {kind, url, status:"ok", content, ...}; without this branch
+    status fires showing 'ok'. Error paths (blocked/timeout/error) all carry 'error'
+    str which is caught by the error-first guard and are unaffected.
+    """
+    out = summarize_tool_result(
+        "web_fetch",
+        {"kind": "web_fetch", "url": "https://example.com/api/v1",
+         "status": "ok", "status_code": 200, "content": "body text"},
+    )
+    assert "example.com" in out and "{" not in out
+    long_url = "https://example.com/" + "a" * 80
+    out2 = summarize_tool_result(
+        "web_fetch",
+        {"kind": "web_fetch", "url": long_url, "status": "ok", "content": ""},
+    )
+    assert "…" in out2 and "\n" not in out2
+
+
+def test_file_regenerate_index_shows_indexed_path() -> None:
+    """Tier 2: file regenerate_index result shows 'Indexed <path>' not raw dict.
+
+    file op='regenerate_index' returns {kind:"file", op:"regenerate_index", path, status:"ok",
+    entries:int} — 'entries' is an int (not a list) so no list branch fires; without the
+    op branch this falls through to the status branch and shows 'ok'.
+    """
+    assert summarize_tool_result(
+        "file__regenerate_index",
+        {"kind": "file", "op": "regenerate_index", "path": "/repo/.reyn/index",
+         "status": "ok", "entries": 42},
+    ) == "Indexed /repo/.reyn/index"
+    assert summarize_tool_result(
+        "file__regenerate_index",
+        {"kind": "file", "op": "regenerate_index", "path": None, "status": "ok"},
+    ) == "Indexed"
+
+
+def test_mcp_drop_server_shows_removed_name() -> None:
+    """Tier 2: mcp_drop_server success shows 'Removed <server>' not 'ok'.
+
+    mcp_drop_server returns {kind:"mcp_drop_server", status:"ok", server:str, ...};
+    without a branch this falls through to status='ok'. not_found result has status
+    'not_found' and should NOT match (stays as 'not_found' via the status fallback).
+    """
+    assert summarize_tool_result(
+        "mcp_drop_server",
+        {"kind": "mcp_drop_server", "status": "ok", "server": "my-mcp"},
+    ) == "Removed my-mcp"
+    assert summarize_tool_result(
+        "mcp_drop_server",
+        {"kind": "mcp_drop_server", "status": "not_found", "server": "missing-mcp"},
+    ) == "not_found"
+
+
+def test_cron_enable_disable_shows_verb_and_name() -> None:
+    """Tier 2: cron_enable/disable shows 'Enabled/Disabled <name>' not 'ok'.
+
+    cron_enable returns {status:"ok", name:str, enabled:True};
+    cron_disable returns {status:"ok", name:str, enabled:False}.
+    Both currently fall through to the status branch showing 'ok'.
+    """
+    assert summarize_tool_result(
+        "cron__enable",
+        {"status": "ok", "name": "daily-sync", "enabled": True},
+    ) == "Enabled daily-sync"
+    assert summarize_tool_result(
+        "cron__disable",
+        {"status": "ok", "name": "daily-sync", "enabled": False},
+    ) == "Disabled daily-sync"
+
+
+def test_sandboxed_exec_cancelled_shows_failure_text() -> None:
+    """Tier 2: sandboxed_exec cancelled result shows '✗ cancelled (exit N)' not plain 'cancelled'.
+
+    sandboxed_exec returns {kind:"sandboxed_exec", status:"cancelled", returncode:int, ...}
+    when the subprocess is killed. Without a branch, the status fallback returns the bare
+    string 'cancelled' with no visual failure signal.
+    """
+    assert summarize_tool_result(
+        "exec",
+        {"kind": "sandboxed_exec", "status": "cancelled",
+         "backend": "local", "returncode": -9, "stdout": "", "stderr": ""},
+    ) == "✗ cancelled (exit -9)"
+
+
+def test_sandboxed_exec_timeout_shows_failure_text() -> None:
+    """Tier 2: sandboxed_exec timeout result shows '✗ timeout (exit N)' not plain 'timeout'.
+
+    sandboxed_exec returns {kind:"sandboxed_exec", status:"timeout", returncode:-1, ...}
+    when the subprocess exceeds the deadline. The bare 'timeout' string is indistinguishable
+    from a successful result in the ⎿ row without an explicit failure prefix.
+    """
+    assert summarize_tool_result(
+        "exec",
+        {"kind": "sandboxed_exec", "status": "timeout",
+         "backend": "local", "returncode": -1, "stdout": "partial", "stderr": ""},
+    ) == "✗ timeout (exit -1)"
+
+
+def test_sandboxed_exec_error_shows_returncode_and_stderr() -> None:
+    """Tier 2: #4753 — an ORDINARY nonzero exit (sandboxed_exec.py's own
+    ``status = "ok" if returncode == 0 else ("timeout" if returncode == -1
+    else "error")``, e.g. the command itself failed — not a sandbox
+    timeout/cancel) previously fell through every branch to the bare
+    fallback string ``"error"``, discarding ``returncode`` AND ``stderr``
+    even though both are present in the result dict. Display-only surface
+    (REPL renderer + inline TUI presenter): what a bare 'error' cost was
+    the OPERATOR's ability to see why the command failed. RED without the
+    fix: the summary is the bare 'error'."""
+    assert summarize_tool_result(
+        "exec",
+        {"kind": "sandboxed_exec", "status": "error", "backend": "landlock",
+         "returncode": 1, "stdout": "", "stderr": "printf: brace-expansion not supported",
+         "truncated": False, "denial_class": None, "argv0_resolved": "/usr/bin/printf"},
+    ) == "✗ exit 1: printf: brace-expansion not supported"
+
+
+def test_sandboxed_exec_error_with_no_stderr_still_shows_returncode() -> None:
+    """Tier 2: (accept-side) a nonzero exit with empty/absent stderr still
+    surfaces the returncode alone — never a bare 'error' with NO signal at
+    all, even in the degraded case where the failing process wrote
+    nothing to stderr."""
+    assert summarize_tool_result(
+        "exec",
+        {"kind": "sandboxed_exec", "status": "error", "backend": "local",
+         "returncode": 2, "stdout": "", "stderr": ""},
+    ) == "✗ exit 2"
+
+
+def test_sandboxed_exec_error_truncates_long_stderr() -> None:
+    """Tier 2: (accept-side) long stderr is truncated, not dumped verbatim
+    into the one-line summary — via the SAME ``_short(...)`` boundary the
+    ``error``/``error_message`` branches in this function already use for
+    a one-line error summary, not a freshly-minted constant (owner
+    instruction: reuse an existing truncation boundary for the same
+    purpose before adding a new one)."""
+    long_stderr = "x" * 200
+    summary = summarize_tool_result(
+        "exec",
+        {"kind": "sandboxed_exec", "status": "error", "backend": "local",
+         "returncode": 1, "stdout": "", "stderr": long_stderr},
+    )
+    assert summary.startswith("✗ exit 1: ")
+    detail = summary[len("✗ exit 1: "):]
+    assert len(detail) < len(long_stderr), "long stderr must be truncated, not dumped verbatim"
+    assert detail.endswith("…")
+
+
+def test_stderr_with_terminal_control_bytes_is_neutralized() -> None:
+    """Tier 2: THE mandatory security witness (#4758, lead-coder review) —
+    ``stderr`` is arbitrary bytes from a sandboxed process (world-derived),
+    not operator-typed ``reyn.yaml`` text. ``_short``'s own truncation
+    (``" ".join(s.split())``) does NOT strip ESC/control sequences —
+    ``str.split()`` splits on whitespace, and ESC is not whitespace — so
+    an ESC/CSI sequence embedded in real-world stderr survived to the
+    terminal through #4754's own new branch (the exact gap #4757 closed
+    for the tool-DETAIL expand path; this is the same class, in the
+    tool-SUMMARY line instead). ``summarize_tool_result``'s own single
+    return boundary is now neutralized via the SAME
+    ``get_neutralizer("terminal")`` FP-0054 seam."""
+    summary = summarize_tool_result(
+        "exec",
+        {"kind": "sandboxed_exec", "status": "error", "backend": "local",
+         "returncode": 1, "stdout": "", "stderr": "boom\x1b[2Jgone"},
+    )
+    assert "\x1b" not in summary, "an ESC byte reached the summary unneutralized"
+    assert "boom" in summary
+    assert "gone" in summary
+
+
+def test_neutralize_preserves_ordinary_text() -> None:
+    """Tier 2: accept-side of the same witness — neutralizing the summary
+    does not corrupt ordinary, control-byte-free content (the common
+    case, every pre-#4758 test in this file)."""
+    summary = summarize_tool_result(
+        "exec",
+        {"kind": "sandboxed_exec", "status": "error", "backend": "local",
+         "returncode": 1, "stdout": "", "stderr": "ordinary error text"},
+    )
+    assert summary == "✗ exit 1: ordinary error text"

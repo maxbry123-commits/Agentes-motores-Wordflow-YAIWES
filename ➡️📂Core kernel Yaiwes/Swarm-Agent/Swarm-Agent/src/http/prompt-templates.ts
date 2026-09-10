@@ -1,0 +1,509 @@
+import type { IncomingMessage, ServerResponse } from "node:http";
+import { z } from "zod";
+import {
+  checkoutPromptTemplate,
+  deletePromptTemplate,
+  getDbClient,
+  getPromptTemplateById,
+  getPromptTemplateHistory,
+  getPromptTemplates,
+  resetPromptTemplateToDefault,
+  resolvePromptTemplate,
+  upsertPromptTemplate,
+} from "../be/db";
+import { getPromptTemplateDefaultDrift } from "../prompts/default-drift";
+import { getAllTemplateDefinitions, getTemplateDefinition } from "../prompts/registry";
+import { resolveTemplate } from "../prompts/resolver";
+import { type PromptTemplate, PromptTemplateHistorySchema, PromptTemplateSchema } from "../types";
+import { interpolate } from "../utils/template";
+import { route } from "./route-def";
+import { jsonError } from "./utils";
+
+// ─── Response Schemas ────────────────────────────────────────────────────────
+
+/** Mirrors `EventTemplateDefinition["variables"]` entries from src/prompts/registry.ts */
+const VariableDefinitionSchema = z.object({
+  name: z.string(),
+  description: z.string(),
+  example: z.string().optional(),
+});
+
+/** Mirrors the plain-object projection of `EventTemplateDefinition` the handlers send. */
+const EventTemplateDefinitionResponseSchema = z.object({
+  eventType: z.string(),
+  header: z.string(),
+  defaultBody: z.string(),
+  variables: z.array(VariableDefinitionSchema),
+  category: z.enum(["event", "system", "common", "task_lifecycle", "session"]),
+});
+
+const PromptTemplateResponseSchema = PromptTemplateSchema.extend({
+  defaultDrifted: z.boolean(),
+}).openapi("PromptTemplateResponse");
+
+function toPromptTemplateResponse(template: PromptTemplate) {
+  const definition = getTemplateDefinition(template.eventType);
+  const defaultDrifted = definition
+    ? getPromptTemplateDefaultDrift(template, definition.defaultBody).defaultDrifted
+    : false;
+
+  return { ...template, defaultDrifted };
+}
+
+/** Mirrors `ResolveResult` from src/prompts/resolver.ts */
+const ResolveResultSchema = z.object({
+  text: z.string(),
+  templateId: z.string().optional(),
+  scope: z.string().optional(),
+  skipped: z.boolean(),
+  unresolved: z.array(z.string()),
+});
+
+/** Mirrors the return type of `resolvePromptTemplate` in src/be/db.ts */
+const DbResolveResultSchema = z
+  .union([
+    z.object({ template: PromptTemplateResponseSchema }),
+    z.object({ skip: z.literal(true) }),
+  ])
+  .nullable();
+
+// ─── Route Definitions ───────────────────────────────────────────────────────
+
+const resolvedRoute = route({
+  method: "get",
+  path: "/api/prompt-templates/resolved",
+  pattern: ["api", "prompt-templates", "resolved"],
+  summary: "Resolve a prompt template for a given event type and scope chain",
+  tags: ["PromptTemplates"],
+  query: z.object({
+    eventType: z.string(),
+    agentId: z.string().optional(),
+    repoId: z.string().optional(),
+  }),
+  responses: {
+    200: {
+      description: "Resolved template info",
+      schema: z.object({
+        resolution: ResolveResultSchema,
+        dbResult: DbResolveResultSchema,
+        definition: EventTemplateDefinitionResponseSchema.nullable(),
+      }),
+    },
+    400: { description: "Missing eventType" },
+  },
+  auth: { apiKey: true },
+});
+
+const eventsRoute = route({
+  method: "get",
+  path: "/api/prompt-templates/events",
+  pattern: ["api", "prompt-templates", "events"],
+  summary: "List all registered event types with their available variables",
+  tags: ["PromptTemplates"],
+  responses: {
+    200: {
+      description: "List of event template definitions",
+      schema: z.object({ events: z.array(EventTemplateDefinitionResponseSchema) }),
+    },
+  },
+  auth: { apiKey: true },
+});
+
+const previewRoute = route({
+  method: "post",
+  path: "/api/prompt-templates/preview",
+  pattern: ["api", "prompt-templates", "preview"],
+  summary: "Dry-run render a template with provided variables",
+  tags: ["PromptTemplates"],
+  body: z.object({
+    eventType: z.string(),
+    body: z.string().optional(),
+    variables: z.record(z.string(), z.unknown()).optional(),
+  }),
+  responses: {
+    200: {
+      description: "Rendered template preview",
+      schema: z.object({ rendered: z.string(), unresolved: z.array(z.string()) }),
+    },
+    400: { description: "Validation error" },
+  },
+  auth: { apiKey: true },
+});
+
+const renderRoute = route({
+  method: "post",
+  path: "/api/prompt-templates/render",
+  pattern: ["api", "prompt-templates", "render"],
+  summary: "Full scope-aware template resolution with interpolation (used by workers via HTTP)",
+  tags: ["PromptTemplates"],
+  body: z.object({
+    eventType: z.string(),
+    variables: z.record(z.string(), z.unknown()).optional(),
+    agentId: z.string().optional(),
+    repoId: z.string().optional(),
+  }),
+  responses: {
+    200: { description: "Fully resolved and interpolated template", schema: ResolveResultSchema },
+    400: { description: "Validation error" },
+  },
+  auth: { apiKey: true },
+});
+
+const checkoutRoute = route({
+  method: "post",
+  path: "/api/prompt-templates/{id}/checkout",
+  pattern: ["api", "prompt-templates", null, "checkout"],
+  summary: "Checkout a specific version of a prompt template from history",
+  tags: ["PromptTemplates"],
+  params: z.object({ id: z.string() }),
+  body: z.object({ version: z.number() }),
+  responses: {
+    200: {
+      description: "Checked-out template",
+      schema: z.object({ template: PromptTemplateResponseSchema }),
+    },
+    400: { description: "Validation error" },
+    404: { description: "Template or version not found" },
+  },
+  auth: { apiKey: true },
+});
+
+const resetRoute = route({
+  method: "post",
+  path: "/api/prompt-templates/{id}/reset",
+  pattern: ["api", "prompt-templates", null, "reset"],
+  summary: "Reset a prompt template to its code-defined default",
+  tags: ["PromptTemplates"],
+  params: z.object({ id: z.string() }),
+  responses: {
+    200: {
+      description: "Reset template",
+      schema: z.object({ template: PromptTemplateResponseSchema }),
+    },
+    404: { description: "Template not found or no code default available" },
+  },
+  auth: { apiKey: true },
+});
+
+const getByIdRoute = route({
+  method: "get",
+  path: "/api/prompt-templates/{id}",
+  pattern: ["api", "prompt-templates", null],
+  summary: "Get a single prompt template with its version history",
+  tags: ["PromptTemplates"],
+  params: z.object({ id: z.string() }),
+  responses: {
+    200: {
+      description: "Template with history",
+      schema: z.object({
+        template: PromptTemplateResponseSchema,
+        history: z.array(PromptTemplateHistorySchema),
+      }),
+    },
+    404: { description: "Template not found" },
+  },
+  auth: { apiKey: true },
+});
+
+const deleteByIdRoute = route({
+  method: "delete",
+  path: "/api/prompt-templates/{id}",
+  pattern: ["api", "prompt-templates", null],
+  summary: "Delete a prompt template override",
+  tags: ["PromptTemplates"],
+  params: z.object({ id: z.string() }),
+  responses: {
+    200: {
+      description: "Template deleted",
+      schema: z.object({ deleted: z.literal(true) }),
+    },
+    400: { description: "Cannot delete default template" },
+    404: { description: "Template not found" },
+  },
+  auth: { apiKey: true },
+});
+
+const listRoute = route({
+  method: "get",
+  path: "/api/prompt-templates",
+  pattern: ["api", "prompt-templates"],
+  summary: "List prompt templates with optional filters",
+  tags: ["PromptTemplates"],
+  query: z.object({
+    eventType: z.string().optional(),
+    scope: z.string().optional(),
+    scopeId: z.string().optional(),
+    isDefault: z.enum(["true", "false"]).optional(),
+  }),
+  responses: {
+    200: {
+      description: "List of prompt templates",
+      schema: z.object({ templates: z.array(PromptTemplateResponseSchema) }),
+    },
+  },
+  auth: { apiKey: true },
+});
+
+const upsertRoute = route({
+  method: "put",
+  path: "/api/prompt-templates",
+  pattern: ["api", "prompt-templates"],
+  summary: "Create or update a prompt template override",
+  tags: ["PromptTemplates"],
+  body: z.object({
+    eventType: z.string().min(1),
+    scope: z.enum(["global", "agent", "repo"]).optional(),
+    scopeId: z.string().optional(),
+    state: z.enum(["enabled", "default_prompt_fallback", "skip_event"]).optional(),
+    body: z.string(),
+    changedBy: z.string().optional(),
+    changeReason: z.string().optional(),
+  }),
+  responses: {
+    200: {
+      description: "Upserted template",
+      schema: z.object({ template: PromptTemplateResponseSchema }),
+    },
+    400: { description: "Validation error" },
+  },
+  auth: { apiKey: true },
+});
+
+// ─── Handler ─────────────────────────────────────────────────────────────────
+
+export async function handlePromptTemplates(
+  req: IncomingMessage,
+  res: ServerResponse,
+  pathSegments: string[],
+  queryParams: URLSearchParams,
+): Promise<boolean> {
+  // 3-segment literal: /api/prompt-templates/resolved
+  if (resolvedRoute.match(req.method, pathSegments)) {
+    const parsed = await resolvedRoute.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+
+    const { eventType, agentId, repoId } = parsed.query;
+    if (!eventType) {
+      jsonError(res, "eventType query parameter is required", 400);
+      return true;
+    }
+
+    const result = resolveTemplate(eventType, {}, { agentId, repoId });
+    const dbResult = resolvePromptTemplate(eventType, agentId, repoId);
+    const definition = getTemplateDefinition(eventType);
+
+    resolvedRoute.respond(res, 200, {
+      resolution: result,
+      dbResult:
+        dbResult && "template" in dbResult
+          ? { template: toPromptTemplateResponse(dbResult.template) }
+          : dbResult,
+      definition: definition
+        ? {
+            eventType: definition.eventType,
+            header: definition.header,
+            defaultBody: definition.defaultBody,
+            variables: definition.variables,
+            category: definition.category,
+          }
+        : null,
+    });
+    return true;
+  }
+
+  // 3-segment literal: /api/prompt-templates/events
+  if (eventsRoute.match(req.method, pathSegments)) {
+    const parsed = await eventsRoute.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+
+    const definitions = getAllTemplateDefinitions();
+    eventsRoute.respond(res, 200, {
+      events: definitions.map((d) => ({
+        eventType: d.eventType,
+        header: d.header,
+        defaultBody: d.defaultBody,
+        variables: d.variables,
+        category: d.category,
+      })),
+    });
+    return true;
+  }
+
+  // 3-segment literal: /api/prompt-templates/preview
+  if (previewRoute.match(req.method, pathSegments)) {
+    const parsed = await previewRoute.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+
+    const { eventType, body: customBody, variables } = parsed.body;
+    const definition = getTemplateDefinition(eventType);
+    const templateBody = customBody ?? definition?.defaultBody ?? "";
+    const header = definition?.header ?? "";
+    const composed = header ? `${header}\n\n${templateBody}` : templateBody;
+    const { result: rendered, unresolved } = interpolate(composed, variables ?? {});
+
+    previewRoute.respond(res, 200, { rendered, unresolved });
+    return true;
+  }
+
+  // 3-segment literal: /api/prompt-templates/render
+  if (renderRoute.match(req.method, pathSegments)) {
+    const parsed = await renderRoute.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+
+    const { eventType, variables, agentId, repoId } = parsed.body;
+    const result = resolveTemplate(eventType, variables ?? {}, { agentId, repoId });
+    renderRoute.respond(res, 200, result);
+    return true;
+  }
+
+  // 4-segment with param: /api/prompt-templates/{id}/checkout
+  if (checkoutRoute.match(req.method, pathSegments)) {
+    const parsed = await checkoutRoute.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+
+    try {
+      const template = await checkoutPromptTemplate(parsed.params.id, parsed.body.version);
+      checkoutRoute.respond(res, 200, { template: toPromptTemplateResponse(template) });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unknown error";
+      if (message.includes("not found")) {
+        jsonError(res, message, 404);
+      } else {
+        jsonError(res, message, 400);
+      }
+    }
+    return true;
+  }
+
+  // 4-segment with param: /api/prompt-templates/{id}/reset
+  if (resetRoute.match(req.method, pathSegments)) {
+    const parsed = await resetRoute.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+
+    const existing = await getPromptTemplateById(parsed.params.id);
+    if (!existing) {
+      jsonError(res, `Prompt template ${parsed.params.id} not found`, 404);
+      return true;
+    }
+
+    const definition = getTemplateDefinition(existing.eventType);
+    if (!definition) {
+      jsonError(res, `No code default found for event type "${existing.eventType}"`, 404);
+      return true;
+    }
+
+    try {
+      // The sync helper stays on the raw handle for the boot seeder; on this
+      // request path, run it inside a client transaction so the write holds
+      // the FIFO lock instead of landing inside a foreign BEGIN window.
+      const template = await getDbClient().transaction(async () =>
+        resetPromptTemplateToDefault(parsed.params.id, definition.defaultBody),
+      );
+      resetRoute.respond(res, 200, { template: toPromptTemplateResponse(template) });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unknown error";
+      jsonError(res, message, 400);
+    }
+    return true;
+  }
+
+  // 3-segment with param: GET /api/prompt-templates/{id}
+  if (getByIdRoute.match(req.method, pathSegments)) {
+    const parsed = await getByIdRoute.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+
+    const template = await getPromptTemplateById(parsed.params.id);
+    if (!template) {
+      jsonError(res, "Prompt template not found", 404);
+      return true;
+    }
+
+    const history = await getPromptTemplateHistory(parsed.params.id);
+    getByIdRoute.respond(res, 200, { template: toPromptTemplateResponse(template), history });
+    return true;
+  }
+
+  // 3-segment with param: DELETE /api/prompt-templates/{id}
+  if (deleteByIdRoute.match(req.method, pathSegments)) {
+    const parsed = await deleteByIdRoute.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+
+    try {
+      const deleted = await deletePromptTemplate(parsed.params.id);
+      if (!deleted) {
+        jsonError(res, "Prompt template not found", 404);
+        return true;
+      }
+      deleteByIdRoute.respond(res, 200, { deleted: true });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unknown error";
+      jsonError(res, message, 400);
+    }
+    return true;
+  }
+
+  // 2-segment: GET /api/prompt-templates
+  if (listRoute.match(req.method, pathSegments)) {
+    const parsed = await listRoute.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+
+    const templates = getPromptTemplates({
+      eventType: parsed.query.eventType || undefined,
+      scope: parsed.query.scope || undefined,
+      scopeId: parsed.query.scopeId || undefined,
+      isDefault: parsed.query.isDefault ? parsed.query.isDefault === "true" : undefined,
+    });
+
+    listRoute.respond(res, 200, { templates: templates.map(toPromptTemplateResponse) });
+    return true;
+  }
+
+  // 2-segment: PUT /api/prompt-templates
+  if (upsertRoute.match(req.method, pathSegments)) {
+    const parsed = await upsertRoute.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+
+    const {
+      eventType,
+      scope: rawScope,
+      scopeId,
+      state,
+      body,
+      changedBy,
+      changeReason,
+    } = parsed.body;
+    const scope = rawScope ?? "global";
+
+    if (scope === "global" && scopeId) {
+      jsonError(res, "Global scope must not have scopeId", 400);
+      return true;
+    }
+    if ((scope === "agent" || scope === "repo") && !scopeId) {
+      jsonError(res, "Agent/repo scope requires scopeId", 400);
+      return true;
+    }
+
+    try {
+      // Same rationale as the reset route: serialize the sync raw-handle
+      // write through the client's lock on this request path.
+      const template = await getDbClient().transaction(async () =>
+        upsertPromptTemplate({
+          eventType,
+          scope,
+          scopeId: scopeId || null,
+          state,
+          body,
+          changedBy,
+          changeReason,
+        }),
+      );
+      upsertRoute.respond(res, 200, { template: toPromptTemplateResponse(template) });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unknown error";
+      jsonError(res, message, 500);
+    }
+    return true;
+  }
+
+  return false;
+}

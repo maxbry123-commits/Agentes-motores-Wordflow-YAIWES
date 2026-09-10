@@ -1,0 +1,57 @@
+"""Tier 2: picker hint sweep — Wave-12 T2-1 (Topic A #3/#4/#7).
+
+3 slash commands whose picker hints underspecified behavior:
+  /pending (A#3) — added usage; sub-command vocab now visible in hint
+  /agent   (A#4) — summary now mentions rm escape hatch
+  /image   (A#7) — summary now lists supported extensions
+
+All assertions use the REGISTRY public surface (cmd.usage / cmd.summary).
+No MagicMock / patch per testing policy.
+"""
+from __future__ import annotations
+
+import sys
+
+from tests._support.paths import REPO_ROOT
+
+_SRC = REPO_ROOT / "src"
+if str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
+
+
+def test_pending_usage_surfaces_subcommand_vocab() -> None:
+    """Tier 2: /pending usage exposes list/discard/claim in the picker hint."""
+    from reyn.interfaces.slash import REGISTRY
+
+    cmd = REGISTRY.get("pending")
+    assert cmd is not None, "/pending not in registry"
+    assert cmd.usage == "/pending [list|discard <id>|claim <id>]", (
+        f"/pending usage mismatch: got {cmd.usage!r}"
+    )
+
+
+def test_agent_summary_mentions_rm_escape_hatch() -> None:
+    """Tier 2: /agent summary tells the user where rm lives."""
+    from reyn.interfaces.slash import REGISTRY
+
+    cmd = REGISTRY.get("agent")
+    assert cmd is not None, "/agent not in registry"
+    assert "rm via `reyn agent rm`" in cmd.summary, (
+        f"/agent summary missing rm escape hatch: {cmd.summary!r}"
+    )
+
+
+def test_image_summary_lists_supported_extensions() -> None:
+    """Tier 2: /image summary surfaces png and webp without pinning exact wording."""
+    from reyn.interfaces.slash import REGISTRY
+
+    cmd = REGISTRY.get("image")
+    assert cmd is not None, "/image not in registry"
+    assert "png" in cmd.summary, (
+        f"/image summary missing 'png': {cmd.summary!r}"
+    )
+    assert "webp" in cmd.summary, (
+        f"/image summary missing 'webp': {cmd.summary!r}"
+    )
+
+

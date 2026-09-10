@@ -1,0 +1,96 @@
+---
+title: Telemetry
+description: What telemetry Agent Swarm collects, how it's anonymized, and how to opt out — lifecycle, session-cost, workflow, schedule, and compaction event tracking without PII collection
+---
+
+Agent Swarm includes optional, anonymized telemetry to help the maintainers understand usage patterns and improve the product. Telemetry is **enabled by default** and can be disabled at any time.
+
+## What is collected
+
+Telemetry tracks high-level lifecycle and operational events — no task content, prompts, outputs, stderr payloads, or personally identifiable information is ever sent.
+
+| Event | When it fires | Properties |
+|---|---|---|
+| `server.started` | API server boots | — |
+| `task.created` | A new task is created | source, tags, hasParent, priority |
+| `task.started` | A task is assigned to an agent | source, agentId |
+| `task.claimed` | An agent auto-claims a task from the pool | source, agentId |
+| `task.completed` | A task finishes successfully | agentId, durationMs |
+| `task.failed` | A task fails | agentId, durationMs |
+| `task.cancelled` | A task is cancelled | source, agentId, previousStatus, durationMs |
+| `task.session_completed` | A provider session exits for a task | agentId, provider, model, harnessVariant, harnessVersion, exitCode, isError, durationMs |
+| `session.started` | A worker session begins | agentId, taskId |
+| `session.ended` | A worker session ends | agentId, taskId, durationMs, tasksProcessed |
+| `session.cost` | A provider reports token/cost usage | agentId, provider, model, inputTokens, outputTokens, cache/read-write token counters, durationMs, totalCostUsd, isError |
+| `session.failure` | A provider session ends with an error | agentId, provider, model, errorCategory, durationMs, wasRateLimited |
+| `schedule.executed` | A schedule run completes | scheduleType, triggeredWorkflows, wasRecovered |
+| `schedule.error` | A schedule run errors | scheduleType, triggeredWorkflows, wasRecovered, consecutiveErrors |
+| `workflow.created` | A workflow definition is created | workflowId, nodeCount, source (when known) |
+| `workflow.deleted` | A workflow definition is deleted | workflowId, source (when known) |
+| `workflow.started` / `workflow.completed` / `workflow.failed` | Workflow lifecycle transitions | runId, workflowId, durationMs, executor metadata |
+| `compaction.triggered` | A harness emits a compaction event | compactTrigger, preCompactTokens, contextTotalTokens |
+
+The exact shape can expand over time as new lifecycle milestones are instrumented, but the contract stays the same: anonymous operational metadata only.
+
+Every event also includes:
+- A timestamp (`occurred_at`)
+- The source component (`api-server` or `worker`)
+- The environment (`production` by default; override with `DESPLEGA_TELEMETRY_ENV`)
+- A schema version number
+- `is_cloud` — boolean flag indicating whether the event originated from a cloud-hosted swarm or a self-hosted install. Lets the backend partition cloud vs self-hosted traffic without joining to another dimension.
+- `has_embedding_key` — boolean, whether an embedding-capable key (`EMBEDDING_API_KEY` or `OPENAI_API_KEY`) is configured, i.e. whether semantic memory search is likely enabled.
+- `has_slack_channel` / `has_email_channel` / `has_notification_channel` — booleans indicating whether an outbound notification channel (Slack, AgentMail email, or either) is configured. Presence only — never a token, channel ID, or address.
+- `install_method` — enum: `onboard_interactive`, `onboard_noninteractive`, `e2b`, or `manual`. Which entry point produced this install.
+- `install_preset` (metadata, optional) — the onboard wizard preset used (`dev`, `content`, `research`, `solo`, or `custom`), when the install went through the wizard. Allow-listed against the wizard's known preset IDs — any other value (including free text accidentally placed in `INSTALL_PRESET`) is omitted rather than forwarded.
+- `install_created_at` (metadata, optional) — ISO timestamp of when this install's identity was first minted, persisted once alongside the installation ID. Only set when this process genuinely mints a new installation ID; an existing installation ID with no stored anchor emits this field as **absent**, not back-filled with the current time — absence means "pre-existing install, anchor unknown". Use `min(occurred_at)` per `installation_id` in ClickHouse as the real anchor for that population.
+
+## How it's anonymized
+
+- **Installation ID**: Each installation generates a random, opaque identifier (e.g. `install_a1b2c3d4e5f6g7h8`) stored in the `swarm_config` table. This ID cannot be traced back to you or your organization.
+- **No content**: Task descriptions, prompts, outputs, agent names, and error messages are never included.
+- **No IPs logged**: The telemetry endpoint (`proxy.desplega.sh`) does not store client IP addresses.
+- **No auth required**: Events are sent in anonymous actor mode with no authentication headers.
+
+## Installation ID mechanism
+
+On first startup, the telemetry module checks `swarm_config` for a `telemetry_installation_id` key:
+
+1. If found, it reuses the existing ID for consistent tracking across restarts.
+2. If not found, it generates a new random ID (`install_` + 16 hex characters) and persists it.
+3. If config access fails (e.g. worker without DB access), an ephemeral ID (`ephemeral_` prefix) is generated for that session only.
+
+Workers access the installation ID via HTTP (respecting the DB boundary invariant), while the API server reads it directly from the database.
+
+A `telemetry_installed_at` timestamp is minted alongside the installation ID, but only when this process genuinely mints a **new** installation ID — it anchors "when this install came into being" independent of server restarts. An existing installation ID with no stored anchor (an install that predates this field) leaves it unset, and the field is omitted from events rather than back-filled with the current time; use `min(occurred_at)` per `installation_id` in ClickHouse as the real anchor for that population.
+
+## How to opt out
+
+Set the `ANONYMIZED_TELEMETRY` environment variable to `false`:
+
+```bash title=".env"
+ANONYMIZED_TELEMETRY=false
+```
+
+For Docker workers, also add it to `.env.docker`:
+
+```bash title=".env.docker"
+ANONYMIZED_TELEMETRY=false
+```
+
+When disabled:
+- No events are sent
+- No installation ID is generated or stored
+- The telemetry module initializes as a no-op
+
+## Technical details
+
+- **Endpoint**: `POST https://proxy.desplega.sh/v1/events`
+- **Timeout**: 5 seconds per request
+- **Failure mode**: Fire-and-forget — telemetry never throws exceptions or blocks operations
+- **Module**: `src/telemetry.ts` (importable from both API server and workers)
+
+## Related
+
+- [Environment Variables](/docs/reference/environment-variables) — Full reference for `ANONYMIZED_TELEMETRY` and all configuration options
+- [Deployment Guide](/docs/guides/deployment) — How to set environment variables in production Docker deployments
+- [Architecture Overview](/docs/architecture/overview) — How the API server and workers fit together in the overall system

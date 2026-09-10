@@ -1,0 +1,140 @@
+name: sandbox Landlock deny gate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  landlock-deny-gate:
+    # "single ABI" is the load-bearing half of this name: whatever ABI this
+    # runner's kernel happens to expose (measured: 7, on 6.17.0-azure) is the
+    # ONLY one a green here speaks for. See the script docstring.
+    name: Landlock/seccomp deny must fire (single ABI, #2983 stage 3)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      # `sandbox-linux` is deliberately OMITTED from test.yml's extras (loading a
+      # real default-deny seccomp filter is irrevocable for the process that does
+      # it, which is the wrong shape for pytest's shared session). The cost of
+      # that correct decision is that the enforcement arms of
+      # tests/security/test_landlock_exec_shim_1344e.py skip in EVERY job we have — and a
+      # skip is green. Until this job, the only host that had ever witnessed a
+      # Linux deny was one maintainer's colima VM, run by hand. One host is not a
+      # gate.
+      #
+      # `builtin-rag` is ALSO installed here (#3030): the seccomp allowlist now
+      # loads unconditionally (previously skipped whenever allow_subprocess was
+      # True, the stdio-MCP default), so every such MCP server is now under a
+      # default-deny syscall filter for the first time — the #2962 correctness
+      # risk (its first live load killed /bin/echo). Installing this extra is
+      # what lets tests/security/test_sandbox_seccomp_network_3030.py's representative-
+      # real-MCP-server probes (the builtin rag plugin's chunker_server.py /
+      # vector_store_server.py, launched directly since ADR 0064 P5 retired
+      # the reyn-rag-chunker / reyn-rag-vector-store console scripts) RUN
+      # rather than skip on this job.
+      - name: Install sandbox-linux + builtin-rag extras
+        run: pip install -e ".[dev,sandbox-linux,builtin-rag]"
+
+      # #4302's own "install the plugin's own requirements.txt into the
+      # runner venv" step USED TO live here — REMOVED (design correction,
+      # not #4302's original plan): chunker_server.py/vector_store_server.py
+      # import `fastmcp`, which hard-pins `mcp<2.0`. Installing it into THIS
+      # job's own venv retroactively uninstalled reyn's own `mcp>=2.0` floor
+      # (`pip install fastmcp` here silently downgraded/removed `mcp` for
+      # every step after it) — invisible until #4545 (the first PR to
+      # `from mcp import Client` directly) made a downstream `ImportError`
+      # surface it. The two dependency floors (`mcp>=2.0` for reyn's own
+      # client, `mcp<2.0` transitively via fastmcp for the plugin scripts)
+      # cannot coexist in ONE venv, so the plugin scripts below now launch
+      # via the SEPARATE, per-plugin `rag_plugin_python` fixture venv
+      # (`tests/_support/rag_plugin_venv.py`, #4302's OWN option-A design —
+      # this restores that design rather than departing from it; the
+      # runner-venv install above was the part that never should have
+      # existed) — that venv builds itself from the plugin's
+      # `requirements.txt` (including `fastmcp`) on first use, isolated
+      # from this job's own dependency floor entirely.
+
+      # `uvx` (bundled with the `uv` PyPI package) for the third representative
+      # server probe below (markitdown-mcp, #3030) — the RAG server with the
+      # widest syscall footprint (network fetch on first run via uvx, then a
+      # real file parse).
+      - name: Install uv (for uvx)
+        run: pip install uv
+
+      # The gate. It has no skip path: if Landlock or pyseccomp is missing it
+      # exits FATAL rather than passing having observed nothing, because those
+      # are precisely the conditions under which the deny arms report nothing
+      # while rc stays 0.
+      #
+      # Deliberately NOT path-filtered, same reasoning as wheel-reachability.yml
+      # and the seccomp x86_64 job: an incomplete include-list is itself a
+      # false-allow surface. Letting an enforcement regression under an unlisted
+      # path merge because this gate silently never ran would reproduce the exact
+      # class (#2962 / #2980 / #3020) the gate exists to catch.
+      - name: Landlock + seccomp deny gate (probes must fire a real deny)
+        run: python scripts/sandbox_landlock_deny_gate.py
+
+      # Supplementary: the enforcement group of the shim tests, which has never
+      # run in CI. It is not the gate — the script above is, and it is what
+      # cannot skip. This step is safe from the "skip is green" trap for one
+      # specific reason: `requires_landlock` skips exactly when
+      # `LandlockBackend().available()` is False, which the gate above already
+      # FATALs on. So these arms cannot silently skip while the step above is
+      # green.
+      #
+      # Only this file is collected, and nothing in it loads a filter into the
+      # pytest process (each arm launches the shim as a subprocess). -rs prints
+      # what skipped and why, so "what ran" stays legible rather than being
+      # inferred from a pass count.
+      - name: Shim enforcement tests (supplementary — the gate above is the gate)
+        run: python -m pytest tests/security/test_landlock_exec_shim_1344e.py -v -rs --timeout=120
+
+      # #3030: the network-deny falsification (the exact allow_subprocess=True
+      # condition that used to leak network), the io_uring completeness probe
+      # (bounded-by-construction — the exact gap a syscall-name denylist would
+      # have missed), and the representative-real-MCP-server completeness group
+      # (the builtin rag plugin's chunker/vector-store scripts + uvx markitdown-mcp) — the
+      # ★★ hard gate that an incomplete allowlist does not silently kill a real
+      # MCP server (#2962's class). Same `requires_landlock` skip-safety as the
+      # step above; -rs so a markitdown-mcp network-reachability skip (this
+      # runner's own PyPI egress, orthogonal to allowlist completeness) is
+      # visible rather than silently absorbed into a pass count.
+      - name: Network-gate + io_uring + representative-MCP-server tests (#3030)
+        run: python -m pytest tests/security/test_sandbox_seccomp_network_3030.py -v -rs --timeout=180
+
+      # #4333: the 3-tuple axis contract (deny / exception-boundary /
+      # workload) is the RICHER of CLAUDE.md's two deliberately-separate
+      # sandbox witness layers — `enforcement_self_test` (production, deny
+      # leg only, write+spawn axes only, every host) is the other, and this
+      # PR does not touch it (CLAUDE.md names only the direction "fold a
+      # new axis/leg INTO enforcement_self_test" as forbidden; running the
+      # already-existing CI-conformance layer somewhere real is the
+      # opposite of that). Before this step, the 3-tuple contract's
+      # network-axis arms had no job anywhere that both HAD Landlock
+      # available (this job, uniquely, does) AND collected the file — a
+      # declared-vs-actual gap, not a design gap: the design already put
+      # the richer contract in CI, CI just never actually ran it.
+      #
+      # All 3 files skip for the identical root cause
+      # (`LandlockBackend().available()` False — no Linux kernel Landlock
+      # support / package), independently confirmed per-file before adding
+      # this step, not inferred from "same uncovered set": test_sandbox_axis_contract_2983.py's
+      # `@requires_landlock` group (6 arms), test_sandbox_landlock.py's
+      # `test_landlock_runs_echo` (1), test_subprocess_cancel_1470.py's 2
+      # Landlock cancel arms. Same `requires_landlock`-equivalent skip-
+      # safety as the two steps above: the FATAL gate script already ran
+      # this job to completion, so a skip here would mean the gate script
+      # itself should have FATALed and didn't — -rs makes the actual ran/
+      # skipped split legible rather than inferred from a pass count.
+      - name: Sandbox 3-tuple axis-contract CI-conformance tests (#4333, previously never run anywhere)
+        run: python -m pytest tests/security/test_sandbox_axis_contract_2983.py tests/security/test_sandbox_landlock.py tests/security/test_subprocess_cancel_1470.py -v -rs --timeout=120

@@ -1,0 +1,631 @@
+"""Global ~/.bernstein home directory management.
+
+Provides cross-project config storage, catalog cache, and cost tracking.
+
+Config precedence (highest to lowest):
+  session overrides > project .sdd/config.yaml > ~/.bernstein/config.yaml > built-in defaults
+
+Environment overrides (take priority over all file-based config layers):
+  BERNSTEIN_CLI         Default CLI adapter (e.g. claude, codex, gemini, qwen).
+  BERNSTEIN_BUDGET      Spending cap in USD (0 = unlimited).
+  BERNSTEIN_MAX_AGENTS  Maximum concurrent agents (default 6).
+  BERNSTEIN_EFFORT      Default effort level (max | medium | low).
+  BERNSTEIN_MODEL       Default model override (empty = adapter default).
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast
+
+import yaml
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+
+_CONFIG_YAML_FILENAME = "config.yaml"
+
+# Built-in defaults for known keys.
+_DEFAULTS: dict[str, Any] = {
+    "cli": "claude",
+    "budget": None,
+    "max_agents": 6,
+    "effort": "max",
+    "model": None,
+}
+
+_DEFAULT_CONFIG_YAML = """\
+# Bernstein global config (~/.bernstein/config.yaml)
+# Values here apply to all projects unless overridden by project config.
+
+# Default CLI adapter: claude | codex | gemini | qwen
+cli: claude
+
+# Default spending cap in USD (null = no limit)
+budget: null
+
+# Default max concurrent agents
+max_agents: 6
+
+# Default effort level: max | medium | low
+effort: max
+
+# Default model override (null = adapter default)
+model: null
+"""
+
+ConfigSource = Literal["seed", "session", "project", "context", "global", "default"]
+
+
+class ConfigProvenanceLayer(TypedDict):
+    """Single configuration layer in a resolved precedence chain."""
+
+    source: ConfigSource
+    value: object
+    redacted_value: object
+    path: str | None
+
+
+class ConfigResolution(TypedDict):
+    """Resolved config value with provenance metadata."""
+
+    value: object
+    source: ConfigSource
+    source_chain: list[ConfigProvenanceLayer]
+
+
+class SourcePolicyViolation(TypedDict):
+    """A policy violation when a setting is resolved from a disallowed source."""
+
+    key: str
+    actual_source: ConfigSource
+    allowed_sources: list[ConfigSource]
+    message: str
+
+
+# Keys that must only be set at specific sources (policy enforcement).
+# If a key is absent from this map, any source is allowed.
+_ALLOWED_SOURCE_POLICIES: dict[str, tuple[ConfigSource, ...]] = {
+    # Security-sensitive keys must not be set via session/env overrides alone.
+    # A named operating context (#2550) is an audit-chained, attested source
+    # that sits between project and global, so it joins the allowlist.
+    # The run seed (``bernstein.yaml``, the committed run manifest) is the
+    # value the orchestrator actually enforces at runtime, so it is a
+    # legitimate source on par with the project layer (#2874).
+    "budget": ("seed", "project", "context", "global", "default"),
+    "max_agents": ("seed", "project", "context", "global", "default"),
+}
+
+
+def enforce_source_policy(
+    key: str,
+    resolution: ConfigResolution,
+    *,
+    extra_policies: dict[str, tuple[ConfigSource, ...]] | None = None,
+) -> SourcePolicyViolation | None:
+    """Check whether the resolved source for *key* is allowed by policy.
+
+    Args:
+        key: Config key that was resolved.
+        resolution: The resolved config value with provenance.
+        extra_policies: Additional per-key source restrictions to merge with
+            the built-in ``_ALLOWED_SOURCE_POLICIES``.
+
+    Returns:
+        A :class:`SourcePolicyViolation` if the source is disallowed, else
+        ``None``.
+    """
+    policies = _ALLOWED_SOURCE_POLICIES.copy()
+    if extra_policies:
+        policies.update(extra_policies)
+
+    allowed = policies.get(key)
+    if allowed is None:
+        return None  # no policy for this key
+
+    actual = resolution["source"]
+    if actual in allowed:
+        return None
+
+    return {
+        "key": key,
+        "actual_source": actual,
+        "allowed_sources": list(allowed),
+        "message": (
+            f"Setting '{key}' resolved from '{actual}' but policy requires one of: "
+            + ", ".join(f"'{s}'" for s in allowed)
+        ),
+    }
+
+
+def check_source_policies(
+    bundle: dict[str, ConfigResolution],
+    *,
+    extra_policies: dict[str, tuple[ConfigSource, ...]] | None = None,
+) -> list[SourcePolicyViolation]:
+    """Check all keys in *bundle* against source policies.
+
+    Args:
+        bundle: Mapping of key → :class:`ConfigResolution` (from
+            :func:`resolve_config_bundle`).
+        extra_policies: Additional per-key source restrictions.
+
+    Returns:
+        List of violations (empty when all keys comply).
+    """
+    violations: list[SourcePolicyViolation] = []
+    for key, resolution in bundle.items():
+        violation = enforce_source_policy(key, resolution, extra_policies=extra_policies)
+        if violation is not None:
+            violations.append(violation)
+    return violations
+
+
+class BernsteinHome:
+    """Manages the global ~/.bernstein home directory.
+
+    Attributes:
+        path: Path to the ~/.bernstein directory.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+
+    # ------------------------------------------------------------------
+    # Factory
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def default(cls) -> BernsteinHome:
+        """Return a BernsteinHome pointing at ~/.bernstein."""
+        return cls(Path.home() / ".bernstein")
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def ensure(self) -> None:
+        """Create directory structure and default config if not present."""
+        self.path.mkdir(parents=True, exist_ok=True)
+        (self.path / "agents").mkdir(exist_ok=True)
+        (self.path / "metrics").mkdir(exist_ok=True)
+        (self.path / "mcp").mkdir(exist_ok=True)
+
+        config_path = self.path / _CONFIG_YAML_FILENAME
+        if not config_path.exists():
+            config_path.write_text(_DEFAULT_CONFIG_YAML)
+
+    # ------------------------------------------------------------------
+    # Read / write
+    # ------------------------------------------------------------------
+
+    def _load(self) -> dict[str, Any]:
+        """Load the global config.yaml, returning an empty dict if missing."""
+        config_path = self.path / _CONFIG_YAML_FILENAME
+        if not config_path.exists():
+            return {}
+        try:
+            data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}  # type: ignore[reportUnknownVariableType]
+        except Exception:
+            return {}
+
+    def load_raw(self) -> dict[str, object]:
+        """Return raw persisted global settings without default expansion."""
+        return self._load().copy()
+
+    def _save(self, data: dict[str, Any]) -> None:
+        """Persist data to config.yaml, creating home dir if needed."""
+        self.ensure()
+        config_path = self.path / _CONFIG_YAML_FILENAME
+        config_path.write_text(yaml.dump(data, default_flow_style=False))
+
+    def get(self, key: str) -> Any:
+        """Return the global value for *key*, or None if not set.
+
+        Args:
+            key: Config key name.
+
+        Returns:
+            Value from global config, or None if absent.
+        """
+        data = self._load()
+        if key in data:
+            return data[key]
+        return _DEFAULTS.get(key)
+
+    def set(self, key: str, value: Any) -> None:
+        """Persist *key=value* in the global config.
+
+        Creates the home directory if it does not yet exist.
+
+        Args:
+            key: Config key name.
+            value: Value to store (must be YAML-serialisable).
+        """
+        data = self._load()
+        data[key] = value
+        self._save(data)
+
+    def all(self) -> dict[str, Any]:
+        """Return the full global config dict (merged with defaults).
+
+        Returns:
+            Dict containing all known config keys and their effective values.
+        """
+        data = self._load()
+        merged = _DEFAULTS.copy()
+        merged.update(data)
+        return merged
+
+
+_ENV_OVERRIDE_MAP: dict[str, str] = {
+    "cli": "BERNSTEIN_CLI",
+    "budget": "BERNSTEIN_BUDGET",
+    "max_agents": "BERNSTEIN_MAX_AGENTS",
+    "effort": "BERNSTEIN_EFFORT",
+    "model": "BERNSTEIN_MODEL",
+}
+
+
+def _redact_config_value(key: str, value: object) -> object:
+    """Return a redacted display value for sensitive configuration fields."""
+    lowered = key.lower()
+    if any(token in lowered for token in ("secret", "token", "password", "key")) and value is not None:
+        return "***REDACTED***"
+    return value
+
+
+def _coerce_config_value(key: str, raw: object) -> object:
+    """Coerce raw config values based on built-in defaults."""
+    default = _DEFAULTS.get(key)
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        lowered = raw.strip().lower()
+        if lowered in {"null", "none"}:
+            return None
+        if isinstance(default, int):
+            try:
+                return int(raw)
+            except ValueError:
+                return raw
+        if isinstance(default, float):
+            try:
+                return float(raw)
+            except ValueError:
+                return raw
+    return raw
+
+
+def _session_overrides_from_env() -> dict[str, object]:
+    """Build session-only overrides from Bernstein environment variables."""
+    overrides: dict[str, object] = {}
+    for key, env_name in _ENV_OVERRIDE_MAP.items():
+        value = os.environ.get(env_name)
+        if value is not None:
+            overrides[key] = _coerce_config_value(key, value)
+    return overrides
+
+
+def _load_project_config(project_dir: Path) -> dict[str, object]:
+    """Load ``.sdd/config.yaml`` for a project when present."""
+    sdd_config = project_dir / ".sdd" / _CONFIG_YAML_FILENAME
+    if not sdd_config.exists():
+        return {}
+    try:
+        data = yaml.safe_load(sdd_config.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    typed_data = cast("dict[object, object]", data)
+    return {str(key): value for key, value in typed_data.items()}
+
+
+#: Directory (relative to a project) holding operating-context documents and
+#: the ``active.json`` activation pointer written by the fleet context store.
+_CONTEXT_DIR = ("fleet", "contexts")
+
+#: Fields the fleet context store hashes into the activated settings identity.
+#: Kept in sync with ``bernstein.core.fleet.context._COMPOSITE_FIELDS`` so this
+#: loader can recompute the identity without importing the fleet package.
+_CONTEXT_COMPOSITE_FIELDS = ("server_url", "store_dsn", "adapter_defaults", "budget_envelope")
+
+
+def _context_settings_hash(doc: dict[str, object]) -> str:
+    """Recompute a context document's canonical settings hash.
+
+    Mirrors ``bernstein.core.fleet.context.settings_hash_of(context.composite())``:
+    canonical JSON (sorted keys, compact separators, ASCII) over the composite
+    fields plus the config layer, digested with SHA-256. Kept dependency-light
+    so the low-level config resolver never imports the fleet package.
+    """
+    composite: dict[str, object] = {f: doc.get(f, "") for f in _CONTEXT_COMPOSITE_FIELDS}
+    layer = doc.get("config_layer")
+    composite["config_layer"] = layer if isinstance(layer, dict) else {}
+    canonical = json.dumps(composite, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _load_context_config(project_dir: Path) -> tuple[dict[str, object], str | None]:
+    """Load the active operating context's config overrides (#2550).
+
+    Returns ``(overrides, context_name)``. When no context is active the
+    overrides are empty and the name is ``None`` - so with no context active
+    the precedence chain is byte-for-byte the original four-layer behaviour.
+
+    The context store writes a self-describing document whose ``config_layer``
+    field is the exact key -> value map the context contributes to the
+    precedence chain; this loader reads only plain JSON and never imports the
+    fleet package, so the low-level config resolver stays dependency-light.
+
+    The layer is applied only when the document still hashes to the settings
+    identity recorded at activation. A document edited on disk after
+    activation (its hash no longer matching ``active.json``) is treated as no
+    active context: the resolver fails closed rather than silently resolving
+    under an unaudited configuration.
+    """
+    context_root = project_dir / ".sdd" / _CONTEXT_DIR[0] / _CONTEXT_DIR[1]
+    active_pointer = context_root / "active.json"
+    if not active_pointer.exists():
+        return {}, None
+    try:
+        active = json.loads(active_pointer.read_text(encoding="utf-8"))
+        name = active.get("name")
+        if not isinstance(name, str) or not name:
+            return {}, None
+        doc = json.loads((context_root / f"{name}.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, KeyError):
+        return {}, None
+    if not isinstance(doc, dict):
+        return {}, None
+    recorded_hash = active.get("settings_hash")
+    if isinstance(recorded_hash, str) and recorded_hash and _context_settings_hash(doc) != recorded_hash:
+        # The document drifted from its audited identity; fail closed.
+        return {}, None
+    layer = doc.get("config_layer")
+    if not isinstance(layer, dict):
+        return {}, name
+    return {str(k): v for k, v in layer.items()}, name
+
+
+# ---------------------------------------------------------------------------
+# Config resolution with precedence
+# ---------------------------------------------------------------------------
+
+
+def resolve_config(
+    key: str,
+    *,
+    home: BernsteinHome,
+    project_dir: Path,
+    session_overrides: Mapping[str, object] | None = None,
+    seed_overrides: Mapping[str, object] | None = None,
+    seed_overrides_path: str | None = None,
+) -> ConfigResolution:
+    """Resolve the effective value for *key* across all config layers.
+
+    Precedence (highest first):
+    1. Run seed overrides (``bernstein.yaml``, the value the orchestrator
+       actually enforces at runtime - see ``seed_overrides``)
+    2. Session-only overrides (environment or caller-provided)
+    3. ``<project>/.sdd/config.yaml``
+    4. ``~/.bernstein/config.yaml``
+    5. Built-in defaults
+
+    Args:
+        key: Config key to look up.
+        home: BernsteinHome instance (global config).
+        project_dir: Project root for loading ``.sdd/config.yaml``.
+        session_overrides: Optional session-only overrides.
+        seed_overrides: Optional run-seed effective values. The seed
+            (``bernstein.yaml``) is not read by the low-level file resolver,
+            yet it is the value the orchestrator caps concurrency and spend
+            with. Threading it here as the top-precedence ``seed`` layer keeps
+            surfaces such as the dashboard capacity denominator honest for
+            seed-configured runs (#2874). A key absent from this mapping is
+            resolved exactly as before.
+        seed_overrides_path: Filesystem path recorded on the injected ``seed``
+            layer (the resolved seed file), or ``None`` when unknown.
+
+    Returns:
+        Typed mapping with the effective ``value``, winning ``source``, and the
+        full ``source_chain`` in descending-precedence order.
+    """
+    project_config = _load_project_config(project_dir)
+    context_config, context_name = _load_context_config(project_dir)
+    global_data = home.load_raw()
+    combined_session_overrides = _session_overrides_from_env() | dict(session_overrides or {})
+
+    layers: list[ConfigProvenanceLayer] = []
+    if seed_overrides is not None and key in seed_overrides:
+        value = _coerce_config_value(key, seed_overrides[key])
+        layers.append(
+            {
+                "source": "seed",
+                "value": value,
+                "redacted_value": _redact_config_value(key, value),
+                "path": seed_overrides_path,
+            }
+        )
+    if key in combined_session_overrides:
+        value = _coerce_config_value(key, combined_session_overrides[key])
+        layers.append(
+            {
+                "source": "session",
+                "value": value,
+                "redacted_value": _redact_config_value(key, value),
+                "path": None,
+            }
+        )
+    if key in project_config:
+        value = project_config[key]
+        layers.append(
+            {
+                "source": "project",
+                "value": value,
+                "redacted_value": _redact_config_value(key, value),
+                "path": str(project_dir / ".sdd" / _CONFIG_YAML_FILENAME),
+            }
+        )
+    if key in context_config:
+        value = context_config[key]
+        layers.append(
+            {
+                "source": "context",
+                "value": value,
+                "redacted_value": _redact_config_value(key, value),
+                "path": str(project_dir / ".sdd" / _CONTEXT_DIR[0] / _CONTEXT_DIR[1] / f"{context_name}.json"),
+            }
+        )
+    if key in global_data:
+        value = global_data[key]
+        layers.append(
+            {
+                "source": "global",
+                "value": value,
+                "redacted_value": _redact_config_value(key, value),
+                "path": str(home.path / _CONFIG_YAML_FILENAME),
+            }
+        )
+
+    default_value = _DEFAULTS.get(key)
+    layers.append(
+        {
+            "source": "default",
+            "value": default_value,
+            "redacted_value": _redact_config_value(key, default_value),
+            "path": None,
+        }
+    )
+
+    winning = layers[0]
+    return {
+        "value": winning["value"],
+        "source": winning["source"],
+        "source_chain": layers,
+    }
+
+
+def resolve_config_bundle(
+    *,
+    home: BernsteinHome,
+    project_dir: Path,
+    keys: tuple[str, ...] | None = None,
+    session_overrides: Mapping[str, object] | None = None,
+    seed_overrides: Mapping[str, object] | None = None,
+    seed_overrides_path: str | None = None,
+) -> dict[str, ConfigResolution]:
+    """Resolve a stable bundle of config keys with provenance.
+
+    ``seed_overrides`` threads the run seed's effective values (see
+    :func:`resolve_config`) so the bundle reflects what the orchestrator
+    actually enforces for seed-configured runs (#2874).
+    """
+    target_keys = keys or tuple(sorted(_DEFAULTS))
+    return {
+        key: resolve_config(
+            key,
+            home=home,
+            project_dir=project_dir,
+            session_overrides=session_overrides,
+            seed_overrides=seed_overrides,
+            seed_overrides_path=seed_overrides_path,
+        )
+        for key in target_keys
+    }
+
+
+class SettingConflict(TypedDict):
+    """A conflict where multiple sources define the same key with different values."""
+
+    key: str
+    winning_source: ConfigSource
+    winning_value: object
+    conflicting_layers: list[ConfigProvenanceLayer]
+    explanation: str
+
+
+def explain_conflicts(bundle: dict[str, ConfigResolution]) -> list[SettingConflict]:
+    """Identify settings where multiple sources define different values.
+
+    Args:
+        bundle: Mapping of key → :class:`ConfigResolution`.
+
+    Returns:
+        List of conflicts where at least two non-default layers disagree.
+    """
+    conflicts: list[SettingConflict] = []
+    for key, resolution in bundle.items():
+        non_default = [
+            layer for layer in resolution["source_chain"] if layer["source"] != "default" and layer["value"] is not None
+        ]
+        if len(non_default) < 2:
+            continue
+        # Check if any two layers have different values
+        values = [layer["value"] for layer in non_default]
+        if len({str(v) for v in values}) > 1:
+            winning = resolution["source_chain"][0]
+            conflicts.append(
+                {
+                    "key": key,
+                    "winning_source": resolution["source"],
+                    "winning_value": resolution["value"],
+                    "conflicting_layers": non_default,
+                    "explanation": (
+                        f"'{key}' has conflicting values: "
+                        + ", ".join(f"{layer['source']}={layer['redacted_value']!r}" for layer in non_default)
+                        + f". Using '{winning['source']}' value: {winning['redacted_value']!r}."
+                    ),
+                }
+            )
+    return conflicts
+
+
+class SettingsSnapshot(TypedDict):
+    """Snapshot of resolved settings at a point in time for trace capture."""
+
+    captured_at: float
+    project_dir: str
+    settings: dict[str, object]
+    sources: dict[str, ConfigSource]
+    conflicts: list[SettingConflict]
+    policy_violations: list[SourcePolicyViolation]
+
+
+def capture_settings_snapshot(
+    *,
+    home: BernsteinHome,
+    project_dir: Path,
+    session_overrides: Mapping[str, object] | None = None,
+) -> SettingsSnapshot:
+    """Capture a full settings snapshot with provenance for trace embedding.
+
+    Args:
+        home: BernsteinHome instance.
+        project_dir: Project root directory.
+        session_overrides: Optional session-only overrides.
+
+    Returns:
+        :class:`SettingsSnapshot` suitable for embedding in an
+        :class:`~bernstein.core.traces.AgentTrace`.
+    """
+    import time
+
+    bundle = resolve_config_bundle(
+        home=home,
+        project_dir=project_dir,
+        session_overrides=session_overrides,
+    )
+    return {
+        "captured_at": time.time(),
+        "project_dir": str(project_dir),
+        "settings": {k: v["value"] for k, v in bundle.items()},
+        "sources": {k: v["source"] for k, v in bundle.items()},
+        "conflicts": explain_conflicts(bundle),
+        "policy_violations": check_source_policies(bundle),
+    }

@@ -1,0 +1,21 @@
+{
+  "name": "coral-marketplace",
+  "interface": {
+    "displayName": "CORAL"
+  },
+  "plugins": [
+    {
+      "name": "coral",
+      "description": "Author and run CORAL tasks from Codex — skills for setup, authoring, and running experiments, plus a SessionStart install check.",
+      "source": {
+        "source": "local",
+        "path": "./plugin"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_USE"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

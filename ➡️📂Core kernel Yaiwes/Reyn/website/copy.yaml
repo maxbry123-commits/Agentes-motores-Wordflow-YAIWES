@@ -1,0 +1,220 @@
+# website/copy.yaml — single source of truth for landing page body copy.
+#
+# index.html uses {{TOKEN}} placeholders. Each value below is inserted as
+# raw HTML, so accent words can be wrapped in <em>...</em> to render in the
+# brand clay colour (see CSS rules for h1 em / .section-heading em / .what
+# p em).
+#
+# Build:
+#   python website/build.py    # writes website/dist/index.html
+#
+# Workflow when Claude Design regenerates index.html:
+#   1. The new index.html should keep the {{TOKEN}} placeholders. The
+#      generation prompt in website/_design/claude_design_prompt.md tells
+#      Claude Design to preserve them.
+#   2. If a regeneration introduces new copy slots, add a matching key
+#      here. If a slot disappears, the key becomes unused (build.py warns
+#      on unused keys).
+#   3. Edit values in this file freely — index.html no longer holds copy.
+
+# ── document head + SNS share metadata ─────────────────────────────────────
+PAGE_TITLE: "Reyn — predictable LLM workflows"
+
+# meta description: shows in Google snippets and as the SNS-share blurb when
+# no per-platform override is provided. Aim for 120–160 chars; match the LP
+# hero lede tone without repeating it word-for-word.
+META_DESCRIPTION: >-
+  Reyn is an operating system for LLM agents. Every action is typed,
+  permissioned, audited, and recoverable by construction.
+
+# Canonical URL: the production landing-page URL. Update this together with
+# `site_url` in mkdocs.yml when the project moves to a custom domain
+# (reyn.dev was mentioned in website/TODO.md as a candidate).
+CANONICAL_URL: "https://tya5.github.io/reyn/"
+
+# Open Graph + Twitter share card. og:title is shown above the description
+# in share previews; keep it punchy. og:image is what people SEE in the
+# unfurl — it must be a publicly-accessible URL (relative paths don't work
+# for SNS scrapers). Use the GitHub-hosted asset for now; switch to the
+# custom domain once that lands.
+OG_TITLE: "Reyn — gives you the reins"
+OG_IMAGE: "https://tya5.github.io/reyn/assets/banner-hero-reyn-main.png"
+OG_IMAGE_ALT: "Reyn — an operating system for LLM agents, on a clay-coloured banner"
+
+# ── header / nav ────────────────────────────────────────────────────────────
+NAV_ARCH: "Architecture"
+NAV_ARCH_HREF: "architecture.html"
+NAV_DOCS: "Docs"
+NAV_GITHUB: "GitHub"
+NAV_GITHUB_HREF: "https://github.com/tya5/reyn"
+
+# ── hero ────────────────────────────────────────────────────────────────────
+HERO_EYEBROW: "Open-source agent OS"
+HERO_H1_HTML: "Many agents.<br/>One pair of <em>reins.</em>"
+HERO_LEDE: >-
+  Reyn is an operating system for LLM agents — they decide, organize, and
+  orchestrate; the OS makes every action typed, permissioned, audited, and
+  recoverable by construction.
+HERO_CTA_PRIMARY: "Get Started"
+HERO_CTA_SECONDARY: "Read the docs"
+
+# ── section 01: What is Reyn ────────────────────────────────────────────────
+S01_NUM: "01"
+S01_LABEL: "What is Reyn"
+S01_BODY_HTML: >-
+  Reyn is a runtime <em>engine</em>, not just an orchestrator.
+  <span class="muted">Every LLM transition is gated by a JSON-schema-validated
+  contract and a closed candidate set. The LLM decides; the OS enforces.</span>
+
+# ── section 02: How it works ────────────────────────────────────────────────
+S02_NUM: "02"
+S02_LABEL: "How it works"
+S02_HEADING_HTML: "Every action, <em>typed.</em>"
+S02_BODY_P1: >-
+  The LLM decides what to do next — call a tool, read a Skill's
+  instructions, delegate to another agent. Every decision becomes a
+  schema-validated Control IR op before it touches the world.
+S02_BODY_P2: >-
+  The OS dispatches the op under a permission gate you control. Workspace
+  and Events make every step inspectable and replayable.
+
+# ── section 03: Key concepts ────────────────────────────────────────────────
+S03_NUM: "03"
+S03_LABEL: "Key concepts"
+S03_HEADING_HTML: "Three <em>primitives.</em> Nothing more."
+
+S03_C1_LABEL: "Agent"
+S03_C1_TITLE: "A long-lived process."
+S03_C1_BODY: >-
+  A scoped runner with a memory window, a permission scope, and a curated
+  set of Skills it can invoke.
+
+S03_C2_LABEL: "Skill"
+S03_C2_TITLE: "Instructions the model reads."
+S03_C2_BODY: >-
+  A folder the model chooses to open, not a program the OS executes —
+  a menu entry, an on-demand full read, and the assets it bundles.
+
+S03_C3_LABEL: "OS"
+S03_C3_TITLE: "An auditable runtime."
+S03_C3_BODY: >-
+  Builds context, validates every output, executes Control IR ops under
+  permission gates. Owns Workspace and Events for state and audit.
+
+# ── section 04: Get started ─────────────────────────────────────────────────
+S04_NUM: "04"
+S04_LABEL: "Get started"
+S04_HEADING_HTML: "One install. <em>No service to run.</em>"
+S04_DOCS_LINK: "Read the docs"
+# Reyn is alpha (= 0.1.x) and not yet published to PyPI. The LP shows the
+# git-clone install path so the command works as-typed; switch to
+# `pip install reyn` once 1.0 ships on PyPI.
+S04_INSTALL_CMD: "git clone https://github.com/tya5/reyn"
+
+# ── architecture.html ───────────────────────────────────────────────────────
+# All tokens use the ARCH_ prefix to avoid collision with index.html tokens.
+# Page narrative: components → execution flow → horizontal extensions.
+
+ARCH_PAGE_TITLE: "Reyn — How it works"
+
+# ── hero ─────────────────────────────────────────────────────────────────────
+ARCH_HERO_EYEBROW: "Architecture"
+ARCH_HERO_H1_HTML: "How Reyn <em>works.</em>"
+ARCH_HERO_LEDE: >-
+  A bird's-eye view of the components that make up Reyn,
+  and how they coordinate to execute a single request.
+
+# ── section 01: at a glance ─────────────────────────────────────────────────
+ARCH_S01_NUM: "01"
+ARCH_S01_LABEL: "At a glance"
+ARCH_S01_HEADING_HTML: "The whole system,<br/>on one <em>page.</em>"
+ARCH_S01_BODY: >-
+  Reyn is built from a small set of components. Agents hold long-lived
+  conversations and route each decision through a RouterLoop. Skills are
+  instructions the model reads on demand, not phase graphs the OS executes.
+  Every LLM decision becomes a typed Control IR op, validated and dispatched
+  under a permission gate. Workspace and Events make every step inspectable
+  and replayable.
+
+# ── section 02: the pieces ──────────────────────────────────────────────────
+ARCH_S02_NUM: "02"
+ARCH_S02_LABEL: "The pieces"
+ARCH_S02_HEADING_HTML: "Five components.<br/>Sharp <em>boundaries.</em>"
+ARCH_S02_BODY: >-
+  Each component has one job. Agents don't know how a Skill's
+  instructions are written. The OS is the only layer that touches all of
+  them — and it never embeds skill-specific logic.
+
+ARCH_S02_C1_LABEL: "Agent"
+ARCH_S02_C1_BODY: >-
+  A long-lived ChatSession. RouterLoop dispatches messages to Skills, an
+  optional Planner decomposes complex goals, memory scope and skill
+  allowlist define what the agent can see and do.
+
+ARCH_S02_C2_LABEL: "Skill"
+ARCH_S02_C2_BODY: >-
+  Layered-disclosure instructions the model chooses to read — a one-line
+  menu entry, an on-demand full read, and bundled assets. Not a program
+  the OS executes.
+
+ARCH_S02_C3_LABEL: "Control IR"
+ARCH_S02_C3_BODY: >-
+  The typed contract. Every LLM decision — a tool call, a skill read, a
+  delegation — becomes a schema-validated op before it touches the world.
+  No side effect ever rides a free-form string.
+
+ARCH_S02_C4_LABEL: "OS"
+ARCH_S02_C4_BODY: >-
+  The runtime engine. Builds context, validates LLM output against
+  schemas, executes ops under permission gates, emits an event for every
+  state change. Constant; never embeds skill specifics.
+
+ARCH_S02_C5_LABEL: "State"
+ARCH_S02_C5_BODY: >-
+  Workspace is the single source of truth for inter-phase data.
+  Events is an append-only log of every transition, op call, and decision.
+  Together they make crash recovery and replay possible.
+
+# ── section 03: a request, end to end ───────────────────────────────────────
+ARCH_S03_NUM: "03"
+ARCH_S03_LABEL: "A request, end to end"
+ARCH_S03_HEADING_HTML: "From message<br/>to <em>reply.</em>"
+ARCH_S03_BODY: >-
+  A user message arrives at an Agent. The RouterLoop decides what to do —
+  call a tool, read a Skill's instructions, or delegate to another agent.
+  The OS builds context, calls the LLM with a closed candidate set, and
+  validates the response as a typed Control IR op. The op dispatches
+  under a permission gate and writes to the Workspace; an event records
+  each step. The loop continues, bounded by force-close, until the
+  RouterLoop decides the turn is done, and the reply travels back to the
+  user.
+
+# ── section 04: beyond a single agent ───────────────────────────────────────
+ARCH_S04_NUM: "04"
+ARCH_S04_LABEL: "Beyond a single agent"
+ARCH_S04_HEADING_HTML: "Reyn talks <em>out.</em><br/>Reyn is talked <em>to.</em>"
+ARCH_S04_BODY: >-
+  Agents reach other Agents through a topology gate
+  — network, team, or pipeline — permission-scoped the same way any
+  other capability is.
+  From outside, Reyn exposes itself as an MCP server: Claude Code, Cursor,
+  and any MCP-aware client can call list_agents() and send_to_agent().
+  Inside Phases, Control IR ops can call external MCP servers as well —
+  third-party tools come under the same permission gate and event log
+  as everything else.
+
+# ── CTA ──────────────────────────────────────────────────────────────────────
+ARCH_CTA_HEADING_HTML: "Go deeper in the <em>docs.</em>"
+ARCH_CTA_BODY: >-
+  The concepts section covers each component in detail — with design
+  rationale, edge cases, and links to the implementation.
+ARCH_CTA_DOCS_HREF: "concepts/architecture/"
+
+# ── footer ───────────────────────────────────────────────────────────────────
+# Powered by AI is intentional double-meaning: Reyn (a) runs on LLMs at
+# runtime by design, and (b) was substantially co-authored with AI tooling
+# (Claude Code + Claude Design). Both are honest disclosures; the wording
+# leans into the dual sense rather than splitting them.
+FOOTER_LINE: >-
+  Powered by AI <span class="sep">·</span> MIT licensed
+  <span class="sep">·</span> © 2026 Tetsuya Yasuda

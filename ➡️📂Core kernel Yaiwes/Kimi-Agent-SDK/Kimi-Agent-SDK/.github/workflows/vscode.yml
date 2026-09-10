@@ -1,0 +1,319 @@
+name: VSCode Extension Platform Package
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - "node/**"
+      - ".github/workflows/vscode.yml"
+  pull_request:
+    branches: [main, master]
+    paths:
+      - "node/**"
+      - ".github/workflows/vscode.yml"
+  workflow_dispatch:
+    inputs:
+      run_windows_smoke:
+        description: "Run win32-x64 bundled CLI smoke"
+        required: true
+        type: boolean
+        default: true
+      publish_to_marketplace:
+        description: "Publish verified VSIX files to VS Code Marketplace"
+        required: true
+        type: boolean
+        default: false
+      publish_to_open_vsx:
+        description: "Publish verified VSIX files to Open VSX"
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build extension
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'workflow_dispatch' }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v2
+        with:
+          version: 9
+
+      - name: Use Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: "pnpm"
+          cache-dependency-path: node/pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install
+        working-directory: node/vscode_extension
+
+      - name: Build
+        run: pnpm build
+        working-directory: node/vscode_extension
+
+  package:
+    name: Package platform VSIX
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    outputs:
+      extension_version: ${{ steps.meta.outputs.extension_version }}
+      expected_cli_version: ${{ steps.verify.outputs.expected_cli_version }}
+      artifact_name: ${{ steps.verify.outputs.artifact_name }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v2
+        with:
+          version: 9
+
+      - name: Use Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: "pnpm"
+          cache-dependency-path: node/pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install
+        working-directory: node/vscode_extension
+
+      - name: Read release metadata
+        id: meta
+        shell: bash
+        working-directory: node/vscode_extension
+        run: |
+          set -euo pipefail
+
+          extension_version="$(node -p "require('./package.json').version")"
+
+          echo "extension_version=${extension_version}" >> "$GITHUB_OUTPUT"
+          echo "Extension version: ${extension_version}"
+
+      - name: Package 6 platform VSIX files
+        run: |
+          rm -f *.vsix
+          pnpm package:platform
+        working-directory: node/vscode_extension
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Verify platform packages
+        id: verify
+        working-directory: node/vscode_extension
+        run: node scripts/vsix-verify.js
+
+      - name: Upload VSIX artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.verify.outputs.artifact_name }}
+          path: node/vscode_extension/kimi-code-*.vsix
+          retention-days: 14
+
+  smoke-windows:
+    name: Smoke win32-x64 bundled CLI
+    runs-on: windows-latest
+    needs: package
+    if: ${{ github.event_name == 'workflow_dispatch' && (inputs.run_windows_smoke || inputs.publish_to_marketplace || inputs.publish_to_open_vsx) }}
+
+    steps:
+      - name: Download VSIX artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.package.outputs.artifact_name }}
+          path: node/vscode_extension
+
+      - name: Run kimi.exe info smoke
+        shell: pwsh
+        working-directory: node/vscode_extension
+        env:
+          EXPECTED_CLI_VERSION: ${{ needs.package.outputs.expected_cli_version }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $vsix = Resolve-Path ".\kimi-code-win32-x64.vsix"
+          $workDir = Join-Path $env:RUNNER_TEMP "kimi-vscode-smoke"
+          $vsixDir = Join-Path $workDir "vsix"
+          $cliDir = Join-Path $workDir "cli"
+
+          Remove-Item $workDir -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $vsixDir, $cliDir | Out-Null
+
+          $vsixZip = Join-Path $workDir "kimi-code-win32-x64.zip"
+          Copy-Item $vsix $vsixZip
+          Expand-Archive -Path $vsixZip -DestinationPath $vsixDir -Force
+
+          $archive = Join-Path $vsixDir "extension\bin\kimi\archive.zip"
+          if (!(Test-Path $archive)) {
+            throw "Missing bundled CLI archive: $archive"
+          }
+
+          Expand-Archive -Path $archive -DestinationPath $cliDir -Force
+          $kimi = Get-ChildItem -Path $cliDir -Recurse -Filter "kimi.exe" | Select-Object -First 1
+          if (!$kimi) {
+            throw "kimi.exe not found after extracting $archive"
+          }
+
+          $output = & $kimi.FullName info --json
+          if ($LASTEXITCODE -ne 0) {
+            throw "kimi.exe info --json failed with exit code $LASTEXITCODE"
+          }
+
+          $json = ($output | Out-String).Trim()
+          $info = $json | ConvertFrom-Json
+          if ($info.kimi_cli_version -ne $env:EXPECTED_CLI_VERSION) {
+            throw "CLI version mismatch: got $($info.kimi_cli_version), expected $env:EXPECTED_CLI_VERSION"
+          }
+          if (!$info.wire_protocol_version) {
+            throw "wire_protocol_version is missing from kimi.exe info --json"
+          }
+
+          Write-Host "kimi.exe info OK: version=$($info.kimi_cli_version), wire=$($info.wire_protocol_version)"
+
+  publish:
+    name: Publish platform VSIX
+    runs-on: ubuntu-latest
+    needs: [package, smoke-windows]
+    if: ${{ github.event_name == 'workflow_dispatch' && needs.package.result == 'success' && needs.smoke-windows.result == 'success' && (inputs.publish_to_marketplace || inputs.publish_to_open_vsx) }}
+    environment: release
+
+    steps:
+      - name: Use Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Download VSIX artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.package.outputs.artifact_name }}
+          path: node/vscode_extension
+
+      - name: Check publish tokens
+        shell: bash
+        env:
+          VSCE_PAT: ${{ secrets.VSCODE_MARKETPLACE_PAT }}
+          OVSX_PAT: ${{ secrets.OPEN_VSX_TOKEN }}
+          PUBLISH_TO_MARKETPLACE: ${{ inputs.publish_to_marketplace }}
+          PUBLISH_TO_OPEN_VSX: ${{ inputs.publish_to_open_vsx }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$PUBLISH_TO_MARKETPLACE" == "true" && -z "$VSCE_PAT" ]]; then
+            echo "VSCODE_MARKETPLACE_PAT secret is required to publish to VS Code Marketplace" >&2
+            exit 1
+          fi
+
+          if [[ "$PUBLISH_TO_OPEN_VSX" == "true" && -z "$OVSX_PAT" ]]; then
+            echo "OPEN_VSX_TOKEN secret is required to publish to Open VSX" >&2
+            exit 1
+          fi
+
+      - name: Publish to VS Code Marketplace
+        if: ${{ inputs.publish_to_marketplace }}
+        shell: bash
+        working-directory: node/vscode_extension
+        env:
+          VSCE_PAT: ${{ secrets.VSCODE_MARKETPLACE_PAT }}
+        run: |
+          set -euo pipefail
+
+          publish_vsce() {
+            local file="$1"
+            local output
+            local status
+
+            set +e
+            output="$(npx -y @vscode/vsce publish --packagePath "$file" 2>&1)"
+            status=$?
+            set -e
+
+            printf '%s\n' "$output"
+            if [[ "$status" -ne 0 ]]; then
+              if grep -qi "already exists" <<<"$output"; then
+                echo "Already published: $file"
+                return 0
+              fi
+              return "$status"
+            fi
+          }
+
+          vsix_files=(
+            kimi-code-darwin-arm64.vsix
+            kimi-code-darwin-x64.vsix
+            kimi-code-linux-arm64.vsix
+            kimi-code-linux-x64.vsix
+            kimi-code-win32-arm64.vsix
+            kimi-code-win32-x64.vsix
+          )
+
+          for file in "${vsix_files[@]}"; do
+            if [[ ! -f "$file" ]]; then
+              echo "Missing expected .vsix file: $file" >&2
+              exit 1
+            fi
+
+            echo "Publishing $file to VS Code Marketplace"
+            publish_vsce "$file"
+          done
+
+      - name: Publish to Open VSX
+        if: ${{ inputs.publish_to_open_vsx }}
+        shell: bash
+        working-directory: node/vscode_extension
+        env:
+          OVSX_PAT: ${{ secrets.OPEN_VSX_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          publish_ovsx() {
+            local file="$1"
+            local output
+            local status
+
+            set +e
+            output="$(npx -y ovsx publish "$file" 2>&1)"
+            status=$?
+            set -e
+
+            printf '%s\n' "$output"
+            if [[ "$status" -ne 0 ]]; then
+              if grep -qi "already exists" <<<"$output"; then
+                echo "Already published: $file"
+                return 0
+              fi
+              return "$status"
+            fi
+          }
+
+          vsix_files=(
+            kimi-code-darwin-arm64.vsix
+            kimi-code-darwin-x64.vsix
+            kimi-code-linux-arm64.vsix
+            kimi-code-linux-x64.vsix
+            kimi-code-win32-arm64.vsix
+            kimi-code-win32-x64.vsix
+          )
+
+          for file in "${vsix_files[@]}"; do
+            if [[ ! -f "$file" ]]; then
+              echo "Missing expected .vsix file: $file" >&2
+              exit 1
+            fi
+
+            echo "Publishing $file to Open VSX"
+            publish_ovsx "$file"
+          done

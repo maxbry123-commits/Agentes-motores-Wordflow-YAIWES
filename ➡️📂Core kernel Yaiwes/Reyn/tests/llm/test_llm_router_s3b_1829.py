@@ -1,0 +1,291 @@
+"""Tier 2: OS-invariant tests for #1829 S3b — llm.router.* single-source config,
+multi-deployment fallback chain, and cost-records-actual-model.
+
+S3b adds (a) a single-source resolver (``_resolved_router_config`` — reyn.yaml via
+the ContextVar is authoritative, the legacy env vars are the fallback; ONE
+resolution site so ``_use_llm_router`` and the Router builder never double-source),
+(b) a multi-deployment ``litellm.Router`` builder that wires a cross-model
+``fallbacks`` chain from ``llm.router.fallbacks``, and (c) cost-records-actual-model
+(on a router fallback, attribute cost to ``response.model``, gated so the OFF path
+stays byte-identical).
+
+Policy: no mocks of Reyn collaborators — real ``RouterConfig`` + real resolver +
+real ``recorded_acompletion`` + a real ``litellm.Router`` + a real
+``BudgetTracker`` as the cost recorder (a stand-in recorder that has already
+absorbed one signature change stops detecting the next one). ``litellm.acompletion``
+is patched only because it IS the replay boundary (the same seam ``LLMReplay``
+monkeypatches) — used here to script a deterministic primary-fail → fallback path.
+Tier line first; no private-state / count pins beyond the public contract.
+"""
+from __future__ import annotations
+
+from unittest import mock
+
+import litellm
+import pytest
+
+import reyn.llm.llm as llm_mod
+from reyn.config.infra import RouterConfig
+from reyn.llm.llm import (
+    _resolved_router_config,
+    _single_deployment_router,
+    _use_llm_router,
+    recorded_acompletion,
+    set_router_config,
+)
+from reyn.runtime.budget.budget import BudgetTracker, CostConfig
+
+_PRIMARY = "openai/gpt-4o-mini"
+_FALLBACK = "openai/gpt-3.5-turbo"
+
+
+@pytest.fixture(autouse=True)
+def _isolate_router_ctx_and_model_cost(monkeypatch: pytest.MonkeyPatch):
+    """Each test starts with NO ambient router config (→ env/default fallback) and
+    no router env vars; litellm.model_cost is snapshot/restored (Router build
+    registers price-less placeholders — the #1762 global-state class)."""
+    monkeypatch.delenv("REYN_LLM_USE_ROUTER", raising=False)
+    monkeypatch.delenv("REYN_LLM_ROUTER_NUM_RETRIES", raising=False)
+    llm_mod._router_config_var.set(None)
+    before = dict(litellm.model_cost)
+    yield
+    llm_mod._router_config_var.set(None)
+    litellm.model_cost.clear()
+    litellm.model_cost.update(before)
+
+
+class _Usage:
+    def __init__(self, p: int, c: int) -> None:
+        self.prompt_tokens = p
+        self.completion_tokens = c
+
+
+class _Resp:
+    def __init__(self, model: str) -> None:
+        self.choices = [object()]
+        self.model = model
+        self.usage = _Usage(10, 5)
+
+
+def _recorded_models(tracker: BudgetTracker) -> list[str]:
+    """Which model(s) the tracker recorded a call against, read off its public
+    ``snapshot()`` (the rate-limit window is keyed by the model each recorded
+    call was attributed to)."""
+    return sorted(m for m, n in tracker.snapshot()["rate_window"].items() if n > 0)
+
+
+# ── (a) single-source config resolution ──────────────────────────────────────
+
+def test_contextvar_config_is_authoritative() -> None:
+    """Tier 2: reyn.yaml (the ContextVar RouterConfig) is the authoritative source;
+    _use_llm_router + num_retries both read it (single source, no env)."""
+    set_router_config(RouterConfig(use=True, num_retries=7))
+    assert _use_llm_router() is True
+    assert _resolved_router_config().num_retries == 7
+
+
+def test_env_fallback_when_no_contextvar(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Tier 2: with NO reyn.yaml config in context, the legacy env vars are the
+    fallback tail of the single-source idiom (back-compat)."""
+    monkeypatch.setenv("REYN_LLM_USE_ROUTER", "1")
+    monkeypatch.setenv("REYN_LLM_ROUTER_NUM_RETRIES", "4")
+    assert _use_llm_router() is True
+    assert _resolved_router_config().num_retries == 4
+
+
+def test_router_off_by_default() -> None:
+    """Tier 2: no config + no env → router OFF (the direct litellm.acompletion path)."""
+    assert _use_llm_router() is False
+
+
+# ── (b) multi-deployment fallback chain builder ──────────────────────────────
+
+@pytest.mark.asyncio
+async def test_fallback_chain_built_and_fires() -> None:
+    """Tier 2: a configured llm.router.fallbacks chain builds a multi-deployment
+    Router that actually falls back to the next model when the primary fails."""
+    set_router_config(RouterConfig(use=True, num_retries=0, fallbacks={_PRIMARY: [_FALLBACK]}))
+    calls: list[str] = []
+
+    async def _fake(*a, **k):
+        m = k.get("model")
+        calls.append(m)
+        if m == _PRIMARY:
+            raise litellm.InternalServerError("primary down", model=_PRIMARY, llm_provider="openai")
+        return _Resp(m)
+
+    with mock.patch.object(litellm, "acompletion", side_effect=_fake):
+        resp = await _single_deployment_router(_PRIMARY).acompletion(
+            model=_PRIMARY, messages=[{"role": "user", "content": "x"}],
+        )
+    assert resp.model == _FALLBACK, "the chain must fall back to the configured model"
+    assert _PRIMARY in calls and _FALLBACK in calls, (
+        "both the primary attempt and the fallback must route through "
+        "litellm.acompletion (replay-compat)"
+    )
+
+
+# ── (c) cost-records-actual-model (+ OFF byte-identical) ──────────────────────
+
+@pytest.mark.asyncio
+async def test_router_cache_rebuilds_on_config_change() -> None:
+    """Tier 2: (F1) the per-loop Router cache key includes a config fingerprint —
+    a changed llm.router.* rebuilds the Router (no silent stale reuse), while the
+    same config still hits the cache (the #1762 loop-cache efficiency is kept)."""
+    set_router_config(RouterConfig(use=True, num_retries=2))
+    r1 = _single_deployment_router(_PRIMARY)
+    assert _single_deployment_router(_PRIMARY) is r1, "same config must hit the cache"
+    set_router_config(RouterConfig(use=True, num_retries=5))  # config changed
+    assert _single_deployment_router(_PRIMARY) is not r1, (
+        "a changed config must rebuild the Router, not reuse a stale-config one"
+    )
+
+
+@pytest.mark.asyncio
+async def test_cost_records_actual_model_on_fallback() -> None:
+    """Tier 2: when a router fallback serves the call, cost is attributed to the
+    ACTUAL deployment (response.model), not the requested model.
+
+    #3833: under an operator proxy (``LITELLM_API_BASE`` set —
+    ``proxy_kwargs()`` returns a truthy ``api_base``), reyn's own funnel
+    strips the provider prefix before the model string reaches
+    ``litellm.acompletion`` (an OpenAI-compatible proxy expects a bare
+    name). Match/expect whichever form is ACTUALLY presented on the wire —
+    hardcoding the prefixed form here would make this mock's simulated
+    failure silently never fire under a proxy (the request would "succeed"
+    on the first try, recording the primary rather than exercising the
+    fallback at all), masking exactly the #3833 defect class this file
+    exists to catch. This is the SAME normalisation ``llm.py``'s
+    ``_single_deployment_router`` applies to the fallback map itself — see
+    ``_bare_model_name``.
+    """
+    set_router_config(RouterConfig(use=True, num_retries=0, fallbacks={_PRIMARY: [_FALLBACK]}))
+    tracker = BudgetTracker(CostConfig())
+
+    def _is(model: "str | None", want: str) -> bool:
+        """Whether ``model`` names ``want``, with or without its provider prefix.
+
+        The prefix is the TRANSPORT's (#3791): ``recorded_acompletion`` strips it
+        when proxy routing is configured. Comparing the prefixed form made this
+        fake's trigger miss there — the primary never raised, so no fallback ever
+        happened and the test failed for a reason that had nothing to do with
+        fallback attribution.
+        """
+        return (model or "").rsplit("/", 1)[-1] == want.rsplit("/", 1)[-1]
+
+    async def _fake(*a, **k):
+        if _is(k.get("model"), _PRIMARY):
+            raise litellm.InternalServerError("down", model=_PRIMARY, llm_provider="openai")
+        return _Resp(k.get("model"))
+
+    with mock.patch.object(litellm, "acompletion", side_effect=_fake):
+        await recorded_acompletion(
+            model=_PRIMARY, messages=[{"role": "user", "content": "x"}],
+            purpose="dogfood", recorder=tracker,
+            model_class=None,  # #4206 T1: not subject to the axis (pre-existing call)
+        )
+    assert [m.rsplit("/", 1)[-1] for m in _recorded_models(tracker)] == [
+        _FALLBACK.rsplit("/", 1)[-1]
+    ], (
+        "a fallback must record cost against the model that actually ran, not the "
+        f"requested one (got {_recorded_models(tracker)!r})"
+    )
+
+
+@pytest.mark.asyncio
+async def test_fallback_declared_under_the_prefixed_class_name_still_resolves_under_proxy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Tier 2: #3833's own defect, witnessed directly and self-containedly
+    (forces proxy mode via monkeypatch — does NOT rely on ambient
+    ``LITELLM_API_BASE``, so this test protects the fix regardless of the
+    environment `pytest` happens to run in).
+
+    Blocking co-vet finding (lead-coder/architect): the OTHER test in this
+    file (``test_cost_records_actual_model_on_fallback``, #3832) uses a
+    prefix-agnostic ``_is()``/suffix comparison throughout, so it passes
+    whether or not ``_single_deployment_router``'s ``original_model``
+    lookup path is even reached — it does not discriminate between "the
+    fix works" and "stripping never happened to begin with". Strip-
+    falsifying `_single_deployment_router`'s `rcfg.fallbacks.get(original_
+    model)` branch left ALL 7 tests in this file green.
+
+    THIS test forces the exact owner-reported shape: `LITELLM_API_BASE`
+    set (proxy mode, so the primary model IS stripped before reaching
+    litellm) + a fallback chain declared under the PREFIXED (class) name
+    — the spelling an operator's `reyn.yaml`/`reyn.local.yaml` naturally
+    uses, matching every other `models:` entry. If `_single_deployment_
+    router` only ever looked the config up under the bare (post-strip)
+    `model`, this fallback would never be found — reproducing the
+    reported "Available Model Group Fallbacks=None" silent no-op.
+
+    Falsification (performed for real): stripping `_single_deployment_
+    router`'s `rcfg.fallbacks.get(original_model)` branch (leaving only
+    the bare-name lookup) reproduces the exact reported litellm error
+    verbatim; restored clean.
+    """
+    monkeypatch.setenv("LITELLM_API_BASE", "http://localhost:4000")
+    # Config declared under the PREFIXED class name — matching an
+    # operator's real reyn.local.yaml, which this issue's owner-reported
+    # incident used.
+    set_router_config(RouterConfig(use=True, num_retries=0, fallbacks={_PRIMARY: [_FALLBACK]}))
+    tracker = BudgetTracker(CostConfig())
+
+    # The BARE (post-strip) names — what litellm.acompletion actually
+    # receives once proxy_kwargs()/effective_model strips the prefix.
+    bare_primary = _PRIMARY.rsplit("/", 1)[-1]
+    bare_fallback = _FALLBACK.rsplit("/", 1)[-1]
+
+    async def _fake(*a, **k):
+        if k.get("model") == bare_primary:
+            raise litellm.InternalServerError("down", model=bare_primary, llm_provider="openai")
+        return _Resp(k.get("model"))
+
+    with mock.patch.object(litellm, "acompletion", side_effect=_fake):
+        await recorded_acompletion(
+            model=_PRIMARY, messages=[{"role": "user", "content": "x"}],
+            purpose="dogfood", recorder=tracker,
+            model_class=None,  # #4206 T1: not subject to the axis (pre-existing call)
+        )
+    assert _recorded_models(tracker) == [bare_fallback], (
+        "a fallback declared under the operator's prefixed class-name spelling "
+        "must still resolve and fire once the primary model is stripped for "
+        f"proxy routing (got {_recorded_models(tracker)!r})"
+    )
+
+
+@pytest.mark.asyncio
+async def test_cost_records_requested_model_when_router_off() -> None:
+    """Tier 2: the OFF path records the REQUESTED model, never ``response.model``.
+
+    Not "byte-identical" any more (#3791). ``recorded_acompletion`` strips the
+    provider prefix when proxy routing is configured, so the recorded string is
+    ``gpt-4o-mini`` there and ``openai/gpt-4o-mini`` without it — the same
+    request over two transports. Pinning the prefixed form made this fail for
+    every developer with ``LITELLM_API_BASE`` set.
+
+    The claim survives the strip because ``response.model`` is deliberately a
+    third string (``some/normalized-name``): recording the response instead of
+    the request is still distinguishable either way, which is what stops the
+    looser comparison from being vacuous.
+    """
+    # router OFF (default). The direct litellm.acompletion path.
+    tracker = BudgetTracker(CostConfig())
+
+    async def _fake(*a, **k):
+        return _Resp("some/normalized-name")  # response.model != requested
+
+    with mock.patch.object(litellm, "acompletion", side_effect=_fake):
+        await recorded_acompletion(
+            model=_PRIMARY, messages=[{"role": "user", "content": "x"}],
+            purpose="dogfood", recorder=tracker,
+            model_class=None,  # #4206 T1: not subject to the axis (pre-existing call)
+        )
+    recorded = _recorded_models(tracker)
+    assert [m.rsplit("/", 1)[-1] for m in recorded] == [_PRIMARY.rsplit("/", 1)[-1]], (
+        "OFF path must record the requested model, not switch to response.model "
+        f"(got {recorded!r})"
+    )
+    assert "normalized-name" not in repr(recorded), (
+        f"the RESPONSE's model was recorded instead of the request's: {recorded!r}"
+    )

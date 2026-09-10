@@ -1,0 +1,470 @@
+"""CompactionController — synchronous head/body/tail compaction.
+
+Extracted from Session (FP-0019 Wave 1).  Drives OS-internal compaction
+(PR-N3: a direct Python helper) via :meth:`force_compact_now`.
+
+#1128 PR-a: the background fire-and-forget path (``spawn_maybe`` →
+``_maybe_compact``, the 30K-absolute ``trigger_total_tokens`` trigger) was
+removed. #5528 (owner ruling, same family as #5367's elide removal): the
+synchronous pre-frame guard (``ContextBudgetAdvisor.maybe_force_compact``,
+estimate-based, proactive) that used to ALSO drive auto-compaction is gone
+— a local token estimate cannot know what the actual provider payload will
+look like, so acting on it risked compacting a conversation that would
+have fit fine (#5296 decided this in principle, #5528 carried it out).
+Auto-compaction is now driven solely by the ``retry_loop`` overflow
+recovery path (:meth:`force_compact_now`, reached reactively on an actual
+measured overflow — see ``router_loop_driver.py``'s own byte-limit
+recovery call), plus on-demand (the ``compact`` op / ``/compact``). With
+no background task, compaction always runs synchronously inside the
+serial router handler.
+
+All event emissions go through the injected ``event_log``; no silent
+state changes (P6).  Business logic lives entirely here; Session
+delegates via :meth:`force_compact_now` (P3).
+"""
+from __future__ import annotations
+
+import logging
+from typing import TYPE_CHECKING, Callable
+
+from reyn.config import CompactionConfig
+from reyn.core.events.events import EventLog
+from reyn.services.compaction.engine import (
+    CompactionEngine,
+    HistoryChunkToCompact,
+    trim_head,
+    trim_tail,
+    wrap_summary_as_message,
+)
+
+# #1820 Part1: static reference-only preamble prepended to every rendered
+# compaction summary (Hermes SUMMARY_PREFIX analog). Frames the summary as
+# history — not a fresh instruction — so the model (a) treats the latest user
+# message as the single source of truth and (b) does NOT re-execute `pending` /
+# in-progress work after a reverse-signal (stop / undo / change of direction).
+_SUMMARY_PREAMBLE = (
+    "[CONTEXT SUMMARY — REFERENCE ONLY, NOT A NEW INSTRUCTION]\n"
+    "The text below is a compacted summary of EARLIER conversation, kept for "
+    "reference. It is history, not the current task. The most recent user message "
+    "is the single source of truth: when it conflicts with anything here, follow "
+    "the latest user message. If the recent conversation shows a reverse signal — a "
+    "stop, an undo, or a change of direction — treat any 'pending' or in-progress "
+    "work described below as CANCELLED and do not resume it unless re-requested.\n"
+    "--- summary follows ---\n"
+)
+
+if TYPE_CHECKING:
+    from reyn.runtime.chat_message import ChatMessage
+
+logger = logging.getLogger(__name__)
+
+
+def _estimate_tokens(text: str) -> int:
+    """Cheap chars/4 token estimate. Same heuristic used by other Reyn paths."""
+    return max(1, len(text or "") // 4)
+
+
+def _turn_to_compactor_input(
+    t: "ChatMessage", *, redact: "Callable[[str], str] | None" = None,
+) -> dict:
+    """Serialise a ChatMessage into the compactor's ``new_turns`` shape.
+
+    Post-PR-E1 (issue #383) the history may contain ``assistant`` entries
+    with ``tool_calls``, ``tool`` entries with ``tool_call_id`` + ``name``,
+    and ``user``/``assistant`` entries with multimodal ``content`` lists.
+    The compactor needs enough structure to reason about tool
+    activity in ``artifacts_referenced`` while staying within token caps.
+
+    Shape we emit per turn:
+      {role, text, seq, [tool_calls], [tool_call_id], [tool_name]}
+
+    ``text`` is the derived text view (= str content or first text part
+    from a list content). Tool fields are only included on the entries
+    where they're set.
+
+    FP-0050/#1822 S3 (#1820): when ``redact`` is given, the turn text is run
+    through it so credential/token VALUES are stripped before they enter the
+    summarizer input (and the persisted summary). ``None`` = byte-identical.
+    """
+    text = t.text
+    if redact is not None and isinstance(text, str):
+        text = redact(text)
+    out: dict = {"role": t.role, "text": text, "seq": t.seq}
+    if getattr(t, "tool_calls", None):
+        # Compact representation: function names + arg-string lengths.
+        # Avoid sending raw arg JSON since it can be large and the
+        # compactor only needs the structural shape ("LLM called fn X
+        # with N chars of args"). The agent's ``artifacts_referenced``
+        # rule decides whether to surface the call.
+        out["tool_calls"] = [
+            {
+                "name": (tc.get("function") or {}).get("name", ""),
+                "args_chars": len((tc.get("function") or {}).get("arguments", "") or ""),
+            }
+            for tc in t.tool_calls
+            if isinstance(tc, dict)
+        ]
+    if getattr(t, "tool_call_id", None):
+        out["tool_call_id"] = t.tool_call_id
+    if getattr(t, "name", None):
+        out["tool_name"] = t.name
+    return out
+
+
+class CompactionController:
+    """Background head/body/tail compaction service.
+
+    Parameters
+    ----------
+    event_log:
+        Session-scoped :class:`~reyn.core.events.events.EventLog`.  All
+        compaction events are emitted here.
+    config:
+        :class:`~reyn.config.CompactionConfig` — thresholds and sizing.
+    history_from_disk:
+        Callable ``(after_seq: int) -> (list[ChatMessage], bool)`` (#4472)
+        that returns conversation turns with ``seq > after_seq``, read
+        DIRECTLY from the durable store (``history.jsonl``), branch-
+        visibility filtered, and NEVER residency-gated — so #4387's
+        resident-byte cap can never make compaction blind to content it
+        hasn't actually summarized (#4470's root cause). Every call
+        returns freshly-parsed ``ChatMessage`` instances from ONE source;
+        this class's own :meth:`_select_candidates` excludes head/tail
+        turns by Python object identity (an ``id()`` set), so mixing
+        objects from a second source (e.g. a resident cache) here would
+        silently defeat that exclusion — callers must never combine this
+        with any other history source.
+
+        The ``bool`` is ``truncated`` (architect's + lead-coder's #4472
+        review: the read is capped PER CALL, not unbounded, so a large
+        backlog is examined across multiple compaction passes rather than
+        materialized in one — never claiming coverage of more than what a
+        single pass actually read). ``force_compact_now`` surfaces this on
+        the ``compaction_check``/``compaction_started`` audit events so a
+        capped-batch pass is distinguishable from "there was genuinely
+        nothing more."
+    latest_summary:
+        Zero-argument callable that returns the most recent ``"summary"``
+        :class:`~reyn.runtime.chat_message.ChatMessage`, or ``None``.
+    compaction_engine_factory:
+        Zero-argument callable returning the
+        :class:`~reyn.services.compaction.engine.CompactionEngine`
+        that owns the single LLM call (PR-N3: OS-internal Python helper).
+        #3671 follow-up: a FACTORY, not the built engine — ``CompactionEngine
+        .__init__`` touches litellm's model catalog (``estimate_tokens`` /
+        ``get_max_input_tokens``) to measure its budgets; calling it eagerly
+        at Session construction put that cost on the TUI startup path for a
+        value nothing reads until compaction actually triggers, mid-turn.
+        Called AT MOST ONCE, on first reference to :attr:`_engine` (a lazy
+        property, single-owner cache) — every existing reader (internal and
+        the couple of external private-attribute reads this class has always
+        tolerated) keeps working unchanged, since attribute access transparently
+        triggers the property.
+    history_appender:
+        Callable ``(ChatMessage) -> None`` that appends a message to the
+        persisted history.  Wraps ``Session._append_history``.
+    make_summary_message:
+        Callable ``(rendered_text, structured, covers_through_seq) ->
+        ChatMessage`` that constructs the summary ``ChatMessage`` to be
+        appended.  Provided by the session so the controller does not
+        need to import ``ChatMessage`` or ``_now_iso`` directly.
+    render_summary:
+        Callable ``(structured: dict) -> str`` that renders a structured
+        summary dict to a storage-friendly text blob.
+    """
+
+    def __init__(
+        self,
+        *,
+        event_log: EventLog,
+        config: CompactionConfig,
+        history_from_disk: Callable[[int], "tuple[list[ChatMessage], bool]"],
+        latest_summary: Callable[[], ChatMessage | None],
+        compaction_engine_factory: "Callable[[], CompactionEngine]",
+        history_appender: Callable[[ChatMessage], None],
+        make_summary_message: Callable[..., ChatMessage],
+        render_summary: Callable[[dict], str],
+        # FP-0050/#1822 S3 (#1820): content-threat scan config. When enabled,
+        # turn text is secret-redacted before entering the summarizer input.
+        # None (test paths) → no redaction (byte-identical).
+        threat_scan: "object | None" = None,
+    ) -> None:
+        self._events = event_log
+        self._config = config
+        self._threat_scan = threat_scan
+        self._history_from_disk = history_from_disk
+        self._latest_summary = latest_summary
+        self._compaction_engine_factory = compaction_engine_factory
+        self.__engine_cache: "CompactionEngine | None" = None
+        self._append_history = history_appender
+        self._make_summary_message = make_summary_message
+        self._render_summary = render_summary
+        self._compacting: bool = False
+
+    @property
+    def _engine(self) -> CompactionEngine:
+        """The compaction engine, built via the factory on first reference
+        and cached (single owner, computed at most once — #3671 follow-up).
+
+        A property, not a plain attribute: every existing reader — internal
+        methods below, and the couple of call sites elsewhere in this
+        package that read ``controller._engine`` directly (a private
+        attribute, tolerated pre-existing style) — keeps working with no
+        change, since attribute access transparently triggers this.
+
+        ``None`` (not a separate sentinel, unlike ``RouterHostAdapter``'s
+        ``_TURN_BUDGET_ENGINE_UNSET``) means "not built yet" here — safe
+        because, unlike ``TurnBudgetEngine`` (whose factory can legitimately
+        return ``None`` for a tiny-context model that cannot support
+        force-close), ``CompactionEngine``'s factory has no "built but
+        absent" case: every constructed engine is real, so ``None`` has
+        exactly one meaning and mypy narrows it without a cast."""
+        if self.__engine_cache is None:
+            self.__engine_cache = self._compaction_engine_factory()
+        return self.__engine_cache
+
+    def rebuild_engine(self) -> None:
+        """Discard the cached engine so the factory runs again on next
+        reference (#3785: a ``/model`` switch changes the model the factory
+        resolves against — compaction now always follows the conversation
+        model, so the cached engine goes stale the moment ``/model`` runs).
+
+        Mirrors ``RouterHostAdapter.set_turn_budget_engine`` for the sibling
+        engine, but stays LAZY rather than rebuilding eagerly here: the
+        SAME factory this controller was constructed with reads
+        ``Session.model`` fresh each call, so invalidating the cache is
+        enough — consistent with #3671's "don't touch litellm until
+        actually needed" (a ``/model`` switch that never triggers
+        compaction again should not pay to rebuild it)."""
+        self.__engine_cache = None
+
+    # ── internal compaction logic ─────────────────────────────────────────────
+
+    def _select_candidates(
+        self,
+        turns: "list[ChatMessage]",
+        prev_cover: int,
+    ) -> "list[ChatMessage]":
+        """Select compaction candidates using token-budget-derived HEAD/TAIL boundaries.
+
+        #1128 step 3: replaces the old seq-arithmetic on cfg.head_size/tail_size
+        with token-budget trimming via the engine's ComputedBudgets.  Candidates
+        are the turns strictly between the head (trim_head) and tail (trim_tail)
+        slices that also have seq > prev_cover (= not yet covered by the latest
+        summary).
+
+        Falls back to a quarter of get_max_input_tokens when budgets are None
+        (engine not yet initialised — highly unlikely in production but safe).
+        """
+        budgets = getattr(self._engine, "budgets", None)
+        model = getattr(self._engine, "_model", "")
+        use_chars4 = getattr(self._config, "use_chars4_estimate", False)
+        if budgets is not None:
+            head_budget = budgets.head_budget
+            tail_budget = budgets.tail_budget
+        else:
+            from reyn.llm.model_budget import get_max_input_tokens
+            fallback = get_max_input_tokens(model) if model else 100_000
+            head_budget = tail_budget = fallback // 4
+
+        head_turns = trim_head(turns, head_budget, model, use_chars4=use_chars4)
+        tail_turns = trim_tail(turns, tail_budget, model, use_chars4=use_chars4)
+        head_id_set = {id(t) for t in head_turns}
+        tail_id_set = {id(t) for t in tail_turns}
+        return [
+            t for t in turns
+            if id(t) not in head_id_set
+            and id(t) not in tail_id_set
+            and t.seq > prev_cover
+        ]
+
+    async def force_compact_now(self) -> None:
+        """Synchronous force-trigger — single pass (#1128 PR-c).
+
+        #5528: the pre-frame guard that used to call this proactively, on
+        an ESTIMATE, is gone — this is now reached only reactively (a real
+        overflow the router's own LLM call actually raised —
+        ``router_loop_driver.py``'s byte-limit recovery path) or on-demand
+        (``/compact`` / the ``compact`` op). Emits ``compaction_check``
+        with ``outcome="forced_sync"``.
+
+        #1128 PR-c: collapsed from the former Option-B race-recovery loop
+        (``max_passes`` re-measure + ``ForceCompactRaceUnrecoveredError``) to a
+        single pass. That loop existed to re-run when another coroutine appended
+        to history mid-compaction. Cross-driver turn serialization is now
+        structural — every transport that drives ``run_one_iteration`` holds the
+        shared per-agent lock (PR-b, ``reyn.runtime.agent_locks``), and within a
+        turn ``_append_history`` is synchronous — so no concurrent append can
+        land during this method. If the single pass under-shoots (the guard's
+        estimate under-counted), the ``retry_loop`` overflow backstop in
+        ``_run_router_loop`` folds raw_middle and monotonically shrinks: that is
+        the under-shoot floor, replacing the multi-pass-or-raise contract.
+
+        #1128 PR-a: the former vestigial ``compaction_lock`` acquire was
+        removed — only this method acquired it; no history appender awaited it.
+        Cross-driver turn serialization is the shared per-agent lock's job (PR-b).
+        """
+        if self._compacting:
+            self._events.emit("compaction_check", outcome="already_running")
+            return
+
+        latest = self._latest_summary()
+        prev_cover = (latest.meta or {}).get("covers_through_seq", 0) if latest else 0
+        # #4472: read the candidate INPUT from the durable store
+        # (history.jsonl), never residency-gated — see
+        # Session._durable_active_history_after's own docstring. This is
+        # the structural fix for #4470 (a resource-role eviction was
+        # silently deciding a semantic-role question — whether content had
+        # been summarized): residency now has NO influence on what
+        # compaction considers, so the "gap" #4470/#4471 had to detect and
+        # skip around cannot occur anymore — there is nothing left for a
+        # gap to be a gap IN.
+        #
+        # `batch_truncated` (architect's + lead-coder's #4472 review): the
+        # durable read is capped PER CALL (bounded MATERIALIZATION, not
+        # bounded EXAMINATION — #4470 forbids skipping unseen content, not
+        # reading a contiguous prefix of it per call). A large backlog is
+        # covered across multiple compaction passes; this pass's own
+        # `covers_through_seq` (below, `candidates[-1].seq`) already only
+        # ever reflects what THIS batch actually contained — surfaced on
+        # the audit trail so a capped-batch pass is distinguishable from
+        # "there was genuinely nothing more to compact."
+        history, batch_truncated = self._history_from_disk(prev_cover)
+        turns = [
+            m for m in history
+            if m.role in ("user", "assistant", "tool", "agent")
+        ]
+        if not turns:
+            self._events.emit("compaction_check", outcome="forced_sync_no_turns")
+            return
+        # #4472 architect review, point ③: NOT a normal branch — a defensive
+        # invariant, not a routine outcome. The durable read always starts
+        # its batch immediately after `prev_cover` (only the END of the
+        # batch is capped, never the beginning skipped), so `turns`'s
+        # earliest real seq should always be exactly `prev_cover + 1` (or
+        # the file's own first entry, if prev_cover is 0). A hit here means
+        # something ELSE narrowed the durable read out from under this
+        # method — #4470's silent-coverage-claim defect would otherwise
+        # reopen through that new path. Kept as a LOUD, named audit outcome
+        # (not a silent skip) so a future regression that reintroduces a
+        # bound is caught immediately, not rediscovered the way #4470
+        # itself was.
+        resident_seqs = [t.seq for t in turns if t.seq > 0]
+        if resident_seqs and min(resident_seqs) > prev_cover + 1:
+            self._events.emit(
+                "compaction_check", outcome="compaction_input_gap_invariant_violated",
+            )
+            return
+        candidates = self._select_candidates(turns, prev_cover)
+
+        self._events.emit(
+            "compaction_check", outcome="forced_sync",
+            batch_truncated=batch_truncated,
+            candidate_count=len(candidates),
+        )
+        if not candidates:
+            return
+
+        self._compacting = True
+        try:
+            await self._run_compaction(candidates, latest)
+        except Exception as exc:
+            self._events.emit("compaction_failed", error=str(exc))
+        finally:
+            self._compacting = False
+
+    async def _run_compaction(
+        self,
+        candidates: list[ChatMessage],
+        previous_summary: ChatMessage | None,
+    ) -> None:
+        """Call the compaction engine and persist the resulting summary entry."""
+        cfg = self._config
+        prev_structured: dict | None = None
+        if previous_summary is not None:
+            meta = previous_summary.meta or {}
+            structured = meta.get("structured")
+            if isinstance(structured, dict):
+                prev_structured = structured
+                # carry forward the prior covers_through_seq for continuity
+                if "covers_through_seq" not in prev_structured:
+                    prev_structured = {
+                        **prev_structured,
+                        "covers_through_seq": meta.get("covers_through_seq", 0),
+                    }
+
+        # FP-0050/#1822 S3 (#1820): strip credential/token values from turn text
+        # before it enters the summarizer input (so secrets aren't baked into the
+        # persisted summary). Gated by threat_scan.enabled; None/disabled → no-op.
+        _ts = self._threat_scan
+        _redact = None
+        if _ts is not None and getattr(_ts, "enabled", True):  # #4523: shadow default matches ThreatScanConfig.enabled's own declared True
+            from reyn.security.secret_redaction import redact_secrets
+            _redact = redact_secrets
+        # #5531 condition③: this caller is always tail-side — `candidates`
+        # comes from `_select_candidates(turns, prev_cover)`, which only
+        # ever returns turns chronologically AFTER `prev_cover` (the prior
+        # summary's own covers_through_seq) — so the order is always
+        # summary-then-new-turns, never the reverse (that only happens in
+        # retry_loop's own head-shrink path, engine.py).
+        _summary_messages = (
+            [wrap_summary_as_message(prev_structured)] if prev_structured else []
+        )
+        input_chunk = HistoryChunkToCompact(
+            messages=_summary_messages
+            + [_turn_to_compactor_input(t, redact=_redact) for t in candidates],
+            section_token_caps={
+                "topic_arc": cfg.section_token_caps.topic_arc,
+                "decisions": cfg.section_token_caps.decisions,
+                "pending": cfg.section_token_caps.pending,
+                "session_user_facts": cfg.section_token_caps.session_user_facts,
+                "artifacts_referenced": cfg.section_token_caps.artifacts_referenced,
+            },
+        )
+
+        new_turn_count = len(candidates)
+        # #5475 (architect ruling): compaction_started now emits at
+        # CompactionEngine.compact()'s own entry — the one real entry both
+        # of its callers (this method, and retry_loop's own internal
+        # compaction attempts) share — not here. Moved, not duplicated
+        # (the old emit here is deleted, not left alongside the new one;
+        # see #5382/#5455 for why two emit sites for the same kind is
+        # rejected). This caller's own real `seq` (`candidates[-1].seq` —
+        # unlike retry_loop's wire-dict turns, `_turn_to_compactor_input`
+        # keeps `seq` per turn) is passed through explicitly.
+        chat_summary = await self._engine.compact(
+            input_chunk, covers_through=candidates[-1].seq,
+        )
+        structured = chat_summary.to_dict()
+        covers = chat_summary.covers_through_seq or candidates[-1].seq
+        # #1820 Part1: frame the rendered summary with a static reference-only
+        # preamble (Hermes SUMMARY_PREFIX analog) so the model treats the summary as
+        # history — NOT a fresh instruction — and does not re-execute `pending` work
+        # after a reverse-signal (stop / undo / change of direction). Prepended here
+        # (controller-owned, render-fn-independent) so every rendered summary carries
+        # it. Static string → no LLM dependency.
+        rendered = _SUMMARY_PREAMBLE + self._render_summary(structured)
+
+        summary_msg = self._make_summary_message(rendered, structured, covers)
+        self._append_history(summary_msg)
+        self._events.emit(
+            "compaction_completed",
+            new_turn_count=new_turn_count,
+            covers_through_seq=covers,
+            section_lengths={
+                k: len(v) if isinstance(v, list) else len(str(v))
+                for k, v in structured.items()
+                if k != "covers_through_seq"
+            },
+            # #4703 axis①: the compact() LLM call's own real usage — see
+            # ChatSummary's own docstring for why it lives there and not in
+            # ``structured``/``to_dict()`` (never persisted to history.jsonl).
+            # None only when usage genuinely could not be read off the
+            # response — never coerced to 0.
+            prompt_tokens=chat_summary.prompt_tokens,
+            completion_tokens=chat_summary.completion_tokens,
+            cost_usd=chat_summary.cost_usd,
+        )
+
+
+__all__ = ["CompactionController"]

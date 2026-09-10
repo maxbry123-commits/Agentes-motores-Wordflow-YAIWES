@@ -1,0 +1,12 @@
+node_modules/
+dist/
+plans/
+docs/
+nexttask*.md
+
+# Negations must follow the ignore rules above to take effect.
+!test/workers/__fixtures__/node_modules/
+!test/workers/__fixtures__/node_modules/**
+
+# Run state written by /task when pi-task is developed on itself.
+.pi-tasks/

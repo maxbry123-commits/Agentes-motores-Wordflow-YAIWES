@@ -1,0 +1,194 @@
+# Builtin RAG -- query pipeline (FP-0063 P3).
+# docs/deep-dives/proposals/0063-builtin-turnkey-user-rag.md
+#
+# Embeds the query text (reyn's own `embed` tool -- C1) and returns the
+# top-k nearest chunks from a user-named sqlite vector store (the same
+# builtin `vectorstore` MCP server rag_ingest.yaml writes into).
+#
+# Inputs (all optional except `query_text`/`db`):
+#   query_text          -- (required) the natural-language query.
+#   db                  -- (required) the sqlite file rag_ingest wrote to
+#                          (rag_ingest's `output_db` INPUT param -- the
+#                          param name here is EXACTLY `db`, not `db_path`
+#                          -- that is the raw vector-store MCP tool's OWN
+#                          arg name, one layer down -- and not
+#                          `vector_store_path`, a plausible-sounding name
+#                          this pipeline has never accepted. #2955
+#                          weak-model-hardening follow-up: a live dogfood
+#                          witness had a weak model invent
+#                          `vector_store_path` unprompted; a missing/
+#                          misnamed `db` is now caught explicitly below
+#                          with this exact remedy, before it can be
+#                          misdiagnosed as the vector-store server being
+#                          unreachable).
+#   top_k               -- how many nearest chunks to return (default 5).
+#   embedding_model     -- MUST match what rag_ingest used for this db (a
+#                          mismatched vector dimension raises
+#                          VectorDimensionMismatchError -- one sqlite file
+#                          holds one embedding-vector-space, FP-0057 C4).
+#                          Default "standard".
+#   filters             -- optional metadata equality filter, e.g.
+#                          {source_path: "docs/x.md"} (same shape as the
+#                          vector-store server's `query` tool -- see
+#                          vector_store_server.py's METADATA_COLUMNS).
+#   vectorstore_server  -- the MCP server name as configured under
+#                          `mcp.servers` (default reyn_vector_store).
+#
+# Output: `ctx.result` -- either the top-k list
+# `[{"id", "distance", "metadata", "text", "text_unavailable_reason"}, ...]`
+# (nearest-first) or a decision-enabling blocked message: a missing/misnamed
+# `db` param, an unreachable vector-store server, or (#2955 follow-up) a
+# failed query embed -- each distinguished by cause, never a single generic
+# string. `text` (#3644) is each hit's chunk body, recovered by the
+# vector-store server itself slicing `metadata.source_path` at
+# `[metadata.start_index:metadata.end_index]` -- the store never persists
+# chunk text (FP-0057/0063). When recovery is not possible (no offsets
+# recorded, or source_path is no longer readable) `text` is null and
+# `text_unavailable_reason` names why -- never a silent empty string.
+schema: PreflightCheck
+fields:
+  status: {type: enum, values: ["ok"]}
+---
+# #2955 weak-model-hardening follow-up (see rag_ingest.yaml's identical
+# EmbedOk doc for the full rationale): gates `_query_body`'s `embed` tool
+# step so a litellm failure surfaces its own error text at the embed step,
+# not as a misleading "field absent" crash on `ctx.embedded.structured` two
+# steps later.
+schema: EmbedOk
+fields:
+  total_tokens: {type: number, required: true}
+---
+pipeline: query
+description: >-
+  FP-0063 P3 builtin RAG query: embed the query text and return the top-k
+  nearest chunks from a user-named sqlite vector store. Runs no python of
+  its own -- MCP tools and reyn ops only (#2972), as does rag_ingest.
+steps:
+  - transform: {value: "get(ctx, 'top_k', 5)", output: top_k}
+  - transform: {value: "get(ctx, 'embedding_model', 'standard')", output: embedding_model}
+  - transform: {value: "get(ctx, 'filters', null)", output: filters}
+  - transform: {value: "get(ctx, 'vectorstore_server', 'reyn_vector_store')", output: vectorstore_server}
+
+  # #2955 weak-model-hardening follow-up: catch a missing/misnamed `db`
+  # BEFORE the MCP pre-flight probe below. Previously a null `ctx.db` (from
+  # e.g. a model calling with `vector_store_path` instead of `db`) flowed
+  # straight into the probe's `db_path` arg, the probe tool call itself
+  # errored (not a transport failure), the branch dropped, and the result
+  # was misdiagnosed as "the vector-store MCP server is unreachable" -- a
+  # server-down claim that was simply false. Caught explicitly here with
+  # the correct diagnosis and the exact required param name, at zero probe
+  # cost.
+  - transform: {value: "get(ctx, 'db', null) == null", output: db_missing}
+  - transform:
+      value: >-
+        "Missing required parameter `db` (the sqlite file rag_ingest wrote to, i.e. rag_ingest's `output_db`). The parameter name is EXACTLY `db` -- not `db_path`, not `vector_store_path`. Example: run_pipeline(name=\"rag_query.query\", input={\"query_text\": \"...\", \"db\": \"./rag/docs.sqlite\"})."
+      output: db_missing_message
+  - match:
+      on: ctx.db_missing
+      cases:
+        "True":
+          pipeline: _query_blocked
+          pass:
+            message: ctx.db_missing_message
+      default:
+        pipeline: _query_preflight
+        pass:
+          query_text: ctx.query_text
+          db: ctx.db
+          top_k: ctx.top_k
+          embedding_model: ctx.embedding_model
+          filters: ctx.filters
+          vectorstore_server: ctx.vectorstore_server
+      output: result
+---
+pipeline: _query_preflight
+description: >-
+  X1-equivalent pre-flight for query: a real, cheap probe (list_metadata
+  against THIS db, limit 1) before spending on the query embed. Ported from
+  rag_ingest.yaml's #3064 cause-capture idiom (#2955 weak-model-hardening
+  follow-up) -- a dropped probe branch's real cause (e.g. a genuinely
+  unreachable server, a half-materialised per-plugin venv, or any other
+  probe-call error `_query.query`'s own db-missing gate above did not
+  already catch) is now surfaced as EVIDENCE alongside the remedy, instead
+  of collapsing into one static "is unreachable" string regardless of the
+  actual fault.
+steps:
+  - parallel:
+      on_error: continue
+      branches:
+        vectorstore:
+          tool:
+            name: call_mcp_tool
+            schema: PreflightCheck
+            args:
+              server: !expr ctx.vectorstore_server
+              mcp_tool_name: list_metadata
+              tool_args: !expr "{db_path: ctx.db, limit: 1}"
+      collect:
+        transform:
+          # #3070's PARALLEL_BRANCH_ERRORS_KEY (executor.py) carries the
+          # real cause text a dropped branch's schema-validation-failure
+          # exception now includes -- empty string for a branch that never
+          # dropped. Mirrors rag_ingest.yaml's `reachable` shape exactly.
+          value: >-
+            {ok: get(pipe, "vectorstore", null) != null,
+             cause: get(pipe, "__branch_errors__.vectorstore", "")}
+      output: reachable
+  - transform:
+      value: >-
+        "Vector-store MCP server '" + ctx.vectorstore_server + "' is unreachable. It ships as part of the builtin `rag` plugin, not pre-installed. (1) Not registered yet -- install it yourself and the operator is prompted at the permission gate: install_plugin(source={\"kind\": \"builtin\", \"name\": \"rag\"}). This registers ALL of the rag plugin's capabilities in one call -- it does NOT install the plugin's Python deps for you. (2) Deps/venv missing (the common cause post-registration) -- read the `build-and-query-rag-corpus` skill's SETUP section: create a venv, `pip install -r ~/.reyn/plugins/rag/requirements.txt` into it, then point `reyn_vector_store`'s registered `command` (.reyn/config/mcp.yaml) at that venv's python interpreter absolute path."
+        + join(map(filter([{fired: ctx.reachable.cause != "", text: "\n\n[actual error observed] " + ctx.reachable.cause}], f -> f.fired), f -> f.text), "")
+      output: remedy
+  - match:
+      on: ctx.reachable.ok
+      cases:
+        "True":
+          pipeline: _query_body
+          pass:
+            query_text: ctx.query_text
+            db: ctx.db
+            top_k: ctx.top_k
+            embedding_model: ctx.embedding_model
+            filters: ctx.filters
+            vectorstore_server: ctx.vectorstore_server
+      default:
+        pipeline: _query_blocked
+        pass: {message: ctx.remedy}
+      output: result
+---
+pipeline: _query_blocked
+description: >-
+  Sibling of query/_query_preflight -- returns a pre-flight failure (a
+  missing `db` param, an unreachable vector-store server, or a failed query
+  embed) as the run's own (successful) output: a decision-enabling message
+  naming the actual cause, never a bare transport/field-access exception.
+steps:
+  - transform:
+      value: "'rag query blocked: ' + ctx.message"
+      output: blocked_reason
+---
+pipeline: _query_body
+description: >-
+  The real query work: embed the query text, then ask the vector-store MCP
+  server for the top-k nearest chunks.
+steps:
+  - tool:
+      name: embed
+      schema: EmbedOk
+      args:
+        texts: !expr "[ctx.query_text]"
+        embedding_model: !expr ctx.embedding_model
+      output: embedded
+  - transform:
+      value: "find(ctx.embedded.structured, v -> true)"
+      output: query_vector
+  - tool:
+      name: call_mcp_tool
+      args:
+        server: !expr ctx.vectorstore_server
+        mcp_tool_name: query
+        tool_args: !expr "{db_path: ctx.db, vector: ctx.query_vector, top_k: ctx.top_k, filters: ctx.filters}"
+      output: queried
+  - transform:
+      value: "ctx.queried.structured.result"
+      output: top_k_results

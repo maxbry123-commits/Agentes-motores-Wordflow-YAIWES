@@ -1,0 +1,481 @@
+schema_version: "0.2"
+
+sample:
+  corpus_id: ASL-C005
+  name: autoreview
+  repository: openclaw/agent-skills
+  commit: fe588b1a6267eb47f785d0c748db9f6f3e9a3b4f
+  skill_root: skills/autoreview
+  skill_md_blob_sha: a59642db760c10dac574c3d73885d7bf4aa90004
+  git_tree_sha: be0750c0949d270193ffe3048d8ee4465f9886c9
+  inventory_sha256: e70a7b22d01fcd21ede8488161970f8e18b8775fac93614363bf5ba2d53d2830
+  license:
+    identifier: MIT
+    scope: repository
+    evidence: LICENSE
+
+review:
+  review_id: ASL-C005-manual-001
+  mode: static_manual
+  reviewer: codex-assisted-manual-review
+  reviewed_at: "2026-07-30"
+  source_access: github-connector-at-pinned-commit
+  source_network_accessed: true
+  content_installed: false
+  content_executed: false
+  skill_referenced_urls_contacted: false
+  third_party_content_vendored: false
+  secret_values_accessed: false
+
+manual_baseline:
+  frontmatter_fields: [name, description]
+  files:
+    total: 12
+    scripts:
+      - scripts/autoreview
+      - scripts/autoreview_test.py
+      - scripts/test-review-harness
+      - scripts/test-review-harness.ps1
+      - scripts/test-review-harness.py
+      - tests/test_autoreview_hardening.py
+    references:
+      - AGENTS.md
+    assets: []
+    package_manifests: []
+    symlinks:
+      - CLAUDE.md -> AGENTS.md
+  declared_capabilities:
+    - local-repository-and-diff-read
+    - temporary-snapshot-read-write
+    - subprocess-execution
+    - external-model-review
+    - optional-web-search
+    - engine-authentication-reuse
+    - secret-scanner-execution
+    - optional-parallel-test-execution
+    - optional-blacksmith-credential-staging
+  inferred_capabilities:
+    - source-diff-transfer-to-selected-model-provider
+    - git-metadata-read
+    - environment-variable-filtering-and-forwarding
+    - temporary-file-and-directory-cleanup
+    - optional-github-and-public-pr-read
+  external_urls:
+    - https://github.com/trufflesecurity/trufflehog#installation
+    - https://code.claude.com/docs/en/cli-reference
+    - https://code.claude.com/docs/en/model-config
+    - https://cursor.com/docs/cli/reference/permissions
+    - https://developers.openai.com/api/docs/guides/latest-model
+    - https://opencode.ai/config.json
+  environment_variable_names:
+    - AGENTS_HOME
+    - AUTOREVIEW_ENGINE
+    - AUTOREVIEW_MODEL
+    - AUTOREVIEW_THINKING
+    - AUTOREVIEW_FALLBACK_MODEL
+    - AUTOREVIEW_CODEX_MODEL
+    - AUTOREVIEW_CODEX_THINKING
+    - AUTOREVIEW_CODEX_CONFIG
+    - AUTOREVIEW_CODEX_SPEED
+    - AUTOREVIEW_CLAUDE_FALLBACK_MODEL
+    - AUTOREVIEW_PROVIDER_ENV_ALLOW
+    - AUTOREVIEW_STREAM_ENGINE_OUTPUT
+    - OPENCLAW_TESTBOX
+    - CODEX_HOME
+    - HOME
+    - PATH
+    - TMPDIR
+    - HTTP_PROXY
+    - HTTPS_PROXY
+    - NO_PROXY
+  command_references:
+    - python
+    - python3
+    - git
+    - gh
+    - gitcrawl
+    - trufflehog
+    - codex
+    - claude
+    - pi
+    - droid
+    - copilot
+    - cursor
+    - opencode
+    - bash
+    - sh
+    - powershell
+    - pwsh
+    - pnpm
+    - ps
+  observations:
+    - The package contains 12 pinned entries, including a 12,627-line executable Python helper, cross-platform harnesses, tests, fixtures, and one internal symlink.
+    - The 449-line SKILL.md documents the common workflow while delegating implementation and test detail to bundled files.
+    - The default workflow requires local process execution and TruffleHog before invoking an authenticated external review engine.
+    - Several engines are described, but only Codex, Claude, and Pi are runnable; other named engines fail closed under the documented isolation policy.
+    - Credential-shaped strings in the TypeScript fixtures are explicitly synthetic test data and are not evidence of exposed live secrets.
+
+evidence:
+  - id: ASL-C005-E001
+    location: {path: corpus.yml, start_line: null, end_line: null}
+    fact: The admitted record pins the repository commit, skill root, blob, tree, inventory hash, and repository-scoped MIT license evidence.
+    supports_rules: [AS-PKG-001, AS-RES-001, OC-DISC-001, HA-DISC-001]
+
+  - id: ASL-C005-E002
+    location: {path: SKILL.md, start_line: 1, end_line: 4}
+    fact: Frontmatter contains the lowercase name "autoreview" and a concise, task-specific description.
+    supports_rules:
+      - AS-DOC-001
+      - AS-DOC-002
+      - AS-NAME-001
+      - AS-NAME-002
+      - AS-NAME-003
+      - AS-NAME-004
+      - AS-DESC-001
+      - AS-DESC-002
+      - AS-DESC-003
+      - OC-DOC-001
+      - OC-DOC-002
+      - OC-DOC-003
+      - HA-DOC-001
+      - HA-DOC-002
+      - HA-DOC-005
+
+  - id: ASL-C005-E003
+    location: {path: SKILL.md, start_line: 6, end_line: 449}
+    fact: The Markdown body states activation conditions, review constraints, scope controls, cross-platform paths, target modes, isolation guidance, helper usage, and final reporting.
+    supports_rules:
+      - AS-DOC-003
+      - AS-PD-001
+      - AS-PD-003
+      - HA-DOC-003
+      - HA-DOC-004
+
+  - id: ASL-C005-E004
+    location: {path: SKILL.md, start_line: 39, end_line: 54}
+    fact: The contract permits model tools and web search, preserves selected engine authentication and safe proxy values, and requires a TruffleHog preflight without auto-installing it.
+    supports_rules: []
+
+  - id: ASL-C005-E005
+    location: {path: SKILL.md, start_line: 93, end_line: 191}
+    fact: Cross-platform examples resolve the bundled autoreview and harness scripts and describe local, branch, and commit review modes.
+    supports_rules: [AS-REF-001, AS-REF-002, AS-REF-003]
+
+  - id: ASL-C005-E006
+    location: {path: SKILL.md, start_line: 225, end_line: 253}
+    fact: Optional parallel tests execute a caller-supplied command in an isolated temporary home and may stage a Blacksmith credential file only for a documented trusted-maintainer testbox path.
+    supports_rules: []
+
+  - id: ASL-C005-E007
+    location: {path: SKILL.md, start_line: 291, end_line: 380}
+    fact: The documentation inventories runnable and refused review engines, models, environment overrides, authentication isolation, tool exposure, and web-search behavior.
+    supports_rules: []
+
+  - id: ASL-C005-E008
+    location: {path: SKILL.md, start_line: 390, end_line: 435}
+    fact: Helper documentation names Python, Git, GitHub CLI, TruffleHog, Codex, Claude, Pi, shell, environment, temporary-file, and network assumptions; no helper was invoked.
+    supports_rules: []
+
+  - id: ASL-C005-E009
+    location: {path: inventories.yml, start_line: null, end_line: null}
+    fact: The recursive inventory accounts for all 12 entries and records CLAUDE.md as an internal symlink whose blob content is "AGENTS.md".
+    supports_rules: [AS-RES-001, AS-REF-002, HA-RES-001, HA-RES-002]
+
+  - id: ASL-C005-E010
+    location: {path: scripts/autoreview, start_line: 1, end_line: 30}
+    fact: The main executable is a Python script using standard-library modules for filesystem, subprocess, temporary-file, parsing, concurrency, and network-address handling.
+    supports_rules: [AS-SCRIPT-001]
+
+  - id: ASL-C005-E011
+    location: {path: scripts/autoreview, start_line: 1099, end_line: 1368}
+    fact: The helper constructs filtered engine environments, validates proxy and external paths, creates isolated homes, and contains a bounded optional copy of Blacksmith credentials.
+    supports_rules: []
+
+  - id: ASL-C005-E012
+    location: {path: scripts/autoreview, start_line: 2480, end_line: 2520}
+    fact: The preflight requires an external TruffleHog binary and prepares a temporary Git snapshot before running it.
+    supports_rules: [AS-SCRIPT-002]
+
+  - id: ASL-C005-E013
+    location: {path: scripts/autoreview, start_line: 9824, end_line: 10227}
+    fact: Separate engine functions create temporary workspaces and invoke Codex, Claude, or Pi subprocesses with documented isolation flags and selected model settings.
+    supports_rules: [AS-SCRIPT-001, AS-SCRIPT-002]
+
+  - id: ASL-C005-E014
+    location: {path: tests/test_autoreview_hardening.py, start_line: 1, end_line: 7365}
+    fact: A large static test suite covers secret scanning, snapshots, symlinks, engine isolation, environment handling, subprocess behavior, and failure paths; tests were inspected but not executed.
+    supports_rules: [AS-SCRIPT-002]
+
+  - id: ASL-C005-E015
+    location: {path: tests/fixtures/typescript-sensitive-literals.ts, start_line: 1, end_line: 10}
+    fact: The fixture deliberately contains credential-shaped values visibly marked as fake for scanner tests.
+    supports_rules: []
+
+compatibility:
+  - profile: agent-skills
+    profile_version: research-0.1
+    target_version: specification-blob-20cf9f6
+    surface: core
+    layers:
+      package_structure: compatible
+      platform_packaging: not_applicable
+      capability_availability: unknown
+      behavioral_conformance: not_tested
+      operational_suitability: unknown
+    rules:
+      AS-PKG-001: {result: pass, confidence: high, evidence_refs: [ASL-C005-E001], remediation: null}
+      AS-DOC-001: {result: pass, confidence: high, evidence_refs: [ASL-C005-E002], remediation: null}
+      AS-DOC-002: {result: pass, confidence: high, evidence_refs: [ASL-C005-E002], remediation: null}
+      AS-DOC-003: {result: pass, confidence: high, evidence_refs: [ASL-C005-E003], remediation: null}
+      AS-NAME-001: {result: pass, confidence: high, evidence_refs: [ASL-C005-E002], remediation: null}
+      AS-NAME-002: {result: pass, confidence: high, evidence_refs: [ASL-C005-E002], remediation: null}
+      AS-NAME-003: {result: pass, confidence: high, evidence_refs: [ASL-C005-E002], remediation: null}
+      AS-NAME-004: {result: pass, confidence: high, evidence_refs: [ASL-C005-E001, ASL-C005-E002], remediation: null}
+      AS-DESC-001: {result: pass, confidence: high, evidence_refs: [ASL-C005-E002], remediation: null}
+      AS-DESC-002: {result: pass, confidence: high, evidence_refs: [ASL-C005-E002], remediation: null}
+      AS-DESC-003: {result: pass, confidence: high, evidence_refs: [ASL-C005-E002], remediation: null}
+      AS-RES-001: {result: pass, confidence: high, evidence_refs: [ASL-C005-E001, ASL-C005-E009], remediation: null}
+      AS-REF-001: {result: pass, confidence: high, evidence_refs: [ASL-C005-E005], remediation: null}
+      AS-REF-002: {result: pass, confidence: high, evidence_refs: [ASL-C005-E005, ASL-C005-E009], remediation: null}
+      AS-REF-003: {result: pass, confidence: high, evidence_refs: [ASL-C005-E005], remediation: null}
+      AS-SCRIPT-001: {result: pass, confidence: medium, evidence_refs: [ASL-C005-E010, ASL-C005-E013], remediation: null}
+      AS-SCRIPT-002: {result: pass, confidence: medium, evidence_refs: [ASL-C005-E012, ASL-C005-E013, ASL-C005-E014], remediation: null}
+      AS-PD-001: {result: pass, confidence: high, evidence_refs: [ASL-C005-E003], remediation: null}
+      AS-PD-002:
+        result: unknown
+        confidence: high
+        evidence_refs: [ASL-C005-E003]
+        remediation: Record a named tokenizer before reporting a token estimate.
+      AS-PD-003: {result: pass, confidence: medium, evidence_refs: [ASL-C005-E003, ASL-C005-E009], remediation: null}
+    not_applicable_rules:
+      - AS-LICENSE-001
+      - AS-LICENSE-002
+      - AS-COMPAT-001
+      - AS-COMPAT-002
+      - AS-META-001
+      - AS-META-002
+      - AS-TOOLS-001
+      - AS-TOOLS-002
+    skipped_rules: []
+    observations:
+      - Strict core structure passes; scripts, subprocesses, external engines, credentials, and network behavior remain separate capability and operational questions.
+      - The internal symlink is permitted by the core format but may not survive every transport or filesystem.
+
+  - profile: openclaw
+    profile_version: research-0.1
+    target_version: runtime-blob-ebbfcc0
+    surface: runtime
+    layers:
+      package_structure: compatible
+      platform_packaging: compatible_with_conditions
+      capability_availability: compatible_with_conditions
+      behavioral_conformance: not_tested
+      operational_suitability: unknown
+    rules:
+      OC-DISC-001: {result: pass, confidence: high, evidence_refs: [ASL-C005-E001], remediation: null}
+      OC-DISC-002: {result: unknown, confidence: high, evidence_refs: [], remediation: Evaluate the final OpenClaw installation path.}
+      OC-DISC-003: {result: unknown, confidence: high, evidence_refs: [], remediation: Record the final source root and precedence.}
+      OC-DISC-004: {result: unknown, confidence: high, evidence_refs: [], remediation: Check name collisions in the target installation.}
+      OC-DISC-006: {result: unknown, confidence: high, evidence_refs: [], remediation: Resolve the installed real path and symlink behavior in the target context.}
+      OC-DOC-001: {result: pass, confidence: high, evidence_refs: [ASL-C005-E002], remediation: null}
+      OC-DOC-002: {result: pass, confidence: high, evidence_refs: [ASL-C005-E002], remediation: null}
+      OC-DOC-003: {result: pass, confidence: high, evidence_refs: [ASL-C005-E002], remediation: null}
+    not_applicable_rules:
+      - OC-DISC-005
+      - OC-INV-001
+      - OC-INV-002
+      - OC-INV-003
+      - OC-INV-004
+      - OC-INV-005
+      - OC-INV-006
+      - OC-META-001
+      - OC-META-002
+      - OC-META-003
+      - OC-META-004
+      - OC-META-005
+      - OC-META-006
+      - OC-META-007
+      - OC-META-008
+      - OC-GATE-001
+      - OC-GATE-002
+      - OC-GATE-003
+      - OC-GATE-004
+      - OC-GATE-005
+      - OC-GATE-006
+      - OC-GATE-007
+      - OC-GATE-008
+      - OC-INSTALL-001
+      - OC-INSTALL-002
+      - OC-INSTALL-003
+      - OC-INSTALL-004
+      - CH-PKG-001
+      - CH-PKG-002
+      - CH-PKG-003
+      - CH-PKG-004
+      - CH-PKG-005
+      - CH-PKG-006
+      - CH-PKG-007
+      - CH-PKG-008
+      - CH-GH-001
+      - CH-GH-002
+      - CH-GH-003
+      - CH-GH-004
+      - CH-GH-005
+    skipped_rules: []
+    observations:
+      - OpenClaw-specific gates and installer hints are absent, so runtime prerequisites are not pre-checked through metadata.
+      - Discovery context, binary availability, authentication, network policy, and symlink preservation remain conditional.
+      - ClawHub publication and GitHub import were not requested and are not applicable.
+
+  - profile: hermes-agent
+    profile_version: research-0.1
+    target_version: skills-system-blob-1857648
+    surface: runtime
+    layers:
+      package_structure: compatible
+      platform_packaging: compatible_with_conditions
+      capability_availability: compatible_with_conditions
+      behavioral_conformance: not_tested
+      operational_suitability: unknown
+    rules:
+      HA-DISC-001: {result: pass, confidence: high, evidence_refs: [ASL-C005-E001], remediation: null}
+      HA-DISC-002: {result: unknown, confidence: high, evidence_refs: [], remediation: Evaluate the final Hermes installation path.}
+      HA-DISC-003: {result: unknown, confidence: high, evidence_refs: [], remediation: Record the local or external source root.}
+      HA-DISC-004: {result: unknown, confidence: high, evidence_refs: [], remediation: Check target name collisions and shadowing.}
+      HA-DISC-005: {result: unknown, confidence: high, evidence_refs: [], remediation: Resolve configured external directories when applicable.}
+      HA-DISC-006: {result: unknown, confidence: high, evidence_refs: [], remediation: Record write permissions for external directories.}
+      HA-DOC-001: {result: pass, confidence: high, evidence_refs: [ASL-C005-E002], remediation: null}
+      HA-DOC-002: {result: pass, confidence: high, evidence_refs: [ASL-C005-E002], remediation: null}
+      HA-DOC-003: {result: pass, confidence: high, evidence_refs: [ASL-C005-E003], remediation: null}
+      HA-DOC-004: {result: pass, confidence: medium, evidence_refs: [ASL-C005-E003, ASL-C005-E009], remediation: null}
+      HA-DOC-005: {result: pass, confidence: high, evidence_refs: [ASL-C005-E002], remediation: null}
+      HA-PLAT-003: {result: pass, confidence: high, evidence_refs: [ASL-C005-E002], remediation: null}
+      HA-RES-001: {result: pass, confidence: high, evidence_refs: [ASL-C005-E009], remediation: null}
+      HA-RES-002: {result: pass, confidence: high, evidence_refs: [ASL-C005-E005, ASL-C005-E009], remediation: null}
+    not_applicable_rules:
+      - HA-PLAT-001
+      - HA-PLAT-002
+      - HA-ACT-001
+      - HA-ACT-002
+      - HA-ACT-003
+      - HA-ACT-004
+      - HA-ACT-005
+      - HA-ACT-006
+      - HA-ENV-001
+      - HA-ENV-002
+      - HA-ENV-003
+      - HA-ENV-004
+      - HA-ENV-005
+      - HA-ENV-006
+      - HA-CONFIG-001
+      - HA-CONFIG-002
+      - HA-CONFIG-003
+      - HA-CONFIG-004
+      - HA-CRED-001
+      - HA-CRED-002
+      - HA-CRED-003
+      - HA-CRED-004
+      - HA-CRED-005
+      - HA-RES-003
+      - HA-RES-004
+      - HA-RES-005
+      - HA-BP-001
+      - HA-BP-002
+      - HA-BP-003
+      - HA-BP-004
+      - HH-PKG-001
+      - HH-PKG-002
+      - HH-PKG-003
+      - HH-PROV-001
+      - HH-PROV-002
+      - HH-SCAN-001
+      - HH-SCAN-002
+      - HH-SCAN-003
+      - HT-REPO-001
+      - HT-REPO-002
+      - HT-REPO-003
+      - HT-REPO-004
+      - HT-REPO-005
+      - HT-REPO-006
+    skipped_rules: []
+    observations:
+      - Hermes can index the standard document, but the package does not declare Hermes activation, environment, configuration, or credential requirements.
+      - Process execution, binaries, authentication, network access, external model providers, and optional credential staging remain conditional on the target environment and policy.
+      - Hub installation and GitHub-tap distribution were not requested and are not applicable.
+
+analyzer_runs: []
+
+normalized_findings:
+  - id: ASL-C005-F001
+    source: {type: manual, engine: null, original_id: null}
+    category: capability.undeclared-runtime-prerequisites
+    severity: medium
+    confidence: high
+    compatibility_layers: [capability-availability]
+    targets: [openclaw, hermes-agent]
+    location: {path: SKILL.md, start_line: 39, end_line: 54}
+    evidence_refs: [ASL-C005-E004, ASL-C005-E008, ASL-C005-E010, ASL-C005-E012, ASL-C005-E013]
+    explanation: The default workflow requires Python, Git, TruffleHog, subprocess execution, and an authenticated review-engine CLI, but no platform metadata gates those prerequisites.
+    remediation: Document mandatory runtime requirements in the portable compatibility field and add platform-specific gates where they can be represented without reducing portability.
+    disposition: confirmed
+
+  - id: ASL-C005-F002
+    source: {type: manual, engine: null, original_id: null}
+    category: capability.external-data-and-credential-boundary
+    severity: medium
+    confidence: high
+    compatibility_layers: [capability-availability, operational-suitability]
+    targets: [openclaw, hermes-agent]
+    location: {path: SKILL.md, start_line: 39, end_line: 45}
+    evidence_refs: [ASL-C005-E004, ASL-C005-E006, ASL-C005-E007, ASL-C005-E011, ASL-C005-E013]
+    explanation: Review bundles are passed to selected external model engines with preserved engine authentication and optional web access; a special trusted-maintainer path can also stage a bounded credential file for parallel tests.
+    remediation: Require an explicit data-handling and credential-policy decision before use, keep the trusted testbox path disabled for untrusted code, and disable web access when it is not needed.
+    disposition: confirmed
+
+  - id: ASL-C005-F003
+    source: {type: manual, engine: null, original_id: null}
+    category: compatibility.symlink-portability
+    severity: low
+    confidence: high
+    compatibility_layers: [package-structure, platform-packaging]
+    targets: [agent-skills, openclaw, hermes-agent]
+    location: {path: CLAUDE.md, start_line: null, end_line: null}
+    evidence_refs: [ASL-C005-E009]
+    explanation: CLAUDE.md is an internal symlink to AGENTS.md. The core format permits symlinks, but some archives, installers, and Windows environments may flatten, omit, or reject them.
+    remediation: Preserve and verify the link during distribution, or duplicate the small instruction file where symlink portability cannot be guaranteed.
+    disposition: confirmed
+
+  - id: ASL-C005-F004
+    source: {type: manual, engine: null, original_id: null}
+    category: quality.large-executable-review-surface
+    severity: low
+    confidence: high
+    compatibility_layers: [behavioral-conformance, operational-suitability]
+    targets: [agent-skills, openclaw, hermes-agent]
+    location: {path: scripts/autoreview, start_line: 1, end_line: 12627}
+    evidence_refs: [ASL-C005-E010, ASL-C005-E011, ASL-C005-E012, ASL-C005-E013, ASL-C005-E014]
+    explanation: The primary executable and hardening suite are large and security-sensitive. Static inspection can inventory their boundaries but cannot establish correct runtime behavior.
+    remediation: Preserve focused automated tests, reproducible review provenance, and independent execution only in the separately approved disposable environment.
+    disposition: confirmed
+
+  - id: ASL-C005-F005
+    source: {type: manual, engine: null, original_id: null}
+    category: scanner.synthetic-secret-fixture
+    severity: low
+    confidence: high
+    compatibility_layers: [operational-suitability]
+    targets: [agent-skills, openclaw, hermes-agent]
+    location: {path: tests/fixtures/typescript-sensitive-literals.ts, start_line: 1, end_line: 10}
+    evidence_refs: [ASL-C005-E015]
+    explanation: Credential-shaped strings are intentionally bundled as visibly fake scanner fixtures; a scanner may report them without recognizing their test context.
+    remediation: Preserve fixture provenance and manually verify any future scanner alert before treating it as a live-secret incident or dismissing it.
+    disposition: confirmed
+
+disagreements: []
+
+limitations:
+  - No bundled script, harness, test, command, model engine, secret scanner, or network operation was executed.
+  - No target OpenClaw or Hermes installation, platform, session, binary inventory, authentication state, network policy, or filesystem policy was supplied.
+  - Script behavior, isolation guarantees, secret redaction, cleanup, and test outcomes remain unverified.
+  - The four documentation URLs and two script-contained URLs were inventoried but not contacted.
+  - Symlink behavior was established from the pinned Git object inventory, not from an installation or archive round trip.

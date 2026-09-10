@@ -1,0 +1,321 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.11'
+      - name: Install package
+        run: |
+          python -m pip install --upgrade pip
+          python scripts/sync_package_data.py
+          pip install --no-cache-dir -e '.[dev]'
+      - name: Lint
+        run: |
+          set -o pipefail
+          ruff check ovk tests benchmarks/formal_pr_bench 2>&1 | tee ruff-report.txt
+      - name: Upload lint report on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ruff-report
+          path: ruff-report.txt
+          if-no-files-found: error
+      - name: Unit and integration pytest
+        run: pytest -x -vv --tb=long --junitxml=pytest-results.xml
+      - name: Upload pytest results on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: pytest-results
+          path: |
+            pytest-results.xml
+            pytest-output.txt
+
+  gates:
+    needs: unit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.11'
+      - name: Install package
+        run: |
+          python -m pip install --upgrade pip
+          python scripts/sync_package_data.py
+          pip install --no-cache-dir -e '.[dev]'
+      - name: Validate intent templates
+        run: python scripts/validate_templates.py
+      - name: Validate adapter capabilities
+        run: python scripts/validate_capabilities.py
+      - name: Validate adapter conformance
+        run: python scripts/validate_adapter_conformance.py
+      - name: Check capability tables are fresh
+        run: python scripts/render_capability_tables.py --check
+      - name: Check TCB document is fresh
+        run: python scripts/render_tcb_doc.py --check
+      - name: Verify RC DoD (in-repo)
+        run: python scripts/verify_rc_dod.py
+      - name: Verify RC install surface (Action SHA pins + metadata)
+        run: python scripts/verify_rc_install.py
+      - name: Check template claim registry is fresh
+        run: python scripts/build_template_registry.py --check
+      - name: Require SHA-pinned third-party actions in Action/release paths
+        run: python scripts/pin_action_shas.py
+      - name: Score all benchmark cases
+        run: python benchmarks/formal_pr_bench/score_all_lanes.py
+      - name: Score expanded benchmark and publish leaderboard
+        env:
+          CANDIDATE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          ovk bench --expanded --leaderboard .verification/formal-pr-bench-leaderboard.json
+          python scripts/render_bench_badge.py --benchmark-source-sha "$CANDIDATE_SHA" --dry-run
+      - name: Pilot program
+        run: ovk pilot
+      - name: Exercise ovk check on multi-surface PR
+        run: |
+          ovk check \
+            --changed-files examples/multi_surface/pr_combined.diff \
+            --output-dir .ovk-check-test \
+            --advisory
+      - name: Release preflight
+        run: ovk release-preflight
+      - name: External smoke checklist
+        run: python scripts/external_smoke_checklist.py
+      - name: Multi-lane verify bundle
+        run: |
+          ovk verify \
+            --manifest examples/verification_manifests/full_mvp.json \
+            --output-dir ovk-full-bundle \
+            --advisory
+      - name: Validate release bundle outputs
+        run: ovk validate-outputs ovk-full-bundle
+      - name: Signed envelope smoke
+        env:
+          OVK_SIGNING_KEY: ci-signing-smoke-key
+        run: |
+          ovk release-bundle \
+            --lane infrastructure \
+            --input examples/infrastructure_exposure/input_private_sensitive_resource.json \
+            --output-dir ovk-signed-bundle
+          test -f ovk-signed-bundle/ovk-attestation-envelope.json
+          grep -q '"signature"' ovk-signed-bundle/ovk-attestation-envelope.json
+      - name: Exercise self-protection CI path
+        run: |
+          ovk ci \
+            --github-event examples/github_events/pull_request_bot.json \
+            --metadata examples/no_agent_self_approval/metadata_missing_required_checks.json \
+            --changed-files examples/no_agent_self_approval/changed_files_workflow.txt \
+            --check-metadata examples/no_agent_self_approval/check_metadata_github_shape_removed.json \
+            --evidence-output ovk-evidence.json \
+            --markdown-output ovk-pr-comment.md \
+            --attestation-output ovk-attestation.json \
+            --manifest-output ovk-artifact-manifest.json \
+            --quality-output ovk-evidence-quality.json \
+            --advisory
+      - name: Exercise auth-obligation with quality output
+        run: |
+          ovk auth-obligation \
+            examples/auth_regression/input_admin_protected.json \
+            --evidence-output ovk-auth-evidence.json \
+            --markdown-output ovk-auth-comment.md \
+            --attestation-output ovk-auth-attestation.json \
+            --manifest-output ovk-auth-artifact-manifest.json \
+            --quality-output ovk-auth-evidence-quality.json \
+            --advisory
+      - name: Exercise ci-secrets with quality output
+        run: |
+          ovk ci-secrets \
+            examples/ci_secrets/input_secrets_safe.json \
+            --evidence-output ovk-ci-secrets-evidence.json \
+            --markdown-output ovk-ci-secrets-comment.md \
+            --attestation-output ovk-ci-secrets-attestation.json \
+            --manifest-output ovk-ci-secrets-artifact-manifest.json \
+            --quality-output ovk-ci-secrets-evidence-quality.json \
+            --advisory
+      - name: Exercise deployment-state with quality output
+        run: |
+          ovk deployment-state \
+            examples/deployment_state/input_valid_approval_path.json \
+            --evidence-output ovk-deployment-evidence.json \
+            --markdown-output ovk-deployment-comment.md \
+            --attestation-output ovk-deployment-attestation.json \
+            --manifest-output ovk-deployment-artifact-manifest.json \
+            --quality-output ovk-deployment-evidence-quality.json \
+            --advisory
+      - name: Dogfood composite action (full MVP manifest)
+        uses: ./
+        with:
+          mode: advisory
+          verification-manifest: examples/verification_manifests/full_mvp.json
+          bundle-output-dir: ovk-action-dogfood-bundle
+      - name: Validate dogfood release bundle
+        run: ovk validate-outputs ovk-action-dogfood-bundle
+      - name: Upload OVK artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ovk-ci-artifacts
+          path: |
+            ovk-evidence.json
+            ovk-pr-comment.md
+            ovk-attestation.json
+            ovk-artifact-manifest.json
+            ovk-evidence-quality.json
+            ovk-auth-evidence-quality.json
+            ovk-ci-secrets-evidence-quality.json
+            ovk-deployment-evidence-quality.json
+            ovk-action-dogfood-bundle/**
+            .verification/formal-pr-bench-leaderboard.json
+
+  action_strict_dogfood:
+    needs: unit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Strict emit-check on known-bad diff
+        id: ovk
+        continue-on-error: true
+        uses: ./
+        with:
+          mode: strict
+          use-check: "true"
+          emit-check: "true"
+          changed-files: examples/ci_secrets/workflow_secrets_on_pr.diff
+          post-comment: "false"
+      - name: Assert strict block and observable check
+        run: |
+          test "${{ steps.ovk.outcome }}" = "failure"
+          test "${{ steps.ovk.outputs.recommendation }}" = "block"
+          test "${{ steps.ovk.outputs.exit_code }}" = "1"
+
+  action_default_diff_dogfood:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Exercise automatic diff collection
+        uses: ./
+        with:
+          mode: advisory
+          use-check: "true"
+          emit-check: "false"
+          post-comment: "false"
+      - name: Assert default Action outputs exist
+        run: |
+          test -f ovk-evidence.json
+          test -f ovk-evidence-quality.json
+          ovk evidence-quality ovk-evidence.json
+
+  package:
+    needs: unit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.12'
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install --upgrade pip build twine
+          python scripts/sync_package_data.py
+          python -m build
+          twine check dist/*
+      - name: Smoke-test installed wheel outside checkout
+        run: |
+          WHEEL="$(realpath "$(ls dist/*.whl | head -n 1)")"
+          python -m venv /tmp/ovk-wheel-venv
+          /tmp/ovk-wheel-venv/bin/python -m pip install --upgrade pip
+          /tmp/ovk-wheel-venv/bin/python -m pip install "$WHEEL"
+          rm -rf /tmp/ovk-wheel-consumer
+          mkdir -p /tmp/ovk-wheel-consumer
+          cd /tmp/ovk-wheel-consumer
+          /tmp/ovk-wheel-venv/bin/ovk init
+          /tmp/ovk-wheel-venv/bin/ovk doctor
+          /tmp/ovk-wheel-venv/bin/python - <<'PY'
+          from ovk import mcp_server
+          from ovk.core.capabilities import CapabilityRegistry
+          from ovk.core.kernel import execute_kernel
+          from ovk.core.templates_cli import list_templates
+          from ovk.paths import resource_path, schema_path
+
+          assert len(list_templates()) >= 100
+          assert schema_path("verification.bundle.schema.json").is_file()
+          capabilities = CapabilityRegistry.from_directory(resource_path("adapters")).all()
+          assert len(capabilities) >= 10
+          assert len(mcp_server.list_capabilities()["capabilities"]) == len(capabilities)
+          result = execute_kernel(
+              changed_files=[".github/workflows/release.yml"],
+              metadata={"actor_type": "ai_agent", "changed_files": [".github/workflows/release.yml"]},
+              repo="wheel/consumer",
+              head_sha="wheel-smoke",
+              use_cache=False,
+          )
+          assert result.routing
+          assert result.bundle.subject["repo"] == "wheel/consumer"
+          PY
+
+  template-conformance:
+    needs: unit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.11'
+      - name: Install package
+        run: |
+          python -m pip install --upgrade pip
+          python scripts/sync_package_data.py
+          pip install --no-cache-dir -e '.[dev]'
+      - name: Generate exact-head template conformance candidate
+        run: |
+          mkdir -p .verification
+          python scripts/build_template_conformance.py \
+            --output .verification/template-conformance.generated.json \
+            --print-domain-counts
+      - name: Build and gate template conformance matrix
+        run: |
+          python scripts/build_template_conformance.py --check --print-domain-counts
+          test -f docs/benchmarks/template-conformance.json
+      - name: Upload template conformance matrix
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: template-conformance
+          path: |
+            docs/benchmarks/template-conformance.json
+            .verification/template-conformance.generated.json
+          if-no-files-found: error

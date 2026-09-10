@@ -1,0 +1,113 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ux-research-pipeline.local/schemas/coded-interview.v1.json",
+  "title": "Coded Interview",
+  "description": "Container for a single coded interview. Stored in `.system/coded/<name>.json`.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "interview_id",
+    "respondent_id",
+    "language",
+    "duration_seconds",
+    "segments",
+    "coding_meta"
+  ],
+  "properties": {
+    "interview_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Interview name, usually the same as the transcript file name without extension."
+    },
+    "respondent_id": {
+      "type": "string",
+      "pattern": "^R[0-9]{2,3}$"
+    },
+    "recorded_at": {
+      "type": "string",
+      "format": "date",
+      "description": "ISO date the interview was conducted, YYYY-MM-DD."
+    },
+    "language": {
+      "type": "string",
+      "enum": ["ru", "en", "mixed"],
+      "description": "Interview language. mixed — when two languages are interleaved."
+    },
+    "duration_seconds": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Duration of the source recording in seconds."
+    },
+    "respondent_meta": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Aggregated demographics for context. Respondent PII (name, phone, email) is never recorded here.",
+      "properties": {
+        "demographic_label": {
+          "type": "string",
+          "description": "A free-form label, for example 'female, 34, large city'."
+        },
+        "segment": {
+          "type": "string",
+          "description": "Segment name from `project-config.yaml.segments`."
+        }
+      }
+    },
+    "segments": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "coded-segment.v1.json"
+      },
+      "description": "Coded segments, ordered by timecode_start."
+    },
+    "coding_meta": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["coded_by", "coded_at", "coding_mode", "schema_version"],
+      "properties": {
+        "coded_by": {
+          "type": "string",
+          "description": "Who did the coding. 'agent' — the current assistant. 'external:transcript-coding' — an external skill. 'human:<name>' — manual coding."
+        },
+        "coded_at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "ISO timestamp when coding finished."
+        },
+        "coding_mode": {
+          "type": "string",
+          "enum": ["agent", "external", "human"],
+          "description": "From `project-config.yaml.analysis.coding_mode`."
+        },
+        "model": {
+          "type": "string",
+          "description": "Model used for coding (when agent or external). For example 'claude-opus-4-7' or 'gpt-5-4'."
+        },
+        "subagent_strategy": {
+          "type": ["string", "null"],
+          "enum": ["none", "parallel-chunks", null],
+          "description": "Whether subagents were used. none — a single pass. parallel-chunks — batched parallel coding of chunks with manager validation."
+        },
+        "schema_version": {
+          "type": "string",
+          "const": "coded-segment.v1",
+          "description": "Segment schema version. When the schema is upgraded this field changes, and downstream skills check it."
+        },
+        "verbatim_check": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "passed": {"type": "integer", "minimum": 0},
+            "failed": {"type": "integer", "minimum": 0},
+            "failed_segment_ids": {
+              "type": "array",
+              "items": {"type": "string"}
+            }
+          },
+          "description": "Result of verbatim validation of quotes against the source transcript."
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,10 @@
+[package]
+workspace = "../../../../../toolchain"
+name = "agentos-expr"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "expr implementation for agentos standalone binaries"
+
+[dependencies]
+regex = "1"

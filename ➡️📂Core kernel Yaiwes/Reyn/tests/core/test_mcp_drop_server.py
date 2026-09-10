@@ -1,0 +1,452 @@
+"""Tier 2: FP-0034 PR-4 mcp_drop_server op + ToolDefinition + dispatch route.
+
+Tests for:
+  1. PermissionResolver.require_mcp_drop_server (FP-0034 §D23 gate)
+  2. op_runtime/mcp_drop_server.py — yaml edit, secrets cleanup,
+     scope auto-detect, not-found path, P6 event emission
+  3. tools/mcp_drop.py ToolDefinition shape + registration
+  4. universal_dispatch route for ``mcp.operation__drop_server``
+
+No mocks of collaborators. Uses real PermissionResolver +
+InterventionBus stand-in (= records calls + returns canned answer).
+Filesystem fixtures use tmp_path so secret writes / yaml writes
+never touch the user environment.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from pathlib import Path
+from typing import Any
+
+import pytest
+import yaml
+
+from reyn.data.workspace.workspace import Workspace
+from reyn.schemas.models import MCPDropServerIROp
+from reyn.security.permissions.permissions import PermissionDecl, PermissionResolver
+from reyn.user_intervention import (
+    InterventionAnswer,
+    InterventionBus,
+    UserIntervention,
+)
+
+# ── Shared helpers ────────────────────────────────────────────────────────
+
+
+def _run(coro: Any) -> Any:
+    return asyncio.run(coro)
+
+
+class _RecordingBus:
+    """Real InterventionBus implementation that answers a canned choice.
+
+    Mirrors the pattern in tests/test_permissions_mcp_install.py:_RecordingBus.
+    """
+
+    def __init__(self, answer_choice: str = "no") -> None:
+        self.requests: list[UserIntervention] = []
+        self.answer_choice = answer_choice
+
+    async def request(self, iv: UserIntervention) -> InterventionAnswer:
+        self.requests.append(iv)
+        return InterventionAnswer(choice_id=self.answer_choice)
+
+
+class _CapturingEvents:
+    """Captures emit() calls for P6 assertion."""
+
+    subscribers: list[Any] = []
+
+    def __init__(self) -> None:
+        self.events: list[tuple[str, dict]] = []
+
+    def emit(self, name: str, **kwargs: Any) -> None:
+        self.events.append((name, kwargs))
+
+
+# ── 1. Permission gate — #571 collapse arc Phase 5 ────────────────────────
+#
+# The bool-axis ``require_mcp_drop_server`` resolver method was removed
+# in Phase 5. The op handler now gates via ``require_file_write`` on
+# the canonical ``.reyn/mcp.yaml`` path. The previous suite of
+# bool-axis-specific tests (decl guard / config deny / config allow /
+# interactive approval / interactive denial / auto-approve env /
+# from_dict round-trip) is deleted — they all exercised the removed
+# resolver method. See ``test_permission_collapse_phase2.py`` and
+# ``test_permission_collapse_phase3.py`` for the canonical-path
+# ``require_file_write`` invariants that replace them.
+
+
+# ── 2. op_runtime handler — yaml edit ─────────────────────────────────────
+
+
+def _seed_config(path: Path, servers: dict[str, dict]) -> None:
+    """Write a reyn.local.yaml-shape config with the given servers block."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        yaml.dump({"mcp": {"servers": servers}}, allow_unicode=True),
+        encoding="utf-8",
+    )
+
+
+# #4597 slice ①: _StubWorkspace removed — its docstring's "reads CWD
+# eagerly + pollutes the test filesystem" rationale didn't hold for this
+# file's own call site (always passes tmp_path, never omits base_dir), and
+# Workspace(base_dir=tmp_path) only ever creates tmp_path/.reyn/, which is
+# disposable pytest state, not filesystem pollution. A real Workspace is
+# cheaply constructible (#4581's own precedent).
+
+
+def _phase5_drop_decl(resolver: PermissionResolver, tmp_path: Path) -> PermissionDecl:
+    """Phase 5 successor to ``PermissionDecl(mcp_drop_server=True)``.
+
+    Builds an explicit ``file.write`` decl for ``.reyn/mcp.yaml`` and
+    session-approves it so ``require_file_write`` passes.
+    """
+    canonical = str(tmp_path / ".reyn" / "config" / "mcp.yaml")
+    resolver.session_approve_path(canonical, "test_mcp_drop_server", "file.write")
+    return PermissionDecl(file_write=[{"path": canonical, "scope": "just_path"}])
+
+
+def _make_op_ctx(
+    tmp_path: Path,
+    *,
+    permission_decl: PermissionDecl | None = None,
+    resolver: PermissionResolver | None = None,
+    bus: InterventionBus | None = None,
+    events: _CapturingEvents | None = None,
+) -> Any:
+    """Build a minimal OpContext for op_runtime handler tests."""
+    from reyn.core.op_runtime.context import OpContext
+
+    effective_decl = permission_decl
+    if effective_decl is None:
+        if resolver is not None:
+            effective_decl = _phase5_drop_decl(resolver, tmp_path)
+        else:
+            effective_decl = PermissionDecl()
+
+    effective_events = events or _CapturingEvents()
+    return OpContext(
+        workspace=Workspace(
+            events=effective_events, permission_resolver=resolver, base_dir=tmp_path,
+        ),
+        events=effective_events,
+        permission_decl=effective_decl,
+        permission_resolver=resolver,
+        actor="test_mcp_drop_server",
+        intervention_bus=bus,
+        subscribers=[],
+    )
+
+
+def test_mcp_drop_server_removes_entry_local_scope(tmp_path: Path) -> None:
+    """Tier 2: explicit local scope removes the entry from reyn.local.yaml."""
+    from reyn.core.op_runtime.mcp_drop_server import handle as drop_handle
+
+    cfg_path = tmp_path / "reyn.local.yaml"
+    _seed_config(cfg_path, {
+        "filesystem": {"command": "npx", "args": ["-y", "@mcp/fs"]},
+        "brave":      {"command": "uvx", "args": ["brave-mcp"]},
+    })
+
+    op = MCPDropServerIROp(
+        kind="mcp_drop_server",
+        server="filesystem",
+        scope="local",
+        clear_secrets=False,
+    )
+    result = _run(drop_handle(op=op, ctx=_make_op_ctx(tmp_path)))
+
+    assert result["status"] == "ok"
+    assert result["server"] == "filesystem"
+    assert result["scope"] == "local"
+
+    # Reload and verify yaml shape
+    data = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    assert "filesystem" not in data["mcp"]["servers"]
+    assert "brave" in data["mcp"]["servers"]
+
+
+def test_mcp_drop_server_auto_detects_scope(tmp_path: Path) -> None:
+    """Tier 2: scope=None walks local → project → user and removes from first match."""
+    from reyn.core.op_runtime.mcp_drop_server import handle as drop_handle
+
+    # Server lives in project, not local
+    _seed_config(tmp_path / "reyn.local.yaml", {"other": {}})
+    _seed_config(tmp_path / "reyn.yaml", {"filesystem": {"command": "npx"}})
+
+    op = MCPDropServerIROp(
+        kind="mcp_drop_server",
+        server="filesystem",
+        scope=None,
+        clear_secrets=False,
+    )
+    result = _run(drop_handle(op=op, ctx=_make_op_ctx(tmp_path)))
+
+    assert result["status"] == "ok"
+    assert result["scope"] == "project"
+
+    project_data = yaml.safe_load((tmp_path / "reyn.yaml").read_text(encoding="utf-8"))
+    # Pruned to empty → mcp/servers/mcp blocks removed
+    assert "mcp" not in project_data or "filesystem" not in project_data.get(
+        "mcp", {},
+    ).get("servers", {})
+
+
+def test_mcp_drop_server_prunes_empty_containers(tmp_path: Path) -> None:
+    """Tier 2: when removing the last server, mcp.servers and mcp are pruned."""
+    from reyn.core.op_runtime.mcp_drop_server import handle as drop_handle
+
+    cfg_path = tmp_path / "reyn.local.yaml"
+    _seed_config(cfg_path, {"filesystem": {"command": "npx"}})
+
+    op = MCPDropServerIROp(
+        kind="mcp_drop_server", server="filesystem", scope="local",
+        clear_secrets=False,
+    )
+    _run(drop_handle(op=op, ctx=_make_op_ctx(tmp_path)))
+
+    data = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    # Either entire mcp block gone, or none of its sub-keys remain.
+    assert ("mcp" not in (data or {})) or (data["mcp"] == {})
+
+
+def test_mcp_drop_server_not_found_in_explicit_scope(tmp_path: Path) -> None:
+    """Tier 2: explicit scope without the server returns status=not_found."""
+    from reyn.core.op_runtime.mcp_drop_server import handle as drop_handle
+
+    _seed_config(tmp_path / "reyn.local.yaml", {"other": {}})
+
+    op = MCPDropServerIROp(
+        kind="mcp_drop_server", server="missing_server", scope="local",
+        clear_secrets=False,
+    )
+    result = _run(drop_handle(op=op, ctx=_make_op_ctx(tmp_path)))
+
+    assert result["status"] == "not_found"
+    assert result["server"] == "missing_server"
+    assert result["scope"] == "local"
+
+
+def test_mcp_drop_server_not_found_auto_scope(tmp_path: Path) -> None:
+    """Tier 2: auto-detect with no matching scope returns status=not_found."""
+    from reyn.core.op_runtime.mcp_drop_server import handle as drop_handle
+
+    # No config files exist at all
+    op = MCPDropServerIROp(
+        kind="mcp_drop_server", server="ghost", scope=None,
+        clear_secrets=False,
+    )
+    result = _run(drop_handle(op=op, ctx=_make_op_ctx(tmp_path)))
+
+    assert result["status"] == "not_found"
+    assert result["server"] == "ghost"
+    assert result["scope"] is None
+
+
+def test_mcp_drop_server_empty_server_raises(tmp_path: Path) -> None:
+    """Tier 2: empty server string raises ValueError (= input validation)."""
+    from reyn.core.op_runtime.mcp_drop_server import handle as drop_handle
+
+    op = MCPDropServerIROp(kind="mcp_drop_server", server="   ", scope="local")
+    with pytest.raises(ValueError, match="non-empty"):
+        _run(drop_handle(op=op, ctx=_make_op_ctx(tmp_path)))
+
+
+# ── 3. P6 event emission ──────────────────────────────────────────────────
+
+
+def test_mcp_drop_server_emits_p6_event_on_success(tmp_path: Path) -> None:
+    """Tier 2: mcp_server_removed event emitted with audit metadata."""
+    from reyn.core.op_runtime.mcp_drop_server import handle as drop_handle
+
+    cfg_path = tmp_path / "reyn.local.yaml"
+    _seed_config(cfg_path, {
+        "filesystem": {
+            "command": "npx",
+            "env": {"FS_TOKEN": "${FS_TOKEN}", "FS_URL": "${FS_URL}"},
+        },
+    })
+
+    events = _CapturingEvents()
+    op = MCPDropServerIROp(
+        kind="mcp_drop_server", server="filesystem", scope="local",
+        clear_secrets=False,
+    )
+    _run(drop_handle(
+        op=op,
+        ctx=_make_op_ctx(tmp_path, events=events),
+    ))
+
+    # P6 event check
+    names = [name for name, _ in events.events]
+    assert "mcp_server_removed" in names
+    payload = next(kw for n, kw in events.events if n == "mcp_server_removed")
+    assert payload["server"] == "filesystem"
+    assert payload["scope"] == "local"
+    assert str(cfg_path) == payload["removed_path"]
+    assert set(payload["env_keys_captured"]) == {"FS_TOKEN", "FS_URL"}
+
+
+def test_mcp_drop_server_no_event_on_not_found(tmp_path: Path) -> None:
+    """Tier 2: status=not_found does NOT emit mcp_server_removed."""
+    from reyn.core.op_runtime.mcp_drop_server import handle as drop_handle
+
+    events = _CapturingEvents()
+    op = MCPDropServerIROp(kind="mcp_drop_server", server="ghost", scope=None)
+    _run(drop_handle(
+        op=op,
+        ctx=_make_op_ctx(tmp_path, events=events),
+    ))
+
+    names = [name for name, _ in events.events]
+    assert "mcp_server_removed" not in names
+
+
+# ── 4. secrets cleanup integration ────────────────────────────────────────
+
+
+def test_mcp_drop_server_clears_secrets_when_requested(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Tier 2: clear_secrets=True removes matching keys from secrets.env."""
+    from reyn.core.op_runtime.mcp_drop_server import handle as drop_handle
+    from reyn.security.secrets.store import list_secret_keys, save_secret
+
+    # Redirect secrets store to tmp_path
+    secrets_file = tmp_path / "secrets.env"
+    monkeypatch.setenv("REYN_SECRETS_PATH", str(secrets_file))
+
+    # Seed two secrets — one referenced by the server, one not
+    save_secret("FS_TOKEN", "value-a")
+    save_secret("FS_URL", "value-b")
+    save_secret("UNRELATED", "value-c")
+
+    cfg_path = tmp_path / "reyn.local.yaml"
+    _seed_config(cfg_path, {
+        "filesystem": {
+            "command": "npx",
+            "env": {"FS_TOKEN": "${FS_TOKEN}", "FS_URL": "${FS_URL}"},
+        },
+    })
+
+    op = MCPDropServerIROp(
+        kind="mcp_drop_server", server="filesystem", scope="local",
+        clear_secrets=True,
+    )
+    result = _run(drop_handle(
+        op=op, ctx=_make_op_ctx(tmp_path),
+    ))
+
+    # The two referenced keys should be gone; UNRELATED stays.
+    remaining = set(list_secret_keys())
+    assert "FS_TOKEN" not in remaining
+    assert "FS_URL" not in remaining
+    assert "UNRELATED" in remaining
+
+    # result.env_keys_cleared records what was actually removed
+    assert set(result["env_keys_cleared"]) == {"FS_TOKEN", "FS_URL"}
+
+
+def test_mcp_drop_server_preserves_secrets_when_requested(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Tier 2: clear_secrets=False leaves the secrets.env unchanged."""
+    from reyn.core.op_runtime.mcp_drop_server import handle as drop_handle
+    from reyn.security.secrets.store import list_secret_keys, save_secret
+
+    secrets_file = tmp_path / "secrets.env"
+    monkeypatch.setenv("REYN_SECRETS_PATH", str(secrets_file))
+
+    save_secret("FS_TOKEN", "value-a")
+    save_secret("FS_URL", "value-b")
+
+    cfg_path = tmp_path / "reyn.local.yaml"
+    _seed_config(cfg_path, {
+        "filesystem": {
+            "command": "npx",
+            "env": {"FS_TOKEN": "${FS_TOKEN}", "FS_URL": "${FS_URL}"},
+        },
+    })
+
+    op = MCPDropServerIROp(
+        kind="mcp_drop_server", server="filesystem", scope="local",
+        clear_secrets=False,
+    )
+    result = _run(drop_handle(
+        op=op, ctx=_make_op_ctx(tmp_path),
+    ))
+
+    # Secrets file untouched
+    remaining = set(list_secret_keys())
+    assert "FS_TOKEN" in remaining
+    assert "FS_URL" in remaining
+
+    # env_keys_cleared empty
+    assert result["env_keys_cleared"] == []
+
+
+# ── 5. universal_dispatch route ───────────────────────────────────────────
+
+
+def test_mcp_drop_server_is_an_mcp_category_action() -> None:
+    """Tier 2: mcp_drop_server is browsable under ``mcp`` (#879), so
+    list_actions surfaces it and invoke_action / describe_action accept it."""
+    from reyn.tools.universal_dispatch import action_names_for_category, is_known_action
+
+    assert "mcp_drop_server" in action_names_for_category("mcp")
+    assert is_known_action("mcp_drop_server")
+
+
+# ── 6. ToolDefinition registration ────────────────────────────────────────
+
+
+def test_mcp_drop_server_registered_in_default_registry() -> None:
+    """Tier 2: get_default_registry() includes the new mcp_drop_server tool."""
+    from reyn.tools import get_default_registry
+
+    registry = get_default_registry()
+    td = registry.lookup("mcp_drop_server")
+    assert td is not None
+
+
+def test_mcp_drop_server_is_router_visible() -> None:
+    """Tier 2: mcp_drop_server is router-visible (FP-0034 §D23)."""
+    from reyn.tools import get_default_registry
+
+    registry = get_default_registry()
+    router_names = {t.name for t in registry.for_router()}
+    assert "mcp_drop_server" in router_names
+
+
+def test_mcp_drop_server_tool_schema_requires_server() -> None:
+    """Tier 2: ToolDefinition.parameters requires 'server' field."""
+    from reyn.tools.mcp_drop import MCP_DROP_SERVER_OP
+
+    required = MCP_DROP_SERVER_OP.parameters.get("required", [])
+    assert "server" in required
+    # scope and clear_secrets are optional
+    assert "scope" not in required
+    assert "clear_secrets" not in required
+
+
+def test_mcp_drop_server_tool_scope_enum_three_tiers() -> None:
+    """Tier 2: scope enum is local / project / user (matches mcp_install)."""
+    from reyn.tools.mcp_drop import MCP_DROP_SERVER_OP
+
+    scope_prop = MCP_DROP_SERVER_OP.parameters["properties"]["scope"]
+    assert set(scope_prop["enum"]) == {"local", "project", "user"}
+
+
+# ── #1352-C: SandboxLayer ∩ threaded into the mcp file-write gate ──────────
+#
+# #3901 PR-B ③ (owner ruling B, #3916) retired FILE_WRITE from SandboxLayer's
+# permission-∩ projection. Both the deny-side test (a write outside write_paths
+# is denied via the permission ∩) and its accept-side regression guard (an
+# in-workspace write stays allowed) pinned a mechanism that no longer exists at
+# this layer — FILE_WRITE is ⊤ on SandboxLayer by design now, not by a
+# threading bug, so neither assertion is a live contract to guard. Deleted as
+# a pair, same reasoning as tests/security/test_1199_effective_permission.py's #3901
+# note.

@@ -1,0 +1,295 @@
+"""Tier 2: #1593 PR-3 S3a — CodeActScheme (interpret + execute glue + feedback).
+
+CodeAct is own-logic (not delegating). This pins:
+  - interpret classifies the LLM output: a fenced code block ⇒ CodeBlock; no fence ⇒
+    PlainText (terminal — #1618 root-3 #2 loop-unify "prose = done" contract). The
+    fence label may be python / py / tool_code (#1618 root-3 #5 fence-label variation).
+  - execute threads the OS per-call gate (exec_ctx.extra['dispatch']) + sandbox into
+    the CodeActRunner and wraps the result — and REQUIRES the gate (no silent
+    ungated run).
+  - format_feedback shapes each runner envelope into a user-role observation message
+    (the CodeBlock arm's append shape; the documented Execute/CodeBlock divergence).
+  - build_presentation renders the actions as a code-API in tool_use_sp (#1618 root-3
+    REPLACE channel), no JSON tools=, with excluded actions omitted (presentation
+    parity with JSON).
+
+The per-call gate RE-ENTRY invariant (N calls → N gate invocations, exclude
+per-call) is pinned at the runner level in test_codeact_runner_1593.py (the gate is
+the dispatch callback execute forwards). Real Fake runner / Fake SchemeOps (record
+what's forwarded) — no mocks.
+"""
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import pytest
+
+from reyn.runtime.router_system_prompt import build_system_prompt
+from reyn.tools.scheme import (
+    CodeBlock,
+    ExecContext,
+    ExecutionResult,
+    NoToolsChannel,
+    PlainText,
+)
+from reyn.tools.schemes.codeact import CodeActScheme
+
+
+class _FakeRunner:
+    """Records the args execute forwards; returns a canned envelope. A real Fake
+    (implements ``run``), not a mock."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    async def run(self, **kwargs) -> dict:
+        self.calls.append(kwargs)
+        return {"ok": True, "status": "ok", "result": "ran"}
+
+
+def test_interpret_extracts_fenced_code() -> None:
+    """Tier 2: interpret pulls the fenced ```python block as the CodeBlock."""
+    resp = SimpleNamespace(content="here:\n```python\nresult = tool('m')\n```\nthanks")
+    interp = CodeActScheme().interpret(resp, tool_catalog={}, ops=None)
+    assert isinstance(interp, CodeBlock)
+    assert interp.code.strip() == "result = tool('m')"
+
+
+def test_interpret_no_fence_returns_plaintext_terminal() -> None:
+    """Tier 2: #1618 root-3 (#2) — no recognized fence ⇒ PlainText (terminal), NOT a
+    CodeBlock. A prose-only response is the model's final answer (loop-unify "prose =
+    done" contract); the old "run the whole content as bare code" behavior no-op'd →
+    the model never cleanly finished → loop/timeout. PlainText is dataless (the OS
+    holds the content for the reply)."""
+    resp = SimpleNamespace(content="The file contains a config for the build.")
+    interp = CodeActScheme().interpret(resp, tool_catalog={}, ops=None)
+    assert isinstance(interp, PlainText)
+    # Not misclassified as code (would run prose → no-op → loop).
+    assert not isinstance(interp, CodeBlock)
+
+
+def test_interpret_extracts_tool_code_fence() -> None:
+    """Tier 2: #1618 root-3 (#5) — the Gemini-native ```tool_code fence label is
+    recognized as a code block (fence-label variation), same as ```python."""
+    resp = SimpleNamespace(content="```tool_code\nresult = tool('m')\n```")
+    interp = CodeActScheme().interpret(resp, tool_catalog={}, ops=None)
+    assert isinstance(interp, CodeBlock)
+    assert interp.code.strip() == "result = tool('m')"
+
+
+@pytest.mark.asyncio
+async def test_execute_threads_gate_and_sandbox_into_runner() -> None:
+    """Tier 2: execute forwards the OS gate (exec_ctx.extra['dispatch']) + the
+    sandbox + code into the runner, and wraps the envelope in ExecutionResult."""
+    runner = _FakeRunner()
+    scheme = CodeActScheme(runner=runner)
+
+    async def gate(name: str, args: dict) -> dict:
+        return {"status": "ok", "data": None}
+
+    sentinel_sandbox = object()
+    exec_ctx = ExecContext(
+        sandbox=sentinel_sandbox,
+        extra={"dispatch": gate, "sandbox_policy": {"network": False}, "timeout": 12},
+    )
+    res = await scheme.execute(CodeBlock(code="result = tool('m')"), exec_ctx, ops=None)
+
+    assert isinstance(res, ExecutionResult)
+    assert res.tool_results == [{"ok": True, "status": "ok", "result": "ran"}]
+    forwarded = runner.calls[0]
+    assert forwarded["dispatch"] is gate           # the OS gate is threaded through
+    assert forwarded["sandbox_backend"] is sentinel_sandbox
+    assert forwarded["code"] == "result = tool('m')"
+    assert forwarded["sandbox_policy"] == {"network": False}
+    assert forwarded["timeout"] == 12
+
+
+@pytest.mark.asyncio
+async def test_execute_requires_the_os_gate() -> None:
+    """Tier 2: execute refuses to run without the OS gate (no silent ungated run)."""
+    scheme = CodeActScheme(runner=_FakeRunner())
+    exec_ctx = ExecContext(sandbox=object(), extra={})  # no 'dispatch'
+    with pytest.raises(ValueError, match="dispatch"):
+        await scheme.execute(CodeBlock(code="x = 1"), exec_ctx, ops=None)
+
+
+def test_format_feedback_shapes_observation_message() -> None:
+    """Tier 2: format_feedback shapes each runner envelope into a user-role
+    observation message (the CodeAct ReAct observation turn) — result on success,
+    error/kind on failure — for the loop's CodeBlock arm to append (not raw
+    tool_results; the documented Execute/CodeBlock divergence)."""
+    scheme = CodeActScheme(runner=_FakeRunner())
+    ok = scheme.format_feedback(
+        ExecutionResult(tool_results=[{"ok": True, "result": 42}]), ops=None,
+    )
+    assert ok[0]["role"] == "user"
+    assert "42" in ok[0]["content"]
+    err = scheme.format_feedback(
+        ExecutionResult(tool_results=[{"ok": False, "kind": "ToolError", "error": "denied"}]),
+        ops=None,
+    )
+    assert err[0]["role"] == "user"
+    assert "denied" in err[0]["content"]
+
+
+# ── S3b: build_presentation (code-API render into tool_use_sp) ────────────────
+
+
+class _CatalogOps:
+    """A real Fake SchemeOps exposing the two composition ingredients this cell
+    reads: the async ``catalog_entries`` adapter (#1599) and ``base_tools``,
+    which the cell has composed alongside the catalog since #3381."""
+
+    def base_tools(self, available, layer_ctx) -> list[dict]:
+        return [
+            {"name": "delegate_to_agent", "description": "Delegate to a peer.",
+             "parameters": {"type": "object", "properties": {"to": {"type": "string"}}}},
+        ]
+
+    async def catalog_entries(self) -> list[dict]:
+        return [
+            {"name": "read_file", "description": "Read a file.",
+             "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}},
+            {"name": "web_fetch", "description": "Fetch a URL.\nSecond line ignored.",
+             "parameters": {"type": "object", "properties": {}}},
+        ]
+
+
+@pytest.mark.asyncio
+async def test_build_presentation_renders_code_api_into_tool_use_sp() -> None:
+    """Tier 2: #1618 root-3 — build_presentation renders the actions as a code-API in
+    tool_use_sp (the REPLACE channel); no JSON tools=. Behavior-pinned (action names
+    + tool() proxy + prose=terminal contract present), not format-pinned."""
+    pres = await CodeActScheme().build_presentation({}, {}, _CatalogOps())
+    # No JSON tools= — CodeAct presents via the SP, model writes a snippet. #3421:
+    # the channel is declared ABSENT, which is not the same claim as "empty".
+    assert isinstance(pres.tools_channel, NoToolsChannel)
+    # The actions surface in the code-API as DIRECT functions (#1658: def <name>(...),
+    # not the tool('name') string-proxy), via the REPLACE channel (tool_use_sp).
+    assert "read_file" in pres.tool_use_sp
+    assert "web_fetch" in pres.tool_use_sp
+    assert "def read_file(" in pres.tool_use_sp  # #1658 direct-function signature
+    assert "tool('" not in pres.tool_use_sp        # #1658: no string-proxy token
+    # The prose=terminal contract (#2) must be stated so the model knows how to finish.
+    assert "plain prose" in pres.tool_use_sp
+
+
+@pytest.mark.asyncio
+async def test_build_presentation_includes_arg_names() -> None:
+    """Tier 2: an action's schema arg names appear in its code-API signature."""
+    pres = await CodeActScheme().build_presentation({}, {}, _CatalogOps())
+    assert "path" in pres.tool_use_sp  # read_file's parameters.properties key
+
+
+@pytest.mark.asyncio
+async def test_code_api_has_no_tool_string_proxy_token() -> None:
+    """Tier 2: #1658 (supersedes #1638) — the rendered code-API carries NO
+    ``tool('<x>')`` string-proxy token at all. The direct-function redesign renders
+    ``def read_file(path)`` signatures the model calls by name, so the quoted
+    ``tool('<quoted>')`` token (which caused ~100% empty-choices on
+    gemini-2.5-flash-lite, #1638) is eliminated entirely — there is no string the
+    model produces for the action name. Strictly stronger than the #1638 backtick-wrap."""
+    pres = await CodeActScheme().build_presentation({}, {}, _CatalogOps())
+    # NO tool('...') string-proxy token anywhere (direct functions only).
+    assert "tool('" not in pres.tool_use_sp
+    assert 'tool("' not in pres.tool_use_sp
+    # The action IS present as a DIRECT function the model calls by name.
+    assert "def read_file(" in pres.tool_use_sp
+
+
+@pytest.mark.asyncio
+async def test_build_presentation_omits_excluded_actions() -> None:
+    """Tier 2: presentation parity (#1400/#3378) — a contextually-denied action is
+    omitted from the code-API (CodeAct presentation not looser than JSON tools=). The
+    OS supplies the session's EFFECTIVE narrowing via
+    available['contextual_permission'] — the same source the live gate enforces."""
+    from reyn.security.permissions.effective import ContextualPermission
+
+    pres = await CodeActScheme().build_presentation(
+        {"contextual_permission": ContextualPermission(
+            tool_deny=frozenset({"web_fetch"}),
+        )},
+        {}, _CatalogOps(),
+    )
+    assert "read_file" in pres.tool_use_sp   # kept
+    assert "web_fetch" not in pres.tool_use_sp  # excluded → omitted
+
+
+@pytest.mark.asyncio
+async def test_full_sp_for_codeact_session_carries_os_frame_autonomy_rule() -> None:
+    """Tier 2: sp-autonomy-revision — the ambiguity/proceed-vs-ask and
+    finish-the-job/persistence Behaviour rules were promoted from the
+    scheme-owned `_universal_sp.py` fork to the OS-frame
+    `build_system_prompt` static core specifically because CodeAct's
+    `tool_use_sp` (a bare string) REPLACES the universal scheme's whole
+    `slot_pre_environment` region — so a rule living only in that region
+    (the old location) never reached a CodeAct-scheme agent. This builds a
+    full CodeAct session's tool_use_sp via the real `build_presentation` and
+    feeds it through the real `build_system_prompt`, proving the rule now
+    reaches CodeAct too."""
+    pres = await CodeActScheme().build_presentation({}, {}, _CatalogOps())
+    # CodeAct's tool_use_sp is a bare str (the REPLACE channel) — sanity-check
+    # it still normalises into slot_pre_environment (no dict/list slots leak).
+    assert isinstance(pres.tool_use_sp, str)
+
+    sp = build_system_prompt(
+        agent_name="chat",
+        agent_role="general agent",
+        available_agents=[],
+        memory_index={},
+        tool_use_sp=pres.tool_use_sp,
+    )
+    # The CodeAct code-API is present (REPLACE channel reached the OS frame).
+    assert "def read_file(" in sp
+    # The promoted ambiguity/proceed-vs-ask Behaviour rule reaches CodeAct.
+    assert "Ask ONE targeted clarifying question ONLY when the ambiguity is BOTH" in sp
+    assert "prefer proceeding with a stated," in sp  # interactive default wording
+    # The promoted persistence/anti-premature-yield clause reaches CodeAct.
+    assert "never yield" in sp and "half-done" in sp
+
+
+# ── S4: registration + selectability ─────────────────────────────────────────
+
+
+def test_codeact_scheme_registered_and_selectable() -> None:
+    """Tier 2: FP-0066 P4c (#3247) clean-break — CodeActScheme is registered
+    under the (enumerate-all, content_fence) cell's resolved name, NOT the
+    bare 'codeact' ('codeact' is no longer independently selectable and
+    ``_resolve_tool_use_scheme("codeact")`` now falls back to the default,
+    same as any other unregistered name — the real selection path is the
+    2-axis config: ``tool_use.scheme: enumerate-all`` +
+    ``tool_use.transport: content_fence``, validated + resolved through
+    ``reyn.tools.transport.resolve_scheme_for_transport``). Universal stays
+    the default (not codeact)."""
+    from reyn.runtime.router_loop import _resolve_tool_use_scheme
+    from reyn.tools.transport import (
+        CONTENT_FENCE_ENUMERATE_ALL_SCHEME_NAME,
+        Transport,
+        resolve_scheme_for_transport,
+    )
+
+    # "codeact" is no longer a registered _SCHEMES name → unknown-name fallback.
+    assert _resolve_tool_use_scheme("codeact").name == "enumerate-all"
+
+    # The real selection path: resolve the (scheme, transport) pair.
+    resolved_name = resolve_scheme_for_transport("enumerate-all", Transport.CONTENT_FENCE)
+    assert resolved_name == CONTENT_FENCE_ENUMERATE_ALL_SCHEME_NAME
+    selected = _resolve_tool_use_scheme(resolved_name)
+    assert selected.name == resolved_name
+    assert isinstance(selected, CodeActScheme)
+    # #1657: default is now enumerate-all (not codeact, not universal).
+    assert _resolve_tool_use_scheme(None).name == "enumerate-all"  # #1657
+
+
+def test_tool_use_scheme_codeact_is_config_invalid() -> None:
+    """Tier 1: FP-0066 P4c (#3247) clean-break — ``tool_use.scheme: codeact``
+    is a config-parse-time error, the same legible-error style P4b introduced
+    for the removed ``tool_use.chat`` key. 'codeact' was never a valid
+    presentation-axis ``scheme`` value (only 'category' / 'enumerate-all' /
+    'retrieval' are), and now doubly so: no ``_SCHEMES`` entry named
+    'codeact' exists either. CodeAct is reached ONLY via
+    ``scheme: enumerate-all`` + ``transport: content_fence``."""
+    from reyn.config.execution import _build_tool_use_config
+
+    with pytest.raises(ValueError, match=r"no \(scheme, transport\) registration"):
+        _build_tool_use_config({"scheme": "codeact"})

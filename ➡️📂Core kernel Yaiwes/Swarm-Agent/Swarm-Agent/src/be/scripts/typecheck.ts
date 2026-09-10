@@ -1,0 +1,1004 @@
+import { fileURLToPath } from "node:url";
+import ts from "typescript";
+import { getScriptAppTypes } from "@/apps/script-types";
+import { getScriptApiTypes, getScriptMcpTypes } from "@/be/script-connections";
+import type { ScriptTypeContext } from "./type-contributors";
+
+/**
+ * Structured diagnostic record returned to API callers when typecheck fails.
+ *
+ * Mirrors the most useful subset of the TypeScript compiler diagnostic — file
+ * path + line/col, the diagnostic code, the offending identifier (when the
+ * diagnostic is about a name lookup), and an optional `suggestion` for "did
+ * you mean…" hints surfaced by the compiler.
+ */
+export type ScriptDiagnostic = {
+  severity: "error" | "warning" | "suggestion" | "message";
+  code: number;
+  message: string;
+  file: string;
+  line: number;
+  column: number;
+  endLine?: number;
+  endColumn?: number;
+  identifier?: string;
+  suggestion?: string;
+};
+
+export type ScriptTypecheckResult =
+  | { ok: true }
+  | { ok: false; diagnostics: string[]; structured: ScriptDiagnostic[] };
+
+export const SCRIPT_SDK_TYPES = `
+export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
+export type ScriptScope = "agent" | "global";
+export type ScriptFsMode = "none" | "workspace-rw";
+export type ScriptApiRawOptions = { raw: true };
+export type ScriptApiDefaultOptions = { raw?: false };
+
+export interface ScriptApiRawResult {
+  ok: boolean;
+  status: number;
+  statusText: string;
+  headers: Record<string, string>;
+  url: string;
+  response: Response;
+}
+
+export interface Redacted<T> {
+  readonly __redactedBrand?: T;
+  toString(): "<redacted>";
+  toJSON(): "<redacted>";
+}
+
+export interface RedactedStatic {
+  value<T>(self: Redacted<T>): T;
+  meta<T>(self: Redacted<T>): { type: "system" | "user"; isSecret: boolean };
+  isSecret<T>(self: Redacted<T>): boolean;
+}
+
+export interface SwarmConfig {
+  apiKey: Redacted<string>;
+  agentId: Redacted<string>;
+  mcpBaseUrl: Redacted<string>;
+  get<T = string>(key: string): Redacted<T> | undefined;
+}
+
+export interface KvEntry<T = unknown> {
+  namespace: string;
+  key: string;
+  value: T;
+  valueType: "json" | "string" | "integer";
+  expiresAt: number | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface KvSdkSuccess<T, TStatus extends number = 200> {
+  success: true;
+  status: TStatus;
+  data: T;
+}
+
+export interface KvSdkError {
+  success: false;
+  status: number;
+  data: { error: string };
+}
+
+export type KvSdkResponse<T, TStatus extends number = 200> =
+  | KvSdkSuccess<T, TStatus>
+  | KvSdkError;
+
+export interface KvSetArgsBase {
+  key: string;
+  namespace?: string;
+  ttlSeconds?: number;
+  expiresInSec?: number;
+}
+
+export type KvEmptyData = Record<string, never>;
+
+export interface KvListData<T = unknown> {
+  entries: KvEntry<T>[];
+  total: number;
+  namespace: string;
+}
+
+export interface SwarmSdk {
+  // --- memory ---
+  memory_search(args: { query: string; intent: string; scope?: "all" | "agent" | "swarm"; limit?: number; source?: string }): Promise<unknown>;
+  memory_get(args: { memoryId: string; intent: string }): Promise<unknown>;
+  memory_rate(args: { id: string; useful: boolean; note?: string }): Promise<unknown>;
+  // --- tasks ---
+  task_list(args?: Record<string, unknown>): Promise<unknown>;
+  task_get(args: { taskId: string }): Promise<unknown>;
+  task_storeProgress(args: Record<string, unknown>): Promise<unknown>;
+  task_poll(args?: Record<string, unknown>): Promise<unknown>;
+  // --- kv ---
+  kv_get<T = unknown>(args: { key: string; namespace?: string }): Promise<KvSdkResponse<KvEntry<T>>>;
+  kv_getOrNull<T = unknown>(args: { key: string; namespace?: string }): Promise<KvEntry<T> | null>;
+  kv_set<T>(args: KvSetArgsBase & { value: T; valueType?: "json" }): Promise<KvSdkResponse<KvEntry<T>>>;
+  kv_set(args: KvSetArgsBase & { value: string; valueType: "string" }): Promise<KvSdkResponse<KvEntry<string>>>;
+  kv_set(args: KvSetArgsBase & { value: number | string; valueType: "integer" }): Promise<KvSdkResponse<KvEntry<number>>>;
+  kv_delete(args: { key: string; namespace?: string }): Promise<KvSdkResponse<KvEmptyData, 204>>;
+  kv_del(args: { key: string; namespace?: string }): Promise<KvSdkResponse<KvEmptyData, 204>>;
+  kv_incr(args: { key: string; by?: number; namespace?: string }): Promise<KvSdkResponse<KvEntry<number>>>;
+  kv_list<T = unknown>(args?: { prefix?: string; namespace?: string; limit?: number; offset?: number }): Promise<KvSdkResponse<KvListData<T>>>;
+  // --- repos ---
+  repo_list(args?: Record<string, unknown>): Promise<unknown>;
+  // --- schedules ---
+  schedule_list(args?: { enabled?: boolean; name?: string; scheduleType?: "recurring" | "one_time"; targetType?: "agent-task" | "workflow" | "script"; workflowId?: string; scriptName?: string; hideCompleted?: boolean; consecutiveErrorsMin?: number; lastRunStatus?: "failed" | "succeeded"; includeFull?: boolean }): Promise<unknown>;
+  // --- scripts ---
+  script_search(args: { query?: string; scope?: ScriptScope; limit?: number }): Promise<unknown>;
+  script_run(args: { name?: string; source?: string; args?: unknown; intent?: string; scope?: ScriptScope; fsMode?: ScriptFsMode; idempotencyKey?: string }): Promise<unknown>;
+  // --- swarm / agent ---
+  swarm_get(args?: { includeFull?: boolean }): Promise<unknown>;
+  agent_info(args?: Record<string, unknown>): Promise<unknown>;
+  metrics_get(args?: Record<string, unknown>): Promise<unknown>;
+  user_resolve(args?: { kind?: string; externalId?: string; email?: string; userId?: string; name?: string }): Promise<unknown>;
+  db_query(args: { sql: string; params?: unknown[] }): Promise<unknown>;
+  // --- config ---
+  config_get(args?: { agentId?: string; repoId?: string; key?: string; includeSecrets?: boolean }): Promise<unknown>;
+  config_list(args?: { scope?: "global" | "agent" | "repo"; scopeId?: string; key?: string; includeSecrets?: boolean }): Promise<unknown>;
+  // --- slack ---
+  slack_read(args?: { inboxMessageId?: string; taskId?: string; channelId?: string; threadTs?: string; limit?: number; includeFiles?: boolean }): Promise<unknown>;
+  slack_listChannels(args?: { types?: Array<"public" | "private" | "dm" | "mpim">; limit?: number }): Promise<unknown>;
+  // --- messaging ---
+  message_read(args?: { channel?: string; limit?: number; since?: string; unreadOnly?: boolean; mentionsOnly?: boolean; markAsRead?: boolean }): Promise<unknown>;
+  // --- services ---
+  service_list(args?: { agentId?: string; name?: string; status?: "starting" | "healthy" | "unhealthy" | "stopped"; includeOwn?: boolean }): Promise<unknown>;
+  // --- context / profiles ---
+  context_history(args?: { agentId?: string; field?: "soulMd" | "identityMd" | "toolsMd" | "claudeMd" | "setupScript"; limit?: number }): Promise<unknown>;
+  context_diff(args: { versionId: string; compareToVersionId?: string }): Promise<unknown>;
+  // --- workflows ---
+  workflow_list(args?: { enabled?: boolean; includeFull?: boolean; consecutiveErrorsMin?: number; lastRunStatus?: "running" | "waiting" | "completed" | "failed" | "skipped" | "cancelled" }): Promise<unknown>;
+  workflow_get(args: { id: string }): Promise<unknown>;
+  workflow_listRuns(args: { workflowId: string; status?: "running" | "waiting" | "completed" | "failed" | "skipped" | "cancelled"; limit?: number; offset?: number }): Promise<unknown>;
+  workflow_getRun(args: { id: string }): Promise<unknown>;
+  // --- prompt templates ---
+  prompt_list(args?: { eventType?: string; scope?: "global" | "agent" | "repo"; scopeId?: string; isDefault?: boolean }): Promise<unknown>;
+  prompt_get(args: { id: string }): Promise<unknown>;
+  // --- tracker ---
+  tracker_status(args?: Record<string, unknown>): Promise<unknown>;
+  tracker_syncStatus(args?: Record<string, unknown>): Promise<unknown>;
+  tracker_linkTask(args: { taskId: string; externalId: string; provider?: string }): Promise<unknown>;
+  tracker_unlink(args: { taskId: string }): Promise<unknown>;
+  tracker_mapAgent(args: { agentId: string; externalId: string; provider?: string }): Promise<unknown>;
+
+  // --- write: memory ---
+  memory_delete(args: { id: string }): Promise<unknown>;
+  memory_store(args: { content: string; name: string; scope?: "agent" | "swarm"; tags?: string[]; taskId?: string; intent?: string }): Promise<unknown>;
+  memory_edit(args: {
+    memoryId?: string;
+    key?: string;
+    scope?: "agent" | "swarm";
+    mode?: "replace" | "exact";
+    content?: string;
+    oldString?: string;
+    newString?: string;
+    intent: string;
+    expectedVersion?: number;
+  }): Promise<unknown>;
+  inject_learning(args: { content: string; name?: string; scope?: "agent" | "swarm"; source?: string; tags?: string[] }): Promise<unknown>;
+
+  // --- write: tasks ---
+  task_send(args: Record<string, unknown>): Promise<unknown>;
+  task_cancel(args: { taskId: string }): Promise<unknown>;
+  task_steer(args: { taskId: string; message: string; mode?: "steer" | "queue"; onUnsupported?: "degrade" | "fail" }): Promise<unknown>;
+  task_action(args: Record<string, unknown>): Promise<unknown>;
+
+  // --- write: config ---
+  config_set(args: { key: string; value: unknown; scope?: "global" | "agent" | "repo"; scopeId?: string; isSecret?: boolean }): Promise<unknown>;
+  config_delete(args: { id: string }): Promise<unknown>;
+
+  // --- write: slack ---
+  slack_post(args: { channelId: string; message: string; blocks?: unknown }): Promise<unknown>;
+  slack_reply(args: { channelId?: string; threadTs?: string; message: string; taskId?: string; blocks?: unknown }): Promise<unknown>;
+  slack_startThread(args: { channelId: string; message: string; blocks?: unknown }): Promise<unknown>;
+  slack_createChannel(args: { name: string; isPrivate?: boolean }): Promise<unknown>;
+  slack_inviteToChannel(args: { channelId: string; userIds: string[] }): Promise<unknown>;
+  slack_archiveChannel(args: { channelId: string }): Promise<unknown>;
+  slack_uploadFile(args: Record<string, unknown>): Promise<unknown>;
+  slack_downloadFile(args: { url: string }): Promise<unknown>;
+  slack_delete(args: { channelId: string; messageTs: string }): Promise<unknown>;
+  slack_update(args: { channelId: string; messageTs: string; message: string }): Promise<unknown>;
+
+  // --- write: messaging (internal) ---
+  message_post(args: { channel?: string; content: string; to?: string }): Promise<unknown>;
+
+  // --- write: profiles ---
+  profile_update(args: Record<string, unknown>): Promise<unknown>;
+
+  // --- write: services ---
+  service_register(args: Record<string, unknown>): Promise<unknown>;
+  service_unregister(args: { name: string }): Promise<unknown>;
+  service_updateStatus(args: { name: string; status: "starting" | "healthy" | "unhealthy" | "stopped" }): Promise<unknown>;
+
+  // --- write: schedules ---
+  schedule_create(args: Record<string, unknown>): Promise<unknown>;
+  schedule_update(args: Record<string, unknown>): Promise<unknown>;
+  schedule_patch(args: Record<string, unknown>): Promise<unknown>;
+  schedule_delete(args: { id: string }): Promise<unknown>;
+  schedule_runNow(args: { id: string }): Promise<unknown>;
+
+  // --- write: workflows ---
+  workflow_create(args: Record<string, unknown>): Promise<unknown>;
+  workflow_update(args: Record<string, unknown>): Promise<unknown>;
+  workflow_patch(args: Record<string, unknown>): Promise<unknown>;
+  workflow_patchNode(args: Record<string, unknown>): Promise<unknown>;
+  workflow_delete(args: { id: string }): Promise<unknown>;
+  workflow_trigger(args: { id: string; triggerData?: Record<string, unknown> }): Promise<unknown>;
+  workflow_retryRun(args: { id: string }): Promise<unknown>;
+  workflow_cancelRun(args: { id: string }): Promise<unknown>;
+
+  // --- write: prompt templates ---
+  prompt_set(args: Record<string, unknown>): Promise<unknown>;
+  prompt_delete(args: { id: string }): Promise<unknown>;
+  prompt_preview(args: Record<string, unknown>): Promise<unknown>;
+
+  // --- write: scripts ---
+  script_upsert(args: { name: string; source: string; description?: string; intent?: string; scope?: ScriptScope; fsMode?: ScriptFsMode }): Promise<unknown>;
+  script_delete(args: { name: string; scope?: ScriptScope }): Promise<unknown>;
+  script_queryTypes(args: { name: string; scope?: ScriptScope }): Promise<unknown>;
+  script_launchRun(args: { source: string; args?: unknown; idempotencyKey?: string; scriptName?: string; requestedByUserId?: string }): Promise<unknown>;
+  script_getRun(args: { id: string }): Promise<unknown>;
+  script_listRuns(args?: { status?: "running" | "paused" | "completed" | "failed" | "cancelled" | "aborted_limit"; agentId?: string; limit?: number; offset?: number }): Promise<unknown>;
+
+  // --- write: repos ---
+  repo_update(args: Record<string, unknown>): Promise<unknown>;
+
+  // --- write: agent ---
+  agent_join(args: { name: string; role?: string; description?: string; capabilities?: string[]; requestedId?: string; lead?: boolean }): Promise<unknown>;
+  user_manage(args: Record<string, unknown>): Promise<unknown>;
+
+  // --- skills ---
+  skill_list(args?: { scope?: string; scopeId?: string; includeBuiltin?: boolean }): Promise<unknown>;
+  skill_get(args: { id: string }): Promise<unknown>;
+  skill_getFile(args: { skillId: string; path: string }): Promise<unknown>;
+  skill_search(args: { query: string; limit?: number }): Promise<unknown>;
+  skill_create(args: Record<string, unknown>): Promise<unknown>;
+  skill_update(args: Record<string, unknown>): Promise<unknown>;
+  skill_delete(args: { id: string }): Promise<unknown>;
+  skill_install(args: Record<string, unknown>): Promise<unknown>;
+  skill_uninstall(args: Record<string, unknown>): Promise<unknown>;
+  skill_publish(args: Record<string, unknown>): Promise<unknown>;
+
+  // --- mcp servers ---
+  mcpServer_list(args?: Record<string, unknown>): Promise<unknown>;
+  mcpServer_get(args: { id: string }): Promise<unknown>;
+  mcpServer_create(args: Record<string, unknown>): Promise<unknown>;
+  mcpServer_update(args: Record<string, unknown>): Promise<unknown>;
+  mcpServer_delete(args: { id: string }): Promise<unknown>;
+  mcpServer_install(args: Record<string, unknown>): Promise<unknown>;
+  mcpServer_uninstall(args: Record<string, unknown>): Promise<unknown>;
+
+  // --- pages & metrics ---
+  app_get(args: { appId: string }): Promise<unknown>;
+  app_history(args: { appId: string; limit?: number }): Promise<unknown>;
+  app_diff(args: { appId: string; from?: number; to?: number }): Promise<unknown>;
+  app_list(args?: Record<string, never>): Promise<unknown>;
+  app_patch(args: {
+    appId: string;
+    name?: string;
+    description?: string | null;
+    definition?: Record<string, unknown>;
+    migration?: Record<string, unknown>;
+    forceElementBreak?: string[];
+  }): Promise<unknown>;
+  app_query(args: {
+    appId: string;
+    query: string;
+    params?: Record<string, string | number | boolean>;
+  }): Promise<unknown>;
+  app_rollback(args: {
+    appId: string;
+    version: number;
+    migration?: Record<string, unknown>;
+    forceElementBreak?: string[];
+  }): Promise<unknown>;
+  app_sync(args: { appId: string; model?: string; source?: string }): Promise<unknown>;
+  app_upsert(args: {
+    name: string;
+    description?: string;
+    definition: Record<string, unknown>;
+    appId?: string;
+    migration?: Record<string, unknown>;
+    forceElementBreak?: string[];
+  }): Promise<unknown>;
+  page_create(args: Record<string, unknown>): Promise<unknown>;
+  page_delete(args: { pageId?: string; slug?: string }): Promise<unknown>;
+  metric_create(args: Record<string, unknown>): Promise<unknown>;
+
+  // --- human input ---
+  request_humanInput(args: Record<string, unknown>): Promise<unknown>;
+}
+
+export interface ScriptStdlib {
+  fetch(input: string | URL | Request, init?: RequestInit): Promise<Response>;
+  fetchJson(input: string | URL | Request, init?: RequestInit): Promise<unknown>;
+  grep(pattern: string, files?: string | string[]): Promise<string>;
+  glob(pattern: string): Promise<string[]>;
+  table(rows: Array<Record<string, unknown>>): string;
+  Redacted: RedactedStatic;
+}
+
+export interface ScriptLogger extends Console {}
+
+export interface ScriptRunContext {
+  id: string;
+  agentId: string;
+  args: unknown;
+}
+
+export interface ScriptWorkflowSteps {
+  rawLlm(
+    label: string,
+    config: { prompt: string; model?: string; schema?: Record<string, unknown> },
+  ): Promise<unknown>;
+  agentTask(
+    label: string,
+    config: {
+      template?: string;
+      task?: string;
+      agentId?: string;
+      tags?: string[];
+      priority?: number;
+      offerMode?: boolean;
+      dir?: string;
+      vcsRepo?: string;
+      model?: string;
+      parentTaskId?: string;
+      requestedByUserId?: string;
+      outputSchema?: Record<string, unknown>;
+      /** Wait for the dispatched task to reach a terminal status before resolving. Default: true. */
+      waitForCompletion?: boolean;
+      /** Max ms to wait for a terminal status before throwing. Default: 2h. Only used when waitForCompletion is true. */
+      timeoutMs?: number;
+      /** Throw when the task ends failed/cancelled/superseded (default), or resolve with {taskId,status,error} when false. */
+      failOnTaskFailure?: boolean;
+    },
+  ): Promise<unknown>;
+  swarmScript(
+    label: string,
+    config: {
+      name?: string;
+      scriptName?: string;
+      source?: string;
+      args?: unknown;
+      scope?: ScriptScope;
+      fsMode?: ScriptFsMode;
+      intent?: string;
+      idempotencyKey?: string;
+    },
+  ): Promise<unknown>;
+  humanInTheLoop(): Promise<never>;
+}
+
+export interface ScriptContext {
+  run?: ScriptRunContext;
+  step?: ScriptWorkflowSteps;
+  swarm: SwarmSdk & { config: SwarmConfig };
+  api: ScriptApiRegistry;
+  mcp: ScriptMcpRegistry;
+  stdlib: ScriptStdlib;
+  logger: ScriptLogger;
+}
+
+/**
+ * A swarm script's default export. \`args\` comes FIRST, \`ctx\` second — never swap them.
+ *
+ * @example
+ * import type { ScriptContext } from "swarm-sdk";
+ *
+ * export default async function (args: { name: string }, ctx: ScriptContext) {
+ *   await ctx.logger.log(\`hello \${args.name}\`);
+ *   return { ok: true };
+ * }
+ */
+// biome-ignore lint/suspicious/noExplicitAny: scripts may narrow their args type at the entrypoint.
+export type ScriptMain = (args: any, ctx: ScriptContext) => unknown | Promise<unknown>;
+`;
+
+export async function scriptSdkTypesWithGeneratedApis(
+  apiTypes = getScriptApiTypes(),
+  mcpTypes = getScriptMcpTypes(),
+  appTypes?: string,
+): Promise<string> {
+  const resolvedAppTypes = appTypes ?? (await getScriptAppTypes());
+  if (!resolvedAppTypes) return `${SCRIPT_SDK_TYPES}\n${apiTypes}\n${mcpTypes}\n`;
+  return `${SCRIPT_SDK_TYPES}\n${apiTypes}\n${mcpTypes}\n${resolvedAppTypes}\n`;
+}
+
+const STDLIB_MODULE_TYPES = `
+declare module "stdlib" {
+  export interface Redacted<T> {
+    readonly __redactedBrand?: T;
+    toString(): "<redacted>";
+    toJSON(): "<redacted>";
+  }
+  export const Redacted: {
+    value<T>(self: Redacted<T>): T;
+    meta<T>(self: Redacted<T>): { type: "system" | "user"; isSecret: boolean };
+    isSecret<T>(self: Redacted<T>): boolean;
+  };
+  export function fetch(input: string | URL | Request, init?: RequestInit): Promise<Response>;
+  export function fetchJson(input: string | URL | Request, init?: RequestInit): Promise<unknown>;
+  export function grep(pattern: string, files?: string | string[]): Promise<string>;
+  export function glob(pattern: string): Promise<string[]>;
+  export function table(rows: Array<Record<string, unknown>>): string;
+}
+`;
+
+function stdlibTypesFor(sdkModuleBody: string): string {
+  return `${STDLIB_MODULE_TYPES}
+declare module "swarm-sdk" {
+${sdkModuleBody.replace(/^/gm, "  ")}
+}
+`;
+}
+
+export const SCRIPT_STDLIB_TYPES = stdlibTypesFor(SCRIPT_SDK_TYPES);
+
+/**
+ * Stdlib blob whose ambient `declare module "swarm-sdk"` also carries the
+ * generated per-connection registries (`ScriptApiRegistry` / `ScriptMcpRegistry`
+ * and their `<Slug>Api` / `<Slug>Mcp` interfaces).
+ *
+ * Monaco resolves the bare `import ... from "swarm-sdk"` through this ambient
+ * module — unlike the server typechecker, whose custom resolver maps the
+ * specifier onto the flat SDK virtual file. Without the generated registries
+ * inlined here, the ambient copy of `ScriptContext` references names that do
+ * not exist in that module scope ("Cannot find name 'ScriptApiRegistry'") and
+ * `ctx.api.<slug>` completions break in the editor.
+ */
+export async function scriptStdlibTypesWithGeneratedApis(
+  apiTypes = getScriptApiTypes(),
+  mcpTypes = getScriptMcpTypes(),
+  appTypes?: string,
+): Promise<string> {
+  const resolvedAppTypes = appTypes ?? (await getScriptAppTypes());
+  if (!resolvedAppTypes) return stdlibTypesFor(`${SCRIPT_SDK_TYPES}\n${apiTypes}\n${mcpTypes}`);
+  return stdlibTypesFor(`${SCRIPT_SDK_TYPES}\n${apiTypes}\n${mcpTypes}\n${resolvedAppTypes}`);
+}
+
+/**
+ * Minimal ambient declarations for runtime globals the executor (Bun) actually
+ * exposes. We intentionally avoid pulling in `lib.dom.d.ts` wholesale — the
+ * runtime surface is much narrower than a browser, and the DOM lib would
+ * mislead authors into thinking every browser global works.
+ *
+ * If you add to this list, verify the global is exposed by the eval-harness:
+ *   `src/scripts-runtime/eval-harness.ts` runs user code under `bun run` in a
+ *   subprocess with stripped env. Whatever Bun provides globally is available.
+ */
+export const SCRIPT_RUNTIME_GLOBALS = `
+// === Console ===
+
+interface Console {
+  log(...args: unknown[]): void;
+  warn(...args: unknown[]): void;
+  error(...args: unknown[]): void;
+  info(...args: unknown[]): void;
+  debug(...args: unknown[]): void;
+  trace(...args: unknown[]): void;
+  table(tabularData: unknown, properties?: ReadonlyArray<string>): void;
+  group(...args: unknown[]): void;
+  groupCollapsed(...args: unknown[]): void;
+  groupEnd(): void;
+  assert(condition?: boolean, ...args: unknown[]): void;
+  count(label?: string): void;
+  countReset(label?: string): void;
+  dir(obj: unknown, options?: unknown): void;
+  dirxml(...args: unknown[]): void;
+  time(label?: string): void;
+  timeEnd(label?: string): void;
+  timeLog(label?: string, ...args: unknown[]): void;
+  clear(): void;
+}
+
+declare var console: Console;
+
+// === Fetch / Web ===
+
+type HeadersInit = Headers | Record<string, string> | Array<[string, string]>;
+interface Headers {
+  append(name: string, value: string): void;
+  delete(name: string): void;
+  get(name: string): string | null;
+  has(name: string): boolean;
+  set(name: string, value: string): void;
+  forEach(callback: (value: string, key: string, parent: Headers) => void): void;
+  entries(): IterableIterator<[string, string]>;
+  keys(): IterableIterator<string>;
+  values(): IterableIterator<string>;
+  [Symbol.iterator](): IterableIterator<[string, string]>;
+}
+declare var Headers: { new (init?: HeadersInit): Headers; prototype: Headers };
+
+type BodyInit = string | ArrayBuffer | ArrayBufferView | Blob | FormData | URLSearchParams | ReadableStream<Uint8Array> | null;
+
+interface Blob {
+  readonly size: number;
+  readonly type: string;
+  arrayBuffer(): Promise<ArrayBuffer>;
+  text(): Promise<string>;
+  slice(start?: number, end?: number, contentType?: string): Blob;
+  stream(): ReadableStream<Uint8Array>;
+}
+declare var Blob: { new (parts?: Array<BlobPart>, options?: { type?: string }): Blob; prototype: Blob };
+type BlobPart = string | ArrayBuffer | ArrayBufferView | Blob;
+
+interface FormData {
+  append(name: string, value: string | Blob, filename?: string): void;
+  delete(name: string): void;
+  get(name: string): string | Blob | null;
+  getAll(name: string): Array<string | Blob>;
+  has(name: string): boolean;
+  set(name: string, value: string | Blob, filename?: string): void;
+  forEach(callback: (value: string | Blob, key: string, parent: FormData) => void): void;
+  entries(): IterableIterator<[string, string | Blob]>;
+  keys(): IterableIterator<string>;
+  values(): IterableIterator<string | Blob>;
+  [Symbol.iterator](): IterableIterator<[string, string | Blob]>;
+}
+declare var FormData: { new (): FormData; prototype: FormData };
+
+interface ReadableStream<R = unknown> {
+  readonly locked: boolean;
+  cancel(reason?: unknown): Promise<void>;
+  getReader(): { read(): Promise<{ done: boolean; value?: R }>; releaseLock(): void; cancel(reason?: unknown): Promise<void> };
+  [Symbol.asyncIterator](): AsyncIterableIterator<R>;
+}
+
+interface RequestInit {
+  method?: string;
+  headers?: HeadersInit;
+  body?: BodyInit;
+  signal?: AbortSignal | null;
+  credentials?: string;
+  redirect?: "follow" | "error" | "manual";
+  cache?: string;
+  mode?: string;
+  referrer?: string;
+  referrerPolicy?: string;
+  integrity?: string;
+  keepalive?: boolean;
+}
+
+interface Request {
+  readonly url: string;
+  readonly method: string;
+  readonly headers: Headers;
+  readonly body: ReadableStream<Uint8Array> | null;
+  readonly signal: AbortSignal;
+  clone(): Request;
+  arrayBuffer(): Promise<ArrayBuffer>;
+  blob(): Promise<Blob>;
+  formData(): Promise<FormData>;
+  json(): Promise<unknown>;
+  text(): Promise<string>;
+}
+declare var Request: { new (input: string | URL | Request, init?: RequestInit): Request; prototype: Request };
+
+interface ResponseInit {
+  status?: number;
+  statusText?: string;
+  headers?: HeadersInit;
+}
+
+interface Response {
+  readonly ok: boolean;
+  readonly status: number;
+  readonly statusText: string;
+  readonly headers: Headers;
+  readonly url: string;
+  readonly redirected: boolean;
+  readonly type: string;
+  readonly body: ReadableStream<Uint8Array> | null;
+  clone(): Response;
+  arrayBuffer(): Promise<ArrayBuffer>;
+  blob(): Promise<Blob>;
+  formData(): Promise<FormData>;
+  json(): Promise<unknown>;
+  text(): Promise<string>;
+}
+declare var Response: {
+  new (body?: BodyInit, init?: ResponseInit): Response;
+  prototype: Response;
+  json(data: unknown, init?: ResponseInit): Response;
+  redirect(url: string | URL, status?: number): Response;
+  error(): Response;
+};
+
+declare function fetch(input: string | URL | Request, init?: RequestInit): Promise<Response>;
+
+// === URL ===
+
+interface URLSearchParams {
+  append(name: string, value: string): void;
+  delete(name: string): void;
+  get(name: string): string | null;
+  getAll(name: string): string[];
+  has(name: string): boolean;
+  set(name: string, value: string): void;
+  sort(): void;
+  toString(): string;
+  forEach(callback: (value: string, key: string, parent: URLSearchParams) => void): void;
+  entries(): IterableIterator<[string, string]>;
+  keys(): IterableIterator<string>;
+  values(): IterableIterator<string>;
+  [Symbol.iterator](): IterableIterator<[string, string]>;
+  readonly size: number;
+}
+declare var URLSearchParams: {
+  new (init?: string | string[][] | Record<string, string> | URLSearchParams): URLSearchParams;
+  prototype: URLSearchParams;
+};
+
+interface URL {
+  hash: string;
+  host: string;
+  hostname: string;
+  href: string;
+  toString(): string;
+  readonly origin: string;
+  password: string;
+  pathname: string;
+  port: string;
+  protocol: string;
+  search: string;
+  readonly searchParams: URLSearchParams;
+  username: string;
+  toJSON(): string;
+}
+declare var URL: {
+  new (url: string | URL, base?: string | URL): URL;
+  prototype: URL;
+  canParse(url: string | URL, base?: string): boolean;
+  createObjectURL(obj: Blob): string;
+  revokeObjectURL(url: string): void;
+};
+
+// === Abort ===
+
+interface AbortSignal {
+  readonly aborted: boolean;
+  readonly reason: unknown;
+  throwIfAborted(): void;
+  addEventListener(type: "abort", listener: () => void, options?: { once?: boolean }): void;
+  removeEventListener(type: "abort", listener: () => void): void;
+}
+declare var AbortSignal: {
+  new (): AbortSignal;
+  prototype: AbortSignal;
+  abort(reason?: unknown): AbortSignal;
+  timeout(milliseconds: number): AbortSignal;
+  any(signals: AbortSignal[]): AbortSignal;
+};
+
+interface AbortController {
+  readonly signal: AbortSignal;
+  abort(reason?: unknown): void;
+}
+declare var AbortController: { new (): AbortController; prototype: AbortController };
+
+// === Timers ===
+
+declare function setTimeout(handler: (...args: unknown[]) => void, timeout?: number, ...args: unknown[]): unknown;
+declare function clearTimeout(handle: unknown): void;
+declare function setInterval(handler: (...args: unknown[]) => void, timeout?: number, ...args: unknown[]): unknown;
+declare function clearInterval(handle: unknown): void;
+declare function setImmediate(handler: (...args: unknown[]) => void, ...args: unknown[]): unknown;
+declare function clearImmediate(handle: unknown): void;
+declare function queueMicrotask(callback: () => void): void;
+
+// === Encoding ===
+
+declare function atob(data: string): string;
+declare function btoa(data: string): string;
+
+interface TextEncoder {
+  readonly encoding: "utf-8";
+  encode(input?: string): Uint8Array;
+  encodeInto(source: string, destination: Uint8Array): { read: number; written: number };
+}
+declare var TextEncoder: { new (): TextEncoder; prototype: TextEncoder };
+
+interface TextDecoder {
+  readonly encoding: string;
+  readonly fatal: boolean;
+  readonly ignoreBOM: boolean;
+  decode(input?: ArrayBuffer | ArrayBufferView, options?: { stream?: boolean }): string;
+}
+declare var TextDecoder: {
+  new (label?: string, options?: { fatal?: boolean; ignoreBOM?: boolean }): TextDecoder;
+  prototype: TextDecoder;
+};
+
+declare function structuredClone<T>(value: T, options?: { transfer?: unknown[] }): T;
+
+// === Crypto (Web) ===
+
+interface SubtleCrypto {
+  digest(algorithm: string | { name: string }, data: ArrayBuffer | ArrayBufferView): Promise<ArrayBuffer>;
+  encrypt(algorithm: unknown, key: unknown, data: ArrayBuffer | ArrayBufferView): Promise<ArrayBuffer>;
+  decrypt(algorithm: unknown, key: unknown, data: ArrayBuffer | ArrayBufferView): Promise<ArrayBuffer>;
+  sign(algorithm: unknown, key: unknown, data: ArrayBuffer | ArrayBufferView): Promise<ArrayBuffer>;
+  verify(algorithm: unknown, key: unknown, signature: ArrayBuffer | ArrayBufferView, data: ArrayBuffer | ArrayBufferView): Promise<boolean>;
+  importKey(format: string, keyData: unknown, algorithm: unknown, extractable: boolean, keyUsages: string[]): Promise<unknown>;
+  exportKey(format: string, key: unknown): Promise<ArrayBuffer | unknown>;
+  generateKey(algorithm: unknown, extractable: boolean, keyUsages: string[]): Promise<unknown>;
+  deriveBits(algorithm: unknown, baseKey: unknown, length: number): Promise<ArrayBuffer>;
+  deriveKey(algorithm: unknown, baseKey: unknown, derivedKeyType: unknown, extractable: boolean, keyUsages: string[]): Promise<unknown>;
+}
+
+interface Crypto {
+  readonly subtle: SubtleCrypto;
+  randomUUID(): string;
+  getRandomValues<T extends ArrayBufferView | null>(array: T): T;
+}
+declare var crypto: Crypto;
+
+// === Node-compat surface ===
+// Bun exposes these via its Node compatibility layer; scripts can rely on them.
+// We type process.env as a string-or-undefined record — most env keys are
+// stripped by the executor before user code runs, so callers should not assume
+// any specific keys exist.
+
+interface ProcessEnv {
+  [key: string]: string | undefined;
+}
+interface Process {
+  env: ProcessEnv;
+  platform: string;
+  arch: string;
+  version: string;
+  cwd(): string;
+  hrtime(time?: [number, number]): [number, number];
+}
+declare var process: Process;
+
+interface Buffer extends Uint8Array {
+  toString(encoding?: string, start?: number, end?: number): string;
+  write(text: string, encoding?: string): number;
+  toJSON(): { type: "Buffer"; data: number[] };
+  equals(other: Uint8Array): boolean;
+  compare(other: Uint8Array): number;
+  slice(start?: number, end?: number): Buffer;
+  subarray(start?: number, end?: number): Buffer;
+}
+declare var Buffer: {
+  new (size: number): Buffer;
+  prototype: Buffer;
+  from(input: string | ArrayBuffer | ArrayBufferView | number[], encoding?: string): Buffer;
+  alloc(size: number, fill?: string | number | Buffer, encoding?: string): Buffer;
+  allocUnsafe(size: number): Buffer;
+  concat(list: ReadonlyArray<Uint8Array>, totalLength?: number): Buffer;
+  isBuffer(obj: unknown): boolean;
+  byteLength(string: string | ArrayBufferView, encoding?: string): number;
+};
+
+// globalThis tweak: TS infers an object-typed globalThis from lib.es5, which
+// rejects assignments like \`globalThis.x = 1\`. Mirror lib.dom by allowing
+// arbitrary index access — the runtime permits it.
+interface Window {
+  [key: string]: unknown;
+}
+`;
+
+const USER_FILE = "/virtual/user-script.ts";
+const CHECK_FILE = "/virtual/check.ts";
+const SDK_FILE = "/virtual/swarm-sdk.d.ts";
+const STDLIB_FILE = "/virtual/stdlib.d.ts";
+const RUNTIME_GLOBALS_FILE = "/virtual/runtime-globals.d.ts";
+
+/**
+ * Directory whose `node_modules` holds the type declarations for the bare
+ * imports on the script allowlist (today just `zod`).
+ *
+ * In dev this is the repo root — `node_modules/zod` exists, resolution just
+ * works. In the `bun build --compile` binary `node_modules` is NOT shipped, so
+ * the Dockerfile stages the zod declaration files under `SCRIPT_TYPES_DIR`
+ * (mirroring how `TS_LIB_DIR` stages the TypeScript libs). When that env var is
+ * set, resolve bare imports from there instead.
+ */
+function scriptTypesBase(): string {
+  const dir = process.env.SCRIPT_TYPES_DIR;
+  if (dir) return `${dir}/index.ts`;
+  return fileURLToPath(new URL("../../index.ts", import.meta.url));
+}
+
+function createCompilerHost(
+  files: Map<string, string>,
+  options: ts.CompilerOptions,
+): ts.CompilerHost {
+  const host = ts.createCompilerHost(options, true);
+  const originalGetSourceFile = host.getSourceFile.bind(host);
+
+  host.getSourceFile = (fileName, languageVersion, onError, shouldCreateNewSourceFile) => {
+    const normalized = fileName.replace(/\\/g, "/");
+    const source = files.get(normalized);
+    if (source !== undefined) {
+      return ts.createSourceFile(normalized, source, languageVersion, true, ts.ScriptKind.TS);
+    }
+    return originalGetSourceFile(fileName, languageVersion, onError, shouldCreateNewSourceFile);
+  };
+
+  host.fileExists = (fileName) => {
+    const normalized = fileName.replace(/\\/g, "/");
+    return files.has(normalized) || ts.sys.fileExists(fileName);
+  };
+
+  host.readFile = (fileName) => {
+    const normalized = fileName.replace(/\\/g, "/");
+    return files.get(normalized) ?? ts.sys.readFile(fileName);
+  };
+
+  // Resolve external packages (e.g. "zod") from a real on-disk base rather than
+  // the virtual path "/virtual/..." so TypeScript can find a real node_modules.
+  const projectBase = scriptTypesBase();
+
+  host.resolveModuleNames = (moduleNames, containingFile) =>
+    moduleNames.map((moduleName) => {
+      if (moduleName === "./user-script") {
+        return { resolvedFileName: USER_FILE, extension: ts.Extension.Ts };
+      }
+      if (moduleName === "swarm-sdk") {
+        return { resolvedFileName: SDK_FILE, extension: ts.Extension.Dts };
+      }
+      if (moduleName === "stdlib") {
+        return { resolvedFileName: STDLIB_FILE, extension: ts.Extension.Dts };
+      }
+      // For external packages, resolve from project root so node_modules is found
+      const base = containingFile.startsWith("/virtual/") ? projectBase : containingFile;
+      return ts.resolveModuleName(moduleName, base, options, host).resolvedModule;
+    });
+
+  // In compiled binary mode, TypeScript's lib .d.ts files live alongside
+  // typescript.js in /$bunfs/ — but .d.ts files are not embedded in the binary.
+  // Redirect lib lookups to TS_LIB_DIR where the Dockerfile copies real copies.
+  const tsLibDir = process.env.TS_LIB_DIR;
+  if (tsLibDir) {
+    host.getDefaultLibLocation = () => tsLibDir;
+  }
+
+  return host;
+}
+
+function flattenMessage(messageText: string | ts.DiagnosticMessageChain): string {
+  return ts.flattenDiagnosticMessageText(messageText, "\n");
+}
+
+function diagnosticSeverity(diag: ts.Diagnostic): ScriptDiagnostic["severity"] {
+  switch (diag.category) {
+    case ts.DiagnosticCategory.Error:
+      return "error";
+    case ts.DiagnosticCategory.Warning:
+      return "warning";
+    case ts.DiagnosticCategory.Suggestion:
+      return "suggestion";
+    default:
+      return "message";
+  }
+}
+
+function extractIdentifier(diag: ts.Diagnostic): string | undefined {
+  if (!diag.file || diag.start === undefined) return undefined;
+  const text = diag.file.text;
+  const len = diag.length ?? 0;
+  if (len === 0) return undefined;
+  const slice = text.slice(diag.start, diag.start + len);
+  // Heuristic: only return the identifier when the underlined span looks like
+  // a plain identifier (no whitespace, no punctuation past the first token).
+  if (/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(slice)) return slice;
+  return undefined;
+}
+
+function extractSuggestion(message: string): string | undefined {
+  // The TypeScript compiler embeds suggestions like "Did you mean 'foo'?" in
+  // diagnostic messages. Surface that fragment so clients can render it.
+  const match = message.match(/Did you mean ['"]([^'"]+)['"]\?/);
+  return match?.[1];
+}
+
+function toStructured(diag: ts.Diagnostic): ScriptDiagnostic {
+  const message = flattenMessage(diag.messageText);
+  const file = diag.file?.fileName.replace(/\\/g, "/") ?? "<unknown>";
+  let line = 0;
+  let column = 0;
+  let endLine: number | undefined;
+  let endColumn: number | undefined;
+  if (diag.file && diag.start !== undefined) {
+    const { line: l, character: c } = diag.file.getLineAndCharacterOfPosition(diag.start);
+    line = l + 1;
+    column = c + 1;
+    if (diag.length) {
+      const end = diag.file.getLineAndCharacterOfPosition(diag.start + diag.length);
+      endLine = end.line + 1;
+      endColumn = end.character + 1;
+    }
+  }
+  return {
+    severity: diagnosticSeverity(diag),
+    code: diag.code,
+    message,
+    file,
+    line,
+    column,
+    endLine,
+    endColumn,
+    identifier: extractIdentifier(diag),
+    suggestion: extractSuggestion(message),
+  };
+}
+
+export async function typecheckScript(
+  source: string,
+  context: ScriptTypeContext = {},
+): Promise<ScriptTypecheckResult> {
+  const options: ts.CompilerOptions = {
+    allowImportingTsExtensions: true,
+    lib: ["lib.es2022.d.ts"],
+    module: ts.ModuleKind.ESNext,
+    moduleResolution: ts.ModuleResolutionKind.Bundler,
+    noEmit: true,
+    skipLibCheck: true,
+    strict: true,
+    target: ts.ScriptTarget.ES2022,
+    types: [],
+  };
+
+  const apiTypes = getScriptApiTypes(context);
+  const mcpTypes = getScriptMcpTypes(context);
+  const appTypes = await getScriptAppTypes(context);
+  const sdkTypes = await scriptSdkTypesWithGeneratedApis(apiTypes, mcpTypes, appTypes);
+  const stdlibTypes = appTypes
+    ? await scriptStdlibTypesWithGeneratedApis(apiTypes, mcpTypes, appTypes)
+    : SCRIPT_STDLIB_TYPES;
+  const files = new Map<string, string>([
+    [USER_FILE, source],
+    [SDK_FILE, sdkTypes],
+    [STDLIB_FILE, stdlibTypes],
+    [RUNTIME_GLOBALS_FILE, SCRIPT_RUNTIME_GLOBALS],
+    [
+      CHECK_FILE,
+      `/// <reference path="./runtime-globals.d.ts" />
+import run from "./user-script";
+import type { ScriptMain } from "swarm-sdk";
+const _scriptMain: ScriptMain = run;
+void _scriptMain;
+`,
+    ],
+  ]);
+
+  const host = createCompilerHost(files, options);
+  const program = ts.createProgram(
+    [USER_FILE, CHECK_FILE, SDK_FILE, STDLIB_FILE, RUNTIME_GLOBALS_FILE],
+    options,
+    host,
+  );
+  const diagnostics = [
+    ...program.getSyntacticDiagnostics(),
+    ...program.getSemanticDiagnostics(),
+  ].filter((diagnostic) => {
+    const fileName = diagnostic.file?.fileName.replace(/\\/g, "/");
+    return fileName === USER_FILE || fileName === CHECK_FILE;
+  });
+
+  if (diagnostics.length === 0) return { ok: true };
+
+  const formatHost: ts.FormatDiagnosticsHost = {
+    getCanonicalFileName: (fileName) => fileName,
+    getCurrentDirectory: () => "/virtual",
+    getNewLine: () => "\n",
+  };
+
+  return {
+    ok: false,
+    diagnostics: diagnostics.map((diagnostic) =>
+      ts.formatDiagnosticsWithColorAndContext([diagnostic], formatHost).trimEnd(),
+    ),
+    structured: diagnostics.map(toStructured),
+  };
+}

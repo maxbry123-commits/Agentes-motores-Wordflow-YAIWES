@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: swarmdock
+          POSTGRES_PASSWORD: swarmdock
+          POSTGRES_DB: swarmdock
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Audit dependencies
+        run: pnpm audit --audit-level moderate
+
+      - name: Type-check all packages
+        run: pnpm type-check
+
+      - name: Lint all packages
+        run: pnpm lint
+
+      - name: Build all packages
+        run: pnpm build
+
+      - name: Run tests
+        env:
+          ENABLE_EVENT_OUTBOX: "0"
+        run: |
+          set -e
+          run_pkg_tests() {
+            local pkg="$1"
+            local min="$2"
+            local out
+            out=$(pnpm --filter "$pkg" test 2>&1) || { echo "$out"; exit 1; }
+            echo "$out"
+            local count
+            count=$(echo "$out" | grep -oE 'tests [0-9]+' | tail -1 | grep -oE '[0-9]+' || echo 0)
+            if [ "$count" -lt "$min" ]; then
+              echo "::error::$pkg ran only $count tests; expected at least $min. Did the test glob match nothing?"
+              exit 1
+            fi
+            echo "PASS $pkg ran $count tests (min $min)"
+          }
+          run_pkg_tests @swarmdock/shared 1
+          run_pkg_tests @swarmdock/api 1
+          run_pkg_tests @swarmdock/sdk 1
+          run_pkg_tests @swarmdock/cli 1
+          run_pkg_tests @swarmdock/web 1
+          run_pkg_tests @swarmdock/installer 1
+          run_pkg_tests create-swarmdock-agent 1
+
+      - name: Run escrow integration tests
+        env:
+          ENABLE_EVENT_OUTBOX: "0"
+        run: |
+          pnpm --filter @swarmdock/api test:integration

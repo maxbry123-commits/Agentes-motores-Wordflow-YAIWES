@@ -1,0 +1,270 @@
+name: Adapter conformance canary
+
+# Nightly canary matrix over the primary agent CLIs (refs #2368).
+#
+# The adapter-contract-drift workflow validates contracts against the
+# upstream versions its matrix installs, per run, in isolation. This
+# canary adds the run-over-run memory that turns probes into findings:
+#
+#   1. `scripts/adapter_canary.py` probes every primary adapter (latest
+#      released upstream version the runner could install, one pinned
+#      tiny goal, cheapest usable models) via the same in-process
+#      conformance check operators get from `bernstein adapters check`.
+#   2. Every probe seals a content-addressed receipt (uploaded as an
+#      artifact) -- the canary's outputs are verifiable records, not
+#      just CI log lines.
+#   3. Regressions must repeat: the state file (persisted via
+#      actions/cache) enforces a two-consecutive-failure threshold and
+#      a per-fingerprint dedupe before any issue is opened, so one
+#      upstream flake never pages anyone and the same regression never
+#      opens two issues. The opened issue carries the failing
+#      conformance transcript and the receipt hash.
+#   4. On green results the per-adapter last-green projection
+#      (src/bernstein/adapters/last_green.json + the table in
+#      docs/adapters/conformance-canary.md) is regenerated and proposed
+#      as a PR; `bernstein doctor` reads the packaged projection to warn
+#      when a locally installed agent version is ahead of last-green.
+#
+# ADVISORY, NOT REQUIRED: this workflow is not in the CI gate and never
+# blocks a PR merge.
+
+on:
+  schedule:
+    # 04:53 UTC daily. Off-peak and off-pattern from the 05:41 real-run
+    # canary and the 06:00/14:00/22:00 contract drift runs so the
+    # scheduled jobs do not contend for runners.
+    - cron: '53 4 * * *'
+  workflow_dispatch: {}
+
+concurrency:
+  group: adapter-conformance-canary
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  canary:
+    name: Canary matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write        # push the last-green regeneration branch
+      pull-requests: write   # open the last-green PR
+      issues: write          # open threshold-crossing regression issues
+    steps:
+      - name: Harden runner (audit mode)
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      # persist-credentials kept: this job pushes the last-green
+      # regeneration branch when the projection changed.
+      #
+      # The persisted credential is the same token the PR step uses, so the
+      # branch push and the pull request carry one identity. A push made with
+      # GITHUB_TOKEN emits no `pull_request: synchronize`, so a later nightly
+      # force-push onto an already-open PR would leave its checks stale even
+      # if the PR itself had been opened under a triggering token.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7  # zizmor: ignore[artipacked]
+        with:
+          token: ${{ secrets.BERNSTEIN_AUTOSYNC_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "24"
+
+      - name: Set up uv
+        uses: ./.github/actions/bootstrap
+        with:
+          python-version: '3.13'
+
+      - name: Install project deps
+        run: |
+          uv sync --group dev
+
+      - name: Install upstream CLIs (latest released, best effort)
+        # The canary intentionally tracks the *latest released* upstream
+        # versions: catching a fresh release breaking an adapter contract
+        # is the entire point. Install specs come from the contract
+        # fixtures (the pinning surface); CLIs without an auto-install
+        # method (e.g. the closed-source agy installer) are skipped and
+        # probe as "skip" rather than failing the run.
+        run: |
+          set -euo pipefail
+          uv run python - <<'PY'
+          import subprocess
+          from pathlib import Path
+
+          import yaml
+
+          from bernstein.adapters.canary import CANARY_MATRIX
+
+          for target in CANARY_MATRIX:
+              contract = Path("tests/contract/contracts") / f"{target.adapter}.yaml"
+              if not contract.exists():
+                  continue
+              data = yaml.safe_load(contract.read_text(encoding="utf-8")) or {}
+              install = data.get("install") or {}
+              method, spec = install.get("method", ""), install.get("spec", "")
+              if method == "npm" and spec:
+                  print(f"::group::npm install -g {spec}")
+                  rc = subprocess.run(["npm", "install", "-g", spec], check=False).returncode
+                  print(f"::endgroup::")
+                  if rc != 0:
+                      print(f"::warning::install failed for {target.adapter} ({spec}); will probe as skip")
+              elif method in {"pipx", "pip", "uv"} and spec:
+                  # pip / uv / pipx all resolve to the same PyPI distribution;
+                  # `uv tool install` is the one runner-side installer that
+                  # puts the console script on PATH for every one of them.
+                  # An `install.python` pin in the contract selects the
+                  # interpreter: an unpinned install can resolve to a
+                  # runtime the CLI crashes under, which probes as a
+                  # chronic skip rather than an install failure (#3719).
+                  cmd = ["uv", "tool", "install", spec]
+                  pin = install.get("python", "")
+                  if pin:
+                      cmd[3:3] = ["--python", str(pin)]
+                  print(f"::group::{' '.join(cmd)}")
+                  rc = subprocess.run(cmd, check=False).returncode
+                  print(f"::endgroup::")
+                  if rc != 0:
+                      print(f"::warning::install failed for {target.adapter} ({spec}); will probe as skip")
+              else:
+                  print(f"::notice::{target.adapter}: no auto-install method; probing whatever is on PATH")
+          PY
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Restore canary state (consecutive-failure threshold)
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .sdd/runtime/adapter-canary/state.json
+          key: adapter-canary-state-${{ github.run_id }}
+          restore-keys: |
+            adapter-canary-state-
+
+      - name: Run canary matrix
+        id: canary
+        run: |
+          set -euo pipefail
+          set +e
+          uv run python scripts/adapter_canary.py --update-docs \
+            --out-dir .sdd/runtime/adapter-canary
+          rc=$?
+          set -e
+          # rc=1 means at least one adapter failed conformance; the issue
+          # payloads (already threshold-gated and deduped) drive paging.
+          # The workflow itself stays red only on checker errors.
+          if [ "$rc" -gt 1 ]; then
+            echo "::error::adapter_canary.py exited $rc (checker error)"
+            exit "$rc"
+          fi
+          echo "regressions=$rc" >> "$GITHUB_OUTPUT"
+
+      - name: Save canary state
+        if: always()
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .sdd/runtime/adapter-canary/state.json
+          key: adapter-canary-state-${{ github.run_id }}
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: adapter-canary-receipts
+          path: .sdd/runtime/adapter-canary/receipts/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Open threshold-crossing regression issues
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          PAYLOAD=.sdd/runtime/adapter-canary/issues_to_open.json
+          COUNT=$(jq 'length' "$PAYLOAD")
+          for i in $(seq 0 $((COUNT - 1))); do
+            TITLE=$(jq -r ".[$i].title" "$PAYLOAD")
+            BODY=$(jq -r ".[$i].body" "$PAYLOAD")
+            # Second dedupe layer on top of the state-file fingerprint:
+            # never open a second issue with an identical open title.
+            EXISTING=$(gh issue list \
+              --repo "${{ github.repository }}" \
+              --search "in:title \"$TITLE\"" \
+              --state open \
+              --json number \
+              --jq '.[0].number // ""')
+            if [ -n "$EXISTING" ]; then
+              echo "::notice::open issue #$EXISTING already tracks: $TITLE"
+              continue
+            fi
+            gh issue create \
+              --repo "${{ github.repository }}" \
+              --title "$TITLE" \
+              --label "ci,bot" \
+              --body "$BODY
+
+          Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          done
+
+      - name: Verify last-green projects the receipts
+        # Must stay after `Run canary matrix` (and `--update-docs`) because it
+        # re-reads the receipts off disk in a fresh process and re-derives the
+        # projection against the freshly updated working tree (#3940).
+        # Placed after regression issue opening so a projection mismatch does
+        # not suppress threshold-crossing regression issue creation.
+        run: |
+          set -euo pipefail
+          uv run python scripts/adapter_canary.py --verify-projection \
+            --out-dir .sdd/runtime/adapter-canary
+
+      - name: Propose last-green regeneration PR
+        env:
+          # A PR created with GITHUB_TOKEN does not trigger workflows: the
+          # `CI gate` required context never reports, branch protection
+          # holds it at BLOCKED while the rollup reads SUCCESS, and an
+          # operator has to close it. This lane regenerates the packaged
+          # last-green projection, so a PR that can never merge means the
+          # shipped projection goes stale while the canary keeps reporting
+          # that it ran. The GITHUB_TOKEN fallback keeps forks and
+          # secret-less environments working; see docs/operations/ci.md.
+          GH_TOKEN: ${{ secrets.BERNSTEIN_AUTOSYNC_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- src/bernstein/adapters/last_green.json docs/adapters/conformance-canary.md; then
+            echo "last-green projection unchanged; nothing to propose"
+            exit 0
+          fi
+          git config user.email "canary@users.noreply.github.com"
+          git config user.name "Bernstein Canary"
+          BRANCH=bot/adapter-canary-last-green
+          # Rebuild the branch on origin/main as fetched *now*, not on the
+          # workflow checkout: the checkout predates the matrix run, and a
+          # night that regenerates nothing exits before pushing, so the
+          # long-lived branch drifts behind main and anything merged in that
+          # window reads as a revert in the proposal (#4496). The script also
+          # asserts the staged set against the merge base and fails on a
+          # stray path rather than dropping it.
+          uv run python scripts/canary_propose_branch.py \
+            --branch "$BRANCH" \
+            --base-ref main
+          git push --force -u origin "$BRANCH"
+          EXISTING=$(gh pr list \
+            --repo "${{ github.repository }}" \
+            --head "$BRANCH" \
+            --state open \
+            --json number \
+            --jq '.[0].number // ""')
+          if [ -n "$EXISTING" ]; then
+            echo "::notice::last-green PR #$EXISTING already open; branch updated"
+            exit 0
+          fi
+          gh pr create \
+            --repo "${{ github.repository }}" \
+            --base main \
+            --head "$BRANCH" \
+            --title "docs: regenerate adapter last-green table from canary receipts" \
+            --body "Nightly adapter conformance canary regeneration of the per-adapter last-green projection (packaged last_green.json + the docs table). Every row is anchored to the receipt that attested it; receipts for this run are attached to the workflow run as artifacts.
+
+          Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"

@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Agent Handoff 1.5.1 — GitHub-native context handoff for AI coding agents</title>
+  <meta name="description" content="Agent Handoff 1.5.1 is a GitHub-native standard for actionable review corrections, outcome-oriented execution, and durable context handoff between AI coding agents and human maintainers.">
+  <meta name="robots" content="index, follow">
+  <meta property="og:title" content="Agent Handoff 1.5.1">
+  <meta property="og:description" content="GitHub-native context handoff with actionable review correction contracts, outcome-oriented execution, bounded supporting work, and proportionate security work.">
+  <meta property="og:type" content="website">
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0d1117;
+      --panel: #161b22;
+      --text: #f0f6fc;
+      --muted: #8b949e;
+      --line: #30363d;
+      --accent: #58a6ff;
+      --accent-2: #8957e5;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: radial-gradient(circle at 80% 10%, rgba(31,111,235,.25), transparent 32rem), var(--bg); color: var(--text); line-height: 1.6; }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .wrap { max-width: 1120px; margin: 0 auto; padding: 32px 20px 56px; }
+    header { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 72px; }
+    .brand { font-weight: 800; letter-spacing: .02em; }
+    nav { display: flex; gap: 18px; flex-wrap: wrap; font-size: 14px; }
+    .hero { display: grid; grid-template-columns: 1.2fr .8fr; gap: 28px; align-items: center; margin-bottom: 56px; }
+    .badge { display: inline-flex; border: 1px solid var(--line); border-radius: 999px; padding: 6px 12px; color: var(--muted); font-size: 14px; background: rgba(22,27,34,.75); }
+    h1 { font-size: clamp(42px, 7vw, 76px); line-height: 1; margin: 18px 0; }
+    h2 { font-size: 28px; margin: 0 0 14px; }
+    p { margin: 0 0 16px; color: #c9d1d9; }
+    .lead { font-size: 21px; max-width: 760px; }
+    .actions { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 28px; }
+    .button { display: inline-block; border: 1px solid var(--accent); border-radius: 12px; padding: 11px 16px; font-weight: 700; background: rgba(88,166,255,.12); }
+    .button.secondary { border-color: var(--line); background: rgba(22,27,34,.75); color: var(--text); }
+    .card { border: 1px solid var(--line); border-radius: 22px; padding: 24px; background: rgba(22,27,34,.82); box-shadow: 0 20px 80px rgba(0,0,0,.22); }
+    .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; margin: 22px 0 48px; }
+    .steps { display: grid; gap: 10px; margin-top: 14px; }
+    .step { border: 1px solid var(--line); border-radius: 14px; padding: 12px 14px; color: #c9d1d9; background: #0d1117; }
+    code { background: #0d1117; border: 1px solid var(--line); border-radius: 8px; padding: 2px 6px; color: var(--text); }
+    footer { border-top: 1px solid var(--line); margin-top: 56px; padding-top: 24px; color: var(--muted); font-size: 14px; }
+    @media (max-width: 820px) { header, .hero { display: block; } nav { margin-top: 16px; } .grid { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div class="brand">Agent Handoff</div>
+      <nav aria-label="Main navigation">
+        <a href="https://github.com/artyomboyko/Agent_Handoff">GitHub</a>
+        <a href="https://github.com/artyomboyko/Agent_Handoff/blob/main/AGENT_HANDOFF_STANDARD.md">Standard</a>
+        <a href="https://github.com/artyomboyko/Agent_Handoff/blob/main/docs/releases/v1.5.1.md">Release 1.5.1</a>
+        <a href="https://github.com/artyomboyko/Agent_Handoff/tree/main/examples">Examples</a>
+      </nav>
+    </header>
+
+    <main>
+      <section class="hero">
+        <div>
+          <span class="badge">Standard 1.5.1 · GitHub-native · English · GPL-3.0</span>
+          <h1>Context handoff for AI coding agents</h1>
+          <p class="lead">Agent Handoff helps AI agents and humans keep durable project context inside GitHub, Git, and compact repository-tracked memory files.</p>
+          <div class="actions">
+            <a class="button" href="https://github.com/artyomboyko/Agent_Handoff">Open repository</a>
+            <a class="button secondary" href="https://github.com/artyomboyko/Agent_Handoff/blob/main/README.md">Read README</a>
+          </div>
+        </div>
+        <aside class="card" aria-label="Workflow">
+          <h2>Core workflow</h2>
+          <div class="steps">
+            <div class="step">Issue</div>
+            <div class="step">Work Claim</div>
+            <div class="step">Branch + Draft PR</div>
+            <div class="step">Checks + Review</div>
+            <div class="step">Handoff</div>
+          </div>
+        </aside>
+      </section>
+
+      <section class="grid" aria-label="Key benefits">
+        <article class="card"><h2>For humans</h2><p>See who owns work, what changed, what was tested, what remains risky, and where the next contributor should continue.</p></article>
+        <article class="card"><h2>For agents</h2><p>Start from <code>AGENTS.md</code>, claim work in GitHub, ask for required user decisions, open a Draft PR early, keep <code>ai/</code> compact, and leave a short handoff.</p></article>
+        <article class="card"><h2>For repositories</h2><p>Use Issues, PRs, checks, labels, branches, commits, and small durable memory files instead of long chat logs.</p></article>
+      </section>
+
+      <section class="card">
+        <h2>Quick start</h2>
+        <p>Copy this prompt into an AI coding agent:</p>
+        <p><code>Add Agent Handoff to this repository. Use the latest standard from https://github.com/artyomboyko/Agent_Handoff. Inspect the repository first. Record the primary outcome, smallest acceptance proof, and execution envelope before implementation. Keep supporting work minimum sufficient and handle localized reversible fixes plus bounded post-fix verification inside the same work item. Do not create a stage, handoff, completion target, or approval gate for a supporting-tool failure alone. Give every blocking review finding a stable ID and sufficient correction contract while keeping implementation guidance non-binding for equivalent safe solutions. Keep agent-reported addressed status separate from reviewer verification. Do not let security or evidence work block acceptance or expand scope without a verified High or Critical current-scope risk or an exactly cited mandatory requirement. Keep other risks non-blocking and preserve the existing security baseline. Ask me a separate explicit question about Docker and Docker Compose organization before changing container files or paths.</code></p>
+      </section>
+    </main>
+
+    <footer><p>Agent Handoff is maintained as an open GitHub-native standard for AI-assisted development workflows.</p></footer>
+  </div>
+</body>
+</html>

@@ -1,0 +1,289 @@
+import fs from 'fs'
+import os from 'os'
+import path from 'path'
+import { spawn } from 'child_process'
+import type { StreamChatOptions } from './index'
+import { log } from '../server/logger'
+import { loadRuntimeSettings } from '@/lib/server/runtime/runtime-settings'
+import { resolveCliBinary, buildCliEnv, probeCliAuth, attachAbortHandler, symlinkConfigFiles, isStderrNoise } from './cli-utils'
+import { getAgent } from '@/lib/server/agents/agent-repository'
+import { loadMcpServers } from '@/lib/server/storage'
+
+/**
+ * GitHub Copilot CLI provider — spawns `copilot -p <message> --output-format=json -s --yolo`.
+ * Tracks `session.copilotSessionId` from streamed JSON events to support multi-turn continuity.
+ */
+export function streamCopilotCliChat({ session, message, imagePath, systemPrompt, write, active, signal }: StreamChatOptions): Promise<string> {
+  const processTimeoutMs = loadRuntimeSettings().cliProcessTimeoutMs
+  const binary = resolveCliBinary('copilot')
+  if (!binary) {
+    const msg = 'Copilot CLI not found. Install it (brew install copilot-cli, npm i -g @github/copilot, or https://gh.io/copilot-install) and ensure it is on your PATH.'
+    write(`data: ${JSON.stringify({ t: 'err', text: msg })}\n\n`)
+    return Promise.resolve('')
+  }
+
+  const env = buildCliEnv()
+
+  // Pass GitHub token if available via session API key
+  if (session.apiKey) {
+    env.GH_TOKEN = session.apiKey
+  }
+
+  // Auth probe
+  if (!session.apiKey) {
+    const auth = probeCliAuth(binary, 'copilot', env, session.cwd)
+    if (!auth.authenticated) {
+      log.error('copilot-cli', auth.errorMessage || 'Auth failed')
+      write(`data: ${JSON.stringify({ t: 'err', text: auth.errorMessage || 'Copilot CLI is not authenticated.' })}\n\n`)
+      return Promise.resolve('')
+    }
+  }
+
+  // Build prompt with optional system instructions
+  const promptParts: string[] = []
+  if (imagePath) {
+    promptParts.push(`[The user has shared an image at: ${imagePath}]`)
+  }
+  promptParts.push(message)
+  const prompt = promptParts.join('\n\n')
+
+  const args = ['-p', prompt, '--output-format=json', '-s', '--yolo']
+  if (session.copilotSessionId) args.push(`--resume=${session.copilotSessionId}`)
+  if (session.model) args.push('--model', session.model)
+
+  // System prompt: write temp AGENTS.override.md in a temp config dir
+  // Symlink auth files from the real config dir so auth still works
+  let tempCopilotHome: string | null = null
+  if (systemPrompt && !session.copilotSessionId) {
+    const realCopilotHome = process.env.COPILOT_HOME || path.join(os.homedir(), '.copilot')
+    tempCopilotHome = path.join(os.tmpdir(), `swarmclaw-copilot-${session.id}`)
+    fs.mkdirSync(tempCopilotHome, { recursive: true })
+
+    // Symlink auth/config files from real home into temp dir
+    symlinkConfigFiles(realCopilotHome, tempCopilotHome)
+
+    // Write system prompt as AGENTS.override.md
+    fs.writeFileSync(path.join(tempCopilotHome, 'AGENTS.override.md'), systemPrompt)
+    env.COPILOT_HOME = tempCopilotHome
+  }
+
+  // Inject agent-assigned MCP servers via --additional-mcp-config flag
+  let mcpAdditionalConfigPath: string | null = null
+  try {
+    const agentForMcp = session.agentId ? getAgent(session.agentId as string) : null
+    const agentMcpServerIds: string[] = agentForMcp?.mcpServerIds || []
+    if (agentMcpServerIds.length > 0) {
+      const allMcpServers = loadMcpServers()
+      const mcpServerEntries: Record<string, Record<string, unknown>> = {}
+      for (const serverId of agentMcpServerIds) {
+        const config = allMcpServers[serverId]
+        if (!config) continue
+        const name = config.name.replace(/[^a-zA-Z0-9_-]/g, '-')
+        if (config.transport === 'stdio' && config.command) {
+          mcpServerEntries[name] = {
+            command: config.command,
+            args: config.args || [],
+            ...(config.env && Object.keys(config.env).length > 0 ? { env: config.env } : {}),
+            ...(config.cwd ? { cwd: config.cwd } : {}),
+          }
+        } else if ((config.transport === 'sse' || config.transport === 'streamable-http') && config.url) {
+          mcpServerEntries[name] = {
+            type: config.transport,
+            url: config.url,
+            ...(config.headers && Object.keys(config.headers).length > 0 ? { headers: config.headers } : {}),
+          }
+        }
+      }
+      if (Object.keys(mcpServerEntries).length > 0) {
+        mcpAdditionalConfigPath = path.join(os.tmpdir(), `swarmclaw-copilot-mcp-${session.id}.json`)
+        fs.writeFileSync(mcpAdditionalConfigPath, JSON.stringify({ mcpServers: mcpServerEntries }))
+        args.push('--additional-mcp-config', `@${mcpAdditionalConfigPath}`)
+        log.info('copilot-cli', `Injecting ${Object.keys(mcpServerEntries).length} MCP server(s)`)
+      }
+    }
+  } catch (mcpErr) {
+    log.warn('copilot-cli', `Failed to build MCP config: ${mcpErr}`)
+  }
+
+  log.info('copilot-cli', `Spawning: ${binary}`, {
+    args: args.map((a) => a.length > 100 ? a.slice(0, 100) + '...' : a),
+    cwd: session.cwd,
+    promptLen: prompt.length,
+    hasSystemPrompt: !!systemPrompt,
+    resumeSessionId: session.copilotSessionId || null,
+  })
+
+  const proc = spawn(binary, args, {
+    cwd: session.cwd,
+    env,
+    stdio: ['ignore', 'pipe', 'pipe'],
+    timeout: processTimeoutMs,
+  })
+
+  log.info('copilot-cli', `Process spawned: pid=${proc.pid}`)
+  active.set(session.id, proc)
+  attachAbortHandler(proc, signal)
+
+  let fullResponse = ''
+  let buf = ''
+  let eventCount = 0
+  let stderrText = ''
+
+  proc.stdout!.on('data', (chunk: Buffer) => {
+    const raw = chunk.toString()
+    buf += raw
+
+    if (eventCount === 0) {
+      log.debug('copilot-cli', `First stdout chunk (${raw.length} bytes)`, raw.slice(0, 500))
+    }
+
+    const lines = buf.split('\n')
+    buf = lines.pop()!
+
+    for (const line of lines) {
+      if (!line.trim()) continue
+      try {
+        const ev = JSON.parse(line) as Record<string, unknown>
+        eventCount++
+
+        const data = ev.data as Record<string, unknown> | undefined
+
+        // Capture session ID — legacy 'init' event or modern 'result' event
+        if (ev.type === 'init' && typeof ev.session_id === 'string') {
+          session.copilotSessionId = ev.session_id
+          log.info('copilot-cli', `Got session_id (init): ${ev.session_id}`)
+        } else if (ev.type === 'result' && typeof ev.sessionId === 'string') {
+          session.copilotSessionId = ev.sessionId
+          log.info('copilot-cli', `Got session_id (result): ${ev.sessionId}`)
+        }
+
+        // Modern format: streaming delta — assistant.message_delta { data: { deltaContent } }
+        if (ev.type === 'assistant.message_delta' && typeof data?.deltaContent === 'string') {
+          fullResponse += data.deltaContent
+          write(`data: ${JSON.stringify({ t: 'd', text: data.deltaContent })}\n\n`)
+        }
+
+        // Modern format: full assistant message — assistant.message { data: { content } }
+        else if (ev.type === 'assistant.message' && typeof data?.content === 'string') {
+          // Only emit as final result if we haven't been streaming deltas
+          if (!fullResponse) {
+            fullResponse = data.content
+            write(`data: ${JSON.stringify({ t: 'r', text: data.content })}\n\n`)
+          }
+          log.debug('copilot-cli', `Assistant message (${data.content.length} chars)`)
+        }
+
+        // Legacy: streaming text deltas — content_block_delta { delta: { text } }
+        else if (ev.type === 'content_block_delta') {
+          const delta = ev.delta as Record<string, unknown> | undefined
+          if (typeof delta?.text === 'string') {
+            fullResponse += delta.text
+            write(`data: ${JSON.stringify({ t: 'd', text: delta.text })}\n\n`)
+          }
+        }
+
+        // Legacy: agent message chunks (ACP format)
+        else if (ev.type === 'agent_message_chunk' && typeof ev.text === 'string') {
+          fullResponse += ev.text
+          write(`data: ${JSON.stringify({ t: 'd', text: ev.text })}\n\n`)
+        }
+
+        // Legacy: assistant message content
+        else if (ev.type === 'message' && ev.role === 'assistant' && typeof ev.content === 'string') {
+          fullResponse += ev.content
+          write(`data: ${JSON.stringify({ t: 'd', text: ev.content })}\n\n`)
+        }
+
+        // Legacy: completed item with agent_message
+        else if (ev.type === 'item.completed' && (ev.item as Record<string, unknown>)?.type === 'agent_message') {
+          const item = ev.item as Record<string, unknown>
+          if (typeof item.text === 'string') {
+            fullResponse = item.text
+            write(`data: ${JSON.stringify({ t: 'r', text: item.text })}\n\n`)
+            log.debug('copilot-cli', `Agent message (${item.text.length} chars)`)
+          }
+        }
+
+        // Legacy: final result with string result field
+        else if (ev.type === 'result' && typeof ev.result === 'string') {
+          fullResponse = ev.result
+          write(`data: ${JSON.stringify({ t: 'r', text: ev.result })}\n\n`)
+          log.debug('copilot-cli', `Result event (${ev.result.length} chars)`)
+        }
+
+        // Error result
+        else if (ev.type === 'result' && ev.status === 'error') {
+          const errMsg = typeof ev.error === 'string' ? ev.error : 'Copilot error'
+          write(`data: ${JSON.stringify({ t: 'err', text: errMsg })}\n\n`)
+          log.warn('copilot-cli', `Error result: ${errMsg}`)
+        }
+
+        // Event error
+        else if (ev.type === 'error') {
+          const errMsg = typeof ev.message === 'string'
+            ? ev.message
+            : typeof ev.error === 'string'
+              ? ev.error
+              : 'Unknown Copilot error'
+          write(`data: ${JSON.stringify({ t: 'err', text: errMsg })}\n\n`)
+          log.warn('copilot-cli', `Event error: ${errMsg}`)
+        }
+
+        else if (eventCount <= 10) {
+          log.debug('copilot-cli', `Event: ${String(ev.type)}`)
+        }
+      } catch {
+        if (line.trim()) {
+          log.debug('copilot-cli', `Non-JSON stdout line`, line.slice(0, 300))
+          fullResponse += line + '\n'
+          write(`data: ${JSON.stringify({ t: 'd', text: line + '\n' })}\n\n`)
+        }
+      }
+    }
+  })
+
+  proc.stderr!.on('data', (chunk: Buffer) => {
+    const text = chunk.toString()
+    stderrText += text
+    if (stderrText.length > 16_000) stderrText = stderrText.slice(-16_000)
+    if (isStderrNoise(text)) {
+      log.debug('copilot-cli', `stderr noise [${session.id}]`, text.slice(0, 500))
+    } else {
+      log.warn('copilot-cli', `stderr [${session.id}]`, text.slice(0, 500))
+    }
+  })
+
+  return new Promise((resolve) => {
+    proc.on('close', (code, sig) => {
+      log.info('copilot-cli', `Process closed: code=${code} signal=${sig} events=${eventCount} response=${fullResponse.length}chars`)
+      active.delete(session.id)
+      // Clean up temp config dir
+      if (tempCopilotHome) {
+        try { fs.rmSync(tempCopilotHome, { recursive: true }) } catch { /* ignore */ }
+      }
+      if (mcpAdditionalConfigPath) {
+        try { fs.unlinkSync(mcpAdditionalConfigPath) } catch { /* ignore */ }
+      }
+      if ((code ?? 0) !== 0 && !fullResponse.trim()) {
+        const msg = stderrText.trim()
+          ? `Copilot CLI exited with code ${code ?? 'unknown'}${sig ? ` (${sig})` : ''}: ${stderrText.trim().slice(0, 1200)}`
+          : `Copilot CLI exited with code ${code ?? 'unknown'}${sig ? ` (${sig})` : ''} and returned no output.`
+        write(`data: ${JSON.stringify({ t: 'err', text: msg })}\n\n`)
+      }
+      resolve(fullResponse)
+    })
+
+    proc.on('error', (e) => {
+      log.error('copilot-cli', `Process error: ${e.message}`)
+      active.delete(session.id)
+      if (tempCopilotHome) {
+        try { fs.rmSync(tempCopilotHome, { recursive: true }) } catch { /* ignore */ }
+      }
+      if (mcpAdditionalConfigPath) {
+        try { fs.unlinkSync(mcpAdditionalConfigPath) } catch { /* ignore */ }
+      }
+      write(`data: ${JSON.stringify({ t: 'err', text: e.message })}\n\n`)
+      resolve(fullResponse)
+    })
+  })
+}

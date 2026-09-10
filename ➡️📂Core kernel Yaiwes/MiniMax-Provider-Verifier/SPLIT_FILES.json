@@ -1,0 +1,289 @@
+[
+  {
+    "repo": "MiniMax-Provider-Verifier",
+    "path": "sample.jsonl",
+    "chunks_dir": "MiniMax-Provider-Verifier/sample.jsonl.chunks",
+    "bytes": 14098571,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "MiniMax-Provider-Verifier",
+    "path": "m3_format_check/fixtures/video_3840x2160.mp4",
+    "chunks_dir": "MiniMax-Provider-Verifier/m3_format_check/fixtures/video_3840x2160.mp4.chunks",
+    "bytes": 16867785,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "MiniMax-Provider-Verifier",
+    "path": "m3_format_check/fixtures/video_51mb.mp4",
+    "chunks_dir": "MiniMax-Provider-Verifier/m3_format_check/fixtures/video_51mb.mp4.chunks",
+    "bytes": 54523456,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "MiniMax-Provider-Verifier",
+    "path": "m3_format_check/fixtures/image_11mb.png",
+    "chunks_dir": "MiniMax-Provider-Verifier/m3_format_check/fixtures/image_11mb.png.chunks",
+    "bytes": 11655818,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "MiniMax-Provider-Verifier",
+    "path": "m3_format_check/fixtures/image_9mb.png",
+    "chunks_dir": "MiniMax-Provider-Verifier/m3_format_check/fixtures/image_9mb.png.chunks",
+    "bytes": 9639339,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "MiniMax-Provider-Verifier",
+    "path": "m3_format_check/fixtures/video_49mb.mp4",
+    "chunks_dir": "MiniMax-Provider-Verifier/m3_format_check/fixtures/video_49mb.mp4.chunks",
+    "bytes": 49737906,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "MiniMax-Provider-Verifier",
+    "path": "m3_format_check/fixtures/video_1920x1080.mp4",
+    "chunks_dir": "MiniMax-Provider-Verifier/m3_format_check/fixtures/video_1920x1080.mp4.chunks",
+    "bytes": 13944954,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "MiniMax-Provider-Verifier",
+    "path": "m3_format_check/fixtures/image_65mb.png",
+    "chunks_dir": "MiniMax-Provider-Verifier/m3_format_check/fixtures/image_65mb.png.chunks",
+    "bytes": 70212485,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "MiniMax-Provider-Verifier",
+    "path": "m3_format_check/fixtures/m3_test_videos/D_1800s.mp4",
+    "chunks_dir": "MiniMax-Provider-Verifier/m3_format_check/fixtures/m3_test_videos/D_1800s.mp4.chunks",
+    "bytes": 26757327,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "MiniMax-Provider-Verifier",
+    "path": "m3_format_check/fixtures/m3_test_videos/D_600s.mp4",
+    "chunks_dir": "MiniMax-Provider-Verifier/m3_format_check/fixtures/m3_test_videos/D_600s.mp4.chunks",
+    "bytes": 9234993,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "MiniMax-Provider-Verifier",
+    "path": "m3_format_check/fixtures/m3_test_videos/D_1200s.mp4",
+    "chunks_dir": "MiniMax-Provider-Verifier/m3_format_check/fixtures/m3_test_videos/D_1200s.mp4.chunks",
+    "bytes": 19433478,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "MiniMax-Provider-Verifier",
+    "path": "output-dir/MiniMax-M2.7/loop_01/MiniMax-M2.7/MiniMax-M2.7_results.jsonl",
+    "chunks_dir": "MiniMax-Provider-Verifier/output-dir/MiniMax-M2.7/loop_01/MiniMax-M2.7/MiniMax-M2.7_results.jsonl.chunks",
+    "bytes": 13607080,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "MiniMax-Provider-Verifier",
+    "path": "output-dir/MiniMax-M2.7/loop_06/MiniMax-M2.7/MiniMax-M2.7_results.jsonl",
+    "chunks_dir": "MiniMax-Provider-Verifier/output-dir/MiniMax-M2.7/loop_06/MiniMax-M2.7/MiniMax-M2.7_results.jsonl.chunks",
+    "bytes": 13586434,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "MiniMax-Provider-Verifier",
+    "path": "output-dir/MiniMax-M2.7/loop_02/MiniMax-M2.7/MiniMax-M2.7_results.jsonl",
+    "chunks_dir": "MiniMax-Provider-Verifier/output-dir/MiniMax-M2.7/loop_02/MiniMax-M2.7/MiniMax-M2.7_results.jsonl.chunks",
+    "bytes": 13703255,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "MiniMax-Provider-Verifier",
+    "path": "output-dir/MiniMax-M2.7/loop_08/MiniMax-M2.7/MiniMax-M2.7_results.jsonl",
+    "chunks_dir": "MiniMax-Provider-Verifier/output-dir/MiniMax-M2.7/loop_08/MiniMax-M2.7/MiniMax-M2.7_results.jsonl.chunks",
+    "bytes": 13651056,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "MiniMax-Provider-Verifier",
+    "path": "output-dir/MiniMax-M2.7/loop_09/MiniMax-M2.7/MiniMax-M2.7_results.jsonl",
+    "chunks_dir": "MiniMax-Provider-Verifier/output-dir/MiniMax-M2.7/loop_09/MiniMax-M2.7/MiniMax-M2.7_results.jsonl.chunks",
+    "bytes": 13595782,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "MiniMax-Provider-Verifier",
+    "path": "output-dir/MiniMax-M2.7/loop_10/MiniMax-M2.7/MiniMax-M2.7_results.jsonl",
+    "chunks_dir": "MiniMax-Provider-Verifier/output-dir/MiniMax-M2.7/loop_10/MiniMax-M2.7/MiniMax-M2.7_results.jsonl.chunks",
+    "bytes": 13579828,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "MiniMax-Provider-Verifier",
+    "path": "output-dir/MiniMax-M2.7/loop_04/MiniMax-M2.7/MiniMax-M2.7_results.jsonl",
+    "chunks_dir": "MiniMax-Provider-Verifier/output-dir/MiniMax-M2.7/loop_04/MiniMax-M2.7/MiniMax-M2.7_results.jsonl.chunks",
+    "bytes": 13608642,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "MiniMax-Provider-Verifier",
+    "path": "output-dir/MiniMax-M2.7/loop_07/MiniMax-M2.7/MiniMax-M2.7_results.jsonl",
+    "chunks_dir": "MiniMax-Provider-Verifier/output-dir/MiniMax-M2.7/loop_07/MiniMax-M2.7/MiniMax-M2.7_results.jsonl.chunks",
+    "bytes": 13633283,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "MiniMax-Provider-Verifier",
+    "path": "output-dir/MiniMax-M2.7/loop_03/MiniMax-M2.7/MiniMax-M2.7_results.jsonl",
+    "chunks_dir": "MiniMax-Provider-Verifier/output-dir/MiniMax-M2.7/loop_03/MiniMax-M2.7/MiniMax-M2.7_results.jsonl.chunks",
+    "bytes": 13600924,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "MiniMax-Provider-Verifier",
+    "path": "output-dir/MiniMax-M2.7/loop_05/MiniMax-M2.7/MiniMax-M2.7_results.jsonl",
+    "chunks_dir": "MiniMax-Provider-Verifier/output-dir/MiniMax-M2.7/loop_05/MiniMax-M2.7/MiniMax-M2.7_results.jsonl.chunks",
+    "bytes": 13624652,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "MiniMax-Provider-Verifier",
+    "path": "output-dir/MiniMax-M3/loop_01/minimax-m3-official/minimax-m3-official_results.jsonl",
+    "chunks_dir": "MiniMax-Provider-Verifier/output-dir/MiniMax-M3/loop_01/minimax-m3-official/minimax-m3-official_results.jsonl.chunks",
+    "bytes": 13606562,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "MiniMax-Provider-Verifier",
+    "path": "output-dir/MiniMax-M3/loop_06/minimax-m3-official/minimax-m3-official_results.jsonl",
+    "chunks_dir": "MiniMax-Provider-Verifier/output-dir/MiniMax-M3/loop_06/minimax-m3-official/minimax-m3-official_results.jsonl.chunks",
+    "bytes": 13537034,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "MiniMax-Provider-Verifier",
+    "path": "output-dir/MiniMax-M3/loop_02/minimax-m3-official/minimax-m3-official_results.jsonl",
+    "chunks_dir": "MiniMax-Provider-Verifier/output-dir/MiniMax-M3/loop_02/minimax-m3-official/minimax-m3-official_results.jsonl.chunks",
+    "bytes": 13556500,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "MiniMax-Provider-Verifier",
+    "path": "output-dir/MiniMax-M3/loop_08/minimax-m3-official/minimax-m3-official_results.jsonl",
+    "chunks_dir": "MiniMax-Provider-Verifier/output-dir/MiniMax-M3/loop_08/minimax-m3-official/minimax-m3-official_results.jsonl.chunks",
+    "bytes": 13566379,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "MiniMax-Provider-Verifier",
+    "path": "output-dir/MiniMax-M3/loop_09/minimax-m3-official/minimax-m3-official_results.jsonl",
+    "chunks_dir": "MiniMax-Provider-Verifier/output-dir/MiniMax-M3/loop_09/minimax-m3-official/minimax-m3-official_results.jsonl.chunks",
+    "bytes": 13521296,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "MiniMax-Provider-Verifier",
+    "path": "output-dir/MiniMax-M3/loop_10/minimax-m3-official/minimax-m3-official_results.jsonl",
+    "chunks_dir": "MiniMax-Provider-Verifier/output-dir/MiniMax-M3/loop_10/minimax-m3-official/minimax-m3-official_results.jsonl.chunks",
+    "bytes": 13629642,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "MiniMax-Provider-Verifier",
+    "path": "output-dir/MiniMax-M3/loop_04/minimax-m3-official/minimax-m3-official_results.jsonl",
+    "chunks_dir": "MiniMax-Provider-Verifier/output-dir/MiniMax-M3/loop_04/minimax-m3-official/minimax-m3-official_results.jsonl.chunks",
+    "bytes": 13594204,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "MiniMax-Provider-Verifier",
+    "path": "output-dir/MiniMax-M3/loop_07/minimax-m3-official/minimax-m3-official_results.jsonl",
+    "chunks_dir": "MiniMax-Provider-Verifier/output-dir/MiniMax-M3/loop_07/minimax-m3-official/minimax-m3-official_results.jsonl.chunks",
+    "bytes": 13564625,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "MiniMax-Provider-Verifier",
+    "path": "output-dir/MiniMax-M3/loop_03/minimax-m3-official/minimax-m3-official_results.jsonl",
+    "chunks_dir": "MiniMax-Provider-Verifier/output-dir/MiniMax-M3/loop_03/minimax-m3-official/minimax-m3-official_results.jsonl.chunks",
+    "bytes": 13546997,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "MiniMax-Provider-Verifier",
+    "path": "output-dir/MiniMax-M3/loop_05/minimax-m3-official/minimax-m3-official_results.jsonl",
+    "chunks_dir": "MiniMax-Provider-Verifier/output-dir/MiniMax-M3/loop_05/minimax-m3-official/minimax-m3-official_results.jsonl.chunks",
+    "bytes": 13595104,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "MiniMax-Provider-Verifier",
+    "path": "output-dir/MiniMax-M2.5/loop_01/MiniMax-M2.5/MiniMax-M2.5_results.jsonl",
+    "chunks_dir": "MiniMax-Provider-Verifier/output-dir/MiniMax-M2.5/loop_01/MiniMax-M2.5/MiniMax-M2.5_results.jsonl.chunks",
+    "bytes": 13593293,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "MiniMax-Provider-Verifier",
+    "path": "output-dir/MiniMax-M2.5/loop_06/MiniMax-M2.5/MiniMax-M2.5_results.jsonl",
+    "chunks_dir": "MiniMax-Provider-Verifier/output-dir/MiniMax-M2.5/loop_06/MiniMax-M2.5/MiniMax-M2.5_results.jsonl.chunks",
+    "bytes": 13527593,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "MiniMax-Provider-Verifier",
+    "path": "output-dir/MiniMax-M2.5/loop_02/MiniMax-M2.5/MiniMax-M2.5_results.jsonl",
+    "chunks_dir": "MiniMax-Provider-Verifier/output-dir/MiniMax-M2.5/loop_02/MiniMax-M2.5/MiniMax-M2.5_results.jsonl.chunks",
+    "bytes": 13664969,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "MiniMax-Provider-Verifier",
+    "path": "output-dir/MiniMax-M2.5/loop_08/MiniMax-M2.5/MiniMax-M2.5_results.jsonl",
+    "chunks_dir": "MiniMax-Provider-Verifier/output-dir/MiniMax-M2.5/loop_08/MiniMax-M2.5/MiniMax-M2.5_results.jsonl.chunks",
+    "bytes": 13560919,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "MiniMax-Provider-Verifier",
+    "path": "output-dir/MiniMax-M2.5/loop_09/MiniMax-M2.5/MiniMax-M2.5_results.jsonl",
+    "chunks_dir": "MiniMax-Provider-Verifier/output-dir/MiniMax-M2.5/loop_09/MiniMax-M2.5/MiniMax-M2.5_results.jsonl.chunks",
+    "bytes": 13593644,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "MiniMax-Provider-Verifier",
+    "path": "output-dir/MiniMax-M2.5/loop_10/MiniMax-M2.5/MiniMax-M2.5_results.jsonl",
+    "chunks_dir": "MiniMax-Provider-Verifier/output-dir/MiniMax-M2.5/loop_10/MiniMax-M2.5/MiniMax-M2.5_results.jsonl.chunks",
+    "bytes": 13575291,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "MiniMax-Provider-Verifier",
+    "path": "output-dir/MiniMax-M2.5/loop_04/MiniMax-M2.5/MiniMax-M2.5_results.jsonl",
+    "chunks_dir": "MiniMax-Provider-Verifier/output-dir/MiniMax-M2.5/loop_04/MiniMax-M2.5/MiniMax-M2.5_results.jsonl.chunks",
+    "bytes": 13545199,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "MiniMax-Provider-Verifier",
+    "path": "output-dir/MiniMax-M2.5/loop_07/MiniMax-M2.5/MiniMax-M2.5_results.jsonl",
+    "chunks_dir": "MiniMax-Provider-Verifier/output-dir/MiniMax-M2.5/loop_07/MiniMax-M2.5/MiniMax-M2.5_results.jsonl.chunks",
+    "bytes": 13545996,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "MiniMax-Provider-Verifier",
+    "path": "output-dir/MiniMax-M2.5/loop_03/MiniMax-M2.5/MiniMax-M2.5_results.jsonl",
+    "chunks_dir": "MiniMax-Provider-Verifier/output-dir/MiniMax-M2.5/loop_03/MiniMax-M2.5/MiniMax-M2.5_results.jsonl.chunks",
+    "bytes": 13543768,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "MiniMax-Provider-Verifier",
+    "path": "output-dir/MiniMax-M2.5/loop_05/MiniMax-M2.5/MiniMax-M2.5_results.jsonl",
+    "chunks_dir": "MiniMax-Provider-Verifier/output-dir/MiniMax-M2.5/loop_05/MiniMax-M2.5/MiniMax-M2.5_results.jsonl.chunks",
+    "bytes": 13515380,
+    "chunk_bytes": 8388608
+  }
+]

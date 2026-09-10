@@ -1,0 +1,48 @@
+  # matrix — agent Matrix client
+
+  Lets the lab's live agent talk in Matrix rooms on the federation homeserver
+  (`matrix.microserver.network`). Same pattern as the email agent: a listener notifies the
+  live `claude` session, which replies with a one-shot send tool.
+
+  ## Files
+  - `matrix-listen.py` — watches the agent's rooms; on a message addressed to its call-sign,
+    `tmux send-keys` a directive into the live `claude` session. Auto-joins invites. Never
+    replies itself.
+  - `matrix_read.py` — read-the-room tool the live agent runs *before* replying: pulls recent
+    messages as JSON (**sender + body + ts**, oldest first):
+    `python matrix_read.py '<room_id>' [--limit N]`.
+  - `matrix_send.py` — one-shot reply tool the live agent runs:
+    `python matrix_send.py '<room_id>' "<text>"`. To reach a specific peer, put its call-sign
+    in the text — the listener triggers on the name.
+
+  Baked into the vscode image at `/home/coder/matrix/` (`COPY` in the Dockerfile), started at
+  boot by `entrypoint.d/21-matrix-listen.sh`. `matrix-nio` is in `requirements.txt`.
+
+ 
+## --- Agent Matrix ---
+
+```
+  MATRIX_HOMESERVER=https://matrix.microserver.network
+  MATRIX_USER=@microserverNN:microserver.network                    # NN= 01, 02 , 03 , 04 ...Call Sign from microserver.network
+  MATRIX_TOKEN=syt_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx            # minted from matrix.microserver.network (admin API)
+```
+
+  Token is minted from the homeserver admin API (see the homeserver repo's `TOKENS.md`).
+
+  ## Use
+  Invite `@microserverNN:microserver.network` to a room → the listener auto-joins → address the
+  agent by its call-sign → it replies.
+
+
+  ## Co-located node (NAT hairpin)
+  `matrix.microserver.network` resolves publicly to the homeserver's **public IP**. A node on the
+  **same LAN** as the homeserver can't reach that public IP (the router won't hairpin / NAT-loopback),
+  so the connection fails. Fix: map the name to the homeserver's **LAN IP** inside the container —
+  add to the lab's `docker-compose.yaml` (vscode service):
+
+  ```yaml
+  extra_hosts:
+    - "matrix.microserver.network:192.168.1.84"   # LAN IP of the homeserver/edge — bypasses the hairpin
+  ```
+
+  Only co-located nodes need this. **Off-site nodes reach the public IP directly** and must not add it.

@@ -1,0 +1,704 @@
+"""Workflow YAML loader and validator for kaji_harness."""
+
+from __future__ import annotations
+
+import re
+import shlex
+from collections import Counter
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+from .agents import AGENT_CAPABILITIES
+from .errors import WorkflowValidationError
+from .models import CycleDefinition, Step, Workflow
+
+
+def load_workflow(path: Path) -> Workflow:
+    """YAML ファイルからワークフロー定義をロードする。
+
+    Args:
+        path: ワークフロー定義ファイルのパス
+
+    Returns:
+        Workflow: パースされたワークフロー定義
+
+    Raises:
+        WorkflowValidationError: YAML パースエラーまたはバリデーションエラー
+    """
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except yaml.YAMLError as e:
+        raise WorkflowValidationError(f"YAML parse error: {e}") from e
+    return _parse_workflow(data)
+
+
+def load_workflow_from_str(yaml_str: str) -> Workflow:
+    """YAML 文字列からワークフロー定義をロードする。
+
+    Args:
+        yaml_str: ワークフロー定義のYAML文字列
+
+    Returns:
+        Workflow: パースされたワークフロー定義
+
+    Raises:
+        WorkflowValidationError: YAML パースエラーまたはバリデーションエラー
+    """
+    try:
+        data = yaml.safe_load(yaml_str)
+    except yaml.YAMLError as e:
+        raise WorkflowValidationError(f"YAML parse error: {e}") from e
+    return _parse_workflow(data)
+
+
+VALID_EXECUTION_POLICIES = {"auto", "sandbox", "interactive"}
+VALID_REQUIRES_PROVIDER = {"github", "local", "any"}
+
+_STEP_REQUIRED_KEYS = ("id",)
+
+# exec-step が拒否する agent 専用フィールド。exec-step は LLM を呼ばないため
+# これらは無意味であり、同時指定は parse 時に fail-fast する（Issue #205）。
+_EXEC_FORBIDDEN_KEYS = ("agent", "model", "effort", "resume", "max_budget_usd")
+
+# 削除済み step キー → 移行手順。unknown-key 一般の拒否ではなく、過去に受理していた
+# キーだけを named error で止める（ADR 008: fail-fast、互換層なし）。sid 確定直後・
+# skill-exec 排他検証より前で参照する（Issue #310, #383）。
+_REMOVED_STEP_KEYS: dict[str, str] = {
+    "inject_verdict": (
+        "'inject_verdict' was removed from the workflow step schema "
+        "(apokamo/kaji#310, #383); remove the field and use 'resume: <step-id>' "
+        "for same-agent session continuation, or read the prior verdict with "
+        "'kaji issue resolve-verdict <issue-id> --step <step-id>'"
+    ),
+}
+
+VALID_AGENTS: frozenset[str] = frozenset(AGENT_CAPABILITIES)
+
+_AGENT_EFFORT_ALLOWED: dict[str, frozenset[str]] = {
+    agent: capabilities.effort_allowed
+    for agent, capabilities in AGENT_CAPABILITIES.items()
+    if capabilities.effort_allowed is not None
+}
+
+
+def _normalize_exec(value: Any, step_id: str) -> list[str]:
+    """``exec:`` の表層値（str / list）を正規化済み argv（list[str]）へ変換する。
+
+    parse 境界で argv に正規化することで、runner / 各 consumer が str と list の
+    二形態を毎回分岐せずに済む（Issue #205 § Step dataclass の表現）。
+
+    - ``str`` → ``shlex.split``（POSIX）で argv に分解。空なら error。
+    - ``list`` → 全要素が非空 ``str`` であることを検証。空なら error。
+    - それ以外の型 → error。
+
+    Raises:
+        WorkflowValidationError: 空 / 型不正 / 非空 str でない要素を含む場合
+    """
+    if isinstance(value, str):
+        try:
+            argv = shlex.split(value)
+        except ValueError as exc:
+            raise WorkflowValidationError(
+                f"Step '{step_id}' 'exec' could not be parsed as a command: {exc}"
+            ) from exc
+        if not argv:
+            raise WorkflowValidationError(f"Step '{step_id}' 'exec' must not be an empty command")
+        return argv
+    if isinstance(value, list):
+        if not value:
+            raise WorkflowValidationError(f"Step '{step_id}' 'exec' must not be an empty list")
+        for elem in value:
+            if not isinstance(elem, str) or not elem:
+                raise WorkflowValidationError(
+                    f"Step '{step_id}' 'exec' list elements must be non-empty strings, got {elem!r}"
+                )
+        return list(value)
+    raise WorkflowValidationError(
+        f"Step '{step_id}' 'exec' must be a string or a list of strings, got {type(value).__name__}"
+    )
+
+
+def _require_str(value: Any, label: str, context: str) -> str:
+    """表層値が str であることを確定する（verdict 系: 値の妥当性は L2 が検査）。"""
+    if not isinstance(value, str):
+        raise WorkflowValidationError(
+            f"{context} '{label}' must be a string, got {type(value).__name__}"
+        )
+    return value
+
+
+def _require_non_empty_str(value: Any, label: str, context: str) -> str:
+    """表層値が非空 str であることを確定する（step ID 系）。"""
+    text = _require_str(value, label, context)
+    if not text:
+        raise WorkflowValidationError(f"{context} '{label}' must not be empty")
+    return text
+
+
+def _parse_workflow(data: dict[str, Any]) -> Workflow:
+    """YAML data dict をワークフローオブジェクトに変換する。"""
+    if not isinstance(data, dict):
+        raise WorkflowValidationError("Workflow definition must be a YAML mapping")
+
+    raw_name = data.get("name", "")
+    if not isinstance(raw_name, str):
+        raise WorkflowValidationError(f"'name' must be a string, got {type(raw_name).__name__}")
+    raw_description = data.get("description", "")
+    if not isinstance(raw_description, str):
+        raise WorkflowValidationError(
+            f"'description' must be a string, got {type(raw_description).__name__}"
+        )
+
+    raw_steps = data.get("steps", [])
+    if raw_steps is None:
+        raise WorkflowValidationError("'steps' must be a list, got null")
+    if not isinstance(raw_steps, list):
+        raise WorkflowValidationError(f"'steps' must be a list, got {type(raw_steps).__name__}")
+
+    steps = []
+    for i, step_data in enumerate(raw_steps):
+        if not isinstance(step_data, dict):
+            raise WorkflowValidationError(
+                f"Step at index {i} must be a mapping, got {type(step_data).__name__}"
+            )
+        missing = [k for k in _STEP_REQUIRED_KEYS if k not in step_data]
+        if missing:
+            raise WorkflowValidationError(
+                f"Step at index {i} missing required key(s): {', '.join(missing)}"
+            )
+
+        sid = _require_non_empty_str(step_data["id"], "id", f"Step at index {i}")
+
+        # 削除済みキーの named rejection（Issue #383）。exec-step 排他検証より前に
+        # 置くことで、exec-step + 削除済みキーの組み合わせでも汎用の
+        # "must not set" ではなく移行手順つきエラーになる。
+        for removed_key, guidance in _REMOVED_STEP_KEYS.items():
+            if removed_key in step_data:
+                # step ID は利用者入力。repr() で 1 行にエスケープする（#381 と同じ理由）。
+                raise WorkflowValidationError(f"Step {sid!r}: {guidance}")
+
+        # exactly one of skill / exec（Issue #205）。step 種別は skill を持つか
+        # exec を持つかで一意に決まる。両方 / 両方無しは error。
+        raw_skill = step_data.get("skill")
+        raw_exec = step_data.get("exec")
+        if (raw_skill is None) == (raw_exec is None):
+            raise WorkflowValidationError(
+                f"Step '{sid}' must declare exactly one of 'skill' or 'exec'"
+            )
+        if raw_skill is not None and not isinstance(raw_skill, str):
+            raise WorkflowValidationError(
+                f"Step '{sid}' 'skill' must be a string, got {type(raw_skill).__name__}"
+            )
+        if raw_exec is not None:
+            # exec-step: agent 専用フィールドの同時指定を拒否（exec は LLM 非経路）。
+            for forbidden in _EXEC_FORBIDDEN_KEYS:
+                if forbidden in step_data:
+                    raise WorkflowValidationError(
+                        f"Step '{sid}' with 'exec' must not set '{forbidden}'"
+                    )
+            exec_argv = _normalize_exec(raw_exec, sid)
+        else:
+            exec_argv = None
+
+        if "on" in step_data:
+            raw_on = step_data["on"]
+        elif True in step_data:
+            # YAML 1.1 interprets bare `on` as boolean True
+            raw_on = step_data[True]
+        else:
+            raise WorkflowValidationError(f"Step '{step_data['id']}' missing required key 'on'")
+        if not isinstance(raw_on, dict):
+            raise WorkflowValidationError(
+                f"Step '{step_data['id']}' 'on' must be a mapping, got {type(raw_on).__name__}"
+            )
+        if not raw_on:
+            raise WorkflowValidationError(f"Step '{step_data['id']}' 'on' must not be empty")
+        for verdict_key in raw_on:
+            if not isinstance(verdict_key, str):
+                raise WorkflowValidationError(
+                    f"Step '{sid}' 'on' keys must be strings, got {type(verdict_key).__name__}"
+                )
+        raw_step_workdir = step_data.get("workdir")
+        if raw_step_workdir is not None:
+            if not isinstance(raw_step_workdir, str):
+                raise WorkflowValidationError(
+                    f"Step '{step_data['id']}' 'workdir' must be a string, "
+                    f"got {type(raw_step_workdir).__name__}"
+                )
+            if not raw_step_workdir:
+                raise WorkflowValidationError(
+                    f"Step '{step_data['id']}' 'workdir' must not be empty"
+                )
+            try:
+                expanded_step_workdir = Path(raw_step_workdir).expanduser()
+            except RuntimeError as e:
+                raise WorkflowValidationError(
+                    f"Step '{step_data['id']}' 'workdir' expansion failed: {e}"
+                ) from e
+            if not expanded_step_workdir.is_absolute():
+                raise WorkflowValidationError(
+                    f"Step '{step_data['id']}' 'workdir' must be an absolute path, "
+                    f"got '{raw_step_workdir}'"
+                )
+            raw_step_workdir = str(expanded_step_workdir)
+
+        raw_agent = step_data.get("agent")
+        if raw_agent is not None and not isinstance(raw_agent, str):
+            raise WorkflowValidationError(
+                f"Step '{step_data['id']}' 'agent' must be a string or null, "
+                f"got {type(raw_agent).__name__}"
+            )
+
+        raw_model = step_data.get("model")
+        if raw_model is not None and not isinstance(raw_model, str):
+            raise WorkflowValidationError(
+                f"Step '{step_data['id']}' 'model' must be a string or null, "
+                f"got {type(raw_model).__name__}"
+            )
+
+        raw_max_budget_usd = step_data.get("max_budget_usd")
+        if raw_max_budget_usd is not None:
+            if not isinstance(raw_max_budget_usd, (int, float)) or isinstance(
+                raw_max_budget_usd, bool
+            ):
+                raise WorkflowValidationError(
+                    f"Step '{step_data['id']}' 'max_budget_usd' must be a number or null, "
+                    f"got {type(raw_max_budget_usd).__name__}"
+                )
+            try:
+                raw_max_budget_usd = float(raw_max_budget_usd)
+            except OverflowError as exc:
+                raise WorkflowValidationError(
+                    f"Step '{step_data['id']}' 'max_budget_usd' is too large to "
+                    f"represent as a number"
+                ) from exc
+
+        raw_effort = step_data.get("effort")
+        if raw_effort is not None:
+            if not isinstance(raw_effort, str):
+                raise WorkflowValidationError(
+                    f"Step '{step_data['id']}' 'effort' must be a string, "
+                    f"got {type(raw_effort).__name__}"
+                )
+            # agent が省略された step では effort の agent 別検証は skip
+            # （exec_script 経路では effort は無視される。runner preflight (L2)
+            # で warning を出す）。
+            allowed = _AGENT_EFFORT_ALLOWED.get(raw_agent) if raw_agent is not None else None
+            if allowed is not None and raw_effort not in allowed:
+                raise WorkflowValidationError(
+                    f"Step '{step_data['id']}' effort '{raw_effort}' is not valid for "
+                    f"agent '{raw_agent}' (allowed: {sorted(allowed)})"
+                )
+
+        raw_timeout = step_data.get("timeout")
+        if raw_timeout is not None:
+            if not isinstance(raw_timeout, int) or isinstance(raw_timeout, bool):
+                raise WorkflowValidationError(
+                    f"Step '{step_data['id']}' 'timeout' must be an integer, "
+                    f"got {type(raw_timeout).__name__}"
+                )
+            if raw_timeout <= 0:
+                raise WorkflowValidationError(
+                    f"Step '{step_data['id']}' 'timeout' must be a positive integer, "
+                    f"got {raw_timeout}"
+                )
+
+        raw_resume = step_data.get("resume")
+        if raw_resume is not None:
+            raw_resume = _require_non_empty_str(raw_resume, "resume", f"Step '{sid}'")
+
+        steps.append(
+            Step(
+                id=step_data["id"],
+                skill=raw_skill,
+                exec=exec_argv,
+                agent=raw_agent,
+                model=raw_model,
+                effort=raw_effort,
+                max_budget_usd=raw_max_budget_usd,
+                timeout=raw_timeout,
+                workdir=raw_step_workdir,
+                resume=raw_resume,
+                on=raw_on,
+            )
+        )
+
+    raw_cycles = data.get("cycles", {})
+    if raw_cycles is None:
+        raw_cycles = {}
+    if not isinstance(raw_cycles, dict):
+        raise WorkflowValidationError(
+            f"'cycles' must be a mapping, got {type(raw_cycles).__name__}"
+        )
+
+    cycles = []
+    for cycle_name, cycle_data in raw_cycles.items():
+        if not isinstance(cycle_data, dict):
+            raise WorkflowValidationError(
+                f"Cycle '{cycle_name}' must be a mapping, got {type(cycle_data).__name__}"
+            )
+        cycle_required = ("entry", "loop", "max_iterations", "on_exhaust")
+        missing_cycle = [k for k in cycle_required if k not in cycle_data]
+        if missing_cycle:
+            raise WorkflowValidationError(
+                f"Cycle '{cycle_name}' missing required key(s): {', '.join(missing_cycle)}"
+            )
+        raw_loop = cycle_data["loop"]
+        if not isinstance(raw_loop, list):
+            raise WorkflowValidationError(
+                f"Cycle '{cycle_name}' 'loop' must be a list, got {type(raw_loop).__name__}"
+            )
+        for elem in raw_loop:
+            if not isinstance(elem, str) or not elem:
+                raise WorkflowValidationError(
+                    f"Cycle '{cycle_name}' 'loop' elements must be non-empty strings, got {elem!r}"
+                )
+        raw_max_iter = cycle_data["max_iterations"]
+        if not isinstance(raw_max_iter, int) or isinstance(raw_max_iter, bool):
+            raise WorkflowValidationError(
+                f"Cycle '{cycle_name}' 'max_iterations' must be an integer, "
+                f"got {type(raw_max_iter).__name__}"
+            )
+        if raw_max_iter < 1:
+            raise WorkflowValidationError(
+                f"Cycle '{cycle_name}' 'max_iterations' must be >= 1, got {raw_max_iter}"
+            )
+        raw_entry = _require_non_empty_str(cycle_data["entry"], "entry", f"Cycle '{cycle_name}'")
+        raw_on_exhaust = _require_str(
+            cycle_data["on_exhaust"], "on_exhaust", f"Cycle '{cycle_name}'"
+        )
+        cycles.append(
+            CycleDefinition(
+                name=cycle_name,
+                entry=raw_entry,
+                loop=raw_loop,
+                max_iterations=raw_max_iter,
+                on_exhaust=raw_on_exhaust,
+            )
+        )
+
+    execution_policy = data.get("execution_policy")
+    if execution_policy is None:
+        raise WorkflowValidationError("'execution_policy' is required")
+    if not isinstance(execution_policy, str):
+        raise WorkflowValidationError(
+            f"'execution_policy' must be a string, got {type(execution_policy).__name__}"
+        )
+    if execution_policy not in VALID_EXECUTION_POLICIES:
+        raise WorkflowValidationError(
+            f"execution_policy must be one of {sorted(VALID_EXECUTION_POLICIES)}, "
+            f"got '{execution_policy}'"
+        )
+
+    raw_default_timeout = data.get("default_timeout")
+    if raw_default_timeout is not None:
+        if not isinstance(raw_default_timeout, int) or isinstance(raw_default_timeout, bool):
+            raise WorkflowValidationError(
+                f"'default_timeout' must be an integer, got {type(raw_default_timeout).__name__}"
+            )
+        if raw_default_timeout <= 0:
+            raise WorkflowValidationError(
+                f"'default_timeout' must be a positive integer, got {raw_default_timeout}"
+            )
+
+    raw_workdir = data.get("workdir")
+    if raw_workdir is not None:
+        if not isinstance(raw_workdir, str):
+            raise WorkflowValidationError(
+                f"'workdir' must be a string, got {type(raw_workdir).__name__}"
+            )
+        if not raw_workdir:
+            raise WorkflowValidationError("'workdir' must not be empty")
+        try:
+            expanded_workdir = Path(raw_workdir).expanduser()
+        except RuntimeError as e:
+            raise WorkflowValidationError(f"'workdir' expansion failed: {e}") from e
+        if not expanded_workdir.is_absolute():
+            raise WorkflowValidationError(
+                f"'workdir' must be an absolute path, got '{raw_workdir}'"
+            )
+        raw_workdir = str(expanded_workdir)
+
+    raw_requires_provider = data.get("requires_provider", "any")
+    if not isinstance(raw_requires_provider, str):
+        raise WorkflowValidationError(
+            f"'requires_provider' must be a string, got {type(raw_requires_provider).__name__}"
+        )
+    if raw_requires_provider not in VALID_REQUIRES_PROVIDER:
+        raise WorkflowValidationError(
+            f"'requires_provider' must be one of {sorted(VALID_REQUIRES_PROVIDER)}, "
+            f"got {raw_requires_provider!r}"
+        )
+
+    return Workflow(
+        name=raw_name,
+        description=raw_description,
+        execution_policy=execution_policy,
+        steps=steps,
+        cycles=cycles,
+        default_timeout=raw_default_timeout,
+        workdir=raw_workdir,
+        requires_provider=raw_requires_provider,  # type: ignore[arg-type]
+    )
+
+
+def validate_workflow(workflow: Workflow) -> None:
+    """ワークフロー定義の静的検証。
+
+    Args:
+        workflow: 検証対象のワークフロー
+
+    Raises:
+        WorkflowValidationError: 検証エラーがある場合
+    """
+    errors: list[str] = []
+    base_verdicts = frozenset({"PASS", "RETRY", "BACK", "ABORT"})
+    back_suffix_pattern = re.compile(r"^BACK_[A-Z0-9_]+$")
+
+    def _is_valid_verdict(value: str) -> bool:
+        if value in base_verdicts:
+            return True
+        return bool(back_suffix_pattern.match(value))
+
+    # on が不正な step id を収集。cycle 遷移チェック（.on.get() 呼び出し）から除外するために使用する
+    invalid_on_step_ids: set[str] = set()
+
+    # ---- スキーマレベルのバリデーション ----
+    # default_timeout の検証（_parse_workflow() を経由しない場合も担保）
+    if workflow.default_timeout is not None:
+        if (
+            not isinstance(workflow.default_timeout, int)
+            or isinstance(workflow.default_timeout, bool)
+            or workflow.default_timeout <= 0
+        ):
+            errors.append(
+                f"'default_timeout' must be a positive integer, got {workflow.default_timeout!r}"
+            )
+
+    # execution_policy の enum 検証（_parse_workflow() を経由しない場合も担保）
+    if workflow.execution_policy not in VALID_EXECUTION_POLICIES:
+        errors.append(
+            f"execution_policy must be one of {sorted(VALID_EXECUTION_POLICIES)}, "
+            f"got '{workflow.execution_policy}'"
+        )
+
+    # requires_provider の enum 検証（_parse_workflow() を経由しない場合も担保）
+    if workflow.requires_provider not in VALID_REQUIRES_PROVIDER:
+        errors.append(
+            f"requires_provider must be one of {sorted(VALID_REQUIRES_PROVIDER)}, "
+            f"got '{workflow.requires_provider}'"
+        )
+
+    # workdir の検証（_parse_workflow() を経由しない場合も担保）
+    if workflow.workdir is not None:
+        if not isinstance(workflow.workdir, str) or not workflow.workdir:
+            errors.append(f"'workdir' must be a non-empty string, got {workflow.workdir!r}")
+        elif not Path(workflow.workdir).is_absolute():
+            errors.append(f"'workdir' must be an absolute path, got '{workflow.workdir}'")
+
+    # ワークフローレベルの検証
+    if not workflow.steps:
+        errors.append("Workflow must have at least one step")
+
+    # step ID の一意性（find_step() は先頭一致で解決するため、重複は後続 step を
+    # silently shadow する。Issue #355）
+    id_counts = Counter(step.id for step in workflow.steps)
+    for step_id, count in id_counts.items():
+        if count > 1:
+            errors.append(f"Duplicate step id '{step_id}' (defined {count} times)")
+
+    # ステップレベルの検証
+    for step in workflow.steps:
+        if step.agent is not None and step.agent not in VALID_AGENTS:
+            errors.append(
+                f"Step '{step.id}' has unknown agent '{step.agent}' "
+                f"(allowed: {sorted(VALID_AGENTS)})"
+            )
+        capabilities = AGENT_CAPABILITIES.get(step.agent) if step.agent is not None else None
+        if step.resume and capabilities is not None and not capabilities.supports_resume:
+            errors.append(
+                f"Step '{step.id}' uses agent '{step.agent}' "
+                "which does not support capability 'resume'"
+            )
+
+        # スキーマ: skill / exec の排他（_parse_workflow() を経由せず手組みした
+        # Workflow でも担保する defense-in-depth ミラー。Issue #205）。
+        if (step.skill is None) == (step.exec is None):
+            errors.append(f"Step '{step.id}' must declare exactly one of 'skill' or 'exec'")
+        elif step.exec is not None:
+            # exec-step は agent 専用フィールドを持てない。
+            if step.agent is not None:
+                errors.append(f"Step '{step.id}' with 'exec' must not set 'agent'")
+            if step.model is not None:
+                errors.append(f"Step '{step.id}' with 'exec' must not set 'model'")
+            if step.effort is not None:
+                errors.append(f"Step '{step.id}' with 'exec' must not set 'effort'")
+            if step.resume is not None:
+                errors.append(f"Step '{step.id}' with 'exec' must not set 'resume'")
+            if step.max_budget_usd is not None:
+                errors.append(f"Step '{step.id}' with 'exec' must not set 'max_budget_usd'")
+            # exec argv は非空 list[str]・全要素非空 str であること。
+            if not isinstance(step.exec, list) or not step.exec:
+                errors.append(f"Step '{step.id}' 'exec' must be a non-empty list of strings")
+            elif any(not isinstance(elem, str) or not elem for elem in step.exec):
+                errors.append(f"Step '{step.id}' 'exec' list elements must be non-empty strings")
+
+        # スキーマ: step.timeout の検証（_parse_workflow() を経由しない場合も担保）
+        if step.timeout is not None:
+            if (
+                not isinstance(step.timeout, int)
+                or isinstance(step.timeout, bool)
+                or step.timeout <= 0
+            ):
+                errors.append(
+                    f"Step '{step.id}' 'timeout' must be a positive integer, got {step.timeout!r}"
+                )
+
+        # スキーマ: step.workdir の検証（_parse_workflow() を経由しない場合も担保）
+        if step.workdir is not None:
+            if not isinstance(step.workdir, str) or not step.workdir:
+                errors.append(
+                    f"Step '{step.id}' 'workdir' must be a non-empty string, got {step.workdir!r}"
+                )
+            elif not Path(step.workdir).is_absolute():
+                errors.append(
+                    f"Step '{step.id}' 'workdir' must be an absolute path, got '{step.workdir}'"
+                )
+
+        # スキーマ: step.on は非空の dict であること
+        if not isinstance(step.on, dict) or not step.on:
+            errors.append(f"Step '{step.id}' 'on' must be a non-empty mapping")
+            invalid_on_step_ids.add(step.id)
+            # on が不正な場合、以降の遷移検証はスキップ
+            if step.resume:
+                target = workflow.find_step(step.resume)
+                if not target:
+                    errors.append(f"Step '{step.id}' resumes unknown step '{step.resume}'")
+                elif target.agent != step.agent:
+                    errors.append(
+                        f"Step '{step.id}' resumes '{step.resume}' but agents differ "
+                        f"({step.agent} != {target.agent})"
+                    )
+            continue
+
+        if "PASS" not in step.on:
+            errors.append(f"Step '{step.id}' 'on' must define a 'PASS' transition")
+
+        # 1. resume 先が存在し、同一 agent であること
+        if step.resume:
+            target = workflow.find_step(step.resume)
+            if not target:
+                errors.append(f"Step '{step.id}' resumes unknown step '{step.resume}'")
+            elif target.agent != step.agent:
+                errors.append(
+                    f"Step '{step.id}' resumes '{step.resume}' but agents differ "
+                    f"({step.agent} != {target.agent})"
+                )
+
+        # 2. on の遷移先が存在すること
+        for verdict, next_id in step.on.items():
+            if next_id != "end" and not workflow.find_step(next_id):
+                errors.append(
+                    f"Step '{step.id}' transitions to unknown step '{next_id}' on {verdict}"
+                )
+
+        # 3. verdict 値が有効であること（BACK_* プレフィックスを許可）
+        for verdict in step.on:
+            if not _is_valid_verdict(verdict):
+                errors.append(f"Step '{step.id}' has invalid verdict '{verdict}'")
+
+    if workflow.steps:
+        root_id = workflow.steps[0].id
+        step_ids = {step.id for step in workflow.steps}
+        reachable_step_ids: set[str] = set()
+        pending_step_ids = [root_id]
+
+        while pending_step_ids:
+            step_id = pending_step_ids.pop()
+            if step_id in reachable_step_ids:
+                continue
+            reachable_step_ids.add(step_id)
+            current_step = workflow.find_step(step_id)
+            if current_step is None or current_step.id in invalid_on_step_ids:
+                continue
+            for next_id in current_step.on.values():
+                # 非 str の遷移先は unhashable な場合があり、set 参照前に弾く。
+                # 遷移先自体の不正は上の「遷移先が存在すること」検証が報告する
+                if not isinstance(next_id, str):
+                    continue
+                if next_id in step_ids and next_id not in reachable_step_ids:
+                    pending_step_ids.append(next_id)
+
+        for step in workflow.steps:
+            if step.id not in reachable_step_ids:
+                errors.append(f"Step '{step.id}' is not reachable from the first step '{root_id}'")
+
+    # サイクルレベルの検証
+    for cycle in workflow.cycles:
+        # スキーマ: cycle.loop は list であること
+        if not isinstance(cycle.loop, list):
+            errors.append(
+                f"Cycle '{cycle.name}' 'loop' must be a list, got {type(cycle.loop).__name__}"
+            )
+            continue
+
+        # スキーマ: cycle.max_iterations は正の整数であること
+        if (
+            not isinstance(cycle.max_iterations, int)
+            or isinstance(cycle.max_iterations, bool)
+            or cycle.max_iterations < 1
+        ):
+            errors.append(
+                f"Cycle '{cycle.name}' 'max_iterations' must be an integer >= 1, "
+                f"got {cycle.max_iterations!r}"
+            )
+
+        # 4. loop が非空であること
+        if not cycle.loop:
+            errors.append(f"Cycle '{cycle.name}' loop must not be empty")
+            continue
+
+        # 5. entry ステップが存在すること
+        if not workflow.find_step(cycle.entry):
+            errors.append(f"Cycle '{cycle.name}' entry step '{cycle.entry}' not found")
+
+        # 6. loop 内ステップが存在すること
+        for step_id in cycle.loop:
+            if not workflow.find_step(step_id):
+                errors.append(f"Cycle '{cycle.name}' loop step '{step_id}' not found")
+
+        # 7. loop 末尾ステップが RETRY 時に loop 先頭へ遷移すること
+        # step.on が不正な場合は .get() を呼ばず、この検証をスキップする
+        tail_step = workflow.find_step(cycle.loop[-1])
+        if (
+            tail_step
+            and tail_step.id not in invalid_on_step_ids
+            and tail_step.on.get("RETRY") != cycle.loop[0]
+        ):
+            errors.append(
+                f"Cycle '{cycle.name}' loop tail '{cycle.loop[-1]}' RETRY should "
+                f"transition to loop head '{cycle.loop[0]}'"
+            )
+
+        # 8. entry/loop 内ステップが PASS 時にサイクル外へ遷移すること
+        # step.on が不正なステップは exit 判定から除外する
+        all_cycle_steps = {cycle.entry} | set(cycle.loop)
+        has_exit = False
+        for cycle_step_id in all_cycle_steps:
+            if cycle_step_id in invalid_on_step_ids:
+                continue
+            cycle_step = workflow.find_step(cycle_step_id)
+            if cycle_step and cycle_step.on.get("PASS") not in all_cycle_steps:
+                has_exit = True
+                break
+        if not has_exit:
+            errors.append(f"Cycle '{cycle.name}' has no exit (PASS never leaves the cycle)")
+
+        # 9. on_exhaust が有効な verdict であること（BACK_* プレフィックスを許可）
+        if not _is_valid_verdict(cycle.on_exhaust):
+            errors.append(f"Cycle '{cycle.name}' on_exhaust '{cycle.on_exhaust}' is invalid")
+
+    if errors:
+        raise WorkflowValidationError(errors)

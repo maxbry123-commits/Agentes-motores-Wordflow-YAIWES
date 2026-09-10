@@ -1,0 +1,99 @@
+"""web_search ToolDefinition — POC migration (ADR-0026 M2).
+
+This is the FIRST capability migrated to the unified registry.
+The existing handler in src/reyn/op_runtime/web.py is preserved
+and wrapped via a thin adapter that translates between the old
+(op, ctx) signature and the new (args, ctx) signature.
+
+The router dispatch path consumes this ToolDefinition; M2 verifies
+byte-identity against the pre-migration ToolSpec.
+"""
+from __future__ import annotations
+
+from typing import Any, Mapping
+
+from reyn.llm.model_resolver import resolve_purpose_class  # #1673
+from reyn.tools.descriptions import discovery
+from reyn.tools.types import ToolContext, ToolDefinition, ToolGates, ToolResult
+
+# Reviewable in src/reyn/tools/descriptions/discovery.py (Phase 1 of the
+# tool-description package refactor) — this alias keeps the call site
+# unchanged (byte-identical relocation, no LLM-facing text change).
+_WEB_SEARCH_DESCRIPTION = discovery.web_search.text
+
+# Parameters JSON schema must be byte-identical to the current
+# router_tools.py ToolSpec.parameters for web_search.
+_WEB_SEARCH_PARAMETERS: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "query": {"type": "string"},
+        "max_results": {"type": "integer"},
+    },
+    "required": ["query"],
+}
+
+
+async def _handle(args: Mapping[str, Any], ctx: ToolContext) -> ToolResult:
+    """Adapter wrapping op_runtime.web.handle_web_search.
+
+    Bridges between the unified (args, ctx) signature and the
+    existing (op, ctx) signature. Once M2 succeeds, the
+    body of handle_web_search may be inlined here in M4 cleanup.
+    """
+    # Lazy import to avoid circular dependency at registry-init time.
+    from reyn.core.op_runtime.context import OpContext
+    from reyn.core.op_runtime.web import handle_web_search
+    from reyn.schemas.models import WebSearchIROp
+    from reyn.security.permissions.permissions import PermissionDecl
+
+    # Build a transient WebSearchIROp from args (= reuse Pydantic
+    # validation that the existing op handler expects).
+    op = WebSearchIROp(
+        kind="web_search",
+        query=args["query"],
+        max_results=int(args.get("max_results", 5)),
+    )
+
+    # Build a legacy OpContext from the new ToolContext. Web search is
+    # read-only / public queries today, so an empty PermissionDecl is used.
+    #
+    # events.subscribers: the existing OpContext constructor requires
+    # this to forward subscribers to nested op invocations. Web search
+    # does not spawn nested ops, but OpContext.subscribers is set
+    # defensively via getattr fallback.
+    legacy_ctx = OpContext(
+        workspace=ctx.workspace,
+        events=ctx.events,
+        permission_decl=PermissionDecl(),
+        permission_resolver=ctx.permission_resolver,
+        actor="",
+        # #1673: real resolver + "tool" purpose class (was None + literal
+        # "standard") — eliminates the resolver=None → litellm-BadRequestError class
+        # by construction (uniform with other op handlers; this handler makes no LLM call).
+        model=resolve_purpose_class(None, ctx.resolver, "tool"),
+        resolver=ctx.resolver,
+        subscribers=getattr(ctx.events, "subscribers", []),
+        output_language=None,
+        mcp_servers={},
+        intervention_bus=None,
+        caller="direct",
+        parent_run_id=None,
+    )
+
+    return await handle_web_search(op=op, ctx=legacy_ctx)
+
+
+from reyn.core.offload.canonical import web_search_to_canonical  # noqa: E402
+
+WEB_SEARCH = ToolDefinition(
+    canonical=web_search_to_canonical,
+    name="web_search",
+    router_dispatched=True,
+    description=_WEB_SEARCH_DESCRIPTION,
+    parameters=_WEB_SEARCH_PARAMETERS,
+    gates=ToolGates(router="allow"),
+    handler=_handle,
+    category="discovery",
+    purity="read_only",   # web search has no side effect on workspace
+    returns_external_content=True,  # FP-0050/#1822: internet content
+)

@@ -1,0 +1,53 @@
+# Example reyn.yaml with MCP servers configured.
+# Drop into your project root to enable the read_local_files stdlib skill
+# (and any future skills that target these servers).
+
+llm:
+  model: standard
+  # #4349: the deleted built-in catalog also carried reasoning_effort for
+  # these Gemini reasoning models (#1654) — restored explicitly here so
+  # migrating off the catalog shorthand doesn't silently drop it.
+  models:
+    light:
+      model: gemini/gemini-2.5-flash-lite
+      reasoning_effort: low
+    standard:
+      model: gemini/gemini-2.5-flash-lite
+      reasoning_effort: low
+    strong:
+      model: gemini/gemini-2.5-pro
+      reasoning_effort: medium
+
+permissions:
+  python.pure: allow
+  # Pre-approve MCP server calls so the skill runs without a TTY prompt.
+  # Required in headless / non-interactive mode (CI, piped stdin, dogfood
+  # scripts): without this line every MCP call returns permission_denied.
+  # Remove or comment these lines to get interactive per-call prompts instead.
+  mcp.filesystem: allow
+  mcp.git: allow
+  mcp.fetch: allow
+
+mcp:
+  servers:
+    filesystem:
+      type: stdio
+      command: npx
+      args: ["-y", "@modelcontextprotocol/server-filesystem", "."]
+
+    git:
+      type: stdio
+      command: npx
+      args: ["-y", "@modelcontextprotocol/server-git", "--repository", "."]
+
+    fetch:
+      type: stdio
+      command: uvx
+      args: ["mcp-server-fetch"]
+
+    # Remote HTTP example
+    # team_search:
+    #   type: streamable-http
+    #   url: ${TEAM_SEARCH_MCP_URL}
+    #   headers:
+    #     Authorization: "Bearer ${TEAM_SEARCH_TOKEN}"

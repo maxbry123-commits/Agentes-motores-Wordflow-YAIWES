@@ -1,0 +1,663 @@
+import type { IncomingMessage, ServerResponse } from "node:http";
+import { z } from "zod";
+import {
+  countActiveScriptRuns,
+  countScriptRunJournalAgentTaskSteps,
+  countScriptRunJournalSteps,
+  countScriptRuns,
+  createScriptRun,
+  createTaskExtended,
+  getAgentById,
+  getDbClient,
+  getLatestScriptRunStepTaskByContextKey,
+  getScriptRun,
+  getScriptRunByIdempotencyKey,
+  getScriptRunJournalStep,
+  getTaskById,
+  listScriptRunJournalSteps,
+  listScriptRuns,
+  updateScriptRun,
+  updateScriptRunIfNotTerminal,
+  upsertScriptRunJournalStep,
+} from "../be/db";
+import { lintWorkflowLabels } from "../script-workflows/label-lint";
+import { scriptRunMaxAgentTasks, scriptRunMaxSteps } from "../script-workflows/limits";
+import {
+  abortScriptRunLimit,
+  startScriptRunProcess,
+  terminateScriptRunProcess,
+} from "../script-workflows/supervisor";
+import {
+  AgentTaskStatusSchema,
+  ScriptRunJournalEntrySchema,
+  ScriptRunListItemSchema,
+  ScriptRunSchema,
+  ScriptRunStatusSchema,
+  TERMINAL_SCRIPT_RUN_STATUSES,
+} from "../types";
+import { getAppUrl } from "../utils/constants";
+import {
+  executeRawLlm,
+  RawLlmConfigSchema,
+  RawLlmOutputSchema,
+} from "../workflows/executors/raw-llm";
+import { route } from "./route-def";
+import { deriveApiBaseUrl, json, jsonError } from "./utils";
+
+const DEFAULT_SCRIPT_RUN_CONCURRENCY_CAP = 10;
+
+const runIdParamsSchema = z.object({ runId: z.string().uuid() });
+const idParamsSchema = z.object({ id: z.string().uuid() });
+const stepParamsSchema = z.object({
+  runId: z.string().uuid(),
+  stepKey: z.string().min(1),
+});
+
+const createScriptRunBodySchema = z.object({
+  source: z.string().min(1),
+  args: z.unknown().optional(),
+  background: z.boolean().default(true),
+  idempotencyKey: z.string().min(1).max(200).optional(),
+  scriptName: z.string().min(1).max(200).optional(),
+  requestedByUserId: z.string().optional(),
+});
+
+const listScriptRunsQuerySchema = z.object({
+  status: ScriptRunStatusSchema.optional(),
+  agentId: z.string().optional(),
+  scriptName: z.string().optional(),
+  limit: z.coerce.number().int().min(1).max(500).optional(),
+  offset: z.coerce.number().int().min(0).optional(),
+});
+
+const journalStepBodySchema = z.object({
+  stepKey: z.string().min(1),
+  stepType: z.string().min(1),
+  config: z.unknown().optional(),
+  status: z.enum(["completed", "failed"]),
+  result: z.unknown().optional(),
+  error: z.string().optional(),
+  durationMs: z.number().int().nonnegative().optional(),
+});
+
+const statusBodySchema = z.discriminatedUnion("status", [
+  z.object({ status: z.literal("completed"), output: z.unknown().optional() }),
+  z.object({ status: z.literal("failed"), error: z.string().optional() }),
+  z.object({ status: z.literal("paused") }),
+]);
+
+const agentTaskBodySchema = z.object({
+  stepKey: z.string().min(1),
+  template: z.string().optional(),
+  task: z.string().optional(),
+  agentId: z.string().optional(),
+  tags: z.array(z.string()).optional(),
+  priority: z.number().int().min(0).max(100).optional(),
+  offerMode: z.boolean().optional(),
+  dir: z.string().min(1).optional(),
+  vcsRepo: z.string().min(1).optional(),
+  model: z.string().min(1).optional(),
+  parentTaskId: z.string().uuid().optional(),
+  requestedByUserId: z.string().optional(),
+  outputSchema: z.record(z.string(), z.unknown()).optional(),
+});
+
+const scriptRunCreatedSchema = z.object({
+  id: z.string().uuid(),
+  status: ScriptRunStatusSchema,
+  url: z.string(),
+});
+
+const journalStepReplaySchema = ScriptRunJournalEntrySchema.pick({
+  stepKey: true,
+  stepType: true,
+  status: true,
+  result: true,
+  error: true,
+});
+
+const createScriptRunRoute = route({
+  method: "post",
+  path: "/api/script-runs",
+  pattern: ["api", "script-runs"],
+  operationId: "script_runs_create",
+  summary: "Launch a durable script workflow run",
+  description:
+    "Foundation endpoint for Script Workflows v1. In PR 1 it persists the run and returns its dashboard URL; spawning is added by the supervisor PR.",
+  tags: ["Script Runs"],
+  body: createScriptRunBodySchema,
+  responses: {
+    201: { description: "Script run created", schema: scriptRunCreatedSchema },
+    400: { description: "Validation or label-lint failure" },
+    // Idempotency conflict returns the EXISTING run's pointer, not the
+    // standard error envelope — declare it so the fallback doesn't lie.
+    409: { description: "Existing idempotent run returned", schema: scriptRunCreatedSchema },
+    429: { description: "Script run concurrency cap reached" },
+  },
+  // Matches the inline `POST /api/scripts/run` route and the `launch-script-run`
+  // MCP tool (src/tools/script-runs.ts, UNGATED_TOOL_FILES pin): open to every
+  // authenticated agent by design, not a permission gate. Execution safety comes
+  // from the shared sandbox (ulimits, clean env, bearer over stdin — see
+  // buildSandboxedCommand / LocalProcessScriptExecutor.start), not from
+  // restricting who may launch a run.
+  rbac: {
+    ungated:
+      "matches POST /api/scripts/run — open to all authenticated agents; constrained by the script execution sandbox, not a permission gate",
+  },
+});
+
+const listScriptRunsRoute = route({
+  method: "get",
+  path: "/api/script-runs",
+  pattern: ["api", "script-runs"],
+  operationId: "script_runs_list",
+  summary: "List script workflow runs",
+  tags: ["Script Runs"],
+  query: listScriptRunsQuerySchema,
+  responses: {
+    200: {
+      description: "Paginated script run list",
+      schema: z.object({
+        runs: z.array(ScriptRunListItemSchema),
+        total: z.number().int(),
+      }),
+    },
+  },
+});
+
+const getScriptRunRoute = route({
+  method: "get",
+  path: "/api/script-runs/{id}",
+  pattern: ["api", "script-runs", null],
+  operationId: "script_runs_get",
+  summary: "Get a script workflow run with journal",
+  tags: ["Script Runs"],
+  params: idParamsSchema,
+  responses: {
+    200: {
+      description: "Script run detail",
+      schema: z.object({ run: ScriptRunSchema, journal: z.array(ScriptRunJournalEntrySchema) }),
+    },
+    404: { description: "Script run not found" },
+  },
+});
+
+const deleteScriptRunRoute = route({
+  method: "delete",
+  path: "/api/script-runs/{id}",
+  pattern: ["api", "script-runs", null],
+  operationId: "script_runs_cancel",
+  summary: "Cancel a script workflow run",
+  tags: ["Script Runs"],
+  params: idParamsSchema,
+  responses: {
+    204: { description: "Script run cancelled, or already terminal" },
+    404: { description: "Script run not found" },
+  },
+});
+
+const getInternalStepRoute = route({
+  method: "get",
+  path: "/api/internal/script-runs/{runId}/steps/{stepKey}",
+  pattern: ["api", "internal", "script-runs", null, "steps", null],
+  operationId: "script_runs_internal_step_get",
+  summary: "Get a script run journal step",
+  tags: ["Script Runs"],
+  params: stepParamsSchema,
+  responses: {
+    200: { description: "Journal step found", schema: journalStepReplaySchema },
+    404: { description: "Journal step not found" },
+  },
+});
+
+const postInternalStepRoute = route({
+  method: "post",
+  path: "/api/internal/script-runs/{runId}/steps",
+  pattern: ["api", "internal", "script-runs", null, "steps"],
+  operationId: "script_runs_internal_step_create",
+  summary: "Write a script run journal step",
+  tags: ["Script Runs"],
+  params: runIdParamsSchema,
+  body: journalStepBodySchema,
+  responses: {
+    201: { description: "Journal step written", schema: z.object({ ok: z.literal(true) }) },
+    404: { description: "Script run not found" },
+  },
+});
+
+const heartbeatRoute = route({
+  method: "post",
+  path: "/api/internal/script-runs/{runId}/heartbeat",
+  pattern: ["api", "internal", "script-runs", null, "heartbeat"],
+  operationId: "script_runs_internal_heartbeat",
+  summary: "Record a script run heartbeat",
+  tags: ["Script Runs"],
+  params: runIdParamsSchema,
+  responses: {
+    204: { description: "Heartbeat recorded" },
+    404: { description: "Script run not found" },
+  },
+});
+
+const statusRoute = route({
+  method: "post",
+  path: "/api/internal/script-runs/{runId}/status",
+  pattern: ["api", "internal", "script-runs", null, "status"],
+  operationId: "script_runs_internal_status",
+  summary: "Update script run status from subprocess",
+  tags: ["Script Runs"],
+  params: runIdParamsSchema,
+  body: statusBodySchema,
+  responses: {
+    204: { description: "Status updated" },
+    404: { description: "Script run not found" },
+  },
+});
+
+const rawLlmRoute = route({
+  method: "post",
+  path: "/api/internal/raw-llm",
+  pattern: ["api", "internal", "raw-llm"],
+  operationId: "script_runs_internal_raw_llm",
+  summary: "Execute a raw LLM call for a script workflow",
+  tags: ["Script Runs"],
+  body: RawLlmConfigSchema,
+  responses: {
+    200: { description: "LLM call completed", schema: RawLlmOutputSchema },
+    500: { description: "LLM call failed" },
+  },
+});
+
+const agentTaskRoute = route({
+  method: "post",
+  path: "/api/internal/script-runs/{runId}/agent-task",
+  pattern: ["api", "internal", "script-runs", null, "agent-task"],
+  operationId: "script_runs_internal_agent_task",
+  summary: "Create or wait for a script workflow agent task step",
+  tags: ["Script Runs"],
+  params: runIdParamsSchema,
+  body: agentTaskBodySchema,
+  responses: {
+    200: {
+      description: "Agent task completed",
+      schema: z.object({ taskId: z.string(), taskOutput: z.string().nullable() }),
+    },
+    202: {
+      description: "Agent task created or still running",
+      schema: z.object({ taskId: z.string(), status: AgentTaskStatusSchema }),
+    },
+    404: { description: "Script run not found" },
+  },
+});
+
+async function requireAgent(res: ServerResponse, agentId: string | undefined) {
+  if (!agentId) {
+    jsonError(res, "X-Agent-ID required for script runs API", 400);
+    return null;
+  }
+  const agent = await getAgentById(agentId);
+  if (!agent) {
+    jsonError(res, "Agent not found", 404);
+    return null;
+  }
+  return agent;
+}
+
+function scriptRunUrl(id: string): string {
+  return `${getAppUrl()}/script-runs/${id}`;
+}
+
+function scriptRunConcurrencyCap(): number {
+  const raw = process.env.SCRIPT_RUN_CONCURRENCY_CAP;
+  if (!raw) return DEFAULT_SCRIPT_RUN_CONCURRENCY_CAP;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0
+    ? Math.floor(parsed)
+    : DEFAULT_SCRIPT_RUN_CONCURRENCY_CAP;
+}
+
+function bearerToken(req: IncomingMessage): string | undefined {
+  const raw = req.headers.authorization;
+  const header = Array.isArray(raw) ? raw[0] : raw;
+  return header?.startsWith("Bearer ") ? header.slice("Bearer ".length).trim() : undefined;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function assertRunWithinLimits(
+  runId: string,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  const maxSteps = scriptRunMaxSteps();
+  const stepCount = await countScriptRunJournalSteps(runId);
+  if (stepCount > maxSteps) {
+    const error = `SCRIPT_RUN_MAX_STEPS exceeded (${stepCount}/${maxSteps})`;
+    await abortScriptRunLimit(runId, error);
+    return { ok: false, error };
+  }
+
+  const maxAgentTasks = scriptRunMaxAgentTasks();
+  const agentTaskCount = await countScriptRunJournalAgentTaskSteps(runId);
+  if (agentTaskCount > maxAgentTasks) {
+    const error = `SCRIPT_RUN_MAX_AGENT_TASKS exceeded (${agentTaskCount}/${maxAgentTasks})`;
+    await abortScriptRunLimit(runId, error);
+    return { ok: false, error };
+  }
+
+  return { ok: true };
+}
+
+export async function handleScriptRuns(
+  req: IncomingMessage,
+  res: ServerResponse,
+  pathSegments: string[],
+  queryParams: URLSearchParams,
+  agentId: string | undefined,
+): Promise<boolean> {
+  if (createScriptRunRoute.match(req.method, pathSegments)) {
+    const parsed = await createScriptRunRoute.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+    const agent = await requireAgent(res, agentId);
+    if (!agent) return true;
+
+    const lint = lintWorkflowLabels(parsed.body.source);
+    if (!lint.ok) {
+      json(
+        res,
+        {
+          error: "label_lint_violation",
+          message: "Launch rejected: loop step label collision detected",
+          violations: lint.errors,
+        },
+        400,
+      );
+      return true;
+    }
+
+    if (parsed.body.idempotencyKey) {
+      const existingRun = await getScriptRunByIdempotencyKey(parsed.body.idempotencyKey);
+      if (existingRun) {
+        json(
+          res,
+          { id: existingRun.id, status: existingRun.status, url: scriptRunUrl(existingRun.id) },
+          409,
+        );
+        return true;
+      }
+    }
+
+    // Cap check and insert commit together: N concurrent POSTs otherwise all
+    // read cap-1 active runs and all insert, exceeding the cap.
+    const cap = scriptRunConcurrencyCap();
+    const creation = await getDbClient().transaction(async () => {
+      if ((await countActiveScriptRuns()) >= cap) return null;
+      return await createScriptRun({
+        id: crypto.randomUUID(),
+        agentId: agent.id,
+        source: parsed.body.source,
+        args: parsed.body.args ?? null,
+        scriptName: parsed.body.scriptName,
+        idempotencyKey: parsed.body.idempotencyKey,
+        requestedByUserId: parsed.body.requestedByUserId,
+        createdBy: parsed.body.requestedByUserId,
+      });
+    });
+    if (!creation) {
+      json(res, { error: "script_run_concurrency_cap", cap }, 429);
+      return true;
+    }
+    const { run, existing } = creation;
+
+    if (!existing && parsed.body.background) {
+      startScriptRunProcess(run, deriveApiBaseUrl(req), bearerToken(req)).catch(async (err) => {
+        await updateScriptRun(run.id, {
+          status: "failed",
+          pid: null,
+          finishedAt: new Date().toISOString(),
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+    }
+
+    if (existing) {
+      createScriptRunRoute.respond(res, 409, {
+        id: run.id,
+        status: run.status,
+        url: scriptRunUrl(run.id),
+      });
+      return true;
+    }
+    createScriptRunRoute.respond(res, 201, {
+      id: run.id,
+      status: run.status,
+      url: scriptRunUrl(run.id),
+    });
+    return true;
+  }
+
+  if (listScriptRunsRoute.match(req.method, pathSegments)) {
+    const parsed = await listScriptRunsRoute.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+    const opts = {
+      status: parsed.query.status,
+      agentId: parsed.query.agentId,
+      scriptName: parsed.query.scriptName,
+      limit: parsed.query.limit ?? 50,
+      offset: parsed.query.offset ?? 0,
+    };
+    listScriptRunsRoute.respond(res, 200, {
+      runs: await listScriptRuns(opts),
+      total: await countScriptRuns({
+        status: opts.status,
+        agentId: opts.agentId,
+        scriptName: opts.scriptName,
+      }),
+    });
+    return true;
+  }
+
+  if (getScriptRunRoute.match(req.method, pathSegments)) {
+    const parsed = await getScriptRunRoute.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+    const run = await getScriptRun(parsed.params.id);
+    if (!run) {
+      jsonError(res, "Script run not found", 404);
+      return true;
+    }
+    getScriptRunRoute.respond(res, 200, { run, journal: await listScriptRunJournalSteps(run.id) });
+    return true;
+  }
+
+  if (deleteScriptRunRoute.match(req.method, pathSegments)) {
+    const parsed = await deleteScriptRunRoute.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+    const run = await getScriptRun(parsed.params.id);
+    if (!run) {
+      jsonError(res, "Script run not found", 404);
+      return true;
+    }
+    if (TERMINAL_SCRIPT_RUN_STATUSES.some((status) => status === run.status)) {
+      res.writeHead(204);
+      res.end();
+      return true;
+    }
+    await terminateScriptRunProcess(run.id);
+    // Terminal-guarded write: terminateScriptRunProcess awaits, and the run's
+    // own harness can post its final status in that window. A blind UPDATE
+    // would store a genuinely completed run as "cancelled".
+    await updateScriptRunIfNotTerminal(run.id, {
+      status: "cancelled",
+      pid: null,
+      finishedAt: new Date().toISOString(),
+    });
+    res.writeHead(204);
+    res.end();
+    return true;
+  }
+
+  if (getInternalStepRoute.match(req.method, pathSegments)) {
+    const parsed = await getInternalStepRoute.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+    const step = await getScriptRunJournalStep(parsed.params.runId, parsed.params.stepKey);
+    if (!step) {
+      jsonError(res, "Script run journal step not found", 404);
+      return true;
+    }
+    // `status` + `error` are part of the replay contract, not diagnostics: the
+    // harness rethrows a recorded failure instead of replaying it as a
+    // successful `undefined` (see durableStep in script-workflows/workflow-ctx).
+    getInternalStepRoute.respond(res, 200, {
+      stepKey: step.stepKey,
+      stepType: step.stepType,
+      status: step.status,
+      result: step.result,
+      error: step.error,
+    });
+    return true;
+  }
+
+  if (postInternalStepRoute.match(req.method, pathSegments)) {
+    const parsed = await postInternalStepRoute.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+    const run = await getScriptRun(parsed.params.runId);
+    if (!run) {
+      jsonError(res, "Script run not found", 404);
+      return true;
+    }
+    // The journal write and the cap re-read must be atomic: concurrent
+    // ctx.step.agentTask journal posts for the same run would otherwise all
+    // land before any of them counts, and every one of them would see (and be
+    // refused by) the post-write total.
+    const limit = await getDbClient().transaction(async () => {
+      await upsertScriptRunJournalStep({
+        runId: run.id,
+        stepKey: parsed.body.stepKey,
+        stepType: parsed.body.stepType,
+        config: parsed.body.config ?? {},
+        status: parsed.body.status,
+        result: parsed.body.result,
+        error: parsed.body.error,
+        durationMs: parsed.body.durationMs,
+      });
+      return assertRunWithinLimits(run.id);
+    });
+    if (!limit.ok) {
+      json(res, { error: "script_run_limit", message: limit.error }, 429);
+      return true;
+    }
+    postInternalStepRoute.respond(res, 201, { ok: true });
+    return true;
+  }
+
+  if (heartbeatRoute.match(req.method, pathSegments)) {
+    const parsed = await heartbeatRoute.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+    if (!(await getScriptRun(parsed.params.runId))) {
+      jsonError(res, "Script run not found", 404);
+      return true;
+    }
+    await updateScriptRun(parsed.params.runId, { lastHeartbeatAt: new Date().toISOString() });
+    res.writeHead(204);
+    res.end();
+    return true;
+  }
+
+  if (statusRoute.match(req.method, pathSegments)) {
+    const parsed = await statusRoute.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+    const run = await getScriptRun(parsed.params.runId);
+    if (!run) {
+      jsonError(res, "Script run not found", 404);
+      return true;
+    }
+    if (TERMINAL_SCRIPT_RUN_STATUSES.some((status) => status === run.status)) {
+      res.writeHead(204);
+      res.end();
+      return true;
+    }
+    // Terminal-guarded write: the guard above ran before this handler's own
+    // awaits, so an operator DELETE cancelling the run in that window would
+    // otherwise be overwritten by this status.
+    await updateScriptRunIfNotTerminal(parsed.params.runId, {
+      status: parsed.body.status,
+      pid: null,
+      finishedAt: parsed.body.status === "paused" ? null : new Date().toISOString(),
+      output: "output" in parsed.body ? parsed.body.output : undefined,
+      error: "error" in parsed.body ? (parsed.body.error ?? null) : undefined,
+    });
+    res.writeHead(204);
+    res.end();
+    return true;
+  }
+
+  if (rawLlmRoute.match(req.method, pathSegments)) {
+    const parsed = await rawLlmRoute.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+    const result = await executeRawLlm(parsed.body);
+    if (result.status === "failed") {
+      json(res, { error: result.error }, 500);
+      return true;
+    }
+    rawLlmRoute.respond(res, 200, result.output);
+    return true;
+  }
+
+  if (agentTaskRoute.match(req.method, pathSegments)) {
+    const parsed = await agentTaskRoute.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+    const run = await getScriptRun(parsed.params.runId);
+    if (!run) {
+      jsonError(res, "Script run not found", 404);
+      return true;
+    }
+
+    const contextKey = `script-run:${run.id}:${parsed.body.stepKey}`;
+    let task = await getLatestScriptRunStepTaskByContextKey(contextKey);
+    if (!task) {
+      task = await createTaskExtended(
+        parsed.body.template ?? parsed.body.task ?? parsed.body.stepKey,
+        {
+          agentId: parsed.body.agentId,
+          tags: parsed.body.tags,
+          priority: parsed.body.priority,
+          offeredTo: parsed.body.offerMode ? parsed.body.agentId : undefined,
+          taskType: "script-run-step",
+          source: "mcp",
+          dir: parsed.body.dir,
+          vcsRepo: parsed.body.vcsRepo,
+          model: parsed.body.model,
+          parentTaskId: parsed.body.parentTaskId,
+          requestedByUserId: parsed.body.requestedByUserId ?? run.requestedByUserId,
+          outputSchema: parsed.body.outputSchema,
+          contextKey,
+        },
+      );
+    }
+
+    const deadline = Date.now() + 30_000;
+    while (Date.now() < deadline) {
+      // Once replay lookup/dispatch selects the step, stay pinned to its ID.
+      // A later same-context task must never change which work this poll resolves.
+      const latest = (await getTaskById(task.id)) ?? task;
+      if (latest.status === "completed") {
+        agentTaskRoute.respond(res, 200, { taskId: latest.id, taskOutput: latest.output ?? null });
+        return true;
+      }
+      if (
+        latest.status === "failed" ||
+        latest.status === "cancelled" ||
+        latest.status === "superseded"
+      ) {
+        json(res, { error: `Agent task ${latest.status}`, taskId: latest.id }, 409);
+        return true;
+      }
+      await sleep(1000);
+    }
+
+    agentTaskRoute.respond(res, 202, { taskId: task.id, status: task.status });
+    return true;
+  }
+
+  return false;
+}

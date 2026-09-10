@@ -1,0 +1,70 @@
+# Ollama Research Pipeline
+# ========================
+# A full research-translate pipeline using local Ollama models and
+# a free OpenRouter model. Demonstrates mixing providers in one workflow.
+#
+# Topology:
+#   input → planner → researcher → summarizer → translator → output
+#
+# Prerequisites:
+#   ollama pull llama3.2
+#
+# Run:  binex run examples/ollama-research.yaml --var query="LLM agents"
+
+name: ollama-research
+description: "Research pipeline with Ollama + OpenRouter (free tier)"
+
+nodes:
+  input:
+    agent: human://input
+    outputs: [query]
+    inputs:
+      query: ${user.query}
+
+  planner:
+    agent: llm://ollama/llama3.2
+    outputs: [plan]
+    system_prompt: "file://prompts/gen-research-planner.md"
+    depends_on: [input]
+    inputs:
+      input: ${input.query}
+
+  researcher:
+    agent: llm://openrouter/google/gemma-3-27b-it:free
+    outputs: [findings]
+    system_prompt: "file://prompts/gen-researcher.md"
+    config:
+      max_tokens: 3096
+      temperature: 0.3
+    depends_on: [planner]
+    inputs:
+      plan: ${planner.plan}
+
+  summarizer:
+    agent: llm://ollama/llama3.2
+    outputs: [report]
+    system_prompt: "file://prompts/gen-research-synthesizer.md"
+    config:
+      max_tokens: 8096
+    depends_on: [researcher, planner]
+    inputs:
+      findings: ${researcher.findings}
+      plan: ${planner.plan}
+
+  translator:
+    agent: llm://ollama/llama3.2
+    outputs: [translated]
+    system_prompt: |
+      Translate the provided text to Russian. Preserve formatting, headings,
+      and structure. Adapt idioms to target-language equivalents.
+      Output only the translated text.
+    depends_on: [summarizer]
+    inputs:
+      text: ${summarizer.report}
+
+  output:
+    agent: human://output
+    outputs: [result]
+    depends_on: [translator]
+    inputs:
+      text: ${translator.translated}

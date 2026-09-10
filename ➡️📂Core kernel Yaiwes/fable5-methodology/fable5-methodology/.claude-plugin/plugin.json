@@ -1,0 +1,19 @@
+{
+  "name": "fable5-methodology",
+  "version": "1.0.0",
+  "description": "Self-enforcing engineering methodology extracted from Claude Fable 5 for less advanced models: prime directives + integrity rules injected each session, 26 on-demand skills, 4 contracted subagents (builder, qa-verifier, code-reviewer, research-scout), and 6 lifecycle hooks that gate destructive commands and unverified 'done' claims.",
+  "author": {
+    "name": "UnpaidAttention",
+    "url": "https://github.com/UnpaidAttention"
+  },
+  "homepage": "https://github.com/UnpaidAttention/fable5-methodology",
+  "repository": "https://github.com/UnpaidAttention/fable5-methodology",
+  "keywords": [
+    "methodology",
+    "verification",
+    "integrity",
+    "hooks",
+    "subagents",
+    "skills"
+  ]
+}

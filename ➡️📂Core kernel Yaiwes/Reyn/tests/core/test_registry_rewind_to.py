@@ -1,0 +1,608 @@
+"""Tier 2: OS invariant — AgentRegistry.rewind_to global consistent-cut rewind.
+
+ADR-0038 Stage 1c-2 (D2). Real `AgentRegistry` + `StateLog` + on-disk agents
+(no mocks). One global single-seq WAL + one workspace SSoT ⇒ a single
+reset-record rewinds every agent atomically. Covers: active-target validation,
+multi-agent consistent-cut reconstruct, the **self-contained** snapshot
+(applied_seq = R) that makes restore_all correct-or-absent without a
+floor-clamp (choice (b)), and the no-compaction-during-window guard.
+"""
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from reyn.core.events.agent_snapshot import AgentSnapshot
+from reyn.core.events.snapshot_generations import RewindIntoAbandonedError, rewind
+from reyn.core.events.state_log import StateLog
+from reyn.runtime.profile import AgentProfile
+from reyn.runtime.registry import AgentRegistry
+from tests._support.agent_session import make_session
+
+
+def _no_factory(_profile):
+    raise AssertionError("session factory must not be called in these tests")
+
+
+def _make_registry(tmp_path: Path) -> AgentRegistry:
+    state_log = StateLog(tmp_path / ".reyn" / "wal.jsonl")
+    return AgentRegistry(
+        project_root=tmp_path, session_factory=_no_factory, state_log=state_log,
+    )
+
+
+def _seed_agent(tmp_path: Path, name: str) -> None:
+    """Create the on-disk profile so list_names() includes the agent."""
+    AgentProfile.new(name, role="").save(tmp_path / ".reyn" / "agents" / name)
+
+
+async def _put(log: StateLog, agent: str, text: str) -> int:
+    return await log.append(
+        "inbox_put", target=agent, msg_id=text, msg_kind="user",
+        payload={"text": text},
+    )
+
+
+def _snap_path(tmp_path: Path, name: str) -> Path:
+    return tmp_path / ".reyn" / "agents" / name / "state" / "snapshot.json"
+
+
+def _inbox_ids(snap: AgentSnapshot) -> list[str]:
+    return [m["id"] for m in snap.inbox]
+
+
+@pytest.mark.asyncio
+async def test_rewind_to_rejects_abandoned_target(tmp_path):
+    """Tier 2: rewinding into an abandoned segment is rejected up front (1b guard)."""
+    reg = _make_registry(tmp_path)
+    _seed_agent(tmp_path, "alpha")
+    log = reg.state_log
+    await _put(log, "alpha", "a")          # seq 1
+    await _put(log, "alpha", "b")          # seq 2
+    await rewind(log, target_n=1)          # seq 3 — abandons seq 2
+
+    with pytest.raises(RewindIntoAbandonedError):
+        await reg.rewind_to(2)             # seq 2 is on an abandoned branch
+
+
+@pytest.mark.asyncio
+async def test_rewind_to_reconstructs_all_agents_as_of_n(tmp_path):
+    """Tier 2: rewind_to reconstructs EVERY agent as-of-N (global consistent-cut).
+
+    Two agents with interleaved appends; rewind_to(2) cuts the whole world back
+    to seq 2 — each agent's on-disk snapshot reflects only its <=2 work, and is
+    pinned to applied_seq = R (the reset-record) so it is self-contained.
+    """
+    reg = _make_registry(tmp_path)
+    _seed_agent(tmp_path, "alpha")
+    _seed_agent(tmp_path, "beta")
+    log = reg.state_log
+    await _put(log, "alpha", "a1")         # seq 1 (<=2, kept)
+    await _put(log, "beta", "b1")          # seq 2 (<=2, kept)
+    await _put(log, "alpha", "a2")         # seq 3 (>2, abandoned)
+    await _put(log, "beta", "b2")          # seq 4 (>2, abandoned)
+
+    result = await reg.rewind_to(2)
+    R = result["reset_seq"]
+
+    assert result["target_n"] == 2
+    # consistent-cut covers EVERY known agent (incl. the auto-created default).
+    assert {"alpha", "beta"} <= set(result["agents"])
+
+    alpha = AgentSnapshot.load("alpha", _snap_path(tmp_path, "alpha"))
+    beta = AgentSnapshot.load("beta", _snap_path(tmp_path, "beta"))
+    assert _inbox_ids(alpha) == ["a1"]     # a2 abandoned
+    assert _inbox_ids(beta) == ["b1"]      # b2 abandoned
+    # self-contained: replay floor is R, not N.
+    assert alpha.applied_seq == R
+    assert beta.applied_seq == R
+
+
+@pytest.mark.asyncio
+async def test_rewind_to_snapshot_self_contained_for_restore_all(tmp_path):
+    """Tier 2: the persisted snapshot makes restore_all correct WITHOUT is_active.
+
+    restore_all replays forward from snapshot.applied_seq (no is_active honoring).
+    Because rewind_to pins applied_seq = R, restore_all's replay starts past the
+    abandoned (N, R] segment — so post-rewind work is kept and the abandoned
+    future is never resurrected, even though restore_all doesn't know about
+    rewind records. This is the correctness basis for choice (b).
+    """
+    reg = _make_registry(tmp_path)
+    _seed_agent(tmp_path, "alpha")
+    log = reg.state_log
+    await _put(log, "alpha", "a1")         # seq 1 (kept)
+    await _put(log, "alpha", "a2")         # seq 2 (abandoned by rewind to 1)
+
+    result = await reg.rewind_to(1)
+    R = result["reset_seq"]
+
+    # New active-branch work after the rewind.
+    await _put(log, "alpha", "a3")         # seq R+1
+
+    # Simulate restore_all's algorithm: load the self-contained snapshot, then
+    # replay forward from applied_seq + 1 (NO is_active honoring).
+    saved = AgentSnapshot.load("alpha", _snap_path(tmp_path, "alpha"))
+    assert saved.applied_seq == R
+    saved.apply_events(list(log.iter_from(saved.applied_seq + 1)))
+
+    assert _inbox_ids(saved) == ["a1", "a3"]   # a2 (abandoned, <R) never replayed
+
+    # Idempotent: replaying again from a fresh load yields the same state.
+    again = AgentSnapshot.load("alpha", _snap_path(tmp_path, "alpha"))
+    again.apply_events(list(log.iter_from(again.applied_seq + 1)))
+    assert _inbox_ids(again) == ["a1", "a3"]
+
+
+@pytest.mark.asyncio
+async def test_rewind_to_gates_compaction_during_window(tmp_path):
+    """Tier 2: while a rewind is in progress, maybe_truncate_for_size no-ops.
+
+    The guard returns None BEFORE the size/floor logic — proven by passing a
+    1-byte threshold (the WAL exceeds it, so a non-guarded call would proceed
+    past the threshold check) and still getting None while the flag is set.
+    """
+    reg = _make_registry(tmp_path)
+    _seed_agent(tmp_path, "alpha")
+    log = reg.state_log
+    for i in range(5):
+        await _put(log, "alpha", f"m{i}")
+
+    reg._rewind_in_progress = True
+    result = await reg.maybe_truncate_for_size(threshold_bytes=1)
+    assert result is None                  # gated — no compaction during rewind
+
+
+@pytest.mark.asyncio
+async def test_rewind_to_drives_loaded_session_to_as_of_n_zero_residue(tmp_path):
+    """Tier 2: rewind_to drives a REAL loaded session through the full path.
+
+    A real Session (aligned to the registry's on-disk paths) is injected; the
+    user-facing rewind cancels + quiesces it, reconstructs as-of-N, clears live
+    in-memory residue (reset_for_rewind), and re-adopts the as-of-N snapshot
+    (restore_state). Post-rewind the session reflects as-of-N with zero pre-rewind
+    residue — and its on-disk snapshot is the self-contained recovery artifact.
+    """
+    reg = _make_registry(tmp_path)
+    _seed_agent(tmp_path, "alpha")
+    log = reg.state_log
+    session = make_session(
+        agent_name="alpha", state_log=log,
+        snapshot_path=_snap_path(tmp_path, "alpha"),
+    )
+    session.register_intervention_listener("test")
+    reg._sessions["alpha"] = {"main": session}
+
+    await _put(log, "alpha", "a1")         # seq 1 (kept by rewind to 1)
+    await _put(log, "alpha", "a2")         # seq 2 (abandoned)
+    # live in-memory residue that ONLY reset_for_rewind can clear (no WAL append):
+    session.inbox.put_nowait(("user", {"text": "OLD-residue"}))
+
+    result = await reg.rewind_to(1)
+
+    # the live session reflects as-of-N (a1), OLD residue gone.
+    drained = []
+    while not session.inbox.empty():
+        drained.append(session.inbox.get_nowait())
+    assert drained == [("user", {"text": "a1"})]
+
+    # on-disk snapshot for the loaded agent is as-of-N + self-contained (applied_seq=R).
+    snap = AgentSnapshot.load("alpha", _snap_path(tmp_path, "alpha"))
+    assert _inbox_ids(snap) == ["a1"]
+    assert snap.applied_seq == result["reset_seq"]
+
+
+# ── crash-mid-rewind recovery (runtime substrate; WAL+snapshot, git-independent) ──
+
+
+@pytest.mark.asyncio
+async def test_recover_rewind_restores_active_gen_not_abandoned(tmp_path):
+    """Tier 2: crash mid-rewind ⇒ recovery brings the runtime substrate to as-of-N.
+
+    Simulates a crash AFTER the reset-record is fsync'd but BEFORE materialisation.
+    Recovery must re-materialise the runtime snapshot to the ACTIVE branch as-of-N —
+    NOT the abandoned future.
+    """
+    reg = _make_registry(tmp_path)
+    _seed_agent(tmp_path, "alpha")
+    log = reg.state_log
+
+    await _put(log, "alpha", "a1")          # seq 1  (active)
+    await _put(log, "alpha", "a2")          # seq 2  (will be abandoned)
+
+    # reset-record appended (rewind to 1), then crash BEFORE materialisation.
+    R = await rewind(log, target_n=1)       # seq 3 — abandons (1, 3)
+
+    result = await reg.recover_rewind_if_needed()
+
+    assert result is not None and result["recovered_target_n"] == 1
+    # runtime: self-contained snapshot re-materialised as-of-N (applied_seq = head).
+    snap = AgentSnapshot.load("alpha", _snap_path(tmp_path, "alpha"))
+    assert _inbox_ids(snap) == ["a1"]       # a2 (abandoned future) not present
+    assert snap.applied_seq == R
+
+
+@pytest.mark.asyncio
+async def test_recover_rewind_is_noop_without_reset_record(tmp_path):
+    """Tier 2: with no rewind record, recovery is a no-op (returns None)."""
+    reg = _make_registry(tmp_path)
+    _seed_agent(tmp_path, "alpha")
+    await _put(reg.state_log, "alpha", "a1")
+    assert await reg.recover_rewind_if_needed() is None
+
+
+@pytest.mark.asyncio
+async def test_recover_rewind_keeps_post_rewind_active_agent(tmp_path):
+    """Tier 2: crash AFTER a completed rewind preserves agents created post-rewind.
+
+    Scenario: rewind completed (snapshots pinned to R), then a new agent "delta"
+    is spawned on the active branch (agent_created at C' > R), then crash at K > C'.
+    ``recover_rewind_if_needed`` must NOT drop delta — it is on the ACTIVE branch.
+    A single-cut check (agent_seq > target=N) would wrongly drop any post-rewind
+    agent since C' > R > N = target.
+    """
+    reg = _make_registry(tmp_path)
+    _seed_agent(tmp_path, "alpha")
+    log = reg.state_log
+
+    n_seq = await _put(log, "alpha", "a1")   # seq 1 → N = 1 (rewind target)
+    R = await rewind(log, target_n=n_seq)    # seq 2 = R; abandons nothing (trivial — no gap)
+
+    # New agent created AFTER the rewind on the active branch.
+    await log.append(
+        "agent_created", entity_kind="agent", name="delta", sid="",
+    )                                        # seq 3 = C' (C' > R=2 > N=1)
+    _seed_agent(tmp_path, "delta")           # place the dir so list_names finds it
+
+    # Simulate crash AFTER delta was created (but no new rewind).
+    result = await reg.recover_rewind_if_needed()
+
+    assert result is not None and result["recovered_target_n"] == n_seq
+    # delta (created at C' > R on active branch) must survive.
+    assert "delta" in reg.list_names(), "post-rewind active agent must NOT be dropped by recovery"
+    # alpha (pre-N, no agent_created event) must also survive.
+    assert "alpha" in reg.list_names()
+
+
+@pytest.mark.asyncio
+async def test_recover_rewind_drops_abandoned_branch_agent(tmp_path):
+    """Tier 2: crash mid-rewind ⇒ recovery drops agents created on the abandoned branch.
+
+    An agent whose ``agent_created`` WAL event lands in the abandoned interval (N, R)
+    must be torn down by ``recover_rewind_if_needed``.  Previously the method passed
+    ``workspace_at_or_below=head`` (= R) instead of ``workspace_at_or_below=target``
+    (= N), so agents created at N < C < R had create-seq ≤ R and were NOT dropped.
+    """
+    reg = _make_registry(tmp_path)
+    _seed_agent(tmp_path, "alpha")      # pre-N agent — no agent_created WAL event
+    log = reg.state_log
+
+    n_seq = await _put(log, "alpha", "a1")   # seq 1 → N = 1 (rewind target)
+
+    # Simulate an agent spawned AFTER N on the abandoned branch: emit the WAL event
+    # then create the on-disk directory so list_names() surfaces it.
+    await log.append(
+        "agent_created", entity_kind="agent", name="orphan", sid="",
+    )                                        # seq 2 = C (N < C < R)
+    _seed_agent(tmp_path, "orphan")          # place the dir so list_names finds it
+
+    R = await rewind(log, target_n=n_seq)   # seq 3 = R; abandons interval (1, 3)
+
+    result = await reg.recover_rewind_if_needed()
+
+    assert result is not None and result["recovered_target_n"] == n_seq
+    # orphan (created at C=2 in the abandoned interval) must be gone.
+    assert "orphan" not in reg.list_names(), "abandoned-branch agent must be dropped by recovery"
+    # alpha (pre-N, no agent_created event) must survive.
+    assert "alpha" in reg.list_names(), "pre-N agent must survive crash-mid-rewind recovery"
+
+
+@pytest.mark.asyncio
+async def test_recover_rewind_post_rewind_session_vanished_is_dropped(tmp_path):
+    """Tier 2: a spawned session that vanished POST-REWIND (V > R, active branch) is dropped.
+
+    Scenario: rewind completes (R written), alice's spawned session "s1" then
+    legitimately vanishes at V > R (``session_vanished`` emitted), crash before
+    the rmtree finishes — the session dir survives on disk.
+    ``recover_rewind_if_needed`` must drop (not reconstruct) alice/s1.
+
+    A single-cut ``van_seq ≤ N`` check misses V > R (vanished_by_cut=False) and
+    wrongly calls ``reconstruct()``, writing a stale snapshot.  ``is_active_seq``
+    gives True for V > R and correctly sets vanished_by_cut=True → drop.
+    """
+    sid = "s1"
+    reg = _make_registry(tmp_path)
+    _seed_agent(tmp_path, "alice")
+    log = reg.state_log
+
+    n_seq = await _put(log, "alice", "a1")    # seq 1 = N
+    R = await rewind(log, target_n=n_seq)     # seq 2 = R; abandoned interval (1,2) trivially empty
+    # Session vanishes on the ACTIVE branch post-rewind (V > R).
+    await log.append(
+        "session_vanished", entity_kind="session", name="alice", sid=sid,
+    )                                         # seq 3 = V (is_active_seq(V) = True)
+
+    # Simulate crash-mid-rmtree: spawned session dir still on disk.
+    sess_dir = tmp_path / ".reyn" / "agents" / "alice" / "state" / "sessions" / sid
+    sess_dir.mkdir(parents=True, exist_ok=True)
+    snap_path = sess_dir / "snapshot.json"
+
+    result = await reg.recover_rewind_if_needed()
+
+    assert result is not None
+    # Session must be identified as vanished and NOT reconstructed (snapshot absent).
+    assert not snap_path.exists(), (
+        "session vanished on active branch post-rewind must NOT be reconstructed"
+    )
+
+
+@pytest.mark.asyncio
+async def test_recover_rewind_abandoned_session_vanish_not_applied(tmp_path):
+    """Tier 2: a spawned session that vanished on the ABANDONED branch (N < V < R) is kept.
+
+    The session was alive as-of-target N — the vanish event is on a branch that
+    the rewind discards.  ``vanished_by_cut`` must be False so the session is
+    reconstructed normally.  Both the old ``van_seq ≤ N`` and the new
+    ``is_active_seq(van_seq)`` give the correct answer here; this test is a
+    regression guard ensuring the fix does not accidentally flip this direction.
+    """
+    sid = "s1"
+    reg = _make_registry(tmp_path)
+    _seed_agent(tmp_path, "alice")
+    log = reg.state_log
+
+    n_seq = await _put(log, "alice", "a1")    # seq 1 = N
+    # Session vanishes on the ABANDONED branch (N < V < R).
+    await log.append(
+        "session_vanished", entity_kind="session", name="alice", sid=sid,
+    )                                         # seq 2 = V (is_active_seq(V) will be False)
+    R = await rewind(log, target_n=n_seq)     # seq 3 = R; V is in (1, 3)
+
+    # Session dir on disk (would be cleaned up post-rewind normally).
+    sess_dir = tmp_path / ".reyn" / "agents" / "alice" / "state" / "sessions" / sid
+    sess_dir.mkdir(parents=True, exist_ok=True)
+
+    result = await reg.recover_rewind_if_needed()
+
+    assert result is not None
+    # Session alive as-of-target MUST be reconstructed (snapshot written).
+    snap_path = sess_dir / "snapshot.json"
+    assert snap_path.exists(), (
+        "session alive as-of-target N must be reconstructed even if it vanished on"
+        " the abandoned branch"
+    )
+
+
+@pytest.mark.asyncio
+async def test_recover_rewind_post_rewind_archive_applied(tmp_path):
+    """Tier 2: an agent archived POST-REWIND (aseq > R, active branch) stays archived.
+
+    Scenario: rewind completes, then alice is archived (``agent_archived`` at A > R)
+    on the active branch, crash.  ``_reconcile_archived_as_of_cut`` must WRITE
+    the ``.archived`` marker (agent remains archived after recovery).
+
+    The old ``aseq ≤ cut(=N)`` check had aseq > N → marker unlinked → alice
+    un-archived on recovery.  ``is_active_seq(aseq)`` gives True for aseq > R and
+    correctly writes the marker.
+    """
+    reg = _make_registry(tmp_path)
+    _seed_agent(tmp_path, "alice")
+    log = reg.state_log
+
+    n_seq = await _put(log, "alice", "a1")    # seq 1 = N
+    R = await rewind(log, target_n=n_seq)     # seq 2 = R
+    # Agent archived on the ACTIVE branch post-rewind (A > R).
+    await log.append(
+        "agent_archived", entity_kind="agent", name="alice", sid="",
+    )                                         # seq 3 = A (is_active_seq(A) = True)
+
+    result = await reg.recover_rewind_if_needed()
+
+    assert result is not None
+    marker = tmp_path / ".reyn" / "agents" / "alice" / ".archived"
+    assert marker.is_file(), (
+        "agent archived on active branch post-rewind must remain archived after recovery"
+    )
+
+
+@pytest.mark.asyncio
+async def test_recover_rewind_abandoned_archive_undone(tmp_path):
+    """Tier 2: an agent archived on the ABANDONED branch (N < aseq < R) is un-archived.
+
+    The archival happened on the branch the rewind discards — as-of-target N the agent
+    was active.  ``_reconcile_archived_as_of_cut`` must UNLINK the ``.archived``
+    marker if it was pre-placed.  ``is_active_seq(aseq)`` gives False for aseq in
+    (N, R) → _on_active=False → unlink.
+    """
+    reg = _make_registry(tmp_path)
+    _seed_agent(tmp_path, "alice")
+    log = reg.state_log
+
+    n_seq = await _put(log, "alice", "a1")    # seq 1 = N
+    # Agent archived on the ABANDONED branch (N < aseq < R).
+    await log.append(
+        "agent_archived", entity_kind="agent", name="alice", sid="",
+    )                                         # seq 2 = A (is_active_seq(A) will be False)
+    R = await rewind(log, target_n=n_seq)     # seq 3 = R; A is in (1, 3)
+
+    # Pre-place the .archived marker (simulating it was written before crash).
+    marker = tmp_path / ".reyn" / "agents" / "alice" / ".archived"
+    marker.write_text("2", encoding="utf-8")
+
+    result = await reg.recover_rewind_if_needed()
+
+    assert result is not None
+    assert not marker.is_file(), (
+        "abandoned-branch archive must be undone: agent was active as-of-target N"
+    )
+
+
+@pytest.mark.asyncio
+async def test_restore_all_triggers_crash_recovery(tmp_path):
+    """Tier 2: restore_all (production startup seam) TRIGGERS crash-mid-rewind recovery.
+
+    Wiring proof — recovery must run via ``restore_all`` (the path the 3 startup
+    sites call), NOT only via a direct ``recover_rewind_if_needed`` call. Simulate
+    a crash mid-rewind (reset-record present), then call ``restore_all``: the
+    persisted runtime snapshot must be re-materialised to the ACTIVE gen-N. Events
+    target an unseeded agent so no non-empty snapshot pulls in the session factory.
+    """
+    reg = _make_registry(tmp_path)          # only the auto 'default' agent (empty)
+    log = reg.state_log
+
+    await _put(log, "ghost", "g1")          # seq 1 (advances seq; 'ghost' not in list_names)
+    await _put(log, "ghost", "g2")          # seq 2 (abandoned future)
+    R = await rewind(log, target_n=1)       # seq 3 — abandons (1,3); crash before materialise
+
+    # pre-recovery: the active-branch rewind target is outstanding.
+    from reyn.core.events.snapshot_generations import active_rewind_target
+    assert active_rewind_target(log) == 1
+
+    await reg.restore_all()                 # production seam — must trigger recovery
+
+    # the recovery re-materialised the 'default' agent's snapshot self-contained at
+    # the reset-record head (applied_seq = R) — the observable proof recovery ran via
+    # restore_all (a direct recover_rewind_if_needed would do the same; not calling it
+    # at all leaves applied_seq at 0).
+    snap = AgentSnapshot.load("default", _snap_path(tmp_path, "default"))
+    assert snap.applied_seq == R
+
+
+# ── Stage 1e: retention clamp + GC + window guard ─────────────────────────────
+
+
+class _WatermarkShim:
+    """Minimal session exposing iter_applied_seqs (the floor-calc public surface)."""
+
+    def __init__(self, seqs: list[int]) -> None:
+        self._seqs = seqs
+
+    def iter_applied_seqs(self, *, now_ts: float, long_await_threshold: float) -> list[int]:
+        return list(self._seqs)
+
+
+@pytest.mark.asyncio
+async def test_compute_truncate_floor_clamped_by_retention(tmp_path):
+    """Tier 2: a deeper retention policy clamps the truncate floor below the live floor."""
+    from reyn.core.events.retention import RetentionPolicy
+    from reyn.runtime.registry import AgentRegistry
+
+    state_log = StateLog(tmp_path / ".reyn" / "wal.jsonl")
+    reg = AgentRegistry(
+        project_root=tmp_path, session_factory=_no_factory, state_log=state_log,
+        retention_policy=RetentionPolicy(keep_generations=2),
+    )
+    _seed_agent(tmp_path, "alpha")
+    reg._sessions["alpha"] = {"main": _WatermarkShim([10])}  # live floor = 11
+
+    store = reg._store_for("alpha")                      # record 3 checkpoints
+    for s in (1, 2, 3):
+        snap = AgentSnapshot.empty("alpha")
+        snap.applied_seq = s
+        store.record(snap)
+
+    # keep last 2 gens (2, 3) → oldest retained = 2 → floor = min(11, 2) = 2.
+    assert reg.compute_truncate_floor() == 2
+
+
+@pytest.mark.asyncio
+async def test_live_policy_floor_unchanged(tmp_path):
+    """Tier 2: default (live) policy applies NO clamp — floor stays the live floor."""
+    state_log = StateLog(tmp_path / ".reyn" / "wal.jsonl")
+    reg = AgentRegistry(
+        project_root=tmp_path, session_factory=_no_factory, state_log=state_log,
+    )  # default policy = live
+    _seed_agent(tmp_path, "alpha")
+    reg._sessions["alpha"] = {"main": _WatermarkShim([10])}
+    store = reg._store_for("alpha")
+    for s in (1, 2, 3):
+        snap = AgentSnapshot.empty("alpha")
+        snap.applied_seq = s
+        store.record(snap)
+
+    assert reg.compute_truncate_floor() == 11            # min(watermark)+1, no clamp
+
+
+@pytest.mark.asyncio
+async def test_truncate_gcs_generations_below_floor(tmp_path):
+    """Tier 2: generation GC drops gens below the floor (retained gens stay)."""
+    reg = _make_registry(tmp_path)
+    _seed_agent(tmp_path, "alpha")
+    store = reg._store_for("alpha")
+    for s in (1, 2, 3):
+        snap = AgentSnapshot.empty("alpha")
+        snap.applied_seq = s
+        store.record(snap)
+    assert store.seqs() == [1, 2, 3]
+
+    await reg._prune_generations_below(3)
+
+    kept = reg._store_for("alpha").seqs()
+    assert kept == [3]                                   # 1, 2 GC'd; 3 (>= floor) kept
+
+
+@pytest.mark.asyncio
+async def test_rewind_to_rejects_target_truncated_out_of_wal(tmp_path):
+    """Tier 2: rewinding to a seq below the retained WAL raises (decision-enabling, Q4)."""
+    from reyn.core.events.snapshot_generations import RewindBeyondRetentionError
+
+    reg = _make_registry(tmp_path)
+    _seed_agent(tmp_path, "alpha")
+    log = reg.state_log
+    await _put(log, "alpha", "a")          # seq 1
+    await _put(log, "alpha", "b")          # seq 2
+    await _put(log, "alpha", "c")          # seq 3
+    await log.truncate_below(3)            # drop seq 1, 2; oldest kept = 3
+    await log.flush()                      # #2259 PR-2b: truncate is fire-and-forget
+
+    with pytest.raises(RewindBeyondRetentionError):
+        await reg.rewind_to(2)             # seq 2 truncated → outside retention window
+
+
+async def _put_sid(log: StateLog, agent: str, sid: str, text: str) -> int:
+    """Append a session-tagged inbox_put (mirrors the journal's _wal_append)."""
+    return await log.append(
+        "inbox_put", target=agent, session_id=sid,
+        msg_id=text, msg_kind="user", payload={"text": text},
+    )
+
+
+@pytest.mark.asyncio
+async def test_rewind_to_is_per_session_consistent_cut(tmp_path):
+    """Tier 2: FP-0043 S5 — a global rewind reconstructs EACH session at the cut.
+
+    A whole-world rewind (D2) must bring every (agent, session) to the target,
+    each reconstructed from ONLY its own session_id-routed WAL entries. Pre-S5
+    this loop was main-only, so a spawned session's snapshot would be left at HEAD
+    — an inconsistent world. Asserts both per-session correctness (each keeps its
+    pre-cut entry, drops its post-cut entry) AND cross-session isolation.
+    """
+    reg = _make_registry(tmp_path)
+    _seed_agent(tmp_path, "alpha")
+    log = reg.state_log
+
+    # The spawned session's on-disk dir must exist for disk-discovery (the rewind
+    # materialiser is shared with crash-recovery, where sessions are not loaded).
+    spawn_snap_path = (
+        tmp_path / ".reyn" / "agents" / "alpha" / "state" / "sessions" / "s1"
+        / "snapshot.json"
+    )
+    AgentSnapshot.empty("alpha", session_id="s1").save(spawn_snap_path)
+
+    await _put_sid(log, "alpha", "main", "m1")   # seq 1 — main, pre-cut
+    await _put_sid(log, "alpha", "s1", "x1")     # seq 2 — spawned, pre-cut (the cut)
+    await _put_sid(log, "alpha", "main", "m2")   # seq 3 — main, post-cut (undone)
+    await _put_sid(log, "alpha", "s1", "x2")     # seq 4 — spawned, post-cut (undone)
+
+    await reg.rewind_to(2)                        # global cut at seq 2
+
+    main_snap = AgentSnapshot.load("alpha", _snap_path(tmp_path, "alpha"))
+    spawn_snap = AgentSnapshot.load("alpha", spawn_snap_path, session_id="s1")
+
+    # each session reconstructed to ONLY its own pre-cut entry; post-cut undone.
+    assert _inbox_ids(main_snap) == ["m1"]
+    assert _inbox_ids(spawn_snap) == ["x1"]
+    # cross-session isolation (both directions).
+    assert "x1" not in _inbox_ids(main_snap)
+    assert "m1" not in _inbox_ids(spawn_snap)

@@ -1,0 +1,20 @@
+diff --git a/deploy/release.yml b/deploy/release.yml
+new file mode 100644
+index 0000000..3333333
+--- /dev/null
++++ b/deploy/release.yml
+@@ -0,0 +1,12 @@
++deployment_states:
++  draft:
++    transitions:
++      - deployed
++  review:
++    requires_approval: true
++    transitions:
++      - approved
++  approved:
++    requires_approval: true
++    transitions:
++      - deployed
++  deployed:
++    requires_approval: true

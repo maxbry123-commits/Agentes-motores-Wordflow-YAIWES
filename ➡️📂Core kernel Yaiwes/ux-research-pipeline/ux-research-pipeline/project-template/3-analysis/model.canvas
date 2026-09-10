@@ -1,0 +1,59 @@
+{
+  "nodes": [
+    {
+      "id": "header",
+      "type": "text",
+      "text": "# Paradigm model\n\nConditions → Context → Actions → Consequences\n\nThe agent builds this diagram after 5+ coded interviews. Nodes are linked to themes and quotes.",
+      "x": -400,
+      "y": -200,
+      "width": 800,
+      "height": 200,
+      "color": "5"
+    },
+    {
+      "id": "conditions",
+      "type": "text",
+      "text": "## Conditions\n\n(why the situation arises)\n\n_nodes appear after 5+ interviews_",
+      "x": -800,
+      "y": 100,
+      "width": 300,
+      "height": 200,
+      "color": "1"
+    },
+    {
+      "id": "context",
+      "type": "text",
+      "text": "## Context\n\n(under what circumstances)\n\n_nodes appear_",
+      "x": -400,
+      "y": 100,
+      "width": 300,
+      "height": 200,
+      "color": "2"
+    },
+    {
+      "id": "actions",
+      "type": "text",
+      "text": "## Actions\n\n(what the respondent does)\n\n_nodes appear_",
+      "x": 0,
+      "y": 100,
+      "width": 300,
+      "height": 200,
+      "color": "3"
+    },
+    {
+      "id": "consequences",
+      "type": "text",
+      "text": "## Consequences\n\n(what happens next)\n\n_nodes appear_",
+      "x": 400,
+      "y": 100,
+      "width": 300,
+      "height": 200,
+      "color": "4"
+    }
+  ],
+  "edges": [
+    {"id": "e1", "fromNode": "conditions", "fromSide": "right", "toNode": "context", "toSide": "left"},
+    {"id": "e2", "fromNode": "context", "fromSide": "right", "toNode": "actions", "toSide": "left"},
+    {"id": "e3", "fromNode": "actions", "fromSide": "right", "toNode": "consequences", "toSide": "left"}
+  ]
+}

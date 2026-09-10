@@ -1,0 +1,38 @@
+services:
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    volumes:
+      - ./configs/otel-collector-config.yaml:/etc/otel-collector-config.yaml
+    ports:
+      - "4318:4318"
+    depends_on:
+      - jaeger
+    networks:
+      - jaeger-network
+
+  jaeger:
+    image: jaegertracing/jaeger:2.3.0
+    ports:
+      - "16686:16686"
+      - "4317:4317"
+      - "14318:4318"
+      - "5778:5778"
+      - "9411:9411"
+    volumes:
+      - ./configs/jaeger-config.yaml:/jaeger/config.yaml
+      - ./configs/config-ui.json:/jaeger/config-ui.json
+    environment:
+      - OTEL_TRACES_SAMPLER=always_off
+    command:
+      - "--config"
+      - "/jaeger/config.yaml"
+    networks:
+      - jaeger-network
+    
+networks:
+  jaeger-network:
+    driver: bridge
+
+volumes:
+  cache:

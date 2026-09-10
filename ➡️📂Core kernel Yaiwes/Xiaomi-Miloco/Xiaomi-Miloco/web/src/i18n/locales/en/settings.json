@@ -1,0 +1,38 @@
+{
+  "settings": {
+    "title": "Settings",
+    "videoShortEdge": "Resolution",
+    "videoShortEdgeHint": "Short edge pixels, keeps aspect ratio",
+    "smartCrop": "Smart Crop Enhance",
+    "smartCropHint": "Crops the active area of the frame before recognition, so people and objects look sharper at the same resolution; a full-view reference frame is sent along. Falls back to the whole frame when no active area is found.",
+    "smartCropUnavailable": "Not enabled on the server yet; not configurable for now.",
+    "omniFps": "Frame Rate",
+    "omniFpsHint": "Higher frame rate uses more resources",
+    "windowSize": "Perception Window",
+    "windowSizeUnit": "sec",
+    "apply": "Apply Settings",
+    "applying": "Applying…",
+    "applySuccess": "Settings applied",
+    "saveFailed": "Save failed",
+    "partialSaveFailed": "Scheduler toggle saved, but perception settings failed to save. Please retry.",
+    "restartFailed": "Settings saved, but engine restart failed. Please restart manually.",
+    "loadFailed": "Failed to load settings",
+    "resetDefaults": "Restore Defaults",
+    "schedulerSaved": "Saved. Takes effect after the next agent gateway restart.",
+    "autoSchedule": "Auto scheduled tasks",
+    "autoScheduleHint": "When on, miloco auto-creates and maintains its built-in scheduled tasks (perception digest / home patrol / memory dreaming / habit insights). When off, those tasks are removed and not recreated. Takes effect after the next agent gateway restart.",
+    "autoScheduleUnavailable": "This backend doesn't support this toggle (version may be too old); not configurable for now.",
+    "minUrgency": "Alert filter",
+    "minUrgencyHint": "Filtered events still show up in the activity log; the main agent is not notified.",
+    "minUrgencyTick": {
+      "low": "Low",
+      "medium": "Med",
+      "high": "High"
+    },
+    "minUrgencyStatus": {
+      "low": "Receive all events",
+      "medium": "Receive medium & high urgency",
+      "high": "Receive high urgency only"
+    }
+  }
+}

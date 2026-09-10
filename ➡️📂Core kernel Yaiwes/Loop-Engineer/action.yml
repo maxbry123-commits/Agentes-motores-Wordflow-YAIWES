@@ -1,0 +1,311 @@
+name: "loop-engineer gate"
+description: "Proof-of-done gate for agent-loop contracts: hard-fails on doctor, scores with inspect (warn-only by default), and can keylessly attest the run's verdict@1 predicate (opt-in)."
+branding:
+  icon: "check-circle"
+  color: "green"
+
+inputs:
+  path:
+    description: "Workspace (or .loop dir) holding the loop contract"
+    required: false
+    default: "."
+  version:
+    description: "loop-engineer version to install from PyPI (e.g. 0.6.1). Empty installs from the action's own checkout."
+    required: false
+    default: ""
+  fail-under-score:
+    description: "Fail the job when the inspect score (0-100) is below this. 0 keeps inspect warn-only. NOTE: the inspect score is an advisory heuristic and a determined author can game it — loop doctor is the hard gate."
+    required: false
+    default: "0"
+  python-version:
+    description: "Python version for the gate"
+    required: false
+    default: "3.12"
+  github-token:
+    description: "Token for the optional PR scorecard comment. Empty skips the comment."
+    required: false
+    default: ""
+  expect-chain-head:
+    description: >-
+      Fail the gate unless the store's chain head equals this 64-hex value (an
+      externally remembered anchor). Empty performs NO cross-run tamper
+      detection — the gate then only records the head for a later comparison.
+    required: false
+    default: ""
+  anchor:
+    description: >-
+      Path to a tracked loop-engineer/anchor@1 file carrying a previously
+      attested chain head. The gate corroborates the carried head against the
+      attestation index and then checks it is still an ANCESTOR of this run's
+      chain. An attestation can only corroborate a head, never discover one —
+      GitHub exposes no endpoint that lists attestations without a subject
+      digest. Requires signer-workflow. Empty performs no anchor resolution.
+      Anchor trust is exactly ordinary write access to the anchor file. On a
+      PRIVATE repository the index read needs credentials, so pass
+      github-token as well; on a public repository it succeeds unauthenticated.
+    required: false
+    default: ""
+  signer-workflow:
+    description: >-
+      Mandatory pin when anchor is set, in the form
+      [host/]<owner>/<repo>/<path>/<to>/<workflow>. Without it a corroboration
+      means nothing, so the resolve step fails closed rather than resolving
+      unpinned.
+    required: false
+    default: ""
+  attest:
+    description: >-
+      Emit a loop-engineer/verdict@1 predicate and attest it keylessly via
+      GitHub OIDC. Requires the CALLING JOB to declare `id-token: write` and
+      `attestations: write` — a composite action cannot declare its own
+      permissions. Default false. The predicate is PUBLIC and permanent for
+      public repositories.
+    required: false
+    default: "false"
+
+outputs:
+  chain-head:
+    description: "Chain head event_hash observed by this gate run ('' when the store has no chained events)."
+    value: ${{ steps.chain-head.outputs.chain-head }}
+  attestation-url:
+    description: "URL of the attestation created by this run ('' when attest is false)."
+    value: ${{ steps.attest.outputs.attestation-url }}
+  attestation-id:
+    description: "ID of the attestation created by this run ('' when attest is false)."
+    value: ${{ steps.attest.outputs.attestation-id }}
+  anchor-outcome:
+    description: >-
+      corroborated | contradicted | unavailable ('' when anchor is empty).
+      Distinct for OBSERVABILITY only: anything short of a verified 200 plus a
+      successful gh attestation verify is non-promoting, and transport-class
+      failures are separately reportable but exactly as non-promoting as a
+      clean denial.
+    value: ${{ steps.anchor.outputs.anchor-outcome }}
+
+runs:
+  using: "composite"
+  steps:
+    - uses: actions/setup-python@v7
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Install loop-engineer
+      shell: bash
+      env:
+        LOOP_VERSION: "${{ inputs.version }}"
+      run: |
+        # Install WITH the schema extras on both paths: the gate surface must run
+        # real JSON-Schema validation, not the CLI's pure-stdlib structural default.
+        if [ -n "$LOOP_VERSION" ]; then
+          python -m pip install --quiet "loop-engineer[schemas,yaml]==$LOOP_VERSION"
+        else
+          python -m pip install --quiet "${{ github.action_path }}[schemas,yaml]"
+        fi
+
+    - name: loop doctor (hard gate)
+      shell: bash
+      env:
+        LOOP_PATH: "${{ inputs.path }}"
+        LOOP_EXPECT_HEAD: "${{ inputs.expect-chain-head }}"
+      run: |
+        # -eo pipefail (GitHub's bash default) makes a doctor failure fail the step
+        # despite the tee. Then assert the strict validation path actually ran, so a
+        # future packaging regression that drops the extras fails loudly here. The
+        # check reads one fixed field from doctor's own JSON — no fragile parsing.
+        if [ -n "$LOOP_EXPECT_HEAD" ]; then
+          loop doctor --expect-chain-head "$LOOP_EXPECT_HEAD" "$LOOP_PATH" | tee "${RUNNER_TEMP}/doctor.json"
+        else
+          loop doctor "$LOOP_PATH" | tee "${RUNNER_TEMP}/doctor.json"
+        fi
+        python - "${RUNNER_TEMP}/doctor.json" <<'PY'
+        import json, sys
+        mode = json.load(open(sys.argv[1])).get("validation_mode")
+        if mode != "jsonschema":
+            print(f"::error::loop doctor ran in {mode!r} mode, not 'jsonschema' — "
+                  "the gate is installed without its [schemas] extra")
+            raise SystemExit(1)
+        PY
+
+    - name: chain head (anchor surface)
+      id: chain-head
+      if: always()
+      shell: bash
+      run: |
+        # Runs even when doctor failed: an anchor MISMATCH is exactly the run whose
+        # observed head an operator needs recorded. Absent/empty doctor.json (doctor
+        # never got to write one) is a silent no-op, not an error.
+        [ -s "${RUNNER_TEMP}/doctor.json" ] || exit 0
+        python - "${RUNNER_TEMP}/doctor.json" "$GITHUB_STEP_SUMMARY" "$GITHUB_OUTPUT" <<'PY'
+        import json, sys
+        try:
+            doctor = json.load(open(sys.argv[1]))
+        except (OSError, json.JSONDecodeError):
+            doctor = {}
+        chain = (doctor.get("event_store") or {}).get("chain") or {}
+        head = chain.get("head") or {}
+        value = head.get("event_hash") or ""
+        line = (f"**loop-engineer chain head:** `{value}` (sequence {head.get('sequence')})"
+                if value else "**loop-engineer chain head:** none (no chained events)")
+        open(sys.argv[2], "a").write(line + "\n")
+        open(sys.argv[3], "a").write(f"chain-head={value}\n")
+        PY
+
+    - name: verdict predicate
+      id: verdict
+      if: ${{ inputs.attest == 'true' }}
+      shell: bash
+      env:
+        LOOP_PATH: "${{ inputs.path }}"
+      run: |
+        # Fail with a legible message rather than a raw OIDC 403 from the attest
+        # step: a composite action cannot declare permissions, so the CALLING
+        # job must. ACTIONS_ID_TOKEN_REQUEST_URL is present only when the job
+        # declared id-token: write.
+        if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+          echo "::error::attest: true requires the calling job to declare" \
+               "'permissions: { id-token: write, attestations: write }'." \
+               "A composite action cannot declare its own permissions."
+          exit 1
+        fi
+        loop verdict "$LOOP_PATH" > "${RUNNER_TEMP}/verdict.json"
+        echo "predicate-path=${RUNNER_TEMP}/verdict.json" >> "$GITHUB_OUTPUT"
+
+    - name: chain-head subject file
+      id: subject
+      if: ${{ inputs.attest == 'true' && steps.chain-head.outputs.chain-head != '' }}
+      shell: bash
+      env:
+        LOOP_PATH: "${{ inputs.path }}"
+      run: |
+        # Exactly 64 bytes, lowercase hex, NO trailing newline (reference §24). The one
+        # writer is loop.verdict.subject_bytes, reached via --emit-subject, so the attest
+        # side and the resolve side cannot disagree on the byte form.
+        #
+        # This file is what makes verification runnable at all: the chain head is a
+        # SHA-256 over a synthesized event preimage, so no retrievable bytes hash TO it,
+        # and `gh attestation verify` accepts only a path and hashes that file's CONTENT.
+        loop verdict --emit-subject "$LOOP_PATH" > "${RUNNER_TEMP}/loop-chain-head"
+        echo "path=${RUNNER_TEMP}/loop-chain-head" >> "$GITHUB_OUTPUT"
+
+    - name: attest verdict
+      id: attest
+      if: ${{ inputs.attest == 'true' && steps.chain-head.outputs.chain-head != '' }}
+      uses: actions/attest@v4
+      with:
+        # subject-path ONLY, with no subject-name: upstream requires subject-name only
+        # when the subject is identified by a raw digest input, and with a path the
+        # derived name equals the file's basename (loop-chain-head) — which is exactly
+        # the pinned SUBJECT_NAME.
+        subject-path: ${{ steps.subject.outputs.path }}
+        predicate-type: urn:loop-engineer:verdict:1
+        predicate-path: ${{ steps.verdict.outputs.predicate-path }}
+        push-to-registry: false
+        # Only effective when push-to-registry is true, but pinned false
+        # explicitly per ADR 0002 open item 5: no storage record, ever.
+        create-storage-record: false
+
+    - name: attest skipped (no chained events)
+      if: ${{ inputs.attest == 'true' && steps.chain-head.outputs.chain-head == '' }}
+      shell: bash
+      run: echo "::warning::attest requested but the store has no chained events; nothing to attest."
+
+    - name: resolve the anchor attestation
+      id: anchor
+      # This step carries no error-tolerance key and no run-anyway guard: either would
+      # decouple its exit code from the job's outcome, which IS the gate.
+      # Precedence (ADR 0002 decision 5):
+      # a non-empty expect-chain-head input wins over anchor resolution, and the skip is
+      # announced in the step summary below — a silently dropped anchor is worse than a
+      # refused one.
+      if: ${{ inputs.anchor != '' && inputs.expect-chain-head == '' }}
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        LOOP_ANCHOR: "${{ inputs.anchor }}"
+        LOOP_SIGNER_WORKFLOW: "${{ inputs.signer-workflow }}"
+      run: |
+        # No shell-level error suppression around a gating call. The scorecard step below
+        # suppresses errors deliberately because inspect is ADVISORY — this step is not
+        # advisory, and its exit code is the finding. The script itself fails closed when
+        # --signer-workflow is empty.
+        python "${{ github.action_path }}/scripts/action_anchor_resolve.py" \
+          --anchor "$LOOP_ANCHOR" \
+          --repo "$GITHUB_REPOSITORY" \
+          --signer-workflow "$LOOP_SIGNER_WORKFLOW" \
+          --runner-temp "$RUNNER_TEMP" \
+          --github-output "$GITHUB_OUTPUT"
+
+    - name: compare the attested verdict
+      if: ${{ steps.anchor.outputs.anchor-outcome == 'corroborated' }}
+      shell: bash
+      env:
+        LOOP_PATH: "${{ inputs.path }}"
+        ANCHOR_HEAD: "${{ steps.anchor.outputs.anchor-head }}"
+        CURRENT_HEAD: "${{ steps.chain-head.outputs.chain-head }}"
+        PREDICATE: "${{ steps.anchor.outputs.predicate-path }}"
+      run: |
+        # Authenticity first (gh attestation verify, inside the resolve step above), then
+        # ancestry, then agreement where agreement is a meaningful question. No error
+        # suppression: every call here is gating.
+        #
+        # ANCESTRY IS THE CROSS-RUN GATE and runs unconditionally.
+        loop doctor --expect-chain-ancestor "$ANCHOR_HEAD" "$LOOP_PATH"
+        # AGREEMENT IS A SAME-RUN QUESTION. A verdict projects ONE run, so an attested
+        # head that is merely an ancestor of the current head is a different run's
+        # verdict — a disagreement by design (reference §24). Running --compare against
+        # an older attested predicate on a store that legitimately grew would therefore
+        # fail every time, which would make this input unusable for the cross-run
+        # detection it exists for. So compare only when the anchored head IS the current
+        # head, and say out loud when it was skipped.
+        if [ "$ANCHOR_HEAD" = "$CURRENT_HEAD" ]; then
+          loop verdict --compare "$PREDICATE" "$LOOP_PATH"
+        else
+          echo "**loop-engineer anchor:** corroborated, and still an ancestor of this run's chain." \
+               "\`--compare\` was not run: the anchored head \`$ANCHOR_HEAD\` is an earlier run's," \
+               "and a verdict projects one run (reference §24)." >> "$GITHUB_STEP_SUMMARY"
+        fi
+
+    - name: anchor resolution skipped (explicit head wins)
+      if: ${{ inputs.anchor != '' && inputs.expect-chain-head != '' }}
+      shell: bash
+      run: |
+        echo "**loop-engineer anchor:** not resolved — the explicit expect-chain-head input wins (ADR 0002 decision 5)." \
+          >> "$GITHUB_STEP_SUMMARY"
+
+    - name: loop inspect (scorecard)
+      shell: bash
+      env:
+        LOOP_PATH: "${{ inputs.path }}"
+        LOOP_FAIL_UNDER: "${{ inputs.fail-under-score }}"
+      run: |
+        # inspect is advisory; capture its JSON even on a non-zero verdict, then
+        # let the extracted (tested) scorecard render + apply fail-under. The
+        # script validates fail-under as an int instead of tracebacking on it.
+        set +e
+        loop inspect "$LOOP_PATH" > "${RUNNER_TEMP}/inspect.json"
+        set -e
+        python "${{ github.action_path }}/scripts/action_scorecard.py" \
+          "${RUNNER_TEMP}/inspect.json" "$LOOP_FAIL_UNDER"
+
+    - name: PR scorecard comment (optional)
+      if: ${{ inputs.github-token != '' && github.event_name == 'pull_request' }}
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        GH_REPO: ${{ github.repository }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+      run: |
+        # Sticky comment: find our own marker-bearing comment and edit it in place,
+        # else post a fresh one — so re-runs update one comment instead of spamming.
+        # Non-fatal on any API failure.
+        set +e
+        body="$(cat "${RUNNER_TEMP}/scorecard.md")"
+        existing="$(gh api --paginate "repos/${GH_REPO}/issues/${PR_NUMBER}/comments" \
+          --jq '.[] | select(.body | contains("<!-- loop-engineer-scorecard -->")) | .id' | head -n1)"
+        if [ -n "$existing" ]; then
+          gh api --method PATCH "repos/${GH_REPO}/issues/comments/${existing}" \
+            -f body="$body" || echo "::warning::PR comment update failed (non-fatal)"
+        else
+          gh api --method POST "repos/${GH_REPO}/issues/${PR_NUMBER}/comments" \
+            -f body="$body" || echo "::warning::PR comment failed (non-fatal)"
+        fi

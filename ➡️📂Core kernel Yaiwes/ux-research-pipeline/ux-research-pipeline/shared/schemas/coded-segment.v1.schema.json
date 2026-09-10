@@ -1,0 +1,107 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ux-research-pipeline.local/schemas/coded-segment.v1.json",
+  "title": "Coded Segment",
+  "description": "A single segment of a coded interview. The basic unit of analysis. Produced by `09-flat-coding`, read by all downstream analysis skills.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "segment_id",
+    "respondent_id",
+    "speaker",
+    "timecode_start",
+    "timecode_end",
+    "verbatim",
+    "content_type",
+    "content_codes",
+    "research_question_ids"
+  ],
+  "properties": {
+    "segment_id": {
+      "type": "string",
+      "pattern": "^seg-[0-9]{4}$",
+      "description": "Unique segment ID within an interview. Format seg-NNNN (4 digits). Numbering runs continuously through the interview."
+    },
+    "respondent_id": {
+      "type": "string",
+      "pattern": "^R[0-9]{2,3}$",
+      "description": "Respondent ID: R01, R02, ..., R100. Corresponds to the card in `3-analysis/respondents/<ID>.md`."
+    },
+    "speaker": {
+      "type": "string",
+      "enum": ["respondent", "interviewer"],
+      "description": "Who is speaking in the segment. `interviewer` segments are kept for context but are not used as evidence."
+    },
+    "timecode_start": {
+      "type": "string",
+      "pattern": "^[0-9]{2}:[0-9]{2}:[0-9]{2}$",
+      "description": "Start of the segment in the source recording, format HH:MM:SS."
+    },
+    "timecode_end": {
+      "type": "string",
+      "pattern": "^[0-9]{2}:[0-9]{2}:[0-9]{2}$",
+      "description": "End of the segment, format HH:MM:SS."
+    },
+    "verbatim": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Verbatim text of the segment. MUST exist in the source transcript character-for-character. Checked by the verbatim validator before writing."
+    },
+    "content_type": {
+      "type": "string",
+      "enum": ["fact", "interpretation", "hypothesis"],
+      "description": "Epistemic status of the segment. fact — what the respondent did, observed, or experienced (behavior and experience). interpretation — their explanation of why. hypothesis — their guess about the future or about causes they are themselves unsure of. Used downstream when selecting quotes and phrasing findings; not printed into final artifacts."
+    },
+    "content_codes": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "minLength": 2,
+        "maxLength": 80
+      },
+      "description": "Flat codes close to the respondent's words. No hierarchy. Verb or noun phrases, not categories. Grouping is the job of `13-axial-coding`."
+    },
+    "research_question_ids": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^RQ[0-9]+$"
+      },
+      "description": "Which research questions this segment addresses. Empty array = segment is on the research topic but does not directly answer any research question. Non-empty does not mean evidence — only relevance."
+    },
+    "hypothesis_support": {
+      "type": "array",
+      "description": "Link between the segment and the hypotheses from `project-config.yaml`. Empty array or absent — the segment is evidence neither for nor against.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["hypothesis_id", "direction"],
+        "properties": {
+          "hypothesis_id": {
+            "type": "string",
+            "pattern": "^H[0-9]+$"
+          },
+          "direction": {
+            "type": "string",
+            "enum": ["confirm", "disconfirm", "nuance"],
+            "description": "confirm — the segment is evidence for. disconfirm — against. nuance — refines the boundaries of applicability."
+          },
+          "note": {
+            "type": "string",
+            "description": "Optional explanation of why."
+          }
+        }
+      }
+    },
+    "confidence": {
+      "type": "string",
+      "enum": ["low", "medium", "high"],
+      "description": "The coder's confidence that this particular segment was coded correctly (not in the truthfulness of the respondent's words). low — needs a second pair of eyes or more context."
+    },
+    "notes": {
+      "type": "string",
+      "description": "Internal coder notes. They do not appear in the output artifacts for the researcher."
+    }
+  }
+}

@@ -1,0 +1,2763 @@
+// Backend types (mirrored from agent-swarm backend)
+export type AgentStatus = "idle" | "busy" | "offline" | "waiting_for_credentials";
+export type AgentTaskStatus =
+  | "backlog"
+  | "unassigned"
+  | "offered"
+  | "reviewing"
+  | "pending"
+  | "in_progress"
+  | "paused"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "superseded";
+export type AgentTaskSource =
+  | "mcp"
+  | "slack"
+  | "api"
+  | "ui"
+  | "github"
+  | "gitlab"
+  | "agentmail"
+  | "system"
+  | "schedule"
+  | "workflow"
+  | "linear"
+  | "jira";
+export type ChannelType = "public" | "dm";
+export type ModelTier = "smol" | "regular" | "smart" | "ultra";
+/** Mirrors `REASONING_EFFORT_LEVELS` in `src/providers/reasoning-effort.ts` (backend). */
+export const REASONING_EFFORT_LEVELS = ["off", "low", "medium", "high", "xhigh", "max"] as const;
+export type ReasoningEffortLevel = (typeof REASONING_EFFORT_LEVELS)[number];
+
+/** Mirrors `AgentAvatarSchema` (backend `src/types.ts`). Discriminated union so
+ * future avatar types (emoji, image, ...) can be added with no migration —
+ * server validates shape only; the UI owns the icon catalog + fallback. */
+export interface AgentAvatarLucide {
+  type: "lucide";
+  /** Kebab-case lucide icon name, e.g. "rocket". Must exist in AVATAR_ICON_CATALOG to render. */
+  icon: string;
+  /** `#RRGGBB`. Omitted = use the deterministic color derivation. */
+  color?: string;
+}
+export type AgentAvatar = AgentAvatarLucide;
+
+export interface Agent {
+  id: string;
+  name: string;
+  isLead: boolean;
+  status: AgentStatus;
+  description?: string;
+  role?: string;
+  capabilities?: string[];
+  /** Custom avatar. Null/missing = fall back to the deterministic hash-derived icon/color. */
+  avatar?: AgentAvatar | null;
+  claudeMd?: string;
+  soulMd?: string;
+  identityMd?: string;
+  toolsMd?: string;
+  setupScript?: string;
+  heartbeatMd?: string;
+  maxTasks?: number;
+  capacity?: {
+    current: number;
+    max: number;
+    available: number;
+  };
+  /** Env-var names the worker is blocked on when status is `waiting_for_credentials`. */
+  credentialMissing?: string[] | null;
+  provider?: string;
+  /**
+   * Phase 1.5: canonical harness provider the worker reported at registration
+   * time (or `null`/missing for legacy rows from before migration 054).
+   */
+  harnessProvider?: ProviderName | null;
+  /**
+   * Migration 055: worker-self-reported credential snapshot. Null when the
+   * worker hasn't booted yet, or `CRED_CHECK_DISABLE=1` opted it out.
+   */
+  credStatus?: AgentCredStatus | null;
+  createdAt: string;
+  lastUpdatedAt: string;
+}
+
+export type RuntimeInstanceStatus = "active" | "offline";
+
+export interface RuntimeInstance {
+  id: string;
+  agentId: string;
+  status: RuntimeInstanceStatus;
+  reportedSlots: number;
+  credentialReady?: boolean | null;
+  lastSeenAt: string;
+  createdAt: string;
+  updatedAt: string;
+  isLive: boolean;
+}
+
+export interface AgentRuntimeInstancesResponse {
+  runtimeInstances: RuntimeInstance[];
+  staleThresholdMinutes: number;
+}
+
+export interface AgentCredStatusLiveTest {
+  ok: boolean;
+  error?: string | null;
+  latency_ms: number;
+  testedAt: number;
+}
+
+export interface AgentBedrockStatusModel {
+  id: string;
+  name: string;
+}
+
+export interface AgentBedrockStatus {
+  region: string;
+  probedAt: number;
+  ready: boolean;
+  models: AgentBedrockStatusModel[];
+  error?: string;
+}
+
+export interface AgentCredStatus {
+  ready: boolean;
+  missing: string[];
+  satisfiedBy?: "env" | "file" | "side-effect-pending" | null;
+  hint?: string | null;
+  liveTest?: AgentCredStatusLiveTest | null;
+  latestModel?: AgentLatestModel | null;
+  reportedAt: number;
+  reportKind?: "boot" | "post_task";
+  /** Pi-mono Bedrock enumeration block. Null when not in Bedrock mode. */
+  bedrock?: AgentBedrockStatus | null;
+}
+
+export interface AgentLatestModel {
+  model: string;
+  source: "task" | "agent_config" | "adapter_default" | "custom";
+  taskId?: string | null;
+  harnessProvider?: ProviderName | null;
+  reportedAt: number;
+  /** Level the adapter actually applied (or resolved pre-adapter for the initial report). Absent when unset (harness-native default). */
+  reasoningEffort?: ReasoningEffortLevel;
+}
+
+export interface AgentTask {
+  id: string;
+  key: string;
+  agentId: string | null;
+  creatorAgentId?: string;
+  task: string;
+  title?: string;
+  status: AgentTaskStatus;
+  source: AgentTaskSource;
+  taskType?: string;
+  tags: string[];
+  priority: number;
+  dependsOn: string[];
+  offeredTo?: string;
+  offeredAt?: string;
+  acceptedAt?: string;
+  rejectionReason?: string;
+  slackChannelId?: string;
+  slackThreadTs?: string;
+  slackUserId?: string;
+  createdAt: string;
+  lastUpdatedAt: string;
+  finishedAt?: string;
+  failureReason?: string;
+  output?: string;
+  progress?: string;
+  model?: string;
+  modelTier?: ModelTier;
+  effort?: ReasoningEffortLevel;
+  scheduleId?: string;
+  parentTaskId?: string;
+  dir?: string;
+  claudeSessionId?: string;
+  workflowRunId?: string;
+  workflowRunStepId?: string;
+  vcsProvider?: string;
+  vcsRepo?: string;
+  vcsUrl?: string;
+  vcsNumber?: number;
+  vcsEventType?: string;
+  vcsAuthor?: string;
+  credentialKeySuffix?: string;
+  credentialKeyType?: string;
+  swarmVersion?: string;
+  provider?: ProviderName;
+  providerMeta?: DevinProviderMeta | Record<string, never>;
+  harnessVariant?: string;
+  harnessVariantMeta?: { version?: string; failureArtifact?: string };
+  peakContextPercent?: number;
+  peakContextTokens?: number;
+  contextWindowSize?: number;
+  /** Sum of recorded session costs for this task. Missing when no cost rows exist. */
+  totalCostUsd?: number;
+  /** Phase 1 (≥1.76.0): canonical user who requested this task. */
+  requestedByUserId?: string;
+  /** Phase 1 (≥1.76.0): cross-ingress context key for the conversation/thread. */
+  contextKey?: string;
+  /** Pointer-based artifacts attached to the task, when included by the API response. */
+  attachments?: TaskAttachment[];
+  /**
+   * Steering (≥1.122.1), derived server-side: true when the assigned agent is
+   * the Lead. Only present on task *read* responses (`GET /api/tasks/:id`,
+   * `GET /api/sessions/:rootTaskId`) — absent on list rows and optimistic rows.
+   */
+  isLeadTask?: boolean;
+  /**
+   * Steering (≥1.122.1), derived server-side from `PROVIDER_STEER_CAPABILITIES`:
+   * the modes the target harness can actually honor. Empty array = the harness
+   * has no live-injection path at all (codex), so any steer becomes a
+   * follow-up task. Same presence caveat as `isLeadTask`.
+   */
+  supportedSteerModes?: SteerMode[];
+}
+
+export type ProviderName = "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode";
+export type DevinProviderMeta = {
+  sessionUrl: string;
+  maxAcuLimit?: number;
+  acuCostUsd?: number;
+};
+
+// ============================================================================
+// Task steering (≥1.122.1) — mirrors the `Steering*` block in `src/types.ts`.
+// ============================================================================
+
+/** `"queue"` lands at the next turn boundary; `"steer"` interrupts the turn. */
+export type SteerMode = "steer" | "queue";
+
+export type SteeringStatus = "pending" | "delivered" | "handled" | "promoted" | "cancelled";
+
+export type SteeringSource = "ui" | "mcp" | "script" | "slack" | "api";
+
+/** What the server actually did with the request (the degradation ladder). */
+export type SteerOutcome = "steered" | "queued" | "promoted";
+
+export interface SteeringMessage {
+  id: string;
+  taskId: string;
+  body: string;
+  mode: SteerMode;
+  status: SteeringStatus;
+  /** Mode the worker actually delivered in — may differ from `mode` after a degrade. */
+  deliveredMode?: SteerMode;
+  source: SteeringSource;
+  createdByKind: "user" | "agent" | "system";
+  createdByUserId?: string;
+  createdByAgentId?: string;
+  /** Set when the message became a follow-up task instead of being delivered. */
+  promotedTaskId?: string;
+  /**
+   * Optional short note the agent leaves when it acknowledges the message,
+   * describing how the steering was incorporated. Only meaningful alongside
+   * `status: "handled"`; surfaced in the HANDLED chip's tooltip.
+   */
+  handledNote?: string;
+  createdAt: string;
+  deliveredAt?: string;
+  handledAt?: string;
+}
+
+export interface SteeringMessagesResponse {
+  messages: SteeringMessage[];
+}
+
+/** Response body of `POST /api/tasks/:id/steer`. */
+export interface SteerResult {
+  outcome: SteerOutcome;
+  steeringMessageId?: string;
+  promotedTaskId?: string;
+  effectiveMode: SteerMode;
+  /** Present when the requested mode was downgraded (e.g. `steer` → `queue` on claude). */
+  degradedFrom?: SteerMode;
+}
+
+export interface AgentWithTasks extends Agent {
+  tasks: AgentTask[];
+}
+
+/**
+ * Identity (Phase 2 ≥1.76.0). Mirrors `UserSchema` in `src/types.ts` —
+ * canonical row from the new `users` table. Phase 064: identity columns
+ * normalized into `user_external_ids`; surfaced here via `identities[]`.
+ *
+ * Step-9 (≥1.80.0): server-side `composeUser` decorates every list/detail
+ * response with `identities`, `tokens`, and `recentEvents` (limit configurable
+ * via `?recentEvents=N`). All three are present on every wire row produced by
+ * `/api/users*`.
+ */
+export interface UserIdentity {
+  kind: string;
+  externalId: string;
+}
+
+/**
+ * Coarse user-role union. The backend stores `role` as a free-form string;
+ * this union captures the values the UI currently reasons about and gives a
+ * declarative type for future RBAC (e.g. `NavItem.minRole`). Loosened to
+ * `string` on the `User` row since the wire value is not constrained.
+ */
+export type UserRole = "admin" | "member" | "viewer";
+
+export interface User {
+  id: string;
+  name: string;
+  email?: string;
+  role?: string;
+  notes?: string;
+  emailAliases: string[];
+  preferredChannel: string;
+  timezone?: string;
+  // Phase 064: list of platform identities composed from `user_external_ids`.
+  identities?: UserIdentity[];
+  // Phase 064: token summaries (no plaintext, just preview suffix).
+  tokens?: UserToken[];
+  // Phase 064: the last N identity events (server caps the limit).
+  recentEvents?: IdentityEvent[];
+  // Phase 064: NULL/undefined = unlimited.
+  dailyBudgetUsd?: number | null;
+  status: "invited" | "active" | "suspended";
+  metadata?: Record<string, unknown>;
+  createdAt: string;
+  lastUpdatedAt: string;
+}
+
+export interface UsersResponse {
+  users: User[];
+}
+
+export interface UserResponse {
+  user: User;
+}
+
+/**
+ * GET /api/whoami (DES-771) — the principal behind the configured bearer.
+ * `kind: "user"` means the key is a user-bound `aswt_` token and every write
+ * is server-attributed to `user` regardless of what the client claims.
+ */
+export interface WhoamiResponse {
+  kind: "operator" | "user";
+  user: User | null;
+}
+
+export interface MintTokenResponse {
+  plaintext: string;
+  token: UserToken;
+  user: User;
+}
+
+export interface McpUserConfigResponse {
+  mcpBaseUrl: string;
+  mcpUserUrl: string;
+}
+
+export interface CreateUserInput {
+  name: string;
+  email?: string;
+  role?: string;
+  notes?: string;
+  emailAliases?: string[];
+  preferredChannel?: string;
+  timezone?: string;
+  identities?: UserIdentity[];
+  dailyBudgetUsd?: number | null;
+  status?: "invited" | "active" | "suspended";
+  metadata?: Record<string, unknown>;
+}
+
+/**
+ * Structured communication preferences stored under `users.metadata.comms`.
+ * Mirrors `UserCommsPrefsSchema` in the API's `src/types.ts`. All fields are
+ * free-form strings that agents read to adapt their replies to this person.
+ */
+export interface UserCommsPrefs {
+  tone?: string;
+  language?: string;
+  verbosity?: string;
+}
+
+/**
+ * PATCH /api/users/:id body. Every field is optional (server requires
+ * at least one). Passing `identities` replaces the user's identity set.
+ * `comms` is merged into `metadata.comms` server-side (siblings survive);
+ * `null` clears it.
+ */
+export interface UpdateUserInput {
+  name?: string;
+  email?: string;
+  role?: string;
+  notes?: string;
+  emailAliases?: string[];
+  preferredChannel?: string;
+  timezone?: string;
+  identities?: UserIdentity[];
+  dailyBudgetUsd?: number | null;
+  status?: "invited" | "active" | "suspended";
+  metadata?: Record<string, unknown> | null;
+  comms?: UserCommsPrefs | null;
+}
+
+/**
+ * Identity event types — mirrors `IdentityEventTypeSchema` in `src/types.ts`
+ * and the CHECK constraint on `user_identity_events.eventType` in migration 064.
+ */
+export type IdentityEventType =
+  | "auto_merge"
+  | "manual_merge"
+  | "identity_added"
+  | "identity_removed"
+  | "email_added"
+  | "email_removed"
+  | "token_minted"
+  | "token_revoked"
+  | "budget_changed"
+  | "status_changed"
+  | "profile_changed";
+
+/**
+ * Server-decoded identity event (`src/be/users.ts: rowToEvent`). The
+ * `before`/`after` columns are JSON-parsed server-side so the UI doesn't
+ * have to repeat the parse. `eventType` is loosened to `string` on the wire
+ * (the server stores raw strings) but the UI narrows to `IdentityEventType`
+ * for rendering.
+ */
+export interface IdentityEvent {
+  id: string;
+  userId: string;
+  eventType: IdentityEventType | string;
+  actor: string;
+  before: unknown | null;
+  after: unknown | null;
+  createdAt: string;
+}
+
+export interface IdentityEventsResponse {
+  events: IdentityEvent[];
+}
+
+export interface IdentitiesResponse {
+  identities: UserIdentity[];
+}
+
+/**
+ * Read shape for a user-owned MCP token (Phase 064 schema, endpoints ship
+ * with the future MCP-token plan). `tokenPreview` is the last 4 chars of
+ * the plaintext for UI display ("…ax7b").
+ */
+export interface UserToken {
+  id: string;
+  userId: string;
+  label: string | null;
+  tokenPreview: string;
+  createdAt: string;
+  lastUsedAt: string | null;
+  revokedAt: string | null;
+}
+
+/**
+ * Unmapped identity entry surfaced by `GET /api/users/unmapped`. Composed
+ * server-side by collapsing the two-key-per-identity kv shape
+ * (`<externalId>:meta` + `<externalId>:count`) into a single row.
+ */
+export interface UnmappedIdentity {
+  kind: string;
+  externalId: string;
+  lastSeenAt: string | null;
+  count: number;
+  sampleEventType: string | null;
+  sampleContext: unknown | null;
+}
+
+export interface UnmappedResponse {
+  unmapped: UnmappedIdentity[];
+}
+
+/**
+ * Resolve body — either link to an existing user (`userId`) OR create a
+ * new one inline (`name` + `email`). Mirrors the `z.union` in
+ * `src/http/users.ts: resolveUnmapped`.
+ */
+export type ResolveUnmappedInput = { userId: string } | { name: string; email: string };
+
+export interface MergeUsersInput {
+  sourceUserId: string;
+}
+
+/**
+ * Sessions surface (Phase 4 ≥1.76.0). Mirrors `SessionListItem` from
+ * `src/be/db.ts:8816-8821` — root task plus chain-wide summary used by the
+ * `/sessions` sidebar.
+ */
+export interface SessionListItem {
+  root: AgentTask;
+  chainTaskCount: number;
+  lastActivityAt: string;
+  latestStatus: AgentTaskStatus;
+}
+
+/**
+ * Inbox-state (Phase 6 ≥1.76.0). Mirrors `InboxItemTypeSchema` /
+ * `InboxItemStatusSchema` / `InboxItemStateSchema` in `src/types.ts:252-276`.
+ *
+ * One row per (userId, itemType, itemId) tuple; the dashboard inbox joins
+ * server source data (approvals, agents, tasks, sessions, templates) against
+ * these rows to filter out items the user has dismissed/snoozed/done.
+ */
+export type InboxItemType =
+  | "approval"
+  | "credential_missing"
+  | "broken_task"
+  | "to_read"
+  | "to_start_template";
+
+export type InboxItemStatus = "open" | "snoozed" | "dismissed" | "done";
+
+export interface InboxItemState {
+  id: string;
+  userId: string;
+  itemType: InboxItemType;
+  itemId: string;
+  status: InboxItemStatus;
+  snoozeUntil?: string;
+  dismissedAt?: string;
+  doneAt?: string;
+  createdAt: string;
+  lastUpdatedAt: string;
+}
+
+export interface InboxStateResponse {
+  items: InboxItemState[];
+}
+
+export interface InboxStateUpsertResponse {
+  item: InboxItemState;
+}
+
+export type FavoriteItemType = "page" | "workflow" | "schedule";
+
+export interface UserFavorite {
+  id: string;
+  userId?: string;
+  itemType: FavoriteItemType;
+  itemId: string;
+  createdAt: string;
+  lastUpdatedAt: string;
+  createdBy?: string;
+  updatedBy?: string;
+}
+
+export interface FavoritesResponse {
+  favorites: UserFavorite[];
+  favoriteIds: string[];
+}
+
+export interface FavoriteSetResponse {
+  favorite: boolean;
+  itemType: FavoriteItemType;
+  itemId: string;
+  row?: UserFavorite | null;
+}
+
+/**
+ * Task templates (Phase 6 ≥1.76.0). Mirrors `TaskTemplateSchema` in
+ * `src/types.ts:289-300`. Powers the "To start" inbox bucket.
+ */
+export type TaskTemplateKind = "task" | "workflow" | "schedule";
+
+export interface TaskTemplate {
+  id: string;
+  title: string;
+  description: string;
+  prompt: string;
+  kind: TaskTemplateKind;
+  payload: Record<string, unknown>;
+  category?: string;
+  tags: string[];
+  createdAt: string;
+}
+
+export interface TaskTemplatesResponse {
+  templates: TaskTemplate[];
+}
+
+/**
+ * Bulk credential-status row from `GET /api/agents/credential-status`. Mirrors
+ * the handler shape at `src/http/agents.ts:466-477`. Used by the Blocking
+ * inbox bucket to surface agents stuck on missing creds.
+ */
+export interface CredentialMissingAgent {
+  agentId: string;
+  name: string;
+  status: AgentStatus;
+  /** Top-level missing[] (older worker fallback). */
+  missing: string[];
+  provider: string | null;
+  harnessProvider: ProviderName | null;
+  /** Migration 055 worker self-report; richer per-harness snapshot. */
+  credStatus: AgentCredStatus | null;
+  lastCheckedAt: string;
+}
+
+export interface CredentialMissingAgentsResponse {
+  agents: CredentialMissingAgent[];
+}
+
+export interface SessionsListResponse {
+  sessions: SessionListItem[];
+}
+
+/**
+ * Full chain payload from `GET /api/sessions/:rootTaskId`. The chain is
+ * already ordered by `createdAt` server-side (via the recursive CTE) so the
+ * UI can DFS from `root` without resorting.
+ */
+export interface SessionDetailResponse {
+  root: AgentTask;
+  chain: AgentTask[];
+}
+
+export type AgentLogEventType =
+  | "agent_joined"
+  | "agent_status_change"
+  | "agent_left"
+  | "task_created"
+  | "task_status_change"
+  | "task_progress"
+  | "task_offered"
+  | "task_accepted"
+  | "task_rejected"
+  | "task_claimed"
+  | "task_released"
+  | "channel_message";
+
+export interface AgentLog {
+  id: string;
+  eventType: AgentLogEventType;
+  agentId?: string;
+  taskId?: string;
+  oldValue?: string;
+  newValue?: string;
+  metadata?: string;
+  createdAt: string;
+}
+
+export interface SessionLog {
+  id: string;
+  taskId?: string;
+  sessionId: string;
+  iteration: number;
+  cli: string;
+  content: string;
+  lineNumber: number;
+  createdAt: string;
+}
+
+export interface SessionLogsResponse {
+  logs: SessionLog[];
+}
+
+export interface Channel {
+  id: string;
+  name: string;
+  description?: string;
+  type: ChannelType;
+  createdBy?: string;
+  participants: string[];
+  createdAt: string;
+}
+
+export interface ChannelMessage {
+  id: string;
+  channelId: string;
+  agentId?: string | null;
+  agentName?: string;
+  content: string;
+  replyToId?: string;
+  mentions: string[];
+  createdAt: string;
+}
+
+export interface DashboardStats {
+  agents: {
+    total: number;
+    idle: number;
+    busy: number;
+    offline: number;
+  };
+  tasks: {
+    total: number;
+    pending: number;
+    in_progress: number;
+    paused: number;
+    completed: number;
+    failed: number;
+  };
+  /**
+   * Steering feature flag (≥1.122.1) — served on the authenticated stats
+   * payload, deliberately NOT on the unauthenticated /health endpoint.
+   * Optional for compatibility with older API servers.
+   */
+  steeringEnabled?: boolean;
+}
+
+export type TaskStatus = AgentTaskStatus;
+export type Stats = DashboardStats;
+
+export interface AgentsResponse {
+  agents: Agent[] | AgentWithTasks[];
+}
+
+export interface TasksResponse {
+  tasks: AgentTask[];
+  total: number;
+}
+
+export interface LogsResponse {
+  logs: AgentLog[];
+}
+
+export interface ChannelsResponse {
+  channels: Channel[];
+}
+
+export interface MessagesResponse {
+  messages: ChannelMessage[];
+}
+
+/**
+ * Mirrors `TaskAttachmentKindSchema` in `src/types.ts` and the CHECK
+ * constraint on `task_attachments.kind` (migration 072).
+ */
+export type TaskAttachmentKind = "agent-fs" | "url" | "shared-fs" | "page";
+
+/**
+ * Pointer-based artifact attached to a task via `store-progress.attachments`.
+ * Mirrors `TaskAttachmentSchema` in `src/types.ts`.
+ */
+export interface TaskAttachment {
+  id: string;
+  taskId: string;
+  agentId: string | null;
+  name: string;
+  kind: TaskAttachmentKind;
+  url?: string;
+  path?: string;
+  pageId?: string;
+  providerId?: string;
+  providerKey?: string;
+  capabilities?: Record<string, unknown>;
+  /** agent-fs only — paired with `driveId` to build a public live-host URL. */
+  orgId?: string;
+  /** agent-fs only — paired with `orgId` to build a public live-host URL. */
+  driveId?: string;
+  mimeType?: string;
+  sizeBytes?: number;
+  sha256?: string;
+  intent?: string;
+  description?: string;
+  isPrimary: boolean;
+  createdAt: string;
+}
+
+export interface TaskWithLogs extends AgentTask {
+  logs: AgentLog[];
+  /**
+   * Pointer-based artifacts attached via `store-progress`. Always present
+   * (empty array when none); ordered by `createdAt`.
+   */
+  attachments?: TaskAttachment[];
+}
+
+export type ServiceStatus = "starting" | "healthy" | "unhealthy" | "stopped";
+
+export interface Service {
+  id: string;
+  agentId: string;
+  name: string;
+  port: number;
+  description?: string;
+  url?: string;
+  healthCheckPath: string;
+  status: ServiceStatus;
+  script: string;
+  cwd?: string;
+  interpreter?: string;
+  args?: string[];
+  env?: Record<string, string>;
+  metadata: Record<string, unknown>;
+  createdAt: string;
+  lastUpdatedAt: string;
+}
+
+export interface ServicesResponse {
+  services: Service[];
+}
+
+/**
+ * Phase 2 + Phase 12b: tells the UI where `totalCostUsd` came from so we can
+ * render a badge. See `SessionCostSourceSchema` in `src/types.ts`.
+ *  - 'harness'        — value reported by the harness as-is.
+ *  - 'pricing-table'  — value recomputed by the API from `pricing` rows.
+ *  - 'unpriced'       — recompute attempted but no matching pricing rows.
+ */
+export type SessionCostSource = "harness" | "pricing-table" | "unpriced";
+
+export interface SessionCostModelBreakdown {
+  model: string;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  webSearchRequests?: number | null;
+  costUsd?: number | null;
+  harnessCostUsd?: number | null;
+}
+
+export interface SessionCost {
+  id: string;
+  sessionId: string;
+  taskId?: string;
+  agentId: string;
+  totalCostUsd: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  // Migration 063 nullable — adapters that can't honestly report this
+  // (e.g. Codex SDK) leave it null instead of mixing fake-0 with real-0.
+  cacheWriteTokens: number | null;
+  reasoningOutputTokens: number;
+  thinkingTokens: number;
+  durationMs: number;
+  // Migration 063 nullable — adapters that don't surface numTurns.
+  numTurns: number | null;
+  model: string;
+  isError: boolean;
+  // Phase 12b: surfaced on each row for the UI badge.
+  costSource: SessionCostSource;
+  harnessCostUsd?: number | null;
+  cacheWrite5mTokens?: number | null;
+  cacheWrite1hTokens?: number | null;
+  modelBreakdown?: SessionCostModelBreakdown[] | null;
+  createdAt: string;
+}
+
+export interface SessionCostsResponse {
+  costs: SessionCost[];
+}
+
+export interface UsageSummaryTotals {
+  totalCostUsd: number;
+  totalInputTokens: number;
+  totalOutputTokens: number;
+  totalCacheReadTokens: number;
+  totalCacheWriteTokens: number;
+  totalDurationMs: number;
+  totalSessions: number;
+  avgCostPerSession: number;
+  /**
+   * Cost of tasks with a human requester, over `attributableCostUsd` (not
+   * `totalCostUsd` — that denominator includes structurally-human-free work
+   * that could never have scored). Older API servers omit all three fields.
+   */
+  attributedCostUsd?: number;
+  /** Corrected coverage denominator: `totalCostUsd` minus `excludedCostUsd`. */
+  attributableCostUsd?: number;
+  /** Cost of heartbeat/boot-triage/scheduled work and self-maintenance follow-ups. */
+  excludedCostUsd?: number;
+  /** Distinct tasks behind `excludedCostUsd` — name the exclusion, don't just show a percentage. */
+  excludedTaskCount?: number;
+}
+
+/**
+ * One row of `AttributionByPersonResponse`. `firstPassYield` is always `null`
+ * today — see `getAttributionByPerson` in `src/be/db.ts` for why it's not a
+ * computed proxy.
+ */
+export interface AttributionByPersonRow {
+  userId: string;
+  problemsInitiated: number;
+  problemsShipped: number;
+  agentsReached: number;
+  reposReached: number;
+  surfacesReached: number;
+  firstPassYield: null;
+}
+
+export interface AttributionByPersonResponse {
+  rows: AttributionByPersonRow[];
+}
+
+export interface UsageSummaryDailyRow {
+  date: string;
+  costUsd: number;
+  inputTokens: number;
+  outputTokens: number;
+  sessions: number;
+}
+
+export interface UsageSummaryByAgentRow {
+  agentId: string;
+  costUsd: number;
+  inputTokens: number;
+  outputTokens: number;
+  sessions: number;
+  durationMs: number;
+}
+
+export interface UsageSummaryByUserRow {
+  /** `null` = no human requester (heartbeat, boot triage, other autonomous work). */
+  userId: string | null;
+  costUsd: number;
+  inputTokens: number;
+  outputTokens: number;
+  tasks: number;
+  durationMs: number;
+}
+
+export interface UsageSummaryResponse {
+  totals: UsageSummaryTotals;
+  daily: UsageSummaryDailyRow[];
+  byAgent: UsageSummaryByAgentRow[];
+  byUser?: UsageSummaryByUserRow[];
+}
+
+export interface DashboardCostResponse {
+  costToday: number;
+  costMtd: number;
+}
+
+export interface UsageStats {
+  totalCostUsd: number;
+  totalTokens: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  sessionCount: number;
+  totalDurationMs: number;
+  avgCostPerSession: number;
+}
+
+export interface DailyUsage {
+  date: string;
+  costUsd: number;
+  tokens: number;
+  sessions: number;
+}
+
+export interface AgentUsageSummary {
+  agentId: string;
+  agentName?: string;
+  monthlyCostUsd: number;
+  monthlyTokens: number;
+  sessionCount: number;
+}
+
+export type ScheduledTaskTargetType = "agent-task" | "workflow" | "script";
+
+export interface ScheduledTask {
+  id: string;
+  key: string;
+  name: string;
+  description?: string;
+  cronExpression?: string;
+  intervalMs?: number;
+  taskTemplate?: string;
+  taskType?: string;
+  tags: string[];
+  priority: number;
+  targetAgentId?: string;
+  enabled: boolean;
+  lastRunAt?: string;
+  nextRunAt?: string;
+  createdByAgentId?: string;
+  timezone: string;
+  model?: string;
+  modelTier?: ModelTier;
+  scheduleType?: "recurring" | "one_time";
+  targetType?: ScheduledTaskTargetType;
+  workflowId?: string;
+  scriptName?: string;
+  scriptArgs?: Record<string, unknown>;
+  createdAt: string;
+  lastUpdatedAt: string;
+  favorite?: boolean;
+}
+
+export interface ScheduledTasksResponse {
+  scheduledTasks: ScheduledTask[];
+}
+
+export type SwarmConfigScope = "global" | "agent" | "repo";
+
+export interface SwarmConfig {
+  id: string;
+  scope: SwarmConfigScope;
+  scopeId: string | null;
+  key: string;
+  value: string;
+  isSecret: boolean;
+  envPath: string | null;
+  description: string | null;
+  createdAt: string;
+  lastUpdatedAt: string;
+  // True when the row's value is stored as ciphertext server-side. Plaintext
+  // rows return encrypted=false. Mirrors SwarmConfigSchema in src/types.ts.
+  encrypted: boolean;
+}
+
+export interface SwarmConfigsResponse {
+  configs: SwarmConfig[];
+}
+
+export interface RepoGuidelines {
+  prChecks: string[];
+  mergeChecks: string[];
+  allowMerge: boolean;
+  review: string[];
+}
+
+export interface RepoHooks {
+  enabled: boolean;
+}
+
+export interface SwarmRepo {
+  id: string;
+  url: string;
+  name: string;
+  clonePath: string;
+  defaultBranch: string;
+  autoClone: boolean;
+  hooks: RepoHooks;
+  guidelines: RepoGuidelines | null;
+  createdAt: string;
+  lastUpdatedAt: string;
+}
+
+export interface SwarmReposResponse {
+  repos: SwarmRepo[];
+}
+
+// Workflow types
+
+/** Node types are open strings — new executor types can be added via the registry */
+export type WorkflowNodeType = string;
+
+export interface RetryPolicy {
+  maxRetries: number;
+  strategy: "exponential" | "static" | "linear";
+  baseDelayMs: number;
+  maxDelayMs: number;
+}
+
+export interface StepValidationConfig {
+  executor: string;
+  config: Record<string, unknown>;
+  mustPass: boolean;
+  retry?: RetryPolicy;
+}
+
+export interface WorkflowNode {
+  id: string;
+  type: WorkflowNodeType;
+  label?: string;
+  config: Record<string, unknown>;
+  next?: string | string[] | Record<string, string>;
+  validation?: StepValidationConfig;
+  retry?: RetryPolicy;
+  inputs?: Record<string, string>;
+  inputSchema?: Record<string, unknown>;
+  outputSchema?: Record<string, unknown>;
+}
+
+export interface WorkflowEdge {
+  id: string;
+  source: string;
+  sourcePort: string;
+  target: string;
+}
+
+/** Definition stores only nodes. Edges are auto-generated by the API. */
+export interface WorkflowDefinition {
+  nodes: WorkflowNode[];
+  /** Auto-generated edges returned by GET /api/workflows/:id */
+  edges: WorkflowEdge[];
+  onNodeFailure?: "fail" | "continue";
+}
+
+export type WebhookVerification =
+  | {
+      format: "hmac-sha256";
+      header?: string;
+    }
+  | {
+      format: "timestamped-hmac-sha256";
+      header: string;
+      timestampKey?: string;
+      signatureKey?: string;
+      toleranceSeconds?: number;
+    }
+  | {
+      format: "token-equality";
+      header: string;
+    };
+
+export interface TriggerConfig {
+  type: "webhook" | "schedule";
+  hmacSecret?: string;
+  hmacHeader?: string;
+  verification?: WebhookVerification;
+  scheduleId?: string;
+}
+
+export interface CooldownConfig {
+  hours?: number;
+  minutes?: number;
+  seconds?: number;
+}
+
+export interface Workflow {
+  id: string;
+  key: string;
+  name: string;
+  description?: string;
+  enabled: boolean;
+  definition: WorkflowDefinition;
+  triggers: TriggerConfig[];
+  cooldown?: CooldownConfig;
+  input?: Record<string, string>;
+  triggerSchema?: Record<string, unknown>;
+  dir?: string;
+  vcsRepo?: string;
+  createdByAgentId?: string;
+  createdAt: string;
+  lastUpdatedAt: string;
+  favorite?: boolean;
+}
+
+export type WorkflowRunStatus = "running" | "waiting" | "completed" | "failed" | "skipped";
+
+export interface WorkflowRun {
+  id: string;
+  workflowId: string;
+  status: WorkflowRunStatus;
+  triggerData?: unknown;
+  context?: Record<string, unknown>;
+  error?: string;
+  startedAt: string;
+  lastUpdatedAt: string;
+  finishedAt?: string;
+}
+
+export type WorkflowRunStepStatus =
+  | "pending"
+  | "running"
+  | "waiting"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "skipped";
+
+export interface WorkflowRunStep {
+  id: string;
+  runId: string;
+  nodeId: string;
+  nodeType: string;
+  status: WorkflowRunStepStatus;
+  input?: unknown;
+  output?: unknown;
+  error?: string;
+  retryCount?: number;
+  maxRetries?: number;
+  nextRetryAt?: string;
+  idempotencyKey?: string;
+  diagnostics?: string;
+  nextPort?: string;
+  startedAt: string;
+  finishedAt?: string;
+}
+
+export interface WorkflowRunWithSteps extends WorkflowRun {
+  steps: WorkflowRunStep[];
+}
+
+export interface WorkflowVersion {
+  id: string;
+  workflowId: string;
+  version: number;
+  snapshot: {
+    name: string;
+    description?: string;
+    definition: WorkflowDefinition;
+    triggers: TriggerConfig[];
+    cooldown?: CooldownConfig;
+    input?: Record<string, string>;
+    triggerSchema?: Record<string, unknown>;
+    dir?: string;
+    vcsRepo?: string;
+    enabled: boolean;
+  };
+  changedByAgentId?: string;
+  createdAt: string;
+}
+
+/**
+ * Slim `/api/workflows` list row. The heavy `definition` (full DAG) and
+ * trigger config are dropped — the list only needs `nodeCount`. Fetch the full
+ * `Workflow` via `GET /api/workflows/{id}` (or `?fields=full` on the list).
+ */
+export type WorkflowSummary = Omit<
+  Workflow,
+  "definition" | "triggers" | "cooldown" | "input" | "triggerSchema"
+> & { nodeCount: number };
+
+export interface WorkflowsResponse {
+  workflows: WorkflowSummary[];
+}
+
+export interface WorkflowRunsResponse {
+  runs: WorkflowRun[];
+}
+
+export type ScriptRunStatus =
+  | "running"
+  | "paused"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "aborted_limit";
+
+// `workflow` = durable background run (has a journal). `inline` = synchronous one-off run.
+export type ScriptRunKind = "workflow" | "inline";
+
+export interface ScriptRun {
+  id: string;
+  agentId: string;
+  scriptName?: string;
+  source: string;
+  args?: unknown;
+  kind: ScriptRunKind;
+  status: ScriptRunStatus;
+  pid?: number;
+  startedAt: string;
+  finishedAt?: string;
+  output?: unknown;
+  error?: string;
+  lastHeartbeatAt?: string;
+  idempotencyKey?: string;
+  requestedByUserId?: string;
+}
+
+export type ScriptRunListItem = Omit<ScriptRun, "source" | "args" | "output">;
+
+export type ScriptRunJournalStepType = "swarm-script" | "raw-llm" | "agent-task" | string;
+
+export interface ScriptRunJournalEntry {
+  id: string;
+  runId: string;
+  stepKey: string;
+  stepType: ScriptRunJournalStepType;
+  config: Record<string, unknown>;
+  status: "completed" | "failed";
+  result?: unknown;
+  error?: string;
+  startedAt: string;
+  completedAt?: string;
+  /**
+   * Real wall-clock duration of the step in milliseconds, measured in the
+   * subprocess around the step's execution. Absent on runs recorded before
+   * per-step timing was added (the waterfall falls back to sequence mode).
+   */
+  durationMs?: number;
+}
+
+export interface ScriptRunsResponse {
+  runs: ScriptRunListItem[];
+  total: number;
+}
+
+export interface ScriptRunWithJournal {
+  run: ScriptRun;
+  journal: ScriptRunJournalEntry[];
+}
+
+// Saved scripts catalog (`scripts` table — mirrors ScriptListItem/ScriptDetail in src/types.ts)
+
+export type ScriptScope = "global" | "agent";
+
+export type ScriptFsMode = "none" | "workspace-rw";
+
+/** Lean projection served by `GET /api/scripts` — omits `source` and raw JSON blobs. */
+export interface ScriptListItem {
+  id: string;
+  name: string;
+  scope: ScriptScope;
+  scopeId: string | null;
+  description: string;
+  intent: string;
+  version: number;
+  isScratch: boolean;
+  typeChecked: boolean;
+  fsMode: ScriptFsMode;
+  createdByAgentId: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** Full record served by `GET /api/scripts/{id}` — includes `source` plus parsed `signature`/`argsJsonSchema`. */
+export interface ScriptDetail extends ScriptListItem {
+  source: string;
+  signatureJson: string;
+  contentHash: string;
+  signature: unknown;
+  argsJsonSchema: unknown;
+}
+
+/** Row served by `GET /api/scripts/{id}/versions` — mirrors ScriptVersionRecord in src/types.ts. */
+export interface ScriptVersion {
+  id: string;
+  scriptId: string;
+  version: number;
+  source: string;
+  description: string;
+  intent: string;
+  signatureJson: string;
+  contentHash: string;
+  changedByAgentId: string | null;
+  changedAt: string;
+  changeReason: string | null;
+}
+
+/** `GET /api/scripts/type-defs` — SDK + stdlib .d.ts (incl. generated connection + per-app types) for the Monaco editor. */
+export interface ScriptTypeDefs {
+  sdkTypes: string;
+  stdlibTypes: string;
+}
+
+export interface ScriptsResponse {
+  scripts: ScriptListItem[];
+}
+
+// Script connections (`ctx.api.<slug>` / `ctx.mcp.<slug>`)
+export type ScriptConnectionKind = "openapi" | "graphql" | "mcp";
+export type ScriptConnectionScope = "global" | "agent" | "repo";
+export type OAuthBindingTokenStatus = "ok" | "expiring" | "refresh-failed" | "revoked" | "missing";
+export type CredentialAuthKind = "config" | "oauth";
+
+// Embedded connection auth (step-7). A connection carries a single inline auth
+// intent that the server resolves into an auto-managed credential binding.
+export type ConnectionAuthType = "none" | "bearer" | "header" | "query" | "oauth";
+
+export type ConnectionAuthInput =
+  | { type: "none" }
+  | { type: "bearer"; secret?: string; configKey?: string; template?: string; hosts?: string[] }
+  | {
+      type: "header";
+      headerName: string;
+      secret?: string;
+      configKey?: string;
+      template?: string;
+      hosts?: string[];
+    }
+  | {
+      type: "query";
+      paramName: string;
+      secret?: string;
+      configKey?: string;
+      template?: string;
+      hosts?: string[];
+    }
+  | {
+      type: "oauth";
+      authorizationId: string;
+      configKey?: string;
+      template?: string;
+      hosts?: string[];
+    };
+
+// Write-only summary of a connection's embedded auth (never returns the secret).
+export interface ConnectionAuthSummary {
+  type: ConnectionAuthType;
+  configKey?: string;
+  authorizationId?: string;
+  paramName?: string;
+  status?: OAuthBindingTokenStatus;
+}
+
+export interface ScriptCredentialBinding {
+  id: string;
+  configKey: string;
+  allowedHosts: string[];
+  headerTemplate?: string;
+  queryTemplate?: string;
+  scope: ScriptConnectionScope;
+  scopeId: string | null;
+  active: boolean;
+  authKind: CredentialAuthKind;
+  /** OAuth authorization the binding resolves its token from (authKind==="oauth"). */
+  oauthAuthorizationId?: string;
+  source?: "default" | "user" | "migration";
+  tokenStatus?: OAuthBindingTokenStatus;
+  createdAt: string;
+  updatedAt: string;
+  createdBy: string | null;
+  updatedBy: string | null;
+}
+
+export interface ScriptConnectionCredentialSummary {
+  id: string;
+  configKey: string;
+  authKind: CredentialAuthKind;
+  oauthProvider?: string;
+  tokenStatus?: OAuthBindingTokenStatus;
+}
+
+export interface ScriptConnection {
+  id: string;
+  slug: string;
+  displayName: string | null;
+  kind: ScriptConnectionKind;
+  scope: ScriptConnectionScope;
+  scopeId: string | null;
+  baseUrl: string | null;
+  allowedHosts: string[];
+  credentialBindingId: string | null;
+  credentialBinding: ScriptConnectionCredentialSummary | null;
+  /**
+   * Embedded connection auth summary (step-7), present on list + detail.
+   * `status` mirrors the binding token status; broken states raise the
+   * dependent-connection warning badge.
+   */
+  auth?: ConnectionAuthSummary | null;
+  openapiSpecSourceKind: "url" | "inline" | "agent_fs" | null;
+  openapiSpecSource: string | null;
+  openapiSpecEtag: string | null;
+  openapiSpecFetchedAt: string | null;
+  mcpServerId: string | null;
+  generatedAt: string | null;
+  generationError: string | null;
+  operationCount: number;
+  toolCount: number;
+  enabled: boolean;
+  version: number;
+  createdAt: string;
+  updatedAt: string;
+  createdBy: string | null;
+  updatedBy: string | null;
+}
+
+export interface ScriptConnectionOperationParameter {
+  name: string;
+  in: string;
+  required: boolean;
+  schema?: unknown;
+}
+
+export interface ScriptConnectionOperation {
+  name: string;
+  method: string;
+  path: string;
+  parameters?: ScriptConnectionOperationParameter[];
+  hasBody?: boolean;
+  successStatus?: string;
+  requestBodySchema?: unknown;
+  responseSchema?: unknown;
+}
+
+export interface ScriptConnectionTool {
+  name: string;
+  description?: string;
+  inputSchema?: unknown;
+}
+
+export interface ScriptConnectionDetail extends ScriptConnection {
+  operations: ScriptConnectionOperation[];
+  tools: ScriptConnectionTool[];
+  graphql: boolean;
+  generatedTypes: string;
+  specSummary?: { title?: string; version?: string; pathCount: number };
+  specPreview?: { json: string; truncated: boolean };
+}
+
+export interface ScriptConnectionsResponse {
+  connections: ScriptConnection[];
+}
+
+export interface ScriptConnectionDetailResponse {
+  connection: ScriptConnectionDetail;
+}
+
+export type UpsertScriptConnectionInput =
+  | {
+      id?: string;
+      kind: "openapi";
+      slug: string;
+      displayName?: string;
+      scope?: ScriptConnectionScope;
+      scopeId?: string | null;
+      // Optional: the server extracts spec-declared server URLs (step-3), so
+      // spec-backed connections may leave this empty.
+      baseUrl?: string;
+      allowedHosts?: string[];
+      credentialBindingId?: string | null;
+      // Embedded auth (step-7). Supersedes the legacy flat credential fields.
+      auth?: ConnectionAuthInput;
+      configKey?: string;
+      headerTemplate?: string;
+      queryTemplate?: string;
+      authKind?: CredentialAuthKind;
+      oauthProvider?: string;
+      openapiSpecUrl?: string;
+      openapiSpecJson?: string;
+      // Vendored blessed spec source (step-2).
+      specSource?: { kind: "vendored"; slug: string };
+      enabled?: boolean;
+    }
+  | {
+      id?: string;
+      kind: "graphql";
+      slug: string;
+      displayName?: string;
+      scope?: ScriptConnectionScope;
+      scopeId?: string | null;
+      baseUrl: string;
+      allowedHosts: string[];
+      credentialBindingId?: string | null;
+      auth?: ConnectionAuthInput;
+      configKey?: string;
+      headerTemplate?: string;
+      queryTemplate?: string;
+      authKind?: CredentialAuthKind;
+      oauthProvider?: string;
+      enabled?: boolean;
+    }
+  | {
+      id?: string;
+      kind: "mcp";
+      slug: string;
+      displayName?: string;
+      scope?: ScriptConnectionScope;
+      scopeId?: string | null;
+      mcpServerId: string;
+      enabled?: boolean;
+    };
+
+export interface UpsertCredentialBindingInput {
+  id?: string;
+  configKey: string;
+  allowedHosts: string[];
+  headerTemplate?: string;
+  queryTemplate?: string;
+  scope?: ScriptConnectionScope;
+  scopeId?: string | null;
+  active?: boolean;
+  authKind?: CredentialAuthKind;
+  /** Selected OAuth authorization id (required when authKind==="oauth"). */
+  oauthAuthorizationId?: string;
+}
+
+/** Lifecycle status of a single labeled authorization (mirrors the API). */
+export type OAuthAuthorizationStatus = "active" | "refresh-failed" | "expired" | "revoked";
+
+/** Provenance of an OAuth app row. */
+export type OAuthAppSource = "manual" | "dcr" | "curated-prefill";
+
+/**
+ * A single labeled authorization under an OAuth app (never carries token
+ * material — mirrors the server's `sanitizeAuthorization`).
+ */
+export interface OAuthAuthorization {
+  id: string;
+  label: string;
+  accountEmail: string | null;
+  status: OAuthAuthorizationStatus;
+  expiresAt: string | null;
+  scope: string | null;
+  hasRefreshToken: boolean;
+  lastErrorMessage: string | null;
+  lastRefreshedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** Alias kept for call sites written against the single-flow dialog work. */
+export type OAuthAuthorizationSummary = OAuthAuthorization;
+
+export interface OAuthAppSummary {
+  id: string;
+  provider: string;
+  clientId: string;
+  authorizeUrl: string;
+  tokenUrl: string;
+  redirectUri: string;
+  scopes: string[];
+  extraParams?: Record<string, string>;
+  tokenAuthStyle: "body" | "basic";
+  tokenBodyFormat: "form" | "json";
+  source: OAuthAppSource;
+  /** Legacy default-authorization token status (kept for back-compat). */
+  tokenStatus: OAuthBindingTokenStatus;
+  expiresAt?: string | null;
+  lastRefreshedAt?: string | null;
+  /** N labeled authorizations under this app (empty until first authorize). */
+  authorizations: OAuthAuthorization[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface UpsertOAuthAppInput {
+  /** Target an exact existing app on edit (avoids mutating a same-provider row). */
+  id?: string;
+  /** When set, the server hydrates endpoints/quirks from the curated preset. */
+  presetId?: string;
+  provider?: string;
+  clientId: string;
+  clientSecret?: string;
+  authorizeUrl?: string;
+  tokenUrl?: string;
+  userinfoUrl?: string;
+  revocationUrl?: string;
+  scopes?: string[];
+  scopeSeparator?: string;
+  extraParams?: Record<string, string>;
+  tokenAuthStyle?: "body" | "basic";
+  tokenBodyFormat?: "form" | "json";
+  requiresRefreshTokenRotation?: boolean;
+}
+
+// Curated OAuth preset surfaced by GET /api/oauth-presets (step-6). No secrets.
+export interface OAuthPreset {
+  id: string;
+  displayName: string;
+  provider: string;
+  authorizeUrl: string;
+  tokenUrl: string;
+  revocationUrl?: string;
+  userinfoUrl?: string;
+  scopes: string[];
+  scopeSeparator?: string;
+  tokenAuthStyle?: "body" | "basic";
+  tokenBodyFormat?: "form" | "json";
+  requiresRefreshTokenRotation?: boolean;
+  extraParams?: Record<string, string>;
+  setupHints: string[];
+}
+
+export interface UpsertOAuthAppResult {
+  oauthApp: OAuthAppSummary;
+  redirectUri: string;
+  setupHints?: string[];
+}
+
+/** Result of building an authorization URL for a labeled authorization. */
+export interface OAuthAuthorizeUrlResult {
+  authorizeUrl: string;
+  state: string;
+  label: string;
+  redirectUri: string;
+}
+
+export interface OAuthAppDiscoveryResult {
+  authorizeUrl: string;
+  tokenUrl: string;
+  scopes: string[];
+  sourceUrl: string;
+}
+
+export interface IntegrationsCatalogEntry {
+  id: string;
+  kind: ScriptConnectionKind;
+  slug: string;
+  name: string;
+  description: string;
+  url: string;
+  icon: string | null;
+  domain: string;
+  categories: string[];
+  /** Upstream catalog feeds; "apis-guru" marks bulk-imported entries, "blessed" curated ones. */
+  feeds?: string[];
+  /** Blessed entries reference an in-repo vendored OpenAPI spec (step-2). */
+  vendoredSlug?: string;
+  /** Blessed entries may suggest a curated OAuth preset for the auth flow (step-6). */
+  presetId?: string;
+}
+
+export interface IntegrationsCatalogResponse {
+  entries: IntegrationsCatalogEntry[];
+  cachedAt: string;
+}
+
+// Trimmed integrations.sh per-domain surface details, proxied by
+// GET /api/integrations-catalog/{domain}/surface.
+export interface IntegrationsSurfaceMechanics {
+  in: string;
+  headerName: string | null;
+  scheme: string | null;
+}
+
+export interface IntegrationsSurfaceEntry {
+  type: string;
+  name: string;
+  url: string | null;
+  docs: string | null;
+  /** OpenAPI spec URL advertised by http surfaces (may be YAML). */
+  spec: string | null;
+  auth: {
+    required: boolean;
+    credentialIds: string[];
+    mechanics: IntegrationsSurfaceMechanics | null;
+  };
+}
+
+export interface IntegrationsSurfaceCredential {
+  type: string;
+  label: string;
+  generateUrl: string | null;
+  setup: string | null;
+}
+
+export interface IntegrationsSurfaceResponse {
+  domain: string;
+  summary: string;
+  surfaces: IntegrationsSurfaceEntry[];
+  credentials: Record<string, IntegrationsSurfaceCredential>;
+}
+
+export interface ScriptRunInlineResult {
+  result?: unknown;
+  autoSaved?: { slug: string; reason: string };
+  kvSaved?: { namespace: string; key: string };
+  truncated?: boolean;
+  durationMs?: number;
+  stdout?: string;
+  stderr?: string;
+  exitCode?: number;
+  error?: string;
+  runtimeError?: { name?: string; message?: string; stack?: string };
+}
+
+// External script APIs (POST /api/x/script/<id>) — mirrors ScriptApiRecord in src/types.ts.
+
+export type ScriptApiAuthMode = "none" | "bearer";
+
+export interface ScriptApiRecord {
+  id: string;
+  scriptId: string;
+  agentId: string;
+  authMode: ScriptApiAuthMode;
+  enabled: boolean;
+  label: string | null;
+  callCount: number;
+  lastUsedAt: string | null;
+  createdAt: string;
+}
+
+/** Returned by create / rotate — includes the plaintext bearer token (`null` for `none`). */
+export interface ScriptApiWithSecret extends ScriptApiRecord {
+  token: string | null;
+}
+
+// Prompt Templates
+
+export interface PromptTemplate {
+  id: string;
+  eventType: string;
+  scope: "global" | "agent" | "repo";
+  scopeId: string | null;
+  state: "enabled" | "default_prompt_fallback" | "skip_event";
+  body: string;
+  isDefault: boolean;
+  defaultDrifted: boolean;
+  version: number;
+  createdBy: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface PromptTemplateHistory {
+  id: string;
+  templateId: string;
+  version: number;
+  body: string;
+  state: string;
+  changedBy: string | null;
+  changedAt: string;
+  changeReason: string | null;
+}
+
+export interface EventDefinition {
+  eventType: string;
+  header: string;
+  defaultBody: string;
+  variables: { name: string; description: string; example?: string }[];
+  category: "event" | "system" | "common" | "task_lifecycle" | "session";
+}
+
+export interface UpsertPromptTemplateInput {
+  eventType: string;
+  scope?: "global" | "agent" | "repo";
+  scopeId?: string;
+  state?: "enabled" | "default_prompt_fallback" | "skip_event";
+  body: string;
+  changedBy?: string;
+  changeReason?: string;
+}
+
+export interface PreviewResponse {
+  rendered: string;
+  unresolved: string[];
+}
+
+export interface RenderResponse {
+  text: string;
+  skipped: boolean;
+  unresolved: string[];
+  templateId?: string;
+  scope?: string;
+}
+
+// Approval Requests
+
+export type ApprovalRequestStatus = "pending" | "approved" | "rejected" | "timeout";
+
+export interface ApprovalQuestion {
+  id: string;
+  type: "approval" | "text" | "single-select" | "multi-select" | "boolean";
+  label: string;
+  description?: string;
+  required?: boolean;
+  placeholder?: string;
+  multiline?: boolean;
+  options?: Array<{ value: string; label: string; description?: string }>;
+  minSelections?: number;
+  maxSelections?: number;
+  defaultValue?: boolean;
+}
+
+export interface ApprovalRequest {
+  id: string;
+  title: string;
+  questions: ApprovalQuestion[];
+  approvers: {
+    users?: string[];
+    roles?: string[];
+    policy: "any" | "all" | { min: number };
+  };
+  status: ApprovalRequestStatus;
+  responses: Record<string, unknown> | null;
+  resolvedBy: string | null;
+  resolvedAt: string | null;
+  workflowRunId: string | null;
+  workflowRunStepId: string | null;
+  sourceTaskId: string | null;
+  timeoutSeconds: number | null;
+  expiresAt: string | null;
+  notificationChannels: Array<{ channel: string; target: string }> | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ApprovalRequestsResponse {
+  approvalRequests: ApprovalRequest[];
+}
+
+// Skills
+export type SkillType = "remote" | "personal";
+export type SkillScope = "global" | "swarm" | "agent";
+
+export interface Skill {
+  id: string;
+  name: string;
+  description: string;
+  content: string;
+  type: SkillType;
+  scope: SkillScope;
+  ownerAgentId: string | null;
+  sourceUrl: string | null;
+  sourceRepo: string | null;
+  sourcePath: string | null;
+  sourceBranch: string;
+  sourceHash: string | null;
+  isComplex: boolean;
+  allowedTools: string | null;
+  model: string | null;
+  effort: string | null;
+  context: string | null;
+  agent: string | null;
+  disableModelInvocation: boolean;
+  userInvocable: boolean;
+  version: number;
+  isEnabled: boolean;
+  systemDefault: boolean;
+  createdAt: string;
+  lastUpdatedAt: string;
+  lastFetchedAt: string | null;
+}
+
+export interface AgentSkill extends Skill {
+  isActive: boolean;
+  installedAt: string;
+}
+
+export interface SkillsResponse {
+  skills: Skill[];
+  total: number;
+}
+
+export interface AgentSkillsResponse {
+  skills: AgentSkill[];
+  total: number;
+}
+
+/** Manifest entry for a bundled skill file — everything but the content. */
+export interface SkillFileManifestEntry {
+  id: string;
+  skillId: string;
+  path: string;
+  mimeType: string;
+  isBinary: boolean;
+  size: number | null;
+  createdAt: string;
+  lastUpdatedAt: string;
+}
+
+export interface SkillFile extends SkillFileManifestEntry {
+  content: string;
+}
+
+export interface SkillFilesResponse {
+  files: SkillFileManifestEntry[];
+  total: number;
+}
+
+// MCP Servers
+export type McpServerTransport = "stdio" | "http" | "sse";
+export type McpServerScope = "global" | "swarm" | "agent";
+export type McpAuthMethod = "static" | "oauth" | "auto";
+
+export interface McpServer {
+  id: string;
+  name: string;
+  description: string | null;
+  scope: McpServerScope;
+  ownerAgentId: string | null;
+  transport: McpServerTransport;
+  command: string | null;
+  args: string | null;
+  url: string | null;
+  headers: string | null;
+  envConfigKeys: string | null;
+  headerConfigKeys: string | null;
+  authMethod: McpAuthMethod;
+  isEnabled: boolean;
+  version: number;
+  createdAt: string;
+  lastUpdatedAt: string;
+}
+
+export type McpOAuthStatus = "connected" | "expired" | "error" | "revoked";
+export type McpOAuthClientSource = "dcr" | "manual" | "preregistered";
+
+export interface McpOAuthTokenStatus {
+  id: string;
+  status: McpOAuthStatus;
+  tokenType: string;
+  expiresAt: string | null;
+  scope: string | null;
+  lastErrorMessage: string | null;
+  lastRefreshedAt: string | null;
+  authorizationServerIssuer: string;
+  resourceUrl: string;
+  clientSource: McpOAuthClientSource;
+  hasRefreshToken: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface McpOAuthStatusResponse {
+  mcpServerId: string;
+  authMethod: McpAuthMethod;
+  connected: boolean;
+  token: McpOAuthTokenStatus | null;
+}
+
+export interface McpOAuthMetadataResponse {
+  requiresOAuth: boolean;
+  resourceUrl?: string;
+  authorizationServerIssuer?: string;
+  authorizeUrl?: string;
+  tokenUrl?: string;
+  revocationUrl?: string | null;
+  registrationEndpoint?: string | null;
+  scopes?: string[];
+  dcrSupported?: boolean;
+  bearerMethodsSupported?: string[] | null;
+}
+
+export interface McpServerWithInstallInfo extends McpServer {
+  isActive: boolean;
+  installedAt: string;
+}
+
+export interface McpServersResponse {
+  servers: McpServer[];
+  total: number;
+}
+
+export interface AgentMcpServersResponse {
+  servers: McpServerWithInstallInfo[];
+  total: number;
+}
+
+// Context Usage
+export type ContextSnapshotEventType = "progress" | "compaction" | "completion";
+
+/**
+ * Phase 12b — adapter-supplied tag describing which formula produced
+ * `contextUsedTokens`. Lets the UI render the right label next to a
+ * percent gauge and avoid apples-to-oranges comparisons across providers.
+ */
+export type ContextFormula =
+  | "input-cache-output"
+  | "input-cache-no-output"
+  | "input-output-no-cache"
+  | "peak-proxy"
+  | "pi-delegated"
+  | "harness-reported"
+  | "unknown";
+
+export interface ContextSnapshot {
+  id: string;
+  taskId: string;
+  agentId: string;
+  sessionId: string;
+  contextUsedTokens?: number;
+  contextTotalTokens?: number;
+  contextPercent?: number;
+  eventType: ContextSnapshotEventType;
+  // Migration 063 added 'auto-inferred' (e.g. claude-managed when the SDK
+  // doesn't expose pre-compact counts and we use a proxy).
+  compactTrigger?: "auto" | "manual" | "auto-inferred";
+  preCompactTokens?: number;
+  cumulativeInputTokens: number;
+  cumulativeOutputTokens: number;
+  // Phase 12b — surface to the UI.
+  contextFormula?: ContextFormula;
+  createdAt: string;
+}
+
+export interface ContextSummary {
+  compactionCount: number;
+  peakContextPercent: number | null;
+  // Migration 063: renamed from totalContextTokensUsed; monotonic max across snapshots.
+  peakContextTokens: number | null;
+  contextWindowSize: number | null;
+  snapshotCount: number;
+}
+
+export interface TaskContextResponse {
+  snapshots: ContextSnapshot[];
+  summary: ContextSummary;
+}
+
+// API Key Status
+export type ApiKeyStatusType = "available" | "rate_limited";
+
+export interface ApiKeyStatus {
+  id: string;
+  keyType: string;
+  keySuffix: string;
+  keyIndex: number;
+  scope: string;
+  scopeId: string;
+  status: ApiKeyStatusType;
+  rateLimitedUntil: string | null;
+  lastUsedAt: string | null;
+  lastRateLimitAt: string | null;
+  totalUsageCount: number;
+  rateLimitCount: number;
+  /** Auto-derived harness provider (claude/pi/codex). */
+  provider: string;
+  /** Optional human-friendly label set from the dashboard. */
+  name: string | null;
+  rateLimitWindows: Record<
+    string,
+    {
+      status: string;
+      utilization?: number;
+      resetsAt?: number;
+      isUsingOverage?: boolean;
+      surpassedThreshold?: number;
+      lastSeenAt: string;
+    }
+  >;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ApiKeyStatusResponse {
+  success: boolean;
+  keys: ApiKeyStatus[];
+}
+
+export interface KeyCostSummary {
+  keyType: string;
+  keySuffix: string;
+  totalCost: number;
+  totalInputTokens: number;
+  totalOutputTokens: number;
+  taskCount: number;
+}
+
+export interface KeyCostResponse {
+  success: boolean;
+  costs: KeyCostSummary[];
+}
+
+// Debug / DB Explorer
+export interface DbQueryRequest {
+  sql: string;
+  params?: unknown[];
+}
+
+export interface DbQueryResponse {
+  columns: string[];
+  rows: unknown[][];
+  elapsed: number;
+  total: number;
+}
+
+// Budgets & Pricing — see src/types.ts in the API repo for the source of truth.
+export type BudgetScope = "global" | "agent" | "user";
+
+export interface Budget {
+  scope: BudgetScope;
+  scopeId: string;
+  dailyBudgetUsd: number;
+  createdAt: number;
+  lastUpdatedAt: number;
+}
+
+export interface BudgetsResponse {
+  budgets: Budget[];
+}
+
+export type BudgetRefusalCause = "agent" | "global";
+
+export interface BudgetRefusalNotification {
+  taskId: string;
+  date: string;
+  agentId: string;
+  cause: BudgetRefusalCause;
+  agentSpendUsd?: number | null;
+  agentBudgetUsd?: number | null;
+  globalSpendUsd?: number | null;
+  globalBudgetUsd?: number | null;
+  followUpTaskId?: string | null;
+  createdAt: number;
+}
+
+export interface BudgetRefusalsResponse {
+  refusals: BudgetRefusalNotification[];
+}
+
+export type PricingProvider = "claude" | "codex" | "pi";
+export type PricingTokenClass = "input" | "cached_input" | "output";
+
+export interface PricingRow {
+  provider: PricingProvider;
+  model: string;
+  tokenClass: PricingTokenClass;
+  effectiveFrom: number;
+  pricePerMillionUsd: number;
+  createdAt: number;
+  lastUpdatedAt: number;
+}
+
+export interface PricingResponse {
+  rows: PricingRow[];
+}
+
+// ============================================================================
+// Memory
+// ============================================================================
+
+export type MemoryScope = "agent" | "swarm";
+export type MemoryScopeFilter = MemoryScope | "all";
+export type MemorySource = "manual" | "file_index" | "session_summary" | "task_completion";
+
+export interface MemoryListRequest {
+  query?: string;
+  agentId?: string;
+  scope?: MemoryScopeFilter;
+  source?: MemorySource;
+  sourcePath?: string;
+  limit?: number;
+  offset?: number;
+}
+
+export interface MemoryEntry {
+  id: string;
+  name: string;
+  content: string;
+  agentId: string | null;
+  scope: MemoryScope;
+  source: MemorySource;
+  similarity?: number;
+  createdAt: string;
+  accessedAt: string;
+  accessCount: number;
+  expiresAt: string | null;
+  embeddingModel: string | null;
+  sourceTaskId: string | null;
+  sourcePath: string | null;
+  chunkIndex: number;
+  totalChunks: number;
+  tags: string[];
+}
+
+export interface MemoryListResponse {
+  results: MemoryEntry[];
+  total: number;
+  limit?: number;
+  offset?: number;
+  mode: "semantic" | "list";
+}
+
+/**
+ * Windowed usefulness analytics from `GET /api/memory/usefulness`
+ * (memory-retrieval-v2 Phase 1). Mirrors `UsefulnessStats` in
+ * `src/be/memory/usefulness-stats.ts`. Older API servers don't expose this
+ * route; the client returns `null` on any non-2xx so the /memory page hides
+ * the Usefulness panel rather than erroring.
+ */
+export interface MemoryUsefulnessStats {
+  windowDays: number;
+  threshold: number;
+  /** ISO cutoff — rows strictly newer than this are inside the window. */
+  cutoff: string;
+  volume: {
+    retrievals: number;
+    distinctMemories: number;
+    retrievalGroups: number;
+    byEventType: { search: number; get: number };
+  };
+  byArm: {
+    /** 'vec' | 'fts' | 'hybrid' | 'fallback' ('graph' after DES-639a); null = pre-provenance legacy rows. */
+    retrievalSource: string | null;
+    retrievals: number;
+    distinctMemories: number;
+    citedRetrievals: number;
+    /** citedRetrievals / retrievals — in [0, 1]. */
+    citationRate: number;
+  }[];
+  citationBySource: {
+    source: string;
+    ratings: number;
+    positive: number;
+    /** positive / ratings — a true rate in [0, 1]. */
+    citationRate: number;
+    /** AVG(signal) over the window's implicit-citation ratings — in [-1, 1]. */
+    avgSignal: number;
+  }[];
+  posterior: {
+    totalMemories: number;
+    movedFromPrior: number;
+    avgPosteriorMean: number | null;
+    avgPosteriorMeanMoved: number | null;
+    aboveThreshold: number;
+  };
+  sanity: {
+    totalRetrievalRows: number;
+    totalRatingRows: number;
+    ratingsBySource: { source: string; count: number }[];
+  };
+}
+
+// ─── /status (Phase 1: cloud personalization) ──────────────────────────────
+
+export type SetupMilestoneState = "unverified" | "configured" | "verified";
+
+export type MilestoneId =
+  | "harness"
+  | "slack"
+  | "github"
+  | "linear"
+  | "jira"
+  | "workers"
+  | "first_task";
+
+export interface SetupMilestone {
+  id: MilestoneId;
+  label: string;
+  state: SetupMilestoneState;
+  hint?: string;
+  action_url?: string;
+  /**
+   * Phase 1.5: only the `harness` milestone populates this. The UI uses
+   * it directly (no hint-string regex). Undefined when HARNESS_PROVIDER
+   * is unset or unknown.
+   */
+  provider?: ProviderName;
+}
+
+export interface StatusIdentity {
+  name: string;
+  logo_url: string | null;
+  brand_color: string | null;
+  is_cloud: boolean;
+  marketing_url: string | null;
+  hide_cloud_promo: boolean;
+  /** Stable org/tenant identifier (set via `SWARM_ORG_ID`); null on self-host. */
+  org_id: string | null;
+}
+
+export interface StatusActivity {
+  agents_online: number;
+  leads_online: number;
+  recent_tasks_count: number;
+}
+
+export interface StatusAgentFs {
+  configured: boolean;
+  base_url: string | null;
+  provider_id: string;
+  capabilities: Record<string, unknown>;
+}
+
+/**
+ * Phase 2: Aggregate health rolled up server-side from the setup milestones.
+ * Drives the always-on header badge color.
+ */
+export type StatusHealth = "ok" | "degraded" | "broken";
+
+export interface StatusResponse {
+  identity: StatusIdentity;
+  setup: SetupMilestone[];
+  activity: StatusActivity;
+  agent_fs: StatusAgentFs;
+  /** Phase 2: rolled-up health for the always-on header badge. */
+  health: StatusHealth;
+}
+
+export interface TestConnectionResponse {
+  ok: boolean;
+  error?: string;
+  latency_ms: number;
+}
+
+// ─── Pages (DB-backed artifacts) ──────────────────────────────────────────────
+
+export type PageContentType = "text/html" | "application/json";
+export type PageAuthMode = "public" | "authed" | "password";
+
+/**
+ * Response shape from `GET /p/:id.json` — current head state of a page (no
+ * version history). Mirrors `pages-public.ts` JSON response. `passwordHash`
+ * and `agentId` are intentionally NOT exposed by the server.
+ */
+export interface PageMetadata {
+  id: string;
+  version: number;
+  title: string;
+  description: string | null;
+  contentType: PageContentType;
+  authMode: PageAuthMode;
+  body: string;
+}
+
+/**
+ * Public view-count payload — the page-public JSON path doesn't expose
+ * `viewCount` (it would imply re-rendering every time view_count changes,
+ * which would defeat any caching downstream). Listing and detail endpoints
+ * do expose it.
+ */
+
+/**
+ * Row shape returned by `GET /api/pages` (authed listing endpoint). Server
+ * decorates each row with `app_url` + `api_url`. Unlike `PageMetadata` this
+ * one exposes `agentId` (the listing is bearer-gated, so the creator is
+ * visible) — used by the SPA's `/pages` page for the "My pages only" toggle.
+ */
+export interface PageListItem {
+  id: string;
+  key: string;
+  agentId: string;
+  slug: string;
+  title: string;
+  description?: string;
+  contentType: PageContentType;
+  authMode: PageAuthMode;
+  body: string;
+  needsCredentials?: string[];
+  viewCount: number;
+  createdAt: string;
+  updatedAt: string;
+  app_url: string;
+  api_url: string;
+  favorite?: boolean;
+}
+
+export interface PagesListResponse {
+  pages: PageListItem[];
+  total: number;
+}
+
+// ─── Cross-entity asset namespaces ─────────────────────────────────────────
+
+export type AssetEntityType = "task" | "workflow" | "schedule" | "page" | "file";
+
+export interface AssetProviderRef {
+  providerId: string;
+  orgId?: string;
+  driveId?: string;
+  providerKey: string;
+}
+
+export interface AssetSummary {
+  entityType: AssetEntityType;
+  id: string;
+  key: string;
+  label: string;
+  updatedAt: string;
+  providerRef?: AssetProviderRef;
+}
+
+export interface AssetKeyMapping {
+  id: string;
+  providerId: string;
+  providerOrgId?: string;
+  providerDriveId?: string;
+  providerKey: string;
+  key: string;
+  sourceEntityType?: "task-attachment" | "external";
+  sourceEntityId?: string;
+  createdAt: string;
+  updatedAt: string;
+  createdBy?: string;
+  updatedBy?: string;
+}
+
+export interface AssetKeyAuditIssue {
+  severity: "fatal" | "warning";
+  code:
+    | "missing-key"
+    | "noncanonical-key"
+    | "unknown-personal-user"
+    | "missing-provider-mapping"
+    | "provider-mapping-drift";
+  entityType: AssetEntityType;
+  entityId: string;
+  message: string;
+}
+
+export interface AssetKeyAuditResult {
+  ok: boolean;
+  structuralValid: boolean;
+  checked: number;
+  fatalCount: number;
+  warningCount: number;
+  issues: AssetKeyAuditIssue[];
+}
+
+export type MetricVisualization = "stat" | "table" | "bar" | "line" | "multi-bar" | "multi-line";
+export type MetricFormat = "number" | "integer" | "currency" | "percent" | "duration";
+export type MetricParam = string | number | boolean | null;
+export type MetricVariableType = "text" | "number" | "select";
+
+export interface MetricVariable {
+  key: string;
+  label?: string;
+  type?: MetricVariableType;
+  defaultValue?: MetricParam;
+  options?: Array<{
+    label: string;
+    value: MetricParam;
+  }>;
+  optionsQuery?: {
+    sql: string;
+    valueKey: string;
+    labelKey?: string;
+  };
+}
+
+export interface MetricVizColumn {
+  key: string;
+  label?: string;
+  format?: MetricFormat;
+}
+
+export interface MetricWidget {
+  id: string;
+  title: string;
+  description?: string;
+  query: {
+    sql: string;
+    params?: Array<string | number | boolean | null>;
+    maxRows?: number;
+  };
+  viz: {
+    type: MetricVisualization;
+    x?: string;
+    y?: string;
+    series?: string[];
+    label?: string;
+    value?: string;
+    columns?: MetricVizColumn[];
+    format?: MetricFormat;
+  };
+  colSpan?: number;
+  rowSpan?: number;
+}
+
+export interface MetricDefinition {
+  version: 1;
+  widgets: MetricWidget[];
+  variables?: MetricVariable[];
+  layout?: {
+    columns?: number;
+  };
+  refreshSeconds?: number;
+}
+
+export interface Metric {
+  id: string;
+  agentId: string;
+  slug: string;
+  title: string;
+  description?: string;
+  definition: MetricDefinition;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type MetricListItem = Omit<Metric, "definition"> & { definition?: MetricDefinition };
+
+export interface MetricsListResponse {
+  metrics: MetricListItem[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface MetricRunResult {
+  metric: Metric;
+  variables?: Record<string, MetricParam>;
+  widgets: Array<{
+    widget: MetricWidget;
+    result: {
+      columns: string[];
+      rows: Record<string, unknown>[];
+      elapsed: number;
+      total: number;
+      truncated: boolean;
+      maxRows: number;
+    };
+  }>;
+  /** First widget result, kept for older callers during rollout. */
+  result: {
+    columns: string[];
+    rows: Record<string, unknown>[];
+    elapsed: number;
+    total: number;
+    truncated: boolean;
+    maxRows: number;
+  };
+}
+
+export interface MetricSaveInput {
+  slug?: string;
+  title: string;
+  description?: string | null;
+  definition: MetricDefinition;
+}
+
+export interface MetricSaveResponse {
+  id: string;
+  version: number;
+}
+
+/**
+ * Lightweight swarm-wide counts from `GET /api/metrics` (API >= the
+ * generic-metrics release). Pure `COUNT(*)` aggregates — no cost/usage data.
+ * Older API servers don't expose this route; the client returns `null` for a
+ * 404 so consumers hide the indicators rather than erroring.
+ */
+export interface SwarmMetrics {
+  tasks: { total: number; by_status: Record<string, number> };
+  agents: { total: number; by_status: Record<string, number> };
+  workflows: { total: number; enabled: number };
+  pages: { total: number };
+  sessions: { active: number };
+  skills: { total: number };
+}
+
+// ─── Swarm apps (spike) ─────────────────────────────────────────────────────
+// Mirrors the frozen `AppDefinition` contract served by `/api/apps/*`.
+
+export type AppColumnKind = "string" | "number" | "boolean" | "date" | "enum";
+
+export interface AppColumnDef {
+  kind: AppColumnKind;
+  required?: boolean;
+  enum?: string[];
+  index?: boolean;
+  default?: string | number | boolean;
+}
+
+export interface AppModelDef {
+  columns: Record<string, AppColumnDef>;
+}
+
+/**
+ * A named query filter value: a literal, or `{ "$param": "<name>" }` — a route
+ * param resolved server-side at query time (see `AppPageDef.params`).
+ */
+export type AppQueryFilterValue = string | number | boolean | { $param: string };
+
+export interface AppQueryDef {
+  model: string;
+  filter?: Record<string, AppQueryFilterValue>;
+  sort?: { column: string; dir: "asc" | "desc" };
+  limit?: number;
+}
+
+/**
+ * A named custom action of an app definition, invoked from the runtime via the
+ * `app.action` json-render action (`POST /api/apps/:id/actions/:name`).
+ */
+export type AppActionDef =
+  | { kind: "script"; scriptId: string; args?: Record<string, unknown> }
+  | { kind: "task"; prompt: string; agentId?: string };
+
+/** Route param declared by a page; URL strings are coerced to `kind`. */
+export interface AppPageParamDef {
+  kind?: "string" | "number" | "boolean";
+  required?: boolean;
+}
+
+/**
+ * One page of an app — a json-render spec (`root` + `elements`) plus the route
+ * params it reads. Rendered at `/apps/:id/p/<name>`.
+ */
+export interface AppPageDef {
+  root: string;
+  elements: Record<string, unknown>;
+  /** Display title (breadcrumb / header); defaults to the page name. */
+  title?: string;
+  params?: Record<string, AppPageParamDef>;
+}
+
+/** One declared prop of a reusable element (`definition.elements.<name>`). */
+export interface AppElementPropDef {
+  kind: AppColumnKind;
+  required?: boolean;
+  enum?: string[];
+  default?: string | number | boolean;
+}
+
+/**
+ * A reusable element: a json-render subtree (`root` + `elements`) referenced
+ * from a page — or, when `export` is set, from another app — through an
+ * `ElementRef` node. `pure` elements render only from their declared `props`;
+ * `bound` elements additionally read their OWN app's queries and actions,
+ * which the client assembler rewrites to `/refs/<definingAppId>/…` when the
+ * element is borrowed (see `@/lib/json-render/assemble`).
+ */
+export interface AppElementDef {
+  mode: "pure" | "bound";
+  export?: boolean;
+  props?: Record<string, AppElementPropDef>;
+  root: string;
+  elements: Record<string, unknown>;
+}
+
+/**
+ * One declared per-viewer preference. The SCHEMA is versioned with the app
+ * definition; the VALUES live outside it (per app × user), which is what makes
+ * a definition rollback leave a viewer's preferences intact.
+ *
+ * No `required`: every field must be total through `default` or read as null.
+ */
+export interface AppUserConfigField {
+  kind: AppColumnKind;
+  default?: string | number | boolean;
+  enum?: string[];
+  label?: string;
+}
+
+/** A stored userConfig value — `null` means "unset, and no declared default". */
+export type AppUserConfigValue = string | number | boolean | null;
+
+/**
+ * `GET|PUT /api/apps/:id/user-config`. `values` is the server's tolerant merge
+ * of the stored row against the CURRENT schema: unknown fields dropped,
+ * nonconforming ones replaced by their default (or null). An app with no
+ * declared `userConfig` answers `{ values: {}, schema: {} }`.
+ */
+export interface AppUserConfigResponse {
+  values: Record<string, AppUserConfigValue>;
+  schema: Record<string, AppUserConfigField>;
+}
+
+export interface AppDefinition {
+  models: Record<string, AppModelDef>;
+  queries?: Record<string, AppQueryDef>;
+  actions?: Record<string, AppActionDef>;
+  /** Reusable element subtrees, referenced by `ElementRef` nodes. */
+  elements?: Record<string, AppElementDef>;
+  /**
+   * The canonical multi-page form (server-normalized on every write): named
+   * json-render specs plus the page a bare `/apps/:id` renders.
+   */
+  pages?: Record<string, AppPageDef>;
+  defaultPage?: string;
+  /** Per-viewer preference SCHEMA; the values live outside the definition. */
+  userConfig?: Record<string, AppUserConfigField>;
+  /**
+   * Preset theme id for the app's rendered surface (see `@/lib/themes`).
+   * Unknown ids fall back to inheriting the dashboard theme; a viewer's
+   * reserved `$theme` user-config value overrides it per-user.
+   */
+  theme?: string;
+}
+
+/**
+ * `POST /api/apps/:id/actions/:name` response. One loose shape covering both
+ * action kinds: script runs answer with `result`/`stdout`/`durationMs`, task
+ * actions answer with `taskId` + the freshly created task's `status`.
+ */
+export interface AppActionResponse {
+  ok: boolean;
+  result?: unknown;
+  stdout?: string;
+  error?: string;
+  durationMs?: number;
+  taskId?: string;
+  status?: AgentTaskStatus;
+}
+
+export interface AppListItem {
+  id: string;
+  name: string;
+  description?: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface AppDetail extends AppListItem {
+  definition: AppDefinition;
+}
+
+/** A row from `app/<appId>/<model>/row/<rowId>`. */
+export type AppRow = Record<string, unknown> & {
+  id: string;
+  createdAt: string;
+  updatedAt: string;
+};

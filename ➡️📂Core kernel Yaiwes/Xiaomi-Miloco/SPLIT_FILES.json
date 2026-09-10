@@ -1,0 +1,30 @@
+[
+  {
+    "repo": "Xiaomi-Miloco",
+    "path": "backend/miot/src/miot/libs/linux/x86_64/libmiot_camera_lite.so",
+    "chunks_dir": "Xiaomi-Miloco/backend/miot/src/miot/libs/linux/x86_64/libmiot_camera_lite.so.chunks",
+    "bytes": 8579088,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "Xiaomi-Miloco",
+    "path": "backend/miloco/src/miloco/perception/models/bge-small-zh-v1.5-int8.onnx",
+    "chunks_dir": "Xiaomi-Miloco/backend/miloco/src/miloco/perception/models/bge-small-zh-v1.5-int8.onnx.chunks",
+    "bytes": 23919084,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "Xiaomi-Miloco",
+    "path": "backend/miloco/src/miloco/perception/models/human_body_reid_v2.onnx",
+    "chunks_dir": "Xiaomi-Miloco/backend/miloco/src/miloco/perception/models/human_body_reid_v2.onnx.chunks",
+    "bytes": 10474255,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "Xiaomi-Miloco",
+    "path": "backend/miloco/src/miloco/perception/models/det_4C.onnx",
+    "chunks_dir": "Xiaomi-Miloco/backend/miloco/src/miloco/perception/models/det_4C.onnx.chunks",
+    "bytes": 44643491,
+    "chunk_bytes": 8388608
+  }
+]

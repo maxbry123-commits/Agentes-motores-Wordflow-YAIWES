@@ -1,0 +1,46 @@
+{
+  "name": "ux-research-pipeline",
+  "version": "0.5.1",
+  "description": "An AI research assistant for qualitative in-depth interviews. 13 stages from a stakeholder brief to a finished report, presented through a concierge-style chat: you talk to the agent, it decides which step to run.",
+  "author": "shipaleks",
+  "license": "All rights reserved (see NOTICE)",
+  "skills": [
+    "skills/00-welcome",
+    "skills/01-brief-intake",
+    "skills/02-rq-audit",
+    "skills/03-desk-research",
+    "skills/04-guide-builder",
+    "skills/05-screener",
+    "skills/06-transcribe",
+    "skills/06.2-speaker-verify",
+    "skills/07-quick-summary",
+    "skills/08-screen-vlm",
+    "skills/09-flat-coding",
+    "skills/10-saturation-map",
+    "skills/11-matrix-pivot",
+    "skills/12-link-detector",
+    "skills/13-axial-coding",
+    "skills/14-paradigmatic-model",
+    "skills/15-disconfirm-triangulate",
+    "skills/16-typology",
+    "skills/17-key-findings",
+    "skills/18-report-draft",
+    "skills/18.5-narrative-adapt",
+    "skills/19-format",
+    "skills/20-presentation",
+    "skills/transcript-coding",
+    "skills/ux-transcribe"
+  ],
+  "config_files": [
+    "AGENT.md",
+    "CLAUDE.md",
+    "AGENTS.md",
+    ".env.example"
+  ],
+  "v2_roadmap": [
+    "desk-research-index — RAG over an archive of past transcripts and reports",
+    "live-cohost — a co-pilot during the interview itself",
+    "edits-categorizer — auto-diff and categorization of the researcher's edits",
+    "regression-eval — a golden set + prompt regression after the first projects"
+  ]
+}

@@ -1,0 +1,1113 @@
+"""The V3 pipeline orchestrator: probe, candidate generation, sandbox
+verification, the lens/structural/call-graph vetoes, candidate selection,
+the repair phases, stage telemetry, and the /v3/generate problem builder."""
+
+import json
+import os
+import re
+import threading
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from stages.llm_client import extract_code
+from stages.budget_forcing import BudgetForcing, BudgetForcingConfig
+from stages import cxgx_gate
+from stages.plan_search import PlanSearch, PlanSearchConfig
+from stages.div_sampling import DivSampling, DivSamplingConfig
+from stages.failure_analysis import FailingCandidate
+from stages.pr_cot import PRCoT, PRCoTConfig
+from stages.refinement_loop import (
+    RefinementLoop, RefinementLoopConfig,
+    can_afford_iteration, estimate_iteration_ms,
+)
+from stages.self_test_gen import SelfTestGen, SelfTestGenConfig
+from stages.candidate_selection import CandidateInfo, select_candidate
+
+import adapters
+import scoring
+import symbols
+
+BASE_TEMPERATURE = 0.6
+DIVERSITY_TEMPERATURE = 0.8
+MAX_TOKENS = 8192
+
+
+# --- Stage telemetry ---------------------------------------------------------
+
+# Serializes pipeline-summary appends across the ThreadingHTTPServer's
+# request threads. Stage JSONL appends need no lock: each event is one
+# small O_APPEND write.
+_SUMMARY_LOCK = threading.Lock()
+
+_TELEMETRY_DISABLE_VALUES = {"0", "off", "none", "disabled", "false"}
+
+# stage name -> summary phase. Stages not listed (token/llm_*/task_type/…)
+# don't contribute a phase row.
+_STAGE_PHASE = {}
+for _phase, _stages in {
+    "probe": ("probe", "probe_light", "probe_retry", "probe_failed",
+              "probe_error", "probe_scored", "probe_sandbox", "probe_pass"),
+    "self_test": ("self_test_gen", "self_test_done", "self_test_error",
+                  "self_test_skip"),
+    "allocation": ("phase2", "phase2_allocated"),
+    "generation": ("phase1", "plansearch", "plansearch_done",
+                   "plansearch_error", "divsampling", "divsampling_done",
+                   "divsampling_error", "lens_per_step"),
+    "sandbox": ("sandbox_test", "sandbox_pass", "sandbox_fail",
+                "sandbox_done", "smoke_check", "interactive_lint",
+                "self_test_verify", "build_verify",
+                "build_verify_unavailable"),
+    "veto": ("lens_veto", "structural_veto", "call_graph_veto"),
+    "selection": ("selected",),
+    "repair_pr_cot": ("phase3", "call_chain_context", "pr_cot",
+                      "pr_cot_pass", "pr_cot_failed", "pr_cot_error"),
+    "repair_refinement": ("refinement", "refinement_pass",
+                          "refinement_failed", "refinement_error",
+                          "refinement_verify_failed", "refinement_skip"),
+    "fallback": ("fallback", "fallback_all_vetoed"),
+}.items():
+    for _s in _stages:
+        _STAGE_PHASE[_s] = _phase
+
+_VETO_STAGES = frozenset(("lens_veto", "structural_veto", "call_graph_veto"))
+
+
+def _remaining_budget_ms(start: float) -> Optional[float]:
+    """Remaining wall-clock (ms) in this run's ATLAS_V3_TIMEOUT budget.
+
+    The proxy's V3 bridge abandons a live pipeline call after
+    ``ATLAS_V3_TIMEOUT`` seconds (default 180; 0 disables the cap).
+    The service reads the same knob so late phases can skip work the
+    bridge would abandon mid-flight anyway. Returns None when the cap
+    is disabled.
+    """
+    raw = os.environ.get("ATLAS_V3_TIMEOUT", "").strip()
+    try:
+        seconds = int(raw) if raw else 180
+    except ValueError:
+        seconds = 180
+    if seconds <= 0:
+        return None
+    return seconds * 1000.0 - (time.time() - start) * 1000.0
+
+
+def _resolve_telemetry_dir() -> Optional[Path]:
+    """Resolve the stage-telemetry directory for the live service.
+
+    ``ATLAS_V3_TELEMETRY_DIR`` names the directory; a disable value
+    (``0``/``off``/``none``/``disabled``/``false``) turns telemetry off;
+    unset/empty falls back to ``/data/telemetry`` when writable (the
+    compose volume), else telemetry is disabled. Resolution never
+    raises — telemetry must not break generation.
+    """
+    configured = os.environ.get("ATLAS_V3_TELEMETRY_DIR", "").strip()
+    if configured.lower() in _TELEMETRY_DISABLE_VALUES:
+        return None
+    candidate = Path(configured) if configured else Path("/data/telemetry")
+    try:
+        candidate.mkdir(parents=True, exist_ok=True)
+        probe = candidate / ".write_probe"
+        probe.touch()
+        probe.unlink()
+        return candidate
+    except OSError as e:
+        if configured:
+            print(f"  [telemetry] {candidate} not writable ({e}) — "
+                  f"stage telemetry disabled", flush=True)
+        return None
+
+
+def _summarize_phases(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Fold the run's progress events into ordered per-phase rows.
+
+    Each row carries the phase name, the stage that closed it (its
+    outcome marker), that stage's detail, and the span between the
+    phase's first and last event. Derived purely from the events the
+    run already emits — no extra instrumentation in the hot path.
+    """
+    rows: List[Dict[str, Any]] = []
+    by_phase: Dict[str, Dict[str, Any]] = {}
+    for ev in events:
+        phase = _STAGE_PHASE.get(ev.get("stage", ""))
+        if phase is None:
+            continue
+        row = by_phase.get(phase)
+        if row is None:
+            row = {"phase": phase, "first_ms": round(ev.get("t", 0.0) * 1000)}
+            by_phase[phase] = row
+            rows.append(row)
+        row["outcome"] = ev.get("stage", "")
+        row["detail"] = str(ev.get("detail", ""))[:120]
+        row["duration_ms"] = round(ev.get("t", 0.0) * 1000) - row["first_ms"]
+    return rows
+
+
+# --- V3 Pipeline Orchestrator ------------------------------------------------
+
+def _candidate_by_index(candidates: List[Dict[str, Any]], index: int) -> Optional[Dict[str, Any]]:
+    """Return the candidate dict whose original ``index`` field matches.
+
+    Selection reports the winner by the candidate's original index, but
+    the ``passing`` list has been sorted and filtered — positional
+    indexing would pick the wrong candidate (or IndexError). Returns None
+    when no candidate carries that index.
+    """
+    return next((c for c in candidates if c.get("index") == index), None)
+
+
+def _make_self_test(code: str, tc) -> str:
+    """Build executable assertion code for a single test case.
+
+    Uses ast.literal_eval (safe — only parses Python literals) to convert
+    I/O string representations to actual values for comparison.
+    All code runs inside the sandboxed container.
+    """
+    inp = tc.input_str.strip()
+    exp = tc.expected_output.strip()
+    fn = re.search(r'^def (\w+)\(', code, re.MULTILINE)
+    if fn and 'input()' not in code:
+        name = fn.group(1)
+        return (code + "\nimport ast as _a\n"
+            + f"_i={repr(inp)}\n_e={repr(exp)}\n"
+            + "try:\n _p=_a.literal_eval(_i)\nexcept:\n _p=_i\n"  # noqa: E722  -- bare except inside generated user code, intentional
+            + f"_r={name}(*_p) if isinstance(_p,tuple) else {name}(_p) if isinstance(_p,list) else {name}(_p)\n"
+            + "try:\n _ev=_a.literal_eval(_e)\nexcept:\n _ev=_e\n"  # noqa: E722  -- bare except inside generated user code, intentional
+            + "assert str(_r)==str(_ev) or _r==_ev,f'got {_r}'\nprint('SELF_TEST_PASS')\n")
+    # exec the candidate from a string literal instead of splicing its lines
+    # under `try:` — per-line indenting corrupts multiline string literals
+    # inside the candidate. exec(..., globals()) keeps the namespace (and
+    # __name__) identical to the previous inline form.
+    return (
+        "import sys as _s,io as _o\n"
+        f"_s.stdin=_o.StringIO({repr(inp)})\n"
+        "_c=_o.StringIO()\n_old=_s.stdout\n_s.stdout=_c\n"
+        f"_src={repr(code)}\n"
+        "try:\n    exec(compile(_src,'solution.py','exec'),globals())\nfinally:\n _s.stdout=_old\n"
+        f"assert _c.getvalue().strip()=={repr(exp)},f'got {{_c.getvalue().strip()}}'\n"
+        "print('SELF_TEST_PASS')\n")
+
+
+class V3PipelineService:
+    """Full V3 pipeline for a single coding task, with streaming progress."""
+
+    def __init__(self):
+        # ALL V3 components enabled — same as benchmark runner with all phases
+        # active. Stage telemetry mirrors the bench runner's telemetry/*.jsonl
+        # into ATLAS_V3_TELEMETRY_DIR so live-orchestrator runs are measurable.
+        self.telemetry_dir = _resolve_telemetry_dir()
+        t = self.telemetry_dir
+        self.budget_forcing = BudgetForcing(BudgetForcingConfig(enabled=True),
+                                            telemetry_dir=t)
+        self.plan_search = PlanSearch(PlanSearchConfig(enabled=True),
+                                      telemetry_dir=t)
+        self.div_sampling = DivSampling(DivSamplingConfig(enabled=True),
+                                        telemetry_dir=t)
+        self.pr_cot = PRCoT(PRCoTConfig(enabled=True), telemetry_dir=t)
+        self.refinement_loop = RefinementLoop(RefinementLoopConfig(enabled=True),
+                                              telemetry_dir=t)
+        self.self_test_gen = SelfTestGen(SelfTestGenConfig(enabled=True),
+                                         telemetry_dir=t)
+
+    def run(self, problem: str, task_id: str = "cli",
+            progress_callback=None, files: Dict[str, str] = None,
+            file_path: str = "", build_command: str = "",
+            working_dir: str = "/workspace") -> Dict[str, Any]:
+        """Run the full V3 pipeline on a coding problem.
+
+        Args:
+            problem: Problem description
+            task_id: Task identifier
+            progress_callback: SSE progress emitter
+            files: Dict of filename→content from Aider's existing file context
+            file_path: Target file path (used by PC-048 to detect language
+                for the smoke check — `.html` files use HTML parser, not
+                Python compile, etc.)
+            build_command: Optional project build command to run against an
+                ephemeral candidate overlay after syntax/self-tests pass.
+            working_dir: Container workspace root used by the sandbox overlay.
+
+        Writes one pipeline-summary telemetry line per task (fail-soft;
+        see _write_pipeline_summary) around the actual pipeline body.
+        """
+        start = time.time()
+        result: Optional[Dict[str, Any]] = None
+        error = ""
+        try:
+            result = self._run_impl(
+                problem, task_id=task_id, progress_callback=progress_callback,
+                files=files, file_path=file_path, build_command=build_command,
+                working_dir=working_dir)
+            return result
+        except Exception as e:
+            error = f"{type(e).__name__}: {e}"
+            raise
+        finally:
+            self._write_pipeline_summary(task_id, result, error, start)
+
+    def _write_pipeline_summary(self, task_id: str,
+                                result: Optional[Dict[str, Any]],
+                                error: str, start: float) -> None:
+        """Append one summary line to telemetry/pipeline_summary.jsonl.
+
+        Carries the per-task shape the bench runner gets for free from its
+        per-task JSON files: phases run (outcome + duration, folded from the
+        run's progress events), veto events, and the final result fields.
+        Fail-soft by construction — a telemetry error never reaches the
+        caller, so it can never break generation.
+        """
+        if self.telemetry_dir is None:
+            return
+        try:
+            events = (result or {}).get("events") or []
+            line = {
+                "schema": "v3_pipeline_summary_v1",
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "task_id": task_id,
+                "passed": bool((result or {}).get("passed")),
+                "phase_solved": (result or {}).get("phase_solved", "none"),
+                "task_type": (result or {}).get("task_type", ""),
+                "candidates_generated": (result or {}).get("candidates_generated", 0),
+                "total_tokens": (result or {}).get("total_tokens", 0),
+                "total_time_ms": round(
+                    (result or {}).get("total_time_ms")
+                    or (time.time() - start) * 1000),
+                "phases": _summarize_phases(events),
+                "veto_events": [
+                    {"stage": ev.get("stage", ""),
+                     "index": (ev.get("data") or {}).get("index", -1),
+                     "detail": str(ev.get("detail", ""))[:120]}
+                    for ev in events if ev.get("stage") in _VETO_STAGES
+                ],
+            }
+            if error:
+                line["error"] = error[:300]
+            with _SUMMARY_LOCK:
+                with open(self.telemetry_dir / "pipeline_summary.jsonl", "a") as f:
+                    f.write(json.dumps(line) + "\n")
+        except Exception as e:
+            print(f"  [telemetry] pipeline summary write failed (non-fatal): {e}",
+                  flush=True)
+
+    def _run_impl(self, problem: str, task_id: str = "cli",
+                  progress_callback=None, files: Dict[str, str] = None,
+                  file_path: str = "", build_command: str = "",
+                  working_dir: str = "/workspace") -> Dict[str, Any]:
+        """The pipeline body — see run() for the argument contract."""
+        start = time.time()
+        events = []
+        files = files or {}
+
+        # PC-048: derive language from the target file's extension. Used
+        # only by smoke_compile_check below to pick the right syntax
+        # checker. Defaults to Python when no file_path is supplied.
+        _ext = Path(file_path).suffix.lower() if file_path else ""
+        # Only languages scoring.smoke_compile_check can actually verify —
+        # an entry here that the checker rejects would fail every candidate
+        # with "verification unavailable" instead of checking anything.
+        _ext_to_lang = {
+            ".py": "python", ".pyw": "python",
+            ".html": "html", ".htm": "html",
+            ".json": "json",
+            ".yaml": "yaml", ".yml": "yaml",
+            ".js": "javascript", ".mjs": "javascript", ".cjs": "javascript",
+            ".ts": "typescript", ".tsx": "typescript",
+            ".xml": "xml",
+            ".sh": "bash", ".bash": "bash",
+            ".go": "go",
+            ".java": "java",
+            ".kt": "kotlin",
+            ".rs": "rust",
+            ".rb": "ruby",
+            ".php": "php",
+        }
+        smoke_language = _ext_to_lang.get(_ext, "python")
+
+        # If existing file context is provided, prepend it to the problem
+        # so all V3 modules (PlanSearch, PR-CoT, etc.) can see the code
+        if files:
+            file_context_parts = []
+            for fname, content in files.items():
+                file_context_parts.append(f"### Existing file: {fname}\n```\n{content}\n```")
+            problem = (
+                "The following files already exist in the project:\n\n"
+                + "\n\n".join(file_context_parts)
+                + "\n\n---\n\nTask:\n" + problem
+            )
+
+        def emit(stage, detail="", **data):
+            ev = {"stage": stage, "detail": detail, "t": time.time() - start}
+            if data:
+                ev["data"] = data
+            # Token deltas stream live through the callback but are not
+            # stored: one dict per token would make the final `event: result`
+            # frame multi-MB on long generations.
+            if stage != "token":
+                events.append(ev)
+            if progress_callback:
+                try:
+                    progress_callback(stage, detail, **data)
+                except TypeError:
+                    progress_callback(stage, detail)
+
+        def check_client():
+            """Abort at phase boundaries once the SSE client disconnects.
+            The handler sets `disconnected` on the callback when a write
+            hits BrokenPipeError; a dead client must not keep burning GPU."""
+            if getattr(progress_callback, "disconnected", False):
+                raise adapters.ClientDisconnected(f"client disconnected during task {task_id}")
+
+        llm = adapters.LLMAdapter(progress_callback=emit)
+        # PC-046: ship the user's other project files into the sandbox so
+        # multi-file imports resolve. `files` is the same Dict that V3
+        # already prepends to the LLM prompt above; passing it to the
+        # sandbox closes the gap where the model writes
+        # `from utils import helper` and the sandbox imports a workspace
+        # that contains only solution.py.
+        sandbox = adapters.SandboxAdapter(project_files=files)
+        embed = adapters.EmbedAdapter()
+
+        result = {
+            "task_id": task_id,
+            "passed": False,
+            "code": "",
+            "phase_solved": "none",
+            "candidates_generated": 0,
+            "total_tokens": 0,
+            "total_time_ms": 0.0,
+            "events": [],
+            "verification_evidence": [],
+        }
+
+        # ===== PHASE 0: PROBE =====
+        emit("probe", "Generating probe candidate...")
+        # Light probe first (1024 thinking tokens), retry with standard if fails
+        try:
+            chatml = self.budget_forcing.format_chatml(problem, "light")
+            response, tokens, t_ms = llm(chatml, BASE_TEMPERATURE, MAX_TOKENS, 42)
+            probe_code = extract_code(response)
+            if probe_code:
+                emit("probe_light", f"Light probe: {len(probe_code)} chars, {tokens} tokens, {t_ms:.0f}ms")
+        except Exception as e:
+            emit("probe_error", str(e))
+            probe_code = ""
+
+        if not probe_code:
+            emit("probe_retry", "Light probe failed — retrying with standard budget")
+            try:
+                chatml = self.budget_forcing.format_chatml(problem, "standard")
+                response, tokens, t_ms = llm(chatml, BASE_TEMPERATURE, MAX_TOKENS, 42)
+                probe_code = extract_code(response)
+            except Exception as e:
+                emit("probe_error", str(e))
+
+        if not probe_code:
+            emit("probe_failed", "No code extracted from probe")
+            # Generate with the minimal reasoning budget
+            chatml = self.budget_forcing.format_chatml(problem, "nothink")
+            response, tokens, t_ms = llm(chatml, BASE_TEMPERATURE, MAX_TOKENS, 42)
+            probe_code = extract_code(response)
+
+        # Classify task type. Interactive tasks (games, UIs, framework code)
+        # skip synthetic I/O self-tests entirely — those tests would fail by
+        # construction, falsely triggering PR-CoT/refinement on working code.
+        # See ISSUES.md PC-022.
+        task_type = scoring.classify_task_type(problem)
+        emit("task_type", task_type)
+        result["task_type"] = task_type
+
+        # Generate self-tests (algorithmic tasks only) — used for sandbox verification
+        self_tests = None
+        if task_type == "algorithmic":
+            emit("self_test_gen", "Generating verification tests...")
+            try:
+                self_tests = self.self_test_gen.generate(problem, llm, task_id)
+                emit("self_test_done", f"{len(self_tests.test_cases)} test cases")
+                result["total_tokens"] += self_tests.generation_tokens
+            except Exception as e:
+                emit("self_test_error", str(e)[:200])
+        else:
+            emit("self_test_skip", "Interactive task — using compile smoke-test")
+
+        def verified_sandbox(code, extra_test=""):
+            """Sandbox + verification. Algorithmic tasks: I/O self-tests; interactive: compile smoke."""
+            verification_evidence: List[Dict[str, Any]] = []
+
+            def verify_build_if_requested(out="", err=""):
+                ok, build_out, build_err, evidence = scoring.verify_build_command(
+                    code=code,
+                    sandbox=sandbox,
+                    build_command=build_command,
+                    file_path=file_path,
+                    project_files=files,
+                    working_dir=working_dir or "/workspace",
+                    emit=emit,
+                )
+                if evidence:
+                    verification_evidence.append(evidence)
+                if not ok:
+                    return False, build_out, build_err, verification_evidence
+                return True, out, err, verification_evidence
+
+            # Non-Python candidates always use the language-aware syntax path.
+            # Python self-tests cannot establish correctness for another language.
+            if smoke_language not in ("python", "py"):
+                ok, out, err = scoring.smoke_compile_check(code, sandbox, language=smoke_language)
+                emit("smoke_check", f"compile={'OK' if ok else 'FAIL'} ({smoke_language})")
+                if not ok:
+                    return ok, out, err, verification_evidence
+                return verify_build_if_requested(out, err)
+
+            # Interactive tasks: skip the run-and-test; just verify the code
+            # parses and compiles. Running curses/pygame/flask in the sandbox
+            # would fail for environmental reasons (no TTY, no display) even
+            # when the code is correct — see PC-022.
+            if task_type == "interactive":
+                # PC-048: pass the detected language so HTML/JSON/etc. files
+                # don't get parsed as Python (which produces spurious
+                # SYNTAX_ERROR cascades into PR-CoT repair + LLM timeouts).
+                ok, out, err = scoring.smoke_compile_check(code, sandbox, language=smoke_language)
+                emit("smoke_check", f"compile={'OK' if ok else 'FAIL'} ({smoke_language})")
+                if not ok:
+                    return ok, out, err, verification_evidence
+                # Interactive lint is Python-AST based — only meaningful for
+                # Python files. Skip for HTML/CSS/JSON/etc.
+                if smoke_language not in ("python", "py"):
+                    return True, out, err, verification_evidence
+                # Interactive lint: catch raw stdin reads / blocking input loops
+                # that compile fine but don't actually work for keystroke
+                # handling (PC-034).
+                lint_ok, lint_reason = scoring.interactive_lint(code)
+                if lint_ok:
+                    emit("interactive_lint", "OK")
+                    return verify_build_if_requested(out, err)
+                emit("interactive_lint", f"FAIL: {lint_reason}")
+                return False, out, f"interactive_lint: {lint_reason}", verification_evidence
+
+            ok, out, err = sandbox(code)
+            if not ok:
+                return False, out, err, verification_evidence
+            if self_tests and self_tests.test_cases:
+                p, fails = 0, []
+                for i, tc in enumerate(self_tests.test_cases):
+                    try:
+                        tc_code = _make_self_test(code, tc)
+                        tp, to, te = sandbox(tc_code)
+                        if tp and "SELF_TEST_PASS" in to:
+                            p += 1
+                        else:
+                            fails.append(f"TC{i+1}:{te[:60] if te else 'wrong'}")
+                    except Exception as ex:
+                        fails.append(f"TC{i+1}:{str(ex)[:40]}")
+                total = len(self_tests.test_cases)
+                emit("self_test_verify", f"{p}/{total} passed")
+                if total > 0 and p < total / 2:
+                    return False, out, f"Self-test:{p}/{total}. "+";".join(fails[:3]), verification_evidence
+            return verify_build_if_requested(out, err)
+
+        # Score and test probe with self-generated tests. The probe is the
+        # only candidate the CxGx gate below can see, so it is scored with
+        # the combined C(x)+G(x) call — one embedding extraction, both
+        # models — rather than C(x) alone.
+        probe_scores = dict(scoring.NEUTRAL_COMBINED)
+        probe_energy_raw, probe_energy_norm = 0.0, 0.5
+        probe_cx_calibrated = False
+        probe_passed = False
+        if probe_code:
+            probe_scores = scoring.score_candidate_combined(probe_code)
+            probe_energy_raw = probe_scores["cx_energy"]
+            probe_energy_norm = probe_scores["cx_normalized"]
+            probe_cx_calibrated = probe_scores["cx_calibrated"]
+            norm_label = f"{probe_energy_norm:.2f}" if probe_cx_calibrated else "uncalibrated"
+            emit("probe_scored",
+                 f"C(x)={probe_energy_raw:.2f} norm={norm_label} "
+                 f"G(x)={probe_scores['gx_score']:.2f} "
+                 f"({probe_scores['verdict']})",
+                 gx_score=probe_scores["gx_score"],
+                 gx_available=probe_scores["gx_available"],
+                 verdict=probe_scores["verdict"])
+            probe_passed, probe_stdout, probe_stderr, probe_evidence = verified_sandbox(probe_code)
+            emit("probe_sandbox", f"passed={probe_passed} stderr={probe_stderr[:80] if probe_stderr else ''}")
+            result["total_tokens"] += tokens
+
+        if probe_passed:
+            emit("probe_pass", "Probe passed — returning early")
+            result["passed"] = True
+            result["code"] = probe_code
+            result["phase_solved"] = "probe"
+            result["candidates_generated"] = 1
+            result["total_time_ms"] = (time.time() - start) * 1000
+            result["verification_evidence"] = probe_evidence
+            result["winning_score"] = probe_energy_norm
+            result["events"] = events
+            return result
+
+        # ===== PHASE 2: CxGx K ALLOCATION =====
+        # The probe failed verification, so this task is not trivial: C(x)
+        # picks a base tier, G(x) escalates it, and k never drops below the
+        # gate's k=3 floor (what this phase allocated unconditionally
+        # before the gate existed).
+        #
+        # Live-path difference from the bench the gate was measured on: the
+        # proxy's V3 bridge abandons this call after ATLAS_V3_TIMEOUT
+        # (default 180s), a cap the bench never had. An unbounded escalation
+        # to k=8 here would spend the whole budget on generation and hand
+        # the user a timeout fallback instead of the k=3 answer the clock
+        # could have produced — the failure mode the phase-3 refinement gate
+        # already fixes. So the remaining wall-clock and the per-call
+        # latency observed on THIS task go into the allocation, and the gate
+        # lowers the tier to what the budget can actually generate. The
+        # floor is not budget-dependent: k=3 is what would have run anyway.
+        check_client()
+        emit("phase2", "Allocating compute budget...")
+        alloc = cxgx_gate.allocate(
+            cx_normalized=probe_energy_norm,
+            cx_calibrated=probe_cx_calibrated,
+            gx_score=probe_scores["gx_score"],
+            gx_available=probe_scores["gx_available"],
+            gx_verdict=probe_scores["verdict"],
+            remaining_ms=_remaining_budget_ms(start),
+            observed_llm_call_ms=getattr(llm, "avg_call_ms", 0.0),
+        )
+        k, budget_tier = alloc.k, alloc.tier
+        bf_tier = budget_tier
+        emit("phase2_allocated", f"k={k} tier={budget_tier}",
+             k=k, tier=budget_tier, base_tier=alloc.base_tier,
+             gx_escalation=alloc.gx_escalation,
+             capped_from=alloc.capped_from, reason=alloc.reason)
+
+        # ===== PHASE 1: CONSTRAINT-DIVERSE CANDIDATE GENERATION =====
+        emit("phase1", f"Generating {k} diverse candidates...", k=k)
+        candidates = []
+
+        # Start with probe if it produced code
+        if probe_code:
+            candidates.append({
+                "index": 0, "code": probe_code,
+                "energy": probe_energy_raw, "energy_norm": probe_energy_norm,
+                "energy_calibrated": probe_cx_calibrated,
+                "passed": probe_passed, "stdout": "", "stderr": "",
+            })
+
+        remaining_k = max(0, k - len(candidates))
+
+        # Step 1A: PlanSearch
+        if remaining_k > 0:
+            emit("plansearch", f"Generating {remaining_k} plans...",
+                 plans=remaining_k)
+            try:
+                ps_result = self.plan_search.generate(
+                    problem, task_id, llm, num_plans=remaining_k,
+                )
+                for i, code in enumerate(ps_result.candidates):
+                    if code:
+                        energy_raw, energy_norm, energy_calibrated = scoring.score_candidate(code)
+                        per_step = scoring.score_candidate_per_step(code)  # PC-207
+                        cand_index = len(candidates)
+                        candidates.append({
+                            "index": cand_index, "code": code,
+                            "energy": energy_raw, "energy_norm": energy_norm,
+                            "energy_calibrated": energy_calibrated,
+                            "passed": False, "stdout": "", "stderr": "",
+                            "per_step": per_step,
+                        })
+                        if per_step:
+                            emit("lens_per_step",
+                                 f"cand {cand_index}: gx_min={per_step['gx_score_min']:.2f} "
+                                 f"first_off_rails={per_step['first_off_rails_idx']}",
+                                 index=cand_index,
+                                 source="plansearch",
+                                 first_off_rails_idx=per_step["first_off_rails_idx"],
+                                 gx_score_min=per_step["gx_score_min"],
+                                 gx_score_mean=per_step["gx_score_mean"],
+                                 cx_norm_max=per_step["cx_norm_max"],
+                                 n_tokens=per_step["n_tokens"])
+                result["total_tokens"] += ps_result.total_tokens
+                emit("plansearch_done",
+                     f"{len(ps_result.candidates)} candidates from PlanSearch",
+                     candidates=len(ps_result.candidates),
+                     tokens=ps_result.total_tokens)
+            except Exception as e:
+                emit("plansearch_error", str(e)[:200])
+
+        # Step 1B: DivSampling to fill remaining slots
+        remaining_k = max(0, k - len(candidates))
+        if remaining_k > 0:
+            emit("divsampling", f"Filling {remaining_k} slots with diverse sampling...",
+                 slots=remaining_k)
+            for idx in range(remaining_k):
+                check_client()
+                try:
+                    perturbed = self.div_sampling.apply(problem, len(candidates) + idx, task_id)
+                    chatml = self.budget_forcing.format_chatml(perturbed, bf_tier)
+                    response, tokens, t_ms = llm(
+                        chatml, DIVERSITY_TEMPERATURE,
+                        self.budget_forcing.get_max_tokens(bf_tier),
+                        42 + len(candidates) + idx,
+                    )
+                    code = extract_code(response)
+                    if code:
+                        energy_raw, energy_norm, energy_calibrated = scoring.score_candidate(code)
+                        per_step = scoring.score_candidate_per_step(code)  # PC-207
+                        cand_index = len(candidates)
+                        candidates.append({
+                            "index": cand_index, "code": code,
+                            "energy": energy_raw, "energy_norm": energy_norm,
+                            "energy_calibrated": energy_calibrated,
+                            "passed": False, "stdout": "", "stderr": "",
+                            "per_step": per_step,
+                        })
+                        if per_step:
+                            emit("lens_per_step",
+                                 f"cand {cand_index}: gx_min={per_step['gx_score_min']:.2f} "
+                                 f"first_off_rails={per_step['first_off_rails_idx']}",
+                                 index=cand_index,
+                                 source="divsampling",
+                                 first_off_rails_idx=per_step["first_off_rails_idx"],
+                                 gx_score_min=per_step["gx_score_min"],
+                                 gx_score_mean=per_step["gx_score_mean"],
+                                 cx_norm_max=per_step["cx_norm_max"],
+                                 n_tokens=per_step["n_tokens"])
+                    result["total_tokens"] += tokens
+                except Exception as e:
+                    emit("divsampling_error", str(e)[:200])
+            emit("divsampling_done", f"{len(candidates)} total candidates",
+                 total=len(candidates))
+
+        result["candidates_generated"] = len(candidates)
+
+        # ===== SANDBOX TESTING =====
+        emit("sandbox_test", f"Testing {len(candidates)} candidates...",
+             candidates=len(candidates))
+        # Sort by energy (easy first) for early-exit potential
+        candidates.sort(key=lambda c: c.get("energy", 0))
+
+        passing = []
+        for c in candidates:
+            check_client()
+            if c.get("passed"):
+                passing.append(c)
+                continue
+            sb_start = time.time()
+            passed, stdout, stderr, verification_evidence = verified_sandbox(c["code"])
+            sb_ms = int((time.time() - sb_start) * 1000)
+            c["passed"] = passed
+            c["stdout"] = stdout
+            c["stderr"] = stderr
+            c["verification_evidence"] = verification_evidence
+            if passed:
+                passing.append(c)
+                emit("sandbox_pass", f"Candidate {c['index']} passed",
+                     index=c["index"], elapsed_ms=sb_ms,
+                     energy=c.get("energy_norm", 0.0))
+            else:
+                emit("sandbox_fail", f"Candidate {c['index']} failed",
+                     index=c["index"], elapsed_ms=sb_ms,
+                     stderr=(stderr or "")[:120])
+
+        emit("sandbox_done", f"{len(passing)}/{len(candidates)} passed",
+             passed=len(passing), total=len(candidates))
+
+        # ===== LENS VETO =====
+        # PC-207 alignment fix: hard-reject sandbox-passing candidates whose
+        # geometric-lens gx_min sits below THIS model's calibrated severe band.
+        # Sandbox is an ORM (does it execute?), lens is a PRM (is the
+        # generation pattern collapsing into a stub?) — they answer
+        # different questions. The May 7 dashboard.html session shipped
+        # a 10-line `<h1>Dashboard</h1>` stub because sandbox said pass
+        # while lens said gx_min=0.069. Without this filter, V3 returns
+        # passed=True and the proxy's PC-044 nudges the agent to done.
+        #
+        # Language-agnostic by construction: the lens runs on the model's
+        # residual stream; gx values don't depend on whether the file
+        # being scored is HTML, Python, Rust, or Java.
+        if passing:
+            kept, vetoed = [], []
+            for c in passing:
+                per_step = c.get("per_step") or {}
+                gx_min = per_step.get("gx_score_min")
+                severe = (per_step.get("thresholds") or {}).get("severe")
+                if (gx_min is not None and isinstance(severe, (int, float))
+                        and gx_min < severe):
+                    # A vetoed candidate is a failing candidate: mark it so
+                    # the phase-3 pool (`not c.get("passed")`) picks it up
+                    # and the energy fallback can never return it. The veto
+                    # reason replaces the (empty) passing-run stderr so
+                    # repair sees WHY it was rejected.
+                    c["passed"] = False
+                    c["vetoed_by"] = "lens"
+                    c["stderr"] = (
+                        f"lens veto: gx_min={gx_min:.3f} below the severe "
+                        f"threshold {severe:.3f} — generation pattern "
+                        f"collapsed toward a stub; the code executes but "
+                        f"likely does not implement the task")
+                    vetoed.append(c)
+                    emit("lens_veto",
+                         f"Candidate {c['index']} sandbox-passed but lens-vetoed "
+                         f"(gx_min={gx_min:.3f} < {severe:.3f}) — likely a stub",
+                         index=c["index"], gx_score_min=gx_min,
+                         first_off_rails_idx=per_step.get("first_off_rails_idx", -1))
+                else:
+                    kept.append(c)
+            if vetoed:
+                print(
+                    f"  [lens] vetoed {len(vetoed)}/{len(passing)} sandbox-passing "
+                    f"candidates using per-model severe thresholds — falling "
+                    f"{'through to phase-3 repair' if not kept else 'back to remaining %d' % len(kept)}",
+                    flush=True,
+                )
+            passing = kept
+
+        # ===== STRUCTURAL VETO =====
+        # GH #39 point 1: hard-reject candidates whose direct-identifier
+        # calls don't resolve against (local defs, imports, builtins,
+        # project symbols). Sandbox can pass for code where the unresolved
+        # call is in a try/except ImportError fallback or a dead branch
+        # that doesn't execute under the tests; tree-sitter sees the
+        # surface bug regardless. Same architecture as lens veto.
+        #
+        # Language-agnostic fit: v1 supports Python only (matches the
+        # rest of the GH #39 stack), but the resolution-order pattern
+        # generalizes to any language with explicit imports + named
+        # functions (Go, Rust, JS/TS modules). Adding a language adds
+        # implementation surface, not model-facing API surface.
+        if passing:
+            # #147: gate on `passing` alone, not `passing and files`. The
+            # edit path (improveContentWithV3) frequently sends no
+            # project_context, so `files` was empty and the whole veto was
+            # skipped — a NameError edit (render_template called with only
+            # render_template_string imported) sailed through and landed as
+            # verified. structural_score resolves against the candidate's
+            # OWN imports/defs/builtins, so it catches an unresolved direct
+            # call with empty project_symbols; project symbols only add
+            # lenient cross-file crediting.
+            project_symbols = symbols.build_project_symbols(files or {})
+            kept = []
+            for c in passing:
+                struct = symbols.structural_score(project_symbols, c.get("code", ""))
+                if struct.get("ok") and struct.get("n_unresolved", 0) >= 1:
+                    # Same contract as the lens veto: vetoed = failing.
+                    c["passed"] = False
+                    c["vetoed_by"] = "structural"
+                    c["stderr"] = (
+                        "structural veto: unresolved direct call(s) that "
+                        "would raise NameError at runtime: "
+                        + ", ".join(struct["unresolved_calls"][:5]))
+                    emit("structural_veto",
+                         f"Candidate {c['index']} sandbox-passed but "
+                         f"{struct['n_unresolved']} unresolved call(s): "
+                         f"{', '.join(struct['unresolved_calls'][:3])}",
+                         index=c["index"],
+                         n_unresolved=struct["n_unresolved"],
+                         unresolved_calls=struct["unresolved_calls"][:5],
+                         n_calls_total=struct["n_calls_total"])
+                    print(
+                        f"  [structural] vetoed cand {c['index']} — "
+                        f"{struct['n_unresolved']} unresolved: {struct['unresolved_calls'][:5]}",
+                        flush=True,
+                    )
+                    continue
+                if struct.get("ok"):
+                    c["structural"] = struct  # stash for phase 3 / repair
+                kept.append(c)
+            if len(kept) < len(passing):
+                print(
+                    f"  [structural] kept {len(kept)}/{len(passing)} candidates after structural veto"
+                    f"{' — falling through to phase-3 repair' if not kept else ''}",
+                    flush=True,
+                )
+            passing = kept
+
+        # ===== CALL-GRAPH VETO (issue #39, Phase 1) =====
+        # Deepens the structural veto using the import graph: reject a candidate
+        # whose direct calls don't resolve to a real, in-scope definition (local,
+        # builtin, imported, or supplied by a resolved wildcard) — not merely
+        # "some project file defines that name." Catches broken cross-file
+        # references the shipped veto accepts. Flag-gated by ATLAS_CALL_GRAPH;
+        # conservative — stays lenient on opaque wildcards and never empties the
+        # candidate set (a fully-failing set falls through intact to repair).
+        if passing and files and file_path:
+            try:
+                from graph import call_graph_enabled, unresolved_calls
+                _cg_on = call_graph_enabled()
+            except Exception:
+                _cg_on = False
+            if _cg_on:
+                cg_kept, cg_vetoed = [], []
+                for c in passing:
+                    try:
+                        res = unresolved_calls(
+                            file_path, c.get("code", ""), files, strict=True)
+                    except Exception as cge:
+                        print(f"  [call_graph] veto skipped for cand {c.get('index')}: {cge}",
+                              flush=True)
+                        cg_kept.append(c)
+                        continue
+                    if res.get("ok") and res.get("unresolved"):
+                        cg_vetoed.append((c, res["unresolved"]))
+                        continue
+                    cg_kept.append(c)
+                if cg_kept:  # only prune when at least one candidate survives
+                    # Marking happens only when the prune actually applies —
+                    # the conservative all-vetoed case keeps the full set
+                    # (and its passed flags) intact.
+                    for c, unresolved in cg_vetoed:
+                        c["passed"] = False
+                        c["vetoed_by"] = "call_graph"
+                        c["stderr"] = (
+                            "call-graph veto: cross-file call(s) that resolve "
+                            "to no in-scope definition: "
+                            + ", ".join(unresolved[:5]))
+                        emit("call_graph_veto",
+                             f"Candidate {c.get('index')} has unresolved call(s): "
+                             f"{', '.join(unresolved[:3])}",
+                             index=c.get("index"), unresolved=unresolved[:5])
+                        print(f"  [call_graph] vetoed cand {c.get('index')} — "
+                              f"unresolved: {unresolved[:5]}", flush=True)
+                    passing = cg_kept
+
+        # ===== CANDIDATE SELECTION =====
+        # Lens selection: minimum C(x) energy among the passing candidates.
+        # (S* tiebreaking used to run first for 2+ passers; across 118 H200
+        # tiebreaks every pair scored 0-0 and 110/110 winners equaled the
+        # lens min-energy pick, so it carried zero discriminating signal.)
+        if passing:
+            ci_list = [
+                CandidateInfo(c["index"], c["code"], c["energy"], c["passed"])
+                for c in passing
+            ]
+            selected = select_candidate(ci_list, strategy="lens")
+            if selected:
+                emit("selected", f"Lens selected candidate {selected.index}",
+                     index=selected.index, energy=getattr(selected, "energy", 0.0))
+                result["passed"] = True
+                result["code"] = selected.code
+                result["phase_solved"] = "phase1"
+                result["total_time_ms"] = (time.time() - start) * 1000
+                winner = _candidate_by_index(passing, selected.index)
+                result["verification_evidence"] = (winner or {}).get("verification_evidence", [])
+                result["winning_score"] = (winner or {}).get("energy_norm", 0.0)
+                result["events"] = events
+                return result
+
+        # ===== PHASE 3: VERIFIED ITERATIVE REFINEMENT =====
+        check_client()
+        emit("phase3", "All candidates failed — entering repair phase...",
+             failing=len([c for c in candidates if not c.get("passed")]))
+
+        failing = [
+            FailingCandidate(
+                index=c["index"], code=c["code"],
+                error_output=c.get("stderr", ""),
+            )
+            for c in candidates if not c.get("passed")
+        ]
+
+        # Repair verifies against the SAME self-tests phase 0 generated —
+        # verified_sandbox closes over them. Regenerate only when phase 0
+        # produced none (e.g. a transient LLM failure); a failed retry here
+        # must not downgrade an existing good set to None. Interactive
+        # tasks repair against compile-smoke (PC-022).
+        if task_type == "algorithmic" and not (self_tests and self_tests.test_cases):
+            emit("self_test_gen", "Generating self-tests...")
+            try:
+                self_tests = self.self_test_gen.generate(problem, llm, task_id)
+                emit("self_test_done", f"{len(self_tests.test_cases)} test cases generated")
+                result["total_tokens"] += self_tests.generation_tokens
+            except Exception as e:
+                emit("self_test_error", str(e)[:200])
+
+        # GH #39 point 3: build call-graph context for the failing
+        # function once, reuse across PR-CoT + refinement. Skips
+        # cleanly when stderr isn't a Python traceback or the failing
+        # function isn't defined in the project — both arms get plain
+        # error_output in that case. When ATLAS_CALL_GRAPH is on the
+        # block is a multi-hop reachability slice (entry-point path,
+        # transitive impact, callees); flag-off it stays at direct
+        # callers/callees (1 hop). Fail-soft on any graph failure.
+        chain_context_block = ""
+        if failing:
+            failing_func = symbols._failing_function_from_stderr(failing[0].error_output)
+            if failing_func and files:
+                try:
+                    from graph import call_graph_enabled as _cg_on, repair_context as _cg_repair
+                    chain_context_block = _cg_repair(files, failing_func, transitive=_cg_on())
+                except Exception as cge:
+                    print(f"  [phase3] graph repair-context skipped: {cge}", flush=True)
+                if chain_context_block:
+                    emit("call_chain_context",
+                         f"Built call-chain for failing `{failing_func}`",
+                         function=failing_func)
+                    print(
+                        f"  [phase3] call-chain context built for `{failing_func}`",
+                        flush=True,
+                    )
+
+        def _enriched_error(stderr: str) -> str:
+            """Append call-chain context to a candidate's stderr if available."""
+            if not chain_context_block:
+                return stderr
+            return (stderr or "") + "\n\n" + chain_context_block
+
+        # Strategy 1: PR-CoT Quick Repair
+        if failing:
+            emit("pr_cot", "Attempting PR-CoT repair...",
+                 strategy="pr_cot", failing=len(failing))
+            best_failing = failing[0]
+            try:
+                pr_result = self.pr_cot.repair(
+                    problem=problem,
+                    code=best_failing.code,
+                    error=_enriched_error(best_failing.error_output),
+                    llm_call=llm,
+                    task_id=task_id,
+                )
+                result["total_tokens"] += pr_result.total_tokens
+                for repair_code in pr_result.repairs:
+                    passed, stdout, stderr, repair_evidence = verified_sandbox(repair_code)
+                    if passed:
+                        emit("pr_cot_pass", "PR-CoT repair succeeded!",
+                             strategy="pr_cot", tokens=pr_result.total_tokens)
+                        result["passed"] = True
+                        result["code"] = repair_code
+                        result["phase_solved"] = "pr_cot"
+                        result["total_time_ms"] = (time.time() - start) * 1000
+                        result["verification_evidence"] = repair_evidence
+                        result["events"] = events
+                        return result
+                emit("pr_cot_failed", "PR-CoT repair did not produce passing code")
+            except Exception as e:
+                emit("pr_cot_error", str(e)[:200])
+
+        # Strategy 2: Refinement Loop — entered only when the remaining
+        # wall-clock can afford one iteration. H200 join: 453/487
+        # refinement entries timed out with ZERO completed iterations
+        # while burning ~6 minutes each; one iteration is ~3 sequential
+        # LLM calls, estimated at the per-call latency observed on THIS
+        # run. The budget is the ATLAS_V3_TIMEOUT cap the proxy's V3
+        # bridge enforces — starting work the bridge will abandon only
+        # delays the fallback the user ends up with.
+        run_refinement = bool(failing)
+        if run_refinement:
+            est_ms = estimate_iteration_ms(getattr(llm, "avg_call_ms", 0.0))
+            remaining_ms = _remaining_budget_ms(start)
+            if (remaining_ms is not None
+                    and not can_afford_iteration(remaining_ms, est_ms)):
+                run_refinement = False
+                emit("refinement_skip",
+                     f"remaining budget {remaining_ms / 1000:.0f}s cannot "
+                     f"afford one iteration (~{est_ms / 1000:.0f}s) — "
+                     f"skipping to fallback",
+                     strategy="refinement",
+                     remaining_ms=round(remaining_ms),
+                     estimated_iteration_ms=round(est_ms))
+        if run_refinement:
+            check_client()
+            emit("refinement", "Starting refinement loop...",
+                 strategy="refinement", failing=len(failing))
+            # GH #39 point 3: enrich each failing candidate's error_output
+            # with call-chain context so the refinement loop sees it on
+            # every iteration. Cheap (chain_context_block is built once
+            # above and reused).
+            failing_for_refinement = failing
+            if chain_context_block:
+                failing_for_refinement = [
+                    FailingCandidate(
+                        index=c.index,
+                        code=c.code,
+                        error_output=_enriched_error(c.error_output),
+                    )
+                    for c in failing
+                ]
+            try:
+                ref_result = self.refinement_loop.run(
+                    problem=problem,
+                    failing_candidates=failing_for_refinement,
+                    original_constraints=[],
+                    llm_call=llm,
+                    sandbox_run=sandbox,
+                    embed_call=embed,
+                    task_id=task_id,
+                )
+                result["total_tokens"] += ref_result.total_tokens
+                if ref_result.solved:
+                    passed, stdout, stderr, refinement_evidence = verified_sandbox(ref_result.winning_code)
+                    if passed:
+                        emit("refinement_pass",
+                             f"Refinement solved in {ref_result.total_iterations} iterations!",
+                             strategy="refinement",
+                             iterations=ref_result.total_iterations,
+                             tokens=ref_result.total_tokens)
+                        result["passed"] = True
+                        result["code"] = ref_result.winning_code
+                        result["phase_solved"] = "refinement"
+                        result["total_time_ms"] = (time.time() - start) * 1000
+                        result["verification_evidence"] = refinement_evidence
+                        result["events"] = events
+                        return result
+                    emit("refinement_verify_failed", (stderr or "")[:200])
+                emit("refinement_failed", f"Exhausted {ref_result.total_iterations} iterations")
+            except Exception as e:
+                emit("refinement_error", str(e)[:200])
+
+        # ===== FALLBACK: Return best candidate even if none passed =====
+        # Vetoed candidates are excluded outright: a veto means "executes
+        # but is wrong" (stub, NameError-in-waiting), which is worse than
+        # an honest sandbox failure — and returning one is exactly the
+        # May 7 dashboard-stub failure mode. If every candidate was
+        # vetoed, return no code; the caller falls back to its baseline.
+        emit("fallback", "No passing solution found — returning best candidate by energy")
+        fallback_pool = [c for c in candidates if not c.get("vetoed_by")]
+        if fallback_pool:
+            fallback_pool.sort(key=lambda c: c.get("energy", 999))
+            result["code"] = fallback_pool[0]["code"]
+        elif candidates:
+            emit("fallback_all_vetoed",
+                 "Every candidate was vetoed — returning no code")
+        result["total_time_ms"] = (time.time() - start) * 1000
+        result["events"] = events
+        return result
+
+
+# --- Problem Builder for /v3/generate ----------------------------------------
+
+def _build_problem_from_request(
+    file_path: str, baseline_code: str, project_context: Dict[str, str],
+    framework: str, build_command: str, constraints: List[str],
+) -> str:
+    """Build a problem description for the V3 pipeline from a generate request."""
+    parts = []
+
+    parts.append(f"Create the file `{file_path}`")
+    if framework:
+        parts.append(f" for a {framework} project")
+    parts.append(".\n\n")
+
+    # Project context
+    if project_context:
+        parts.append("## Existing project files:\n\n")
+        for path, content in project_context.items():
+            if len(content) < 500:
+                parts.append(f"### {path}\n```\n{content}\n```\n\n")
+            else:
+                parts.append(f"### {path} (truncated)\n```\n{content[:300]}\n...\n```\n\n")
+
+    # Constraints
+    if constraints:
+        parts.append("## Requirements:\n")
+        for c in constraints:
+            parts.append(f"- {c}\n")
+        parts.append("\n")
+
+    # Build command
+    if build_command:
+        parts.append(f"## Build verification:\nThe file must pass: `{build_command}`\n\n")
+
+    # Baseline as reference
+    if baseline_code:
+        parts.append("## Reference implementation:\n")
+        parts.append("Improve upon this baseline if possible, preserving all functionality.\n\n")
+        parts.append(f"```\n{baseline_code}\n```\n")
+
+    return "".join(parts)

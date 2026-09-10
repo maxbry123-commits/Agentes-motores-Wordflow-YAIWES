@@ -1,0 +1,28 @@
+---
+trigger: feedback
+title: "GitHub Copilot App Feedback"
+surfaces:
+  - discussion
+description: Share your feedback on how the GitHub app is going.
+steps:
+  - type: fill
+    template: |-
+      Post this after your first session with the GitHub Copilot app. Don't overthink it — we want your gut reactions!
+
+      If comfortable, please record yourself launching the app for the first time [optional]. Feel free to answer the questions below in your recording by talking out loud rather than writing it down – no need to repeat your answers if you've already answered them verbally. You may attach your video to the discussion comment, or provide a link to a video.
+
+      You've had a few days with the app now. We'd love to hear how things have evolved.
+
+      Again, please feel free to share recordings of specific, real workflows that involve the GitHub app. Talk out loud and feel free to answer the questions below verbally in the video or through written answers.
+
+      **1. What have you tried doing with the app so far (e.g., start a new project, review a PR, write code, etc.), and why?**
+
+      **2. What has been most useful about this app? What tasks is it particularly suited for?**
+
+      **3. How does this experience compare to other tools you use today (e.g., Copilot in your IDE, Claude Code, Codex)? What does the GitHub Copilot app do better or worse?**
+
+      **4. What is missing, or confusing, if anything?**
+
+      **5. What type of tasks do you still feel like you need to go to github.com or other tools for?**
+
+      **6. If you had a magic wand to make this app just right for you, what would you change?**

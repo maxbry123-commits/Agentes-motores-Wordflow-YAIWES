@@ -1,0 +1,3011 @@
+"""Agent lifecycle: tracking, heartbeat, crash detection, reaping.
+
+Methods extracted from the Orchestrator class that deal with agent state
+management: refreshing statuses, handling orphaned tasks, reaping timed-out
+agents, and emitting metrics for dead agents.
+
+Includes ``_save_partial_work()`` which commits and merges uncommitted agent
+work before worktree destruction - preventing data loss on timeout kills.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import json
+import logging
+import signal
+import subprocess
+import time
+from datetime import UTC, datetime
+from enum import StrEnum
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+import httpx
+
+from bernstein.core import heartbeat as heartbeat_protocol
+from bernstein.core.cost import price_model_usage
+from bernstein.core.lifecycle import transition_agent
+from bernstein.core.metrics import get_collector
+from bernstein.core.models import AbortReason, AgentSession, Task, TaskStatus, TransitionReason
+from bernstein.core.task_lifecycle import (
+    collect_completion_data,
+    retry_or_fail_task,
+)
+from bernstein.core.tasks.artifact_completion import is_artifact_mode, verify_task_completion
+from bernstein.core.tick_pipeline import (
+    block_task,
+    complete_task,
+)
+from bernstein.evolution.types import MetricsRecord
+
+_ORPHAN_COMPLETE_ERROR = "Failed to complete orphaned task %s: %s"
+
+if TYPE_CHECKING:
+    from bernstein.core.abort_chain import AbortChain, AbortPolicy
+
+logger = logging.getLogger(__name__)
+
+
+def _retry_escalation_context(orch: Any) -> dict[str, Any]:
+    """Build the ``role_model_policy``/``default_adapter_name`` kwargs for
+    :func:`retry_or_fail_task` from the orchestrator's spawner.
+
+    Lets retry escalation (task_lifecycle.py) know which model the operator
+    named, so it doesn't stamp a Claude tier name ("opus"/"sonnet") onto a
+    task whose model was chosen deliberately (see task_lifecycle.py's
+    retry-escalation docstring for the defect this closes). Both pin routes
+    are reported: ``role_model_policy`` carries the per-role pin and
+    ``run_pinned_model`` the run-level ``--model`` flag. Read-only,
+    best-effort: any missing attribute (older/mock orchestrators in tests)
+    degrades to ``None``, which task_lifecycle.py treats as "assume
+    Claude-compatible" - today's historical behavior, unchanged.
+    """
+    spawner = getattr(orch, "_spawner", None)
+    return {
+        "role_model_policy": getattr(spawner, "role_model_policy", None),
+        "default_adapter_name": getattr(spawner, "default_adapter_name", None),
+        "run_pinned_model": getattr(spawner, "default_model", None),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Abort chain helpers - three-level hierarchy
+# ---------------------------------------------------------------------------
+# The abort chain enforces a strict containment hierarchy:
+#
+#   TOOL  < SIBLING  < SESSION
+#
+# * TOOL   - a single tool invocation is aborted; the agent session continues.
+#            Written as a TOOL_ABORT signal file in the session's signals dir.
+# * SIBLING - sibling agents (same parent) receive SHUTDOWN; the parent and
+#             this session are unaffected unless policy escalates further.
+# * SESSION - the full agent session is torn down and SHUTDOWN cascades to
+#             all descendants via ``propagate_abort``.
+#
+# Escalation between levels is opt-in via ``AbortPolicy``.  By default each
+# level contains its failure and does not propagate upward.
+# ---------------------------------------------------------------------------
+
+
+def _propagate_abort_to_children(orch: Any, session_id: str) -> None:
+    """Cascade SESSION-scope abort signals to all children of the given session.
+
+    Looks for ``_abort_chain`` on the orchestrator.  When present,
+    calls :meth:`~abort_chain.AbortChain.propagate_abort` (SESSION scope)
+    followed by :meth:`~abort_chain.AbortChain.cleanup` for the session.
+
+    This is the most destructive level of the abort hierarchy.  For
+    finer-grained containment use :func:`_abort_siblings` (SIBLING scope) or
+    leave tool-level aborts to the worker process (TOOL scope).
+
+    Args:
+        orch: Orchestrator instance.
+        session_id: Session ID whose children should receive abort signals.
+    """
+    chain: AbortChain | None = getattr(orch, "_abort_chain", None)
+    if chain is None:
+        return
+    try:
+        chain.propagate_abort(session_id)
+    finally:
+        chain.cleanup(session_id)
+
+
+def _abort_siblings(
+    orch: Any,
+    session_id: str,
+    *,
+    reason: str = "sibling_failure",
+    policy: AbortPolicy | None = None,
+) -> list[str]:
+    """Send SHUTDOWN to sibling agents of *session_id* (SIBLING scope).
+
+    Looks for ``_abort_chain`` on the orchestrator.  When present, calls
+    :meth:`~abort_chain.AbortChain.abort_siblings`.  The parent session is
+    *not* stopped unless *policy.sibling_to_session* is ``True``.
+
+    Args:
+        orch: Orchestrator instance.
+        session_id: The session whose siblings should receive SHUTDOWN.
+        reason: Human-readable reason for the sibling abort.
+        policy: Optional escalation policy.  When ``None`` the sibling abort
+            is contained (no cascade to the parent session).
+
+    Returns:
+        List of session IDs that received a SHUTDOWN signal.  Empty list when
+        the chain is not configured or the session has no siblings.
+    """
+    chain: AbortChain | None = getattr(orch, "_abort_chain", None)
+    if chain is None:
+        return []
+    return chain.abort_siblings(
+        session_id,
+        triggering_session_id=session_id,
+        reason=reason,
+        policy=policy,
+    )
+
+
+def classify_agent_abort_reason(session: AgentSession) -> tuple[AbortReason, str]:
+    """Classify an abnormal agent stop into a canonical abort reason.
+
+    Args:
+        session: Agent session with the latest exit metadata populated.
+
+    Returns:
+        Tuple of canonical abort reason and a short detail string.
+    """
+    exit_code = session.exit_code
+    if exit_code is None:
+        return AbortReason.UNKNOWN, "agent stopped without exit code"
+    if exit_code == 124:
+        return AbortReason.TIMEOUT, "process exited with timeout status 124"
+    if exit_code == 137:
+        return AbortReason.OOM, "process exited with status 137"
+    if exit_code == 126:
+        return AbortReason.PERMISSION_DENIED, "process exited with permission denied status 126"
+    if exit_code > 0:
+        return AbortReason.UNKNOWN, f"process exited with status {exit_code}"
+
+    signal_num = abs(exit_code)
+    if signal_num == getattr(signal, "SIGINT", 2):
+        return AbortReason.USER_INTERRUPT, "process interrupted by SIGINT"
+    if signal_num == getattr(signal, "SIGTERM", 15):
+        return AbortReason.SHUTDOWN_SIGNAL, "process terminated by SIGTERM"
+    if signal_num == getattr(signal, "SIGKILL", 9):
+        return AbortReason.OOM, "process killed by SIGKILL"
+    return AbortReason.UNKNOWN, f"process terminated by signal {signal_num}"
+
+
+# Abort reasons that represent deliberate, expected control-flow rather
+# than an agent crash. These must NOT be reported to the error sink: a
+# user interrupt or a cascaded shutdown is not an incident.
+_EXPECTED_ABORT_REASONS: frozenset[AbortReason] = frozenset(
+    {
+        AbortReason.USER_INTERRUPT,
+        AbortReason.SHUTDOWN_SIGNAL,
+        AbortReason.SIBLING_ABORTED,
+        AbortReason.PARENT_ABORTED,
+    }
+)
+
+
+def _capture_agent_crash(
+    session: AgentSession,
+    abort_reason: AbortReason,
+    abort_detail: str,
+) -> None:
+    """Forward an unexpected agent crash to the operator error sink.
+
+    Genuine crashes (timeout, OOM, provider error, non-zero exit) are
+    reported; deliberate aborts (user interrupt, cascaded shutdown) are
+    not. The capture helper is fail-closed, and the whole call is wrapped
+    so the dead-agent cleanup path is never disturbed by telemetry.
+    """
+    if abort_reason in _EXPECTED_ABORT_REASONS:
+        return
+    try:
+        from bernstein.core.observability import error_capture
+
+        error_capture.capture_message(
+            f"agent crashed: {abort_reason.value}",
+            category="agent",
+            tags={
+                "abort_reason": abort_reason.value,
+                "role": session.role or "unknown",
+                "adapter": getattr(session, "adapter", "unknown") or "unknown",
+            },
+            extra={
+                "session_id": session.id,
+                "abort_detail": abort_detail,
+                "finish_reason": session.finish_reason or "",
+                "exit_code": getattr(session, "exit_code", None),
+            },
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("agent-crash telemetry capture skipped for %s: %s", session.id, exc)
+
+
+# ---------------------------------------------------------------------------
+# Partial work preservation
+# ---------------------------------------------------------------------------
+
+
+def _preserve_runner_logs(orch: Any, session: Any) -> Path | None:
+    """Copy the session's runner logs out of the worktree before cleanup.
+
+    Adapter runners (e.g. openai_agents) write their transcript to
+    ``<worktree>/.sdd/runtime/<session_id>*.log`` and their manifest to
+    ``<session_id>.manifest.json``. ``cleanup_worktree()`` deletes the
+    whole worktree, so a dead agent's ONLY diagnostic artifacts are
+    destroyed at exactly the moment they are needed. Copy them into the
+    orchestrator's ``.sdd/runtime/agent_logs/<session_id>/`` first.
+
+    All errors are suppressed so the cleanup path is never interrupted.
+
+    Returns:
+        The destination directory when at least one file was preserved,
+        ``None`` otherwise.
+    """
+    import shutil
+
+    try:
+        worktree_path = orch._spawner.get_worktree_path(session.id)
+        if worktree_path is None:
+            return None
+        runtime_dir = Path(worktree_path) / ".sdd" / "runtime"
+        if not runtime_dir.is_dir():
+            return None
+        candidates = [
+            *runtime_dir.glob(f"{session.id}*.log"),
+            *runtime_dir.glob(f"{session.id}.manifest.json"),
+        ]
+        if not candidates:
+            return None
+        dest_dir = Path(orch._workdir) / ".sdd" / "runtime" / "agent_logs" / session.id
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        copied: list[str] = []
+        for src in candidates:
+            with contextlib.suppress(OSError):
+                shutil.copy2(src, dest_dir / src.name)
+                copied.append(src.name)
+        if not copied:
+            return None
+        logger.info(
+            "Preserved %d runner log/manifest file(s) for dead agent %s: %s -> %s",
+            len(copied),
+            session.id,
+            ", ".join(sorted(copied)),
+            dest_dir,
+        )
+        return dest_dir
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("Runner log preservation for %s skipped: %s", session.id, exc)
+        return None
+
+
+def _save_partial_work(spawner: Any, session: Any) -> bool:
+    """Commit and merge uncommitted agent work before worktree destruction.
+
+    Called before ``cleanup_worktree()`` to prevent data loss on timeout
+    kills and agent crashes.  Stages all changes, creates a ``[WIP]``
+    commit, then attempts to merge the branch back to main via
+    ``reap_completed_agent()``.
+
+    All errors are suppressed so the cleanup path is never interrupted.
+
+    Returns:
+        True if a WIP commit was created, False otherwise.
+    """
+    worktree_path = spawner.get_worktree_path(session.id)
+    if worktree_path is None or not Path(worktree_path).is_dir():
+        return False
+
+    wt = str(worktree_path)
+    committed = False
+    try:
+        subprocess.run(
+            ["git", "add", "-A"],
+            cwd=wt,
+            capture_output=True,
+            timeout=10,
+        )
+        result = subprocess.run(
+            ["git", "commit", "-m", f"[WIP] {session.id} partial work"],
+            cwd=wt,
+            capture_output=True,
+            timeout=10,
+        )
+        committed = result.returncode == 0
+    except Exception:
+        logger.exception(
+            "Partial-work WIP commit failed during reap (session_id=%s role=%s worktree=%s) - reap continues",
+            session.id,
+            session.role,
+            wt,
+        )
+
+    # Try to merge the branch before cleanup
+    try:
+        spawner.reap_completed_agent(session, skip_merge=False)
+    except Exception:
+        logger.exception(
+            "reap_completed_agent (merge) failed during partial-work save "
+            "(session_id=%s role=%s worktree=%s) - reap continues",
+            session.id,
+            session.role,
+            wt,
+        )
+
+    if committed:
+        logger.info("Saved partial work for agent %s", session.id)
+    return committed
+
+
+# ---------------------------------------------------------------------------
+# Agent state refresh
+# ---------------------------------------------------------------------------
+
+
+def _handle_orphaned_task_guarded(
+    orch: Any,
+    task_id: str,
+    session: AgentSession,
+    tasks_snapshot: dict[str, list[Task]],
+) -> None:
+    """Orphan handling for one task, isolated from the rest of the cleanup.
+
+    An exception here used to propagate out of the tick, skipping
+    ``_save_partial_work`` and worktree cleanup, so the dying agent's
+    uncommitted work was lost.
+    """
+    try:
+        handle_orphaned_task(orch, task_id, session, tasks_snapshot)
+    except Exception:
+        logger.exception(
+            "handle_orphaned_task failed for task %s (agent %s); continuing death cleanup",
+            task_id,
+            session.id,
+        )
+
+
+def _handle_dead_agent(orch: Any, session: AgentSession, tasks_snapshot: dict[str, list[Task]]) -> None:
+    """Process a single agent that has been detected as dead."""
+    abort_reason, abort_detail = classify_agent_abort_reason(session)
+    transition_reason = TransitionReason.ABORTED
+    if session.finish_reason == "max_output_tokens":
+        transition_reason = TransitionReason.MAX_OUTPUT_TOKENS
+
+    transition_agent(
+        session,
+        "dead",
+        actor="agent_lifecycle",
+        reason="process not alive",
+        transition_reason=transition_reason,
+        abort_reason=abort_reason,
+        abort_detail=abort_detail,
+        finish_reason=session.finish_reason or "agent_exit",
+    )
+    _capture_agent_crash(session, abort_reason, abort_detail)
+    _propagate_abort_to_children(orch, session.id)
+    if session.role:
+        adapter_name = getattr(session, "adapter", "unknown")
+        orch._agent_failure_timestamps[adapter_name] = time.time()
+
+    _release_file_ownership(orch, session.id)
+    _release_task_to_session(orch, session.task_ids)
+    _rl_tracker = getattr(orch, "_rate_limit_tracker", None)
+    if _rl_tracker is not None and session.provider:
+        _rl_tracker.decrement_active(session.provider)
+    _preserve_runner_logs(orch, session)
+    for task_id in session.task_ids:
+        orch._crash_counts[task_id] = orch._crash_counts.get(task_id, 0) + 1
+        _maybe_preserve_worktree(orch, session, task_id)
+        _handle_orphaned_task_guarded(orch, task_id, session, tasks_snapshot)
+    _save_partial_work(orch._spawner, session)
+    _preserved = getattr(orch, "_preserved_worktrees", {})
+    _session_preserved = any(
+        orch._spawner.get_worktree_path(session.id) == _preserved.get(tid) for tid in session.task_ids
+    )
+    if not _session_preserved:
+        orch._spawner.cleanup_worktree(session.id)
+    with contextlib.suppress(OSError):
+        orch._signal_mgr.clear_signals(session.id)
+
+
+def refresh_agent_states(orch: Any, tasks_snapshot: dict[str, list[Task]]) -> None:
+    """Update alive/dead status for all tracked agents.
+
+    When an agent process dies, handles orphaned tasks via the agent
+    completion protocol: checks task status on the server, runs janitor
+    verification if completion signals exist, and completes or fails
+    accordingly. Also releases file ownership and emits metrics.
+
+    Args:
+        orch: Orchestrator instance.
+        tasks_snapshot: Pre-fetched tasks bucketed by status from this tick.
+    """
+    for session in list(orch._agents.values()):
+        if session.status == "dead":
+            continue
+        if orch._spawner.check_alive(session):
+            continue
+        _handle_dead_agent(orch, session, tasks_snapshot)
+
+    # Re-check every death judgment deferred by _probe_liveness_signals: the
+    # session that deferred it is already "dead" and filtered out of the loop
+    # above, so this is the only place left that can still fail a task whose
+    # deferral was never followed by real progress (issue #4222).
+    _reevaluate_pending_death_judgments(orch, tasks_snapshot)
+
+    # Purge dead agents to prevent unbounded dict growth (memory leak fix)
+    purge_dead_agents(orch)
+
+    # Purge expired spawn backoff entries
+    now = time.time()
+
+    # Memory monitoring: check for leaks in active processes
+    if hasattr(orch, "_memory_guard"):
+        active_sessions = [s for s in orch._agents.values() if s.status != "dead"]
+        leaking_ids = orch._memory_guard.monitor_agents(active_sessions)
+        if leaking_ids:
+            logger.warning("Memory leak detected in sessions: %s", leaking_ids)
+            # Optional: kill leaking agents if configured
+            if getattr(orch._config, "kill_on_memory_leak", False):
+                for sid in leaking_ids:
+                    session = orch._agents.get(sid)
+                    if session:
+                        orch._spawner.kill(session)
+                        _propagate_abort_to_children(orch, sid)
+                        transition_agent(session, "dead", actor="memory_guard", reason="memory leak")
+
+    expired = [k for k, (_, ts) in orch._spawn_failures.items() if now - ts > orch._SPAWN_BACKOFF_MAX_S]
+    for k in expired:
+        del orch._spawn_failures[k]
+
+    # Cap _processed_done_tasks to prevent unbounded growth (FIFO eviction)
+    if len(orch._processed_done_tasks) > orch._MAX_PROCESSED_DONE:
+        excess = len(orch._processed_done_tasks) - orch._MAX_PROCESSED_DONE // 2
+        # popitem(last=False) removes the oldest entry first
+        for _ in range(excess):
+            orch._processed_done_tasks.popitem(last=False)
+
+
+def purge_dead_agents(orch: Any) -> None:
+    """Remove oldest dead agent sessions to bound memory usage.
+
+    Args:
+        orch: Orchestrator instance.
+    """
+    dead = [(sid, s) for sid, s in orch._agents.items() if s.status == "dead"]
+    if len(dead) <= orch._MAX_DEAD_AGENTS_KEPT:
+        return
+    # Sort by heartbeat_ts (oldest first), remove excess
+    dead.sort(key=lambda x: x[1].heartbeat_ts)
+    to_remove = len(dead) - orch._MAX_DEAD_AGENTS_KEPT
+    for sid, _ in dead[:to_remove]:
+        del orch._agents[sid]
+        # Clean up reverse index entries pointing to this agent
+        stale_tasks = [tid for tid, aid in orch._task_to_session.items() if aid == sid]
+        for tid in stale_tasks:
+            del orch._task_to_session[tid]
+
+
+# ---------------------------------------------------------------------------
+# Crash recovery / worktree preservation
+# ---------------------------------------------------------------------------
+
+
+def _maybe_preserve_worktree(orch: Any, session: AgentSession, task_id: str) -> None:
+    """Preserve the crashed agent's worktree for resume if policy permits.
+
+    Stores the worktree path in ``_preserved_worktrees`` so the next spawn
+    for this task can call ``spawn_for_resume`` instead of creating a fresh
+    worktree.  Only applies when ``recovery == "resume"`` and the crash
+    count is still within ``max_crash_retries``.
+
+    Args:
+        orch: Orchestrator instance.
+        session: The crashed agent's session.
+        task_id: ID of the task that was being worked on.
+    """
+    if orch._config.recovery != "resume":
+        return
+    crash_count = orch._crash_counts.get(task_id, 0)
+    if crash_count > orch._config.max_crash_retries:
+        return
+    worktree_path = orch._spawner._worktree_paths.get(session.id)  # type: ignore[attr-defined]
+    if worktree_path is None:
+        return
+    orch._preserved_worktrees[task_id] = worktree_path
+    logger.info(
+        "Crash recovery: preserving worktree %s for task %s (crash #%d)",
+        worktree_path,
+        task_id,
+        crash_count,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Orphaned task handling
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Reactive 413 compaction handler
+# ---------------------------------------------------------------------------
+
+#: Meta-message injected into tasks retried after context-overflow compaction.
+_COMPACT_RETRY_META = (
+    "CONTEXT COMPACTION: Previous attempt hit a context-window limit (HTTP 413). "
+    "The prompt has been compacted.  Focus on the task goal - do NOT try to "
+    "reconstruct the removed context."
+)
+
+#: Maximum number of times a task may be retried via context compaction.
+#: After this many compaction-retries the task is failed permanently.
+_COMPACT_MAX_RETRIES: int = 1
+
+#: Typed terminal failure reason recorded when the sensitive gate refuses
+#: a reactive compaction. Deliberately free of the transient-failure
+#: keywords ``task_lifecycle._dynamic_retry_limit`` matches on, so the
+#: reason never earns a retry budget: combined with ``max_task_retries=0``
+#: at the call site, the failure is terminal by construction.
+_GATE_REFUSAL_FAILURE_REASON: str = "Context overflow: compaction refused by sensitive gate"
+
+
+class CompactRetryOutcome(StrEnum):
+    """Typed outcome of the reactive 413 compact-and-retry handler.
+
+    Each value doubles as the ``error_type`` tag on the orphan metric the
+    caller emits, so a gate-refusal fast-fail stays distinguishable from
+    a pipeline failure in post-run analysis.
+    """
+
+    #: Compaction succeeded and a compacted retry task was queued.
+    RETRIED = "context_overflow_compacted"
+    #: Compaction failed or the compact-retry budget was exhausted.
+    FAILED = "context_overflow_compact_failed"
+    #: The sensitive gate refused the compaction; the task was failed
+    #: fast with :data:`_GATE_REFUSAL_FAILURE_REASON` instead of burning
+    #: the remaining compact retries on an unchanged oversized prompt.
+    GATE_REFUSED = "context_overflow_gate_refused"
+
+
+def _try_compact_and_retry(
+    *,
+    orch: Any,
+    task: Task,
+    task_id: str,
+    session: AgentSession,
+    tasks_snapshot: dict[str, list[Task]],
+    fallback_model: str | None,
+) -> CompactRetryOutcome:
+    """Run the compaction pipeline on the task's prompt and retry once.
+
+    When an agent crashes with a 413 / context-overflow error, this function:
+
+    1. Reads the agent's log to reconstruct what the prompt looked like.
+    2. Runs :class:`~bernstein.core.compaction_pipeline.CompactionPipeline`
+       on the task description (the only mutable part of the prompt).
+    3. Creates a retry task with a ``meta_message`` instructing the agent
+       to work with reduced context.
+
+    Bounded to ``_COMPACT_MAX_RETRIES`` retries to prevent infinite loops.
+
+    When the pipeline's sensitive gate refuses the compaction
+    (``gate_action="refused"``), the description is unchanged and a retry
+    would 413 again with the same oversized prompt - the task is failed
+    fast with a typed terminal reason instead (issue #2253); see
+    :func:`_fail_fast_on_gate_refusal`.
+
+    Args:
+        orch: Orchestrator instance.
+        task: The failed task.
+        task_id: Task ID.
+        session: Dead agent session.
+        tasks_snapshot: Pre-fetched tasks for dedup checks.
+        fallback_model: Optional cascade fallback model.
+
+    Returns:
+        ``CompactRetryOutcome.RETRIED`` when a compacted retry was queued,
+        ``CompactRetryOutcome.GATE_REFUSED`` when the sensitive gate
+        refused and the task was failed fast, ``CompactRetryOutcome.FAILED``
+        when compaction failed or the compact-retry budget was exhausted.
+    """
+    from bernstein.core.compaction_pipeline import CompactionPipeline
+
+    # Guard: check if we've already compacted this task too many times.
+    # We detect previous compaction retries via the meta_messages list.
+    prior_compact_retries = sum(1 for m in task.meta_messages if "CONTEXT COMPACTION" in m)
+    if prior_compact_retries >= _COMPACT_MAX_RETRIES:
+        logger.warning(
+            "Task %s already had %d compaction retries - failing permanently",
+            task_id,
+            prior_compact_retries,
+        )
+        retry_or_fail_task(
+            task_id,
+            f"Context overflow: compaction retries exhausted ({prior_compact_retries}/{_COMPACT_MAX_RETRIES})",
+            client=orch._client,
+            server_url=orch._config.server_url,
+            max_task_retries=0,  # force permanent fail
+            retried_task_ids=orch._retried_task_ids,
+            tasks_snapshot=tasks_snapshot,
+            workdir=getattr(orch, "_workdir", None),
+            **_retry_escalation_context(orch),
+        )
+        return CompactRetryOutcome.FAILED
+
+    # Run the compaction pipeline on the task description.
+    pipeline = CompactionPipeline(plugin_manager=getattr(orch, "_plugin_manager", None))
+    description_text = task.description
+    tokens_before = max(1, len(description_text) // 4)
+
+    # Persist pre-compaction usage in the budget manager (if available) so that
+    # the effective remaining budget shown to the retry agent is accurate.
+    _budget_mgr: Any = getattr(orch, "_budget_manager", None)
+    effective_remaining: int | None = None
+    if _budget_mgr is not None:
+        try:
+            _task_budget = _budget_mgr.get_budget(task_id, complexity=task.scope.value)
+            _task_budget.record_pre_compaction(tokens_before)
+            effective_remaining = _task_budget.effective_remaining()
+        except Exception as _be:
+            logger.debug("Budget pre-compaction snapshot failed for %s: %s", task_id, _be)
+
+    # Resolve the audit chain for sensitive-gate events from the run
+    # workdir so gate refusals and redactions land in the operator chain.
+    from bernstein.core.tokens.sensitive_gate import resolve_default_chain
+
+    _gate_workdir = getattr(orch, "_workdir", None)
+    _gate_chain = resolve_default_chain(Path(_gate_workdir)) if _gate_workdir else resolve_default_chain()
+
+    try:
+        result = pipeline.execute(
+            session_id=session.id,
+            context_text=description_text,
+            tokens_before=tokens_before,
+            reason="provider_413",
+            task_id=task_id,
+            audit_chain=_gate_chain,
+        )
+    except Exception as exc:
+        logger.error("Compaction pipeline failed for task %s: %s", task_id, exc)
+        retry_or_fail_task(
+            task_id,
+            f"Context overflow compaction failed: {exc}",
+            client=orch._client,
+            server_url=orch._config.server_url,
+            max_task_retries=orch._config.max_task_retries,
+            retried_task_ids=orch._retried_task_ids,
+            tasks_snapshot=tasks_snapshot,
+            workdir=getattr(orch, "_workdir", None),
+            **_retry_escalation_context(orch),
+        )
+        return CompactRetryOutcome.FAILED
+
+    if result.gate_action == "refused":
+        # The sensitive gate found credential-shaped content it could not
+        # safely delimit: nothing was sent to the model and the description
+        # is unchanged, so a retry would 413 again with the same oversized
+        # prompt. Fail fast instead of burning the remaining compact
+        # retries (issue #2253).
+        return _fail_fast_on_gate_refusal(
+            orch=orch,
+            task_id=task_id,
+            session=session,
+            description_text=description_text,
+            result=result,
+            chain=_gate_chain,
+            tasks_snapshot=tasks_snapshot,
+        )
+
+    # Reconcile post-compaction budget now that we know how many tokens were saved.
+    if _budget_mgr is not None:
+        try:
+            _task_budget = _budget_mgr.get_budget(task_id, complexity=task.scope.value)
+            _task_budget.reconcile_post_compaction()
+            effective_remaining = _task_budget.effective_remaining()
+        except Exception as _be:
+            logger.debug("Budget post-compaction reconcile failed for %s: %s", task_id, _be)
+
+    # "token" here counts LLM context tokens, not credentials.
+    # nosemgrep: python.lang.security.audit.logging.logger-credential-leak.python-logger-credential-disclosure
+    logger.info(
+        "Compacted task %s description: %d → %d tokens (saved %d, correlation=%s)",
+        task_id,
+        result.tokens_before,
+        result.tokens_after,
+        result.tokens_saved,
+        result.correlation_id,
+    )
+
+    # Receipt the compaction (issue #2246): chain event, replay-journal
+    # step, ledger row, and metric point. Recording is best-effort and
+    # never alters the retry behaviour below; a missing receipt is caught
+    # by the run's audit verification instead. (The gate-refusal branch
+    # above returned already, anchoring its own refusal receipt.)
+    try:
+        _record_reactive_compaction_receipt(
+            orch=orch,
+            session=session,
+            task_id=task_id,
+            pre_text=description_text,
+            result=result,
+            chain=_gate_chain,
+        )
+    except Exception as _receipt_exc:
+        logger.warning("Reactive compaction receipt failed for %s: %s", task_id, _receipt_exc)
+
+    # Retry the task with compacted description and a nudge meta-message.
+    retry_or_fail_task(
+        task_id,
+        f"Context overflow (413): compacted and retrying ({result.correlation_id})",
+        client=orch._client,
+        server_url=orch._config.server_url,
+        max_task_retries=orch._config.max_task_retries,
+        retried_task_ids=orch._retried_task_ids,
+        tasks_snapshot=tasks_snapshot,
+        workdir=getattr(orch, "_workdir", None),
+        **_retry_escalation_context(orch),
+    )
+
+    # Patch the newly created retry task with compacted description and meta-message.
+    # The retry task is the latest open task with the same title prefix.
+    # We inject the compaction meta-message via the task server PATCH endpoint.
+    _patch_retry_with_compaction(
+        client=orch._client,
+        server_url=orch._config.server_url,
+        original_task=task,
+        compacted_description=result.compacted_text,
+        fallback_model=fallback_model,
+        effective_remaining=effective_remaining,
+    )
+
+    # WAL entry for audit trail
+    _wal: Any = getattr(orch, "_wal_writer", None)
+    if _wal is not None:
+        try:
+            _wal.write_entry(
+                decision_type="context_overflow_compacted",
+                inputs={
+                    "task_id": task_id,
+                    "agent_id": session.id,
+                    "tokens_before": result.tokens_before,
+                    "tokens_after": result.tokens_after,
+                },
+                output={
+                    "correlation_id": result.correlation_id,
+                    "tokens_saved": result.tokens_saved,
+                    "compacted": True,
+                },
+                actor="agent_lifecycle",
+            )
+        except OSError:
+            logger.debug("WAL write failed for context_overflow_compacted %s", task_id)
+
+    return CompactRetryOutcome.RETRIED
+
+
+def _fail_fast_on_gate_refusal(
+    *,
+    orch: Any,
+    task_id: str,
+    session: AgentSession,
+    description_text: str,
+    result: Any,
+    chain: Any,
+    tasks_snapshot: dict[str, list[Task]],
+) -> CompactRetryOutcome:
+    """Terminally fail a task whose reactive compaction the gate refused.
+
+    The refusal is deterministic: the same description scanned again
+    produces the same refusal, so re-queueing the retry can only 413
+    again until ``_COMPACT_MAX_RETRIES`` burns down. Instead the task is
+    failed with :data:`_GATE_REFUSAL_FAILURE_REASON` naming the gate and
+    the deny rules that fired, routing it to the dead-letter queue (and
+    the operator error sink) on the first refusal.
+
+    Visibility contract (issue #2253): the pipeline already chained the
+    gate's own ``compaction.sensitive_gate`` events exactly once; this
+    helper anchors the refusal receipt (``gate_action="refused"``,
+    pre == post hashes) exactly once and never re-emits the gate events.
+    No compaction metric point is written - nothing was compacted.
+
+    Args:
+        orch: Orchestrator instance.
+        task_id: Task being failed.
+        session: Dead agent session that overflowed.
+        description_text: Task description the gate refused (unchanged).
+        result: The refusing ``CompactionResult`` from the pipeline.
+        chain: Audit chain store resolved for this run (may be None).
+        tasks_snapshot: Pre-fetched tasks for dedup checks.
+
+    Returns:
+        Always ``CompactRetryOutcome.GATE_REFUSED``.
+    """
+    logger.warning(
+        "Compaction for task %s refused by sensitive gate (rules: %s) - failing fast instead of retrying",
+        task_id,
+        ", ".join(result.gate_rule_ids),
+    )
+
+    # Anchor the refusal receipt before failing the task so the refusal
+    # stays auditable even if the failure PATCH fails midway.
+    try:
+        _record_reactive_compaction_receipt(
+            orch=orch,
+            session=session,
+            task_id=task_id,
+            pre_text=description_text,
+            result=result,
+            chain=chain,
+            record_metric=False,
+        )
+    except Exception as _receipt_exc:
+        logger.warning("Gate-refusal receipt failed for %s: %s", task_id, _receipt_exc)
+
+    reason = (
+        f"{_GATE_REFUSAL_FAILURE_REASON} "
+        f"(rules: {', '.join(result.gate_rule_ids)}; correlation={result.correlation_id})"
+    )
+    retry_or_fail_task(
+        task_id,
+        reason,
+        client=orch._client,
+        server_url=orch._config.server_url,
+        max_task_retries=0,  # deterministic refusal: force permanent fail
+        retried_task_ids=orch._retried_task_ids,
+        tasks_snapshot=tasks_snapshot,
+        workdir=getattr(orch, "_workdir", None),
+        **_retry_escalation_context(orch),
+    )
+
+    _wal: Any = getattr(orch, "_wal_writer", None)
+    if _wal is not None:
+        try:
+            _wal.write_entry(
+                decision_type="context_overflow_gate_refused",
+                inputs={
+                    "task_id": task_id,
+                    "agent_id": session.id,
+                    "gate_rule_ids": list(result.gate_rule_ids),
+                },
+                output={
+                    "correlation_id": result.correlation_id,
+                    "compacted": False,
+                    "failed_fast": True,
+                },
+                actor="agent_lifecycle",
+            )
+        except OSError:
+            logger.debug("WAL write failed for context_overflow_gate_refused %s", task_id)
+
+    return CompactRetryOutcome.GATE_REFUSED
+
+
+def _record_reactive_compaction_receipt(
+    *,
+    orch: Any,
+    session: AgentSession,
+    task_id: str,
+    pre_text: str,
+    result: Any,
+    chain: Any,
+    record_metric: bool = True,
+) -> None:
+    """Anchor the reactive compaction in chain, journal, ledger, metrics.
+
+    Runs the zero-LLM validators purely for the receipt record - on the
+    reactive path they never gate the retry (the fallback behaviour is
+    unchanged; the verdicts are evidence, not a gate). See
+    :mod:`bernstein.core.tokens.compaction_receipt` for the anchors.
+
+    Args:
+        orch: Orchestrator instance.
+        session: The dead agent session that overflowed.
+        task_id: Task being compact-retried.
+        pre_text: Task description before compaction.
+        result: The ``CompactionResult`` from the pipeline.
+        chain: Audit chain store resolved for this run (may be None).
+        record_metric: When ``False``, skip the compaction metric point.
+            Used by the gate-refusal fast-fail, which anchors a receipt
+            for auditability but did not compact anything.
+    """
+    from bernstein.core.tokens.compaction_receipt import (
+        build_receipt,
+        record_compaction_artifacts,
+    )
+    from bernstein.core.tokens.compaction_validate import run_validators
+
+    receipt = build_receipt(
+        task_id=task_id,
+        worker_id=session.id,
+        trigger="reactive",
+        pre_text=pre_text,
+        post_text=result.compacted_text,
+        tokens_before=result.tokens_before,
+        tokens_after=result.tokens_after,
+        verdicts=run_validators(pre_text, result.compacted_text),
+        retry_count=0,
+        gate_action=result.gate_action,
+        gate_rule_ids=result.gate_rule_ids,
+        correlation_id=result.correlation_id,
+    )
+    _workdir = getattr(orch, "_workdir", None)
+    record_compaction_artifacts(
+        receipt=receipt,
+        chain=chain,
+        workdir=Path(_workdir) if _workdir is not None else None,
+        spend_ledger=getattr(orch, "_spend_ledger", None),
+    )
+    if not record_metric:
+        return
+    try:
+        get_collector().record_compaction(
+            session.id,
+            result.tokens_before,
+            result.tokens_after,
+            reason="provider_413",
+            trigger="reactive",
+            correlation_id=receipt.correlation_id,
+        )
+    except Exception as exc:
+        logger.debug("Reactive compaction metric write failed for %s: %s", task_id, exc)
+
+
+def _patch_retry_with_compaction(
+    *,
+    client: httpx.Client,
+    server_url: str,
+    original_task: Task,
+    compacted_description: str,
+    fallback_model: str | None,
+    effective_remaining: int | None = None,
+) -> None:
+    """Patch the retry task created by ``retry_or_fail_task`` with compacted context.
+
+    Finds the most recent open task whose title starts with ``[RETRY`` and
+    matches the original task's title, then patches its description and
+    meta_messages to include the compacted context and the compaction nudge.
+
+    When *effective_remaining* is provided it is injected as an additional
+    operational nudge so the retry agent knows the true remaining token budget
+    (``budget_tokens - pre_compact_used``), preventing it from treating the
+    full budget as available when significant context was already consumed.
+
+    Args:
+        client: httpx client for task-server calls.
+        server_url: Task server base URL.
+        original_task: The original (failed) task.
+        compacted_description: The compacted description text.
+        fallback_model: Optional model to set on the retry task.
+        effective_remaining: Effective remaining token budget after accounting
+            for pre-compaction spend.  ``None`` means unknown / skip injection.
+    """
+    try:
+        resp = client.get(f"{server_url}/tasks", params={"status": "open"})
+        resp.raise_for_status()
+        open_tasks = resp.json()
+    except httpx.HTTPError as exc:
+        logger.warning("Failed to list open tasks for compaction patch: %s", exc)
+        return
+
+    # look the retry task up by metadata.original_task_id and an
+    # incremented retry_count.  Falls back to a title-prefix match for
+    # legacy tasks whose retry clones still carry the old ``[RETRY N]``
+    # prefix (no new ones are created by the orchestrator).
+    retry_task_id: str | None = None
+    lineage_id = original_task.metadata.get("original_task_id", original_task.id)
+    for t in open_tasks:
+        meta = t.get("metadata") or {}
+        same_lineage = meta.get("original_task_id") == lineage_id
+        bumped = int(t.get("retry_count") or 0) > original_task.retry_count
+        if same_lineage and bumped:
+            retry_task_id = t.get("id")
+    if retry_task_id is None:
+        base_title = (
+            original_task.title.removeprefix("[RETRY 1] ").removeprefix("[RETRY 2] ").removeprefix("[RETRY 3] ")
+        )
+        for t in open_tasks:
+            title = t.get("title", "")
+            if title == base_title or (title.startswith("[RETRY") and base_title in title):
+                retry_task_id = t.get("id")
+
+    if retry_task_id is None:
+        logger.debug("No retry task found to patch with compaction for %s", original_task.id)
+        return
+
+    # Build patch payload - include compaction nudge and optional budget hint.
+    new_meta = [*original_task.meta_messages, _COMPACT_RETRY_META]
+    if effective_remaining is not None:
+        if effective_remaining >= 1_000_000:
+            budget_hint = f"~{effective_remaining // 1_000_000}M"
+        elif effective_remaining >= 1_000:
+            budget_hint = f"~{effective_remaining // 1_000}K"
+        else:
+            budget_hint = str(effective_remaining)
+        new_meta.append(
+            f"BUDGET EFFECTIVE REMAINING: {budget_hint} tokens remaining after "
+            "accounting for context consumed before compaction.  Plan work to fit."
+        )
+    patch_body: dict[str, Any] = {
+        "description": compacted_description,
+        "meta_messages": new_meta,
+    }
+    if fallback_model:
+        patch_body["model"] = fallback_model
+
+    try:
+        client.patch(f"{server_url}/tasks/{retry_task_id}", json=patch_body).raise_for_status()
+        logger.info(
+            "Patched retry task %s with compacted description (%d chars) and %s meta-message",
+            retry_task_id,
+            len(compacted_description),
+            "compaction",
+        )
+    except httpx.HTTPError as exc:
+        logger.warning("Failed to patch retry task %s with compaction: %s", retry_task_id, exc)
+
+
+def _requeue_rate_limited_task(
+    *,
+    client: httpx.Client,
+    server_url: str,
+    task: Task,
+    fallback_model: str | None,
+) -> bool:
+    """Persist a fallback model if needed, then force-claim the task.
+
+    Args:
+        client: HTTP client for task-server calls.
+        server_url: Base server URL.
+        task: Task to requeue.
+        fallback_model: Optional model override selected by cascade logic.
+
+    Returns:
+        ``True`` when the task was successfully force-claimed, otherwise
+        ``False``.
+    """
+    if fallback_model and fallback_model != task.model:
+        try:
+            client.patch(
+                f"{server_url}/tasks/{task.id}",
+                json={"model": fallback_model},
+            ).raise_for_status()
+            task.model = fallback_model
+        except httpx.HTTPError as exc:
+            logger.warning(
+                "Failed to persist fallback model %s for task %s before requeue: %s",
+                fallback_model,
+                task.id,
+                exc,
+            )
+
+    try:
+        client.post(f"{server_url}/tasks/{task.id}/force-claim").raise_for_status()
+    except httpx.HTTPError as exc:
+        logger.error("Failed to force-claim rate-limited task %s: %s", task.id, exc)
+        return False
+    return True
+
+
+def _resolve_agent_worktree_dir(workdir: Path, session: AgentSession) -> Path | None:
+    """Find the agent's worktree directory across every layout this codebase supports.
+
+    Checks the current default layout (``.sdd/runtime/worktrees/<id>``) first,
+    then the legacy layout (``.sdd/worktrees/<id>``). Returns ``None`` when
+    neither exists -- e.g. worktrees are disabled entirely and the agent runs
+    directly against ``workdir`` with no per-task worktree at all. Callers
+    must handle the ``None`` case with their own root-level fallback rather
+    than assuming a worktree always exists (see the liveness-probe FAIL-NOTE:
+    hardcoding only the legacy ``.sdd/worktrees/<id>`` layout misjudged a
+    live agent running under either alternate layout as dead).
+    """
+    for _wt_dir in (
+        workdir / ".sdd" / "runtime" / "worktrees" / session.id,
+        workdir / ".sdd" / "worktrees" / session.id,
+    ):
+        if _wt_dir.exists():
+            return _wt_dir
+    return None
+
+
+def _resolve_agent_log_path(workdir: Path, session: AgentSession) -> Path:
+    """Find the agent's log file, checking session attribute then standard locations."""
+    _session_lp = getattr(session, "log_path", "")
+    if _session_lp and Path(_session_lp).exists():
+        return Path(_session_lp)
+    log_path = workdir / ".sdd" / "runtime" / f"{session.id}.log"
+    if not log_path.exists():
+        _wt_dir = _resolve_agent_worktree_dir(workdir, session)
+        if _wt_dir is not None:
+            _wt_log = _wt_dir / ".sdd" / "runtime" / f"{session.id}.log"
+            if _wt_log.exists():
+                return _wt_log
+    return log_path
+
+
+def _resolve_tokens_sidecar_path(workdir: Path, session: AgentSession) -> Path:
+    """Return the ``.tokens`` sidecar path for a session.
+
+    Mirrors :func:`bernstein.adapters.openai_agents_runner._resolve_tokens_sidecar_path`
+    and :meth:`bernstein.core.tokens.token_monitor.TokenGrowthMonitor.read_tokens`:
+    the sidecar always lives at the orchestrator-root ``.sdd/runtime/`` directory
+    (never inside a per-task worktree), keyed by session id.
+    """
+    return workdir / ".sdd" / "runtime" / f"{session.id}.tokens"
+
+
+def _read_runner_cost_usd(
+    workdir: Path,
+    session: AgentSession,
+    task_id: str,
+) -> tuple[float, int, int]:
+    """Recover the real LLM cost for a dead agent from its runner cost sidecar.
+
+    Bug (2026-07-03, D2 openrouter FAIL-NOTE): the openai_agents runner prices
+    every LLM call and writes ``{"type": "usage", "cost_usd": ..., "priced": true}``
+    into its own log, and (bug-13) also appends ``{"ts", "in", "out"}`` token
+    records to a ``.tokens`` sidecar file specifically so that cost/usage
+    survives even if the agent process is killed before the orchestrator can
+    read its final log line. The orphan/auto-complete-after-death path
+    (:func:`handle_orphaned_task`) never consulted either source and always
+    recorded ``cost_usd=0.0`` for tasks whose agent died -- this function is
+    the fix: sum the sidecar's token records and price them with the same
+    pricing table the runner itself uses, so a task that a real provider
+    charged real money for is never silently zeroed out.
+
+    Args:
+        workdir: Orchestrator root working directory (``orch._workdir``).
+        session: The dead agent's session (supplies the model for pricing).
+        task_id: Task id, used only for the diagnostic log line.
+
+    Returns:
+        ``(cost_usd, input_tokens, output_tokens)``. All zero if the sidecar
+        is missing, empty, or unreadable -- a missing sidecar is not itself
+        an error (e.g. providers other than openai_agents don't write one).
+    """
+    sidecar_path = _resolve_tokens_sidecar_path(workdir, session)
+    total_in = 0
+    total_out = 0
+    try:
+        raw = sidecar_path.read_text(encoding="utf-8")
+    except OSError:
+        return 0.0, 0, 0
+
+    for line_num, line in enumerate(raw.splitlines(), 1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+            total_in += int(rec.get("in", 0) or 0)
+            total_out += int(rec.get("out", 0) or 0)
+        except (ValueError, TypeError, AttributeError) as exc:
+            # Widened beyond just the json.loads() parse: a well-formed-but-
+            # wrong-shape record (not a dict, or "in"/"out" not coercible to
+            # int) raises on the SUBSEQUENT .get()/int() calls, not on
+            # json.loads() itself. This is read on the failure-recovery path
+            # for a dead agent, so a malformed record is realistic input --
+            # skip it and keep summing the rest rather than aborting cost
+            # recovery for the whole task.
+            logger.debug(
+                "Skipping malformed .tokens sidecar record at %s:%d: %s - line=%s",
+                sidecar_path,
+                line_num,
+                exc,
+                line[:500],
+            )
+            continue
+
+    if total_in <= 0 and total_out <= 0:
+        return 0.0, 0, 0
+
+    model = session.model_config.model if session.model_config else ""
+    price_result = price_model_usage(model, total_in, total_out)
+    logger.info(
+        "orphan_cost_recovered: task_id=%s agent_id=%s source=%s "
+        "input_tokens=%d output_tokens=%d cost_usd=%.6f priced=%s",
+        task_id,
+        session.id,
+        sidecar_path,
+        total_in,
+        total_out,
+        price_result.cost_usd,
+        price_result.priced,
+    )
+    return price_result.cost_usd, total_in, total_out
+
+
+# Failure types detected via log-pattern scanning that are unambiguous,
+# fatal, and MUST fail/retry the task immediately rather than falling
+# through to the generic "died without output" path (which defers behind
+# the double-fork liveness-signal grace window in
+# ``_probe_liveness_signals`` - correct for a process that genuinely might
+# still be alive under an untracked re-exec, but wrong here because the
+# runner already logged an unambiguous fatal exception before it exited).
+#
+# Root-cause fix (task-claimed-stuck bug, 2026-07-05): a MaxTurnsExceeded
+# death was not classified as ANY of these types before, so it fell all the
+# way through ``detect_failure_type`` -> ``_handle_orphan_no_signals`` ->
+# the liveness-deferral / clean-exit branches, and (depending on timing)
+# could sit "claimed" far longer than necessary before ``retry_or_fail_task``
+# ever ran - up to the orchestrator's 30-minute wall-clock reap ceiling in
+# the worst case. Generalized to the other deterministic-fatal log signals
+# (timeout, auth_error, api_error) per the same reasoning - previously only
+# "rate_limit" and "context_overflow" were actually handled here; the other
+# three were detected by ``detect_failure_type`` but silently fell through
+# to ``return False`` below, losing both the fast-fail and the diagnostic
+# reason string.
+_FAST_FAIL_LOG_FAILURE_TYPES: frozenset[str] = frozenset({"max_turns", "timeout", "auth_error", "api_error"})
+
+
+def _handle_failure_detection(
+    orch: Any,
+    task: Task,
+    task_id: str,
+    session: AgentSession,
+    base: str,
+    start_ts: float,
+    tasks_snapshot: dict[str, list[Task]],
+) -> bool:
+    """Detect fatal failure signatures in the agent log and handle them.
+
+    Returns True if handled (task already failed/retried/compacted - caller
+    must not fall through to the generic orphan-no-signals path).
+    """
+    _rl_tracker = getattr(orch, "_rate_limit_tracker", None)
+    if _rl_tracker is None or not session.provider:
+        return False
+
+    _log_path = _resolve_agent_log_path(orch._workdir, session)
+    logger.debug(
+        "_handle_failure_detection: scanning log_path=%s for session=%s provider=%r task=%s",
+        _log_path,
+        session.id,
+        session.provider,
+        task_id,
+    )
+    _failure_type = _rl_tracker.detect_failure_type(_log_path)
+    if _failure_type is None:
+        logger.debug(
+            "_handle_failure_detection: no failure pattern found in log_path=%s for session=%s",
+            _log_path,
+            session.id,
+        )
+        return False
+
+    _fallback_model: str | None = None
+    if _failure_type == "max_turns":
+        # A max-turns cap is task-scoped: the agent exhausted its own turn
+        # budget, which says nothing about provider health. Skip the
+        # provider throttle (exponential backoff + background suppression)
+        # and the cascade model fallback that the provider-scoped failure
+        # types below get -- both would penalize a healthy provider for a
+        # per-task configuration ceiling. Fall through to the fast-fail
+        # branch, which retries the task with the same routing.
+        logger.warning(
+            "Failure detected (max_turns) in log for session %s (provider=%r, task=%s, log_path=%s)"
+            " - turn-cap exhaustion is task-scoped, provider not throttled",
+            session.id,
+            session.provider,
+            task_id,
+            _log_path,
+        )
+    else:
+        _rl_tracker.throttle_provider(session.provider, getattr(orch, "_router", None))
+        # Triggering evidence: the specific pattern/excerpt that caused this
+        # throttle decision is logged by RateLimitTracker._scan_log_for_patterns
+        # (matched pattern=..., line_type=..., excerpt=...) immediately before
+        # this line -- log_path here is the pointer that ties the two together.
+        logger.warning(
+            "Failure detected (%s) in log for session %s (provider=%r, task=%s, log_path=%s) -> throttling provider %r",
+            _failure_type,
+            session.id,
+            session.provider,
+            task_id,
+            _log_path,
+            session.provider,
+        )
+
+        _fallback_model = _run_cascade_fallback(orch, task, task_id, session, _rl_tracker, _failure_type)
+
+    if _failure_type == "rate_limit":
+        _handle_rate_limit_orphan(orch, task, task_id, session, base, start_ts, _fallback_model)
+        return True
+
+    if _failure_type == "context_overflow":
+        _outcome = _try_compact_and_retry(
+            orch=orch,
+            task=task,
+            task_id=task_id,
+            session=session,
+            tasks_snapshot=tasks_snapshot,
+            fallback_model=_fallback_model,
+        )
+        emit_orphan_metrics(orch._workdir, task_id, session, start_ts, success=False, error_type=_outcome.value)
+        orch._record_provider_health(session, success=False)
+        return True
+
+    if _failure_type in _FAST_FAIL_LOG_FAILURE_TYPES:
+        reason = f"Agent {session.id} died; {_failure_type} detected in agent log (exit_code={session.exit_code!r})"
+        try:
+            retry_or_fail_task(
+                task_id,
+                reason,
+                client=orch._client,
+                server_url=base,
+                max_task_retries=orch._config.max_task_retries,
+                retried_task_ids=orch._retried_task_ids,
+                tasks_snapshot=tasks_snapshot,
+                workdir=getattr(orch, "_workdir", None),
+                **_retry_escalation_context(orch),
+            )
+            logger.warning(
+                "Task '%s' failed/retried fast (log-detected fatal error): %s",
+                task.title,
+                reason,
+            )
+        except httpx.HTTPError as exc:
+            logger.error("Failed to retry/fail task %s after %s detection: %s", task_id, _failure_type, exc)
+        emit_orphan_metrics(orch._workdir, task_id, session, start_ts, success=False, error_type=_failure_type)
+        orch._record_provider_health(session, success=False)
+        return True
+
+    return False
+
+
+def _resolve_budget_remaining_usd(orch: Any) -> float | None:
+    """Return the orchestrator's current remaining budget in USD, or None.
+
+    used to wire budget-awareness into both the cascade fallback
+    manager and the module-level router guard.  Returns ``None`` when the
+    orchestrator has no cost tracker, the budget is unlimited, or the
+    lookup fails for any reason - callers must treat ``None`` as "unknown"
+    rather than "exhausted".
+    """
+    tracker = getattr(orch, "_cost_tracker", None)
+    if tracker is None:
+        return None
+    try:
+        status = tracker.status()
+    except Exception:  # pragma: no cover - defensive
+        return None
+    remaining = getattr(status, "remaining_usd", None)
+    if remaining is None:
+        return None
+    # Unlimited budgets surface as +inf; downstream code treats None == unknown
+    # and inf == unlimited identically, so pass inf straight through.
+    return float(remaining)
+
+
+def _run_cascade_fallback(
+    orch: Any,
+    task: Task,
+    task_id: str,
+    session: AgentSession,
+    _rl_tracker: Any,
+    _failure_type: str,
+) -> str | None:
+    """Run cascade fallback logic and return the fallback model (or None)."""
+    from bernstein.core.cascade import CascadeDecision, CascadeFallbackManager
+    from bernstein.core.routing.router_core import set_budget_context
+
+    # thread budget awareness into cascade + module-level router
+    # guard so that a single opus task near the cap cannot overshoot by 150%+.
+    _budget_remaining = _resolve_budget_remaining_usd(orch)
+    _budget_flag = bool(getattr(orch._config, "budget_aware_routing_enabled", True))
+    set_budget_context(_budget_remaining, enabled=_budget_flag)
+
+    _cascade = getattr(orch, "_cascade_manager", None)
+    if _cascade is None:
+        _cascade = CascadeFallbackManager(
+            rate_limit_tracker=_rl_tracker,
+            budget_remaining=_budget_remaining,
+        )
+        orch._cascade_manager = _cascade  # type: ignore[attr-defined]
+    else:
+        # Keep the sticky manager's budget view current on every cascade event.
+        if _budget_remaining is not None:
+            _cascade.update_budget(_budget_remaining)
+
+    _throttled = frozenset(p for p in _rl_tracker.throttle_summary() if _rl_tracker.is_throttled(p))
+    _current_entry = getattr(task, "model", None) or session.provider or None
+    _decision = _cascade.find_fallback(
+        task.complexity,
+        _throttled,
+        current_entry=_current_entry,
+        trigger=_failure_type,
+    )
+
+    if isinstance(_decision, CascadeDecision):
+        logger.info(
+            "Cascade fallback: task %s reassigned from %s → %s (%s)",
+            task_id,
+            session.provider,
+            _decision.fallback_provider,
+            _decision.reason,
+        )
+        _cascade.save_metrics(orch._workdir / ".sdd" / "metrics")
+        return _decision.fallback_model
+
+    logger.warning(
+        "Cascade exhausted for task %s: %s - task will wait for throttle recovery",
+        task_id,
+        _decision.reason,
+    )
+    return None
+
+
+def _handle_rate_limit_orphan(
+    orch: Any,
+    task: Task,
+    task_id: str,
+    session: AgentSession,
+    base: str,
+    start_ts: float,
+    _fallback_model: str | None,
+) -> None:
+    """Handle a rate-limited orphaned task: requeue or fail."""
+    error_type: str | None
+    if _requeue_rate_limited_task(client=orch._client, server_url=base, task=task, fallback_model=_fallback_model):
+        if _fallback_model:
+            task.model = _fallback_model
+        error_type = "rate_limit_requeued"
+        logger.info(
+            "Requeued rate-limited orphaned task %s via force-claim (provider=%s, model=%s)",
+            task_id,
+            session.provider,
+            task.model or "",
+        )
+        _wal = getattr(orch, "_wal_writer", None)
+        if _wal is not None:
+            try:
+                _wal.write_entry(
+                    decision_type="task_requeued",
+                    inputs={"task_id": task_id, "agent_id": session.id, "orphaned": True, "trigger": "rate_limit"},
+                    output={"model": task.model or "", "provider": session.provider or ""},
+                    actor="agent_lifecycle",
+                )
+            except OSError:
+                logger.debug("WAL write failed for orphaned task_requeued %s", task_id)
+    else:
+        error_type = "rate_limit_requeue_failed"
+
+    _rl_cost_usd, _rl_tokens_in, _rl_tokens_out = _read_runner_cost_usd(orch._workdir, session, task_id)
+    emit_orphan_metrics(
+        orch._workdir,
+        task_id,
+        session,
+        start_ts,
+        success=False,
+        error_type=error_type,
+        cost_usd=_rl_cost_usd,
+        tokens_prompt=_rl_tokens_in,
+        tokens_completion=_rl_tokens_out,
+    )
+    orch._record_provider_health(session, success=False)
+    if orch._evolution is not None:
+        try:
+            orch._evolution.record_task_completion(
+                task=task,
+                duration_seconds=round(time.time() - start_ts, 2),
+                cost_usd=_rl_cost_usd,
+                janitor_passed=False,
+                model=session.model_config.model,
+                provider=session.provider,
+                tokens_prompt=_rl_tokens_in,
+                tokens_completion=_rl_tokens_out,
+            )
+        except Exception as exc:
+            logger.warning("Evolution record_task_completion for orphan %s failed: %s", task_id, exc)
+
+
+# Below this runtime, a clean (exit code 0) agent exit with no file
+# changes, no git commits, and no completion signals is treated as
+# "suspicious" rather than simply healthy no-op work.
+_FAST_EXIT_THRESHOLD_S = 60.0
+# Never truncate the diagnostic beyond this many trailing log lines - this
+# is a display cap for the log file itself, not a cap on what gets logged.
+_FAST_EXIT_LOG_TAIL_LINES = 60
+
+
+def _probe_fast_exit(
+    orch: Any,
+    session: AgentSession,
+    task_id: str,
+) -> dict[str, Any]:
+    """Probe a clean-but-fast agent exit and surface full diagnostic detail.
+
+    Historically a very-short-lived agent that exited cleanly (code 0, no
+    files modified, no commits, no completion signals) was accepted as
+    "no changes needed" with nothing more than a WARNING log line, and
+    callers downstream only ever saw a bare ``bool`` verdict - there was no
+    way to report or act on *why* the exit looked suspicious. Ground truth:
+    run-9 attempt-7's manager exited 0 after ~3s with zero tools and zero
+    child tasks, the orphan handler auto-completed the task, and the run
+    then declared itself healthy (see
+    work/agent-reports/2026-07-02-run9-attempt9-audit.md).
+
+    This probe is unconditional for every clean exit (not just ones under
+    the threshold) so the caller always has the full structured record;
+    ``suspicious`` tells the caller whether the runtime crossed
+    ``_FAST_EXIT_THRESHOLD_S``. Never truncates/swallows anything: the
+    exit code, a manifest path (when a runner manifest was preserved), and
+    the last ``_FAST_EXIT_LOG_TAIL_LINES`` lines of the agent's log are all
+    returned in full and logged at ERROR when suspicious.
+
+    Args:
+        orch: Orchestrator instance.
+        session: The dead agent's session (exit_code, spawn_ts, id must be set).
+        task_id: The orphaned task this exit is being evaluated for.
+
+    Returns:
+        A dict (never a bare bool) with keys: ``suspicious`` (bool),
+        ``runtime_s`` (float), ``exit_code`` (int | None), ``manifest_path``
+        (str | None), ``log_path`` (str | None), ``log_tail`` (list[str]),
+        ``session_id`` (str), ``task_id`` (str), ``tokens_used`` (int) and
+        ``no_session_activity`` (bool).
+
+        ``no_session_activity`` is the transport-failure signal: the agent
+        exited without consuming a single token, so it never exchanged
+        anything with the model. That is a different fault from an agent that
+        ran, spent tokens and produced nothing, and it needs a different
+        response - retrying a transport failure is reasonable, while retrying
+        a genuinely empty deliverable just burns the budget again.
+    """
+    runtime_s = time.time() - session.spawn_ts if session.spawn_ts > 0 else -1.0
+    suspicious = 0 <= runtime_s < _FAST_EXIT_THRESHOLD_S
+
+    workdir = Path(orch._workdir)
+    log_path = _resolve_agent_log_path(workdir, session)
+    log_tail: list[str] = []
+    log_path_str: str | None = None
+    if log_path.exists():
+        log_path_str = str(log_path)
+        with contextlib.suppress(OSError):
+            log_tail = log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-_FAST_EXIT_LOG_TAIL_LINES:]
+
+    # Runner manifests (e.g. openai_agents_runner.py) are preserved by
+    # _preserve_runner_logs() into agent_logs/<session_id>/ before the
+    # worktree is destroyed - check there first, then fall back to the
+    # (likely already-gone) worktree location for completeness.
+    manifest_path: str | None = None
+    preserved_dir = workdir / ".sdd" / "runtime" / "agent_logs" / session.id
+    with contextlib.suppress(OSError):
+        if preserved_dir.is_dir():
+            manifest_candidates = sorted(preserved_dir.glob(f"{session.id}*.manifest.json"))
+            if manifest_candidates:
+                manifest_path = str(manifest_candidates[0])
+    if manifest_path is None:
+        worktree_path = orch._spawner.get_worktree_path(session.id)
+        if worktree_path is not None:
+            candidate = Path(worktree_path) / ".sdd" / "runtime" / f"{session.id}.manifest.json"
+            with contextlib.suppress(OSError):
+                if candidate.exists():
+                    manifest_path = str(candidate)
+
+    # Callers reach this probe only after no files, no commits and no
+    # completion signals were found, so the deliverable side is already known
+    # to be empty. The one thing still unanswered is whether the agent talked
+    # to the model at all, and tokens_used answers exactly that on its own -
+    # no corroborating signal would add information the caller does not
+    # already have.
+    tokens_used = int(getattr(session, "tokens_used", 0) or 0)
+    no_session_activity = tokens_used == 0
+
+    result: dict[str, Any] = {
+        "suspicious": suspicious,
+        "runtime_s": round(runtime_s, 2),
+        "exit_code": session.exit_code,
+        "manifest_path": manifest_path,
+        "log_path": log_path_str,
+        "log_tail": log_tail,
+        "session_id": session.id,
+        "task_id": task_id,
+        "tokens_used": tokens_used,
+        "no_session_activity": no_session_activity,
+    }
+
+    if suspicious:
+        logger.error(
+            "FAST EXIT: agent %s (task %s) exited cleanly (exit_code=%s) after only "
+            "%.1fs with no files modified, no commits, and no completion signals - "
+            "likely had no tools or never started real work. manifest=%s log=%s "
+            "log_tail=%r",
+            session.id,
+            task_id,
+            session.exit_code,
+            runtime_s,
+            manifest_path or "<none preserved>",
+            log_path_str or "<none found>",
+            log_tail,
+        )
+        # Pull out any structured (JSON) log lines that carry an explicit
+        # error/type/summary payload and log each one IN FULL (never
+        # truncated) -- log_tail above is already the full untruncated text
+        # of up to _FAST_EXIT_LOG_TAIL_LINES lines, but this makes the
+        # actual error payload impossible to miss when scrolling a long
+        # tail. Ground truth: run-9 attempt-7's manager had a fabricated
+        # "completion" event buried in a 60-line tail that got skimmed past.
+        for _raw_line in log_tail:
+            _stripped = _raw_line.lstrip()
+            if not _stripped.startswith("{"):
+                continue
+            try:
+                _parsed = json.loads(_stripped)
+            except ValueError:
+                continue
+            if not isinstance(_parsed, dict):
+                continue
+            _ptype = _parsed.get("type")
+            if _ptype in ("error", "completion", "progress") or "error" in _parsed:
+                logger.error(
+                    "FAST EXIT structured line: agent %s (task %s) type=%r full_payload=%s",
+                    session.id,
+                    task_id,
+                    _ptype,
+                    json.dumps(_parsed),
+                )
+    else:
+        logger.info(
+            "Fast-exit probe: agent %s (task %s) exited cleanly after %.1fs "
+            "(above %.0fs threshold, not flagged suspicious)",
+            session.id,
+            task_id,
+            runtime_s,
+            _FAST_EXIT_THRESHOLD_S,
+        )
+
+    return result
+
+
+# Below this signal age, an agent must NOT be judged dead even if its tracked
+# PID looks dead/exited or reports a young/wrong start time. Ground truth: D2
+# claude leg attempt4-meridian-fixed FAIL-NOTE defect 4/8 -- manager-48832613
+# was judged dead ("process exited (PID 77, 3s runtime)... died without
+# output") while it had done ~109s of real work (spawned 01:04:47, last tool
+# activity ~01:06, created 4 child tasks server-side). The runner double-forks
+# (or re-execs): the tracked launcher PID exits in seconds while the real
+# worker keeps running with no linkage back to session.pid, so a single-PID
+# liveness check is not trustworthy on its own.
+_ORPHAN_LIVENESS_GRACE_S = 90.0
+
+
+def _mtime_age(path: Path, now: float) -> float | None:
+    """Return seconds since ``path`` was last modified, or None if unreadable/missing."""
+    with contextlib.suppress(OSError):
+        if path.exists():
+            return now - path.stat().st_mtime
+    return None
+
+
+def _mtime_and_size(path: Path | None) -> tuple[float | None, int | None]:
+    """Return ``(mtime, size)`` for ``path``, or ``(None, None)`` if missing/unreadable.
+
+    Used to build and later compare liveness snapshots (see
+    ``_liveness_snapshot`` / ``_reevaluate_pending_death_judgments``): a plain
+    age check can't tell a one-time write (e.g. a crash traceback flushed on
+    the way down) from ongoing output, but a raw mtime/size pair can be
+    compared against a later read to see whether the file moved at all.
+    """
+    if path is None:
+        return None, None
+    with contextlib.suppress(OSError):
+        if path.exists():
+            st = path.stat()
+            return st.st_mtime, st.st_size
+    return None, None
+
+
+def _probe_liveness_signals(orch: Any, session: AgentSession, now: float) -> dict[str, Any]:
+    """Collect every liveness signal for a possibly-dead agent and log the judgment.
+
+    Never trusts a single tracked PID's reported death as proof the agent is
+    dead -- double-forked/re-exec'd runners break that assumption (see
+    ``_ORPHAN_LIVENESS_GRACE_S`` docstring above). Checks, in order: raw PID
+    liveness, heartbeat file mtime (``.sdd/runtime/heartbeats/<id>.json``,
+    written by the heartbeat loop in ``core/agents/heartbeat.py``), the
+    worktree's runner log mtime, and the worktree ``.git`` mtime (proxy for
+    recent commit/branch activity). ALWAYS logs every input plus the final
+    verdict and why, in one line, never truncated -- a future misjudgment
+    must be diagnosable from this log line alone in under 2 minutes.
+    """
+    pid = session.pid
+    pid_alive = bool(pid) and _is_process_alive(pid)
+
+    heartbeat_path = orch._workdir / ".sdd" / "runtime" / "heartbeats" / f"{session.id}.json"
+    heartbeat_age = _mtime_age(heartbeat_path, now)
+
+    # Resolve log/git paths across every layout this codebase supports
+    # (.sdd/runtime/worktrees/<id>/..., legacy .sdd/worktrees/<id>/..., and
+    # the root .sdd/runtime/<id>.log fallback when worktrees are disabled
+    # entirely) rather than hardcoding the legacy worktree layout -- a live
+    # agent running under either alternate layout was previously misjudged
+    # dead (and then killed/reaped) by this probe.
+    log_path = _resolve_agent_log_path(orch._workdir, session)
+    log_age = _mtime_age(log_path, now)
+
+    # The git signal is only meaningful when this agent has its own worktree:
+    # the worktree ``.git`` mtime reflects THIS agent's commit/branch activity.
+    # When no per-agent worktree exists there is deliberately NO git signal
+    # (git_age stays None) rather than falling back to the root ``workdir/.git``
+    # mtime -- the root repo is shared mutable state touched by the
+    # orchestrator's own git operations, sibling agents, and repo setup, so
+    # its freshness cannot be attributed to this agent. Treating it as a
+    # liveness signal made genuinely dead agents look alive on any busy (or
+    # freshly initialised) repo, deferring the fail path indefinitely. In the
+    # worktrees-disabled layout the agent-specific signals are the heartbeat
+    # file and the root ``.sdd/runtime/<id>.log`` resolved above.
+    _wt_dir = _resolve_agent_worktree_dir(orch._workdir, session)
+    git_path = (_wt_dir / ".git") if _wt_dir is not None else None
+    git_age = _mtime_age(git_path, now) if git_path is not None else None
+
+    fresh_ages = [a for a in (heartbeat_age, log_age, git_age) if a is not None and a < _ORPHAN_LIVENESS_GRACE_S]
+    has_fresh_signal = bool(fresh_ages)
+    verdict = "ALIVE (fresh signal found)" if has_fresh_signal else "DEAD (no fresh signal)"
+    reason = (
+        "at least one file signal is fresher than the grace window -- a dead-looking/wrong "
+        "tracked pid is not trusted alone"
+        if has_fresh_signal
+        else "pid dead/unknown and every file signal is stale or missing -- judged dead"
+    )
+
+    logger.info(
+        "liveness_judgment: session=%s pid=%s pid_alive=%s heartbeat_path=%s heartbeat_age_s=%s "
+        "log_path=%s log_age_s=%s git_path=%s git_age_s=%s grace_s=%.0f verdict=%s reason=%s",
+        session.id,
+        pid or "unknown",
+        pid_alive,
+        heartbeat_path,
+        f"{heartbeat_age:.1f}" if heartbeat_age is not None else "missing",
+        log_path,
+        f"{log_age:.1f}" if log_age is not None else "missing",
+        git_path if git_path is not None else "no-per-agent-worktree",
+        f"{git_age:.1f}" if git_age is not None else "missing",
+        _ORPHAN_LIVENESS_GRACE_S,
+        verdict,
+        reason,
+    )
+
+    return {
+        "pid": pid,
+        "pid_alive": pid_alive,
+        "heartbeat_age_s": heartbeat_age,
+        "log_age_s": log_age,
+        "git_age_s": git_age,
+        "has_fresh_signal": has_fresh_signal,
+        "verdict": verdict,
+    }
+
+
+def _liveness_snapshot(orch: Any, session: AgentSession, now: float) -> dict[str, Any]:
+    """Record the liveness signal state at the moment a deferred death judgment
+    is made, so a later tick can tell whether the agent actually kept working.
+
+    Persisted (keyed by task) in ``orch._pending_liveness_judgments`` by the
+    caller, since the session itself is transitioned to "dead" and dropped
+    from the main ``refresh_agent_states`` loop in this same tick -- nothing
+    else keeps this state alive for the next reap cycle to consult.
+    """
+    heartbeat_path = orch._workdir / ".sdd" / "runtime" / "heartbeats" / f"{session.id}.json"
+    log_path = _resolve_agent_log_path(orch._workdir, session)
+    _wt_dir = _resolve_agent_worktree_dir(orch._workdir, session)
+    git_path = (_wt_dir / ".git") if _wt_dir is not None else None
+
+    heartbeat_mtime, _hb_size = _mtime_and_size(heartbeat_path)
+    log_mtime, log_size = _mtime_and_size(log_path)
+    git_mtime, _git_size = _mtime_and_size(git_path)
+
+    return {
+        "session_id": session.id,
+        "pid": session.pid,
+        "recorded_at": now,
+        "heartbeat_path": heartbeat_path,
+        "log_path": log_path,
+        "git_path": git_path,
+        "heartbeat_mtime": heartbeat_mtime,
+        "log_mtime": log_mtime,
+        "log_size": log_size,
+        "git_mtime": git_mtime,
+    }
+
+
+def _reevaluate_pending_death_judgments(orch: Any, tasks_snapshot: dict[str, list[Task]]) -> None:
+    """Re-judge every task whose death was deferred by ``_probe_liveness_signals``.
+
+    A deferral only proves the agent looked alive *at the moment the tracked
+    pid was found dead* -- the fresh signal that triggered it (e.g. a crash
+    traceback flushed to the log on the process's way down) is frequently a
+    one-time write, not evidence of ongoing work, and the old code never
+    re-checked: the session that owned the deferred task is transitioned to
+    "dead" in this same tick, so it is filtered out of every later
+    ``refresh_agent_states`` pass and the promised "next reap cycle"
+    re-evaluation never actually ran, leaving the task claimed indefinitely
+    (issue #4222).
+
+    Runs every tick, independent of ``orch._agents`` state, and fails the
+    task unless a signal has advanced *past* the snapshot recorded at defer
+    time. A double-forked/re-exec'd runner whose log keeps growing after the
+    tracked launcher pid exits keeps advancing its own snapshot on each
+    check and stays correctly deferred, same as before this fix.
+    """
+    pending: dict[str, dict[str, Any]] | None = getattr(orch, "_pending_liveness_judgments", None)
+    if not pending:
+        return
+
+    base = orch._config.server_url
+    all_cached: list[Task] = []
+    for bucket in tasks_snapshot.values():
+        all_cached.extend(bucket)
+    task_by_id = {t.id: t for t in all_cached}
+
+    for task_id in list(pending.keys()):
+        snapshot = pending[task_id]
+
+        task = task_by_id.get(task_id)
+        if task is None:
+            try:
+                resp = orch._client.get(f"{base}/tasks/{task_id}")
+                resp.raise_for_status()
+                task = Task.from_dict(resp.json())
+            except httpx.HTTPError:
+                # Task no longer resolvable (deleted, or stale prior session) --
+                # nothing left to re-judge.
+                del pending[task_id]
+                continue
+        if task.status not in (TaskStatus.OPEN, TaskStatus.CLAIMED, TaskStatus.IN_PROGRESS):
+            # Resolved through some other path (completed/failed/blocked) since
+            # the deferral -- stop tracking it.
+            del pending[task_id]
+            continue
+
+        heartbeat_mtime, _hb_size = _mtime_and_size(snapshot["heartbeat_path"])
+        log_mtime, log_size = _mtime_and_size(snapshot["log_path"])
+        git_mtime, _git_size = _mtime_and_size(snapshot["git_path"])
+
+        advanced = (
+            (heartbeat_mtime is not None and heartbeat_mtime > (snapshot["heartbeat_mtime"] or 0))
+            or (log_mtime is not None and log_mtime > (snapshot["log_mtime"] or 0))
+            or (log_size is not None and log_size > (snapshot["log_size"] or 0))
+            or (git_mtime is not None and git_mtime > (snapshot["git_mtime"] or 0))
+        )
+
+        if advanced:
+            logger.info(
+                "liveness_reeval: task=%s agent=%s still deferred -- a signal advanced past "
+                "the pid-exit snapshot (heartbeat_mtime=%s log_mtime=%s log_size=%s "
+                "git_mtime=%s), so the agent is still doing observable work",
+                task_id,
+                snapshot["session_id"],
+                heartbeat_mtime,
+                log_mtime,
+                log_size,
+                git_mtime,
+            )
+            pending[task_id] = {
+                **snapshot,
+                "heartbeat_mtime": heartbeat_mtime,
+                "log_mtime": log_mtime,
+                "log_size": log_size,
+                "git_mtime": git_mtime,
+            }
+            continue
+
+        logger.warning(
+            "liveness_reeval: task=%s agent=%s pid=%s judged dead on re-evaluation -- no "
+            "signal advanced past the snapshot taken when the tracked pid exited; the earlier "
+            "fresh signal that deferred this judgment was a one-time write (e.g. a crash "
+            "traceback), not ongoing liveness. Failing/retrying the task now instead of "
+            "leaving it claimed indefinitely.",
+            task_id,
+            snapshot["session_id"],
+            snapshot["pid"] or "unknown",
+        )
+        try:
+            retry_or_fail_task(
+                task_id,
+                f"Agent {snapshot['session_id']} died; deferred death judgment re-evaluated "
+                f"and no liveness signal advanced past the pid-exit snapshot",
+                client=orch._client,
+                server_url=base,
+                max_task_retries=orch._config.max_task_retries,
+                retried_task_ids=orch._retried_task_ids,
+                workdir=getattr(orch, "_workdir", None),
+                **_retry_escalation_context(orch),
+            )
+            del pending[task_id]
+        except httpx.HTTPError as exc:
+            logger.error("Failed to retry/fail task %s on liveness re-evaluation: %s", task_id, exc)
+            # Leave it pending -- retried again next tick rather than lost.
+
+
+def _handle_orphan_no_signals(
+    orch: Any,
+    task: Task,
+    task_id: str,
+    session: AgentSession,
+    base: str,
+    start_ts: float,
+) -> tuple[bool, str | None]:
+    """Handle orphaned task without completion signals by checking work indicators."""
+    completion_data = collect_completion_data(orch._workdir, session)
+    files_changed = len(completion_data.get("files_modified", []))
+    has_commits = False
+    worktree_path = orch._spawner.get_worktree_path(session.id)
+    if worktree_path is not None:
+        has_commits = _has_git_commits_on_branch(worktree_path, start_ts)
+    clean_exit = session.exit_code == 0
+
+    if files_changed > 0:
+        summary = f"Auto-completed: agent {session.id} modified {files_changed} files (no signals to verify)"
+        log_msg = (
+            f"Orphaned task {task_id} auto-completed "
+            f"({files_changed} files modified, no signals) after agent {session.id} died"
+        )
+        return _try_auto_complete(orch, task_id, base, summary, log_msg, session=session, start_ts=start_ts)
+    if has_commits:
+        summary = f"Auto-completed: agent {session.id} made git commits on branch (no signals to verify)"
+        log_msg = (
+            f"Orphaned task {task_id} auto-completed (git commits detected, no signals) after agent {session.id} died"
+        )
+        return _try_auto_complete(orch, task_id, base, summary, log_msg, session=session, start_ts=start_ts)
+    if clean_exit:
+        # A clean exit (code 0) with an empty diff and no completion signals is
+        # only a genuine "no changes needed" completion when the agent actually
+        # ran long enough to have done the work. _probe_fast_exit() flags a
+        # *suspicious* fast exit (runtime below _FAST_EXIT_THRESHOLD_S): the
+        # agent likely never started real work (no tools, immediate exit) or its
+        # tracked process exited in a way that merely looked clean while the
+        # deliverable was never merged. Marking such a task ``done`` records a
+        # deliverable that exists in no ref and makes the run self-declare
+        # healthy (issues #2810, #2806); it also races an in-flight merge/verify
+        # step that may still land the real diff a moment later. Fail/unverify a
+        # suspicious fast clean exit instead of auto-completing it, so the run
+        # surfaces UNHEALTHY and the lineage can retry or reach the DLQ.
+        _probe_result = _probe_fast_exit(orch, session, task_id)
+        if not _probe_result.get("suspicious"):
+            # Long-lived clean exit: the agent had time to do real work and
+            # decided nothing needed changing. Record that as a completion.
+            summary = (
+                f"Auto-completed (no changes needed): agent {session.id} "
+                f"exited cleanly with empty diff (exit code 0, no signals to verify)"
+            )
+            log_msg = (
+                f"Orphaned task {task_id} auto-completed (no changes needed, clean exit) after agent {session.id} died"
+            )
+            return _try_auto_complete(orch, task_id, base, summary, log_msg, session=session, start_ts=start_ts)
+
+        _transport_failure = bool(_probe_result.get("no_session_activity"))
+        if _transport_failure:
+            # Zero tokens means the agent never exchanged anything with the
+            # model: nothing was asked and nothing was answered. That is a
+            # transport failure, not an agent that ran and produced nothing,
+            # and reporting it as an unverified deliverable sends whoever
+            # reads it to inspect a transcript that does not exist. ERROR
+            # rather than WARNING because a spawn that never reached the
+            # provider is an infrastructure fault, not an agent outcome.
+            logger.error(
+                "TRANSPORT FAILURE (zero-token clean exit): agent %s exited cleanly (exit code 0) "
+                "after only %.1fs having consumed 0 tokens -- it never exchanged anything with the "
+                "model, so there is no transcript to inspect and no deliverable was ever possible. "
+                "NOT auto-completing task %s. This is a spawn/transport fault, not an empty "
+                "deliverable. See preserved logs under .sdd/runtime/agent_logs/%s/ (manifest=%s).",
+                session.id,
+                _probe_result.get("runtime_s"),
+                task_id,
+                session.id,
+                _probe_result.get("manifest_path") or "<none preserved>",
+            )
+        else:
+            logger.warning(
+                "SUSPICIOUS clean exit: agent %s exited cleanly (exit code 0) after only %.1fs "
+                "with no files modified, no commits, and no completion signals -- NOT "
+                "auto-completing task %s; failing it as unverified. A fast empty clean exit is a "
+                "defect signal, not health. It consumed %s tokens, so it did reach the model. "
+                "See preserved logs under .sdd/runtime/agent_logs/%s/ "
+                "for the full transcript (manifest=%s).",
+                session.id,
+                _probe_result.get("runtime_s"),
+                task_id,
+                _probe_result.get("tokens_used"),
+                session.id,
+                _probe_result.get("manifest_path") or "<none preserved>",
+            )
+        # The reason string is what an operator reads off the run log, so it
+        # has to name the actual cause. Reporting a transport fault as an
+        # unverified deliverable sent them to look for a transcript that was
+        # never written (#4275).
+        if _transport_failure:
+            _runtime_s = float(_probe_result.get("runtime_s") or 0.0)
+            _retry_reason = (
+                f"Transport failure: agent {session.id} exited cleanly after {_runtime_s:.1f}s "
+                f"having consumed 0 tokens -- it never reached the model, so the task was "
+                f"never attempted"
+            )
+        else:
+            _retry_reason = (
+                f"Agent {session.id} exited cleanly but produced no verified deliverable "
+                f"(empty diff, no commits, no completion signals)"
+            )
+        try:
+            retry_or_fail_task(
+                task_id,
+                _retry_reason,
+                client=orch._client,
+                server_url=base,
+                max_task_retries=orch._config.max_task_retries,
+                retried_task_ids=orch._retried_task_ids,
+                workdir=getattr(orch, "_workdir", None),
+                transport_failure=_transport_failure,
+                **_retry_escalation_context(orch),
+            )
+        except httpx.HTTPError as exc:
+            logger.error("Failed to retry/fail unverified clean-exit task %s: %s", task_id, exc)
+        # Routing is deliberately unchanged: the task is still failed rather
+        # than auto-completed either way. What differs is the retry accounting
+        # (transport_failure above) and the operator-facing reason.
+        return False, "clean_exit_unverified"
+
+    # Before declaring "died without output", check every liveness signal --
+    # a double-forked/re-exec'd runner's tracked PID can exit in seconds while
+    # the real work continues untracked (defect 8, D2 claude leg). Never trust
+    # a dead-looking/wrong-pid alone: an agent doing observable work (fresh
+    # heartbeat file / growing log / recent git activity) must NOT be judged
+    # dead just because session.pid looks dead or young.
+    _liveness = _probe_liveness_signals(orch, session, time.time())
+    if _liveness["has_fresh_signal"]:
+        logger.warning(
+            "Deferring death judgment for task %s: agent %s tracked pid=%s looks dead but "
+            "liveness signals are fresh (heartbeat_age_s=%s log_age_s=%s git_age_s=%s, "
+            "grace_s=%.0f) -- NOT failing the task this tick; recording the current signal "
+            "state and re-evaluating on every subsequent tick until a signal actually "
+            "advances past it or the task is resolved another way.",
+            task_id,
+            session.id,
+            _liveness["pid"] or "unknown",
+            _liveness["heartbeat_age_s"],
+            _liveness["log_age_s"],
+            _liveness["git_age_s"],
+            _ORPHAN_LIVENESS_GRACE_S,
+        )
+        # The session backing this deferral is transitioned to "dead" and its
+        # worktree cleaned up in this same tick (_handle_dead_agent), so it
+        # won't be around for a later tick to re-check. Persist the pending
+        # judgment on the orchestrator itself, keyed by task, so
+        # _reevaluate_pending_death_judgments can keep re-checking it
+        # independent of the session's lifetime.
+        _pending = getattr(orch, "_pending_liveness_judgments", None)
+        if _pending is None:
+            _pending = {}
+            orch._pending_liveness_judgments = _pending
+        _pending[task_id] = _liveness_snapshot(orch, session, time.time())
+        return False, "deferred_liveness_signal_fresh"
+
+    # Agent died without output
+    runtime = int(time.time() - start_ts)
+    try:
+        retry_or_fail_task(
+            task_id,
+            f"Agent {session.id} died; no completion signals and no files modified",
+            client=orch._client,
+            server_url=base,
+            max_task_retries=orch._config.max_task_retries,
+            retried_task_ids=orch._retried_task_ids,
+            workdir=getattr(orch, "_workdir", None),
+            **_retry_escalation_context(orch),
+        )
+        logger.warning(
+            "Task '%s' failed - agent died without output. "
+            "Reason: process exited (PID %s, %ds runtime). Check log: .sdd/runtime/%s.log",
+            task.title,
+            session.pid or "unknown",
+            runtime,
+            session.id,
+        )
+    except httpx.HTTPError as exc:
+        logger.error("Failed to retry/fail orphaned task %s: %s", task_id, exc)
+    return False, "no_signals"
+
+
+def _try_auto_complete(
+    orch: Any,
+    task_id: str,
+    base: str,
+    summary: str,
+    log_msg: str,
+    session: AgentSession | None = None,
+    start_ts: float | None = None,
+) -> tuple[bool, str | None]:
+    """Try to auto-complete a task. Returns (success, error_type)."""
+    try:
+        complete_task(orch._client, base, task_id, summary)
+        logger.info(log_msg)
+        if session is not None:
+            _lifetime_s = (time.time() - start_ts) if start_ts is not None else -1.0
+            logger.warning(
+                "orphan_auto_complete: task_id=%s agent_id=%s agent_lifetime_s=%.2f "
+                "exit_reason=%r summary=%r -- task was auto-completed because its "
+                "agent died, not because the agent reported completion itself",
+                task_id,
+                session.id,
+                _lifetime_s,
+                session.exit_code,
+                summary,
+            )
+        return True, None
+    except httpx.HTTPError as exc:
+        logger.error(_ORPHAN_COMPLETE_ERROR, task_id, exc)
+        return False, "complete_failed"
+
+
+def handle_orphaned_task(
+    orch: Any,
+    task_id: str,
+    session: AgentSession,
+    tasks_snapshot: dict[str, list[Task]],
+) -> None:
+    """Handle a task left behind by a dead agent process.
+
+    Checks task status using the pre-fetched snapshot (no extra HTTP call).
+    Falls back to a live fetch only if the task is not found in the snapshot.
+    Runs janitor verification if the task has completion signals, and marks
+    it complete or failed. Emits a MetricsRecord afterward.
+
+    Args:
+        orch: Orchestrator instance.
+        task_id: ID of the orphaned task.
+        session: The dead agent's session.
+        tasks_snapshot: Pre-fetched tasks bucketed by status from this tick.
+    """
+    base = orch._config.server_url
+    # Root-cause fix (defect 8, D2 claude leg attempt4-meridian-fixed): this used
+    # to be `session.heartbeat_ts if session.heartbeat_ts > 0 else time.time()`.
+    # heartbeat_ts is a "last confirmed alive" watermark that freezes the moment
+    # the tracked PID stops being confirmable (e.g. a double-forked/re-exec'd
+    # runner whose tracked launcher PID exits in ~3s while the real worker keeps
+    # running untracked) -- so it is NOT a start time. Every downstream "runtime"
+    # figure derived from it (the "PID %s, %ds runtime" log line and
+    # emit_orphan_metrics' duration_seconds) reported ~3s for an agent that had
+    # actually been alive and working for ~109s. spawn_ts is the true, immutable
+    # start time and must be preferred for any reported runtime/duration.
+    start_ts = (
+        session.spawn_ts
+        if session.spawn_ts > 0
+        else (session.heartbeat_ts if session.heartbeat_ts > 0 else time.time())
+    )
+    success = False
+    error_type: str | None = None
+
+    # Try to find the task in the pre-fetched snapshot first (avoids HTTP call)
+    all_cached: list[Task] = []
+    for bucket in tasks_snapshot.values():
+        all_cached.extend(bucket)
+    task_by_id = {t.id: t for t in all_cached}
+
+    if task_id in task_by_id:
+        task = task_by_id[task_id]
+        logger.debug("handle_orphaned_task %s: resolved from tick snapshot", task_id)
+    else:
+        # Not in snapshot -- fall back to a live fetch
+        try:
+            resp = orch._client.get(f"{base}/tasks/{task_id}")
+            resp.raise_for_status()
+            task = Task.from_dict(resp.json())
+            logger.debug("handle_orphaned_task %s: fetched live (not in snapshot)", task_id)
+        except httpx.HTTPError as exc:
+            # 404 = task from a previous session - not a real error, just stale
+            if "404" in str(exc):
+                logger.info("Orphaned task %s from previous session (404), skipping", task_id)
+            else:
+                logger.error("Failed to fetch orphaned task %s: %s", task_id, exc)
+            emit_orphan_metrics(
+                orch._workdir,
+                task_id,
+                session,
+                start_ts,
+                success=False,
+                error_type="stale_session" if "404" in str(exc) else "fetch_failed",
+            )
+            return
+
+    status = task.status
+    if status not in (TaskStatus.OPEN, TaskStatus.CLAIMED, TaskStatus.IN_PROGRESS):
+        logger.info(
+            "Orphaned task %s already resolved (status=%s), skipping",
+            task_id,
+            status.value,
+        )
+        # Record as SUCCESS - agent completed work before dying.
+        # Previously this was not recorded at all, causing the SLO tracker
+        # to count it as a failure (the death event was recorded elsewhere
+        # without checking task status), creating a death spiral.
+        emit_orphan_metrics(
+            orch._workdir,
+            task_id,
+            session,
+            start_ts,
+            success=True,
+            error_type="already_resolved",
+        )
+        return
+
+    # Failure detection: scan the agent's log for rate-limit, timeout, or API error
+    # patterns before deciding how to retry.
+    if _handle_failure_detection(orch, task, task_id, session, base, start_ts, tasks_snapshot):
+        return
+
+    # Escalate strategy: block task when crash limit exceeded
+    if orch._config.recovery == "escalate" and orch._crash_counts.get(task_id, 0) >= orch._config.max_crash_retries:
+        reason = (
+            f"Agent {session.id} died; escalating after "
+            f"{orch._crash_counts[task_id]} crash(es) -- requires human intervention"
+        )
+        try:
+            block_task(orch._client, base, task_id, reason)
+            logger.warning(
+                "Escalated task %s to BLOCKED after %d crash(es)",
+                task_id,
+                orch._crash_counts[task_id],
+            )
+        except httpx.HTTPError as exc:
+            logger.error("Failed to block escalated task %s: %s", task_id, exc)
+        emit_orphan_metrics(orch._workdir, task_id, session, start_ts, success=False, error_type="escalated")
+        return
+
+    # Artifact-mode tasks run the pass even with no declared signals: the
+    # signed receipt it records is their completion identity (issue #2608).
+    if task.completion_signals or is_artifact_mode(task):
+        passed, failed_signals = verify_task_completion(task, orch._workdir)
+        if passed:
+            try:
+                result_payload: dict[str, Any] = {
+                    "result_summary": f"Auto-completed after agent {session.id} died; janitor passed",
+                }
+                orch._client.post(
+                    f"{base}/tasks/{task_id}/complete",
+                    json=result_payload,
+                )
+                success = True
+                logger.info(
+                    "Orphaned task %s auto-completed (janitor passed) after agent %s died",
+                    task_id,
+                    session.id,
+                )
+                _lifetime_s = time.time() - start_ts
+                logger.warning(
+                    "orphan_auto_complete: task_id=%s agent_id=%s agent_lifetime_s=%.2f "
+                    "exit_reason=%r summary=%r -- task was auto-completed because its "
+                    "agent died, not because the agent reported completion itself "
+                    "(janitor verification passed on the completion signals it left behind)",
+                    task_id,
+                    session.id,
+                    _lifetime_s,
+                    session.exit_code,
+                    result_payload["result_summary"],
+                )
+            except httpx.HTTPError as exc:
+                logger.error(_ORPHAN_COMPLETE_ERROR, task_id, exc)
+                error_type = "complete_failed"
+        else:
+            try:
+                retry_or_fail_task(
+                    task_id,
+                    f"Agent {session.id} died; janitor failed: {failed_signals}",
+                    client=orch._client,
+                    server_url=base,
+                    max_task_retries=orch._config.max_task_retries,
+                    retried_task_ids=orch._retried_task_ids,
+                    workdir=getattr(orch, "_workdir", None),
+                    **_retry_escalation_context(orch),
+                )
+                logger.info(
+                    "Orphaned task %s retry/failed (janitor failed: %s) after agent %s died",
+                    task_id,
+                    failed_signals,
+                    session.id,
+                )
+            except httpx.HTTPError as exc:
+                logger.error("Failed to retry/fail orphaned task %s: %s", task_id, exc)
+            error_type = "janitor_failed"
+    else:
+        success, error_type = _handle_orphan_no_signals(orch, task, task_id, session, base, start_ts)
+
+    # WAL: record the orphaned-task outcome for audit trail
+    _wal = getattr(orch, "_wal_writer", None)
+    if _wal is not None:
+        _wal_dtype = "task_completed" if success else "task_failed"
+        try:
+            _wal.write_entry(
+                decision_type=_wal_dtype,
+                inputs={"task_id": task_id, "agent_id": session.id, "orphaned": True},
+                output={"success": success, "error_type": error_type or ""},
+                actor="agent_lifecycle",
+            )
+        except OSError:
+            logger.debug("WAL write failed for orphaned %s %s", _wal_dtype, task_id)
+
+    # Recover the real runner cost from the .tokens cost sidecar *before*
+    # emitting any metrics -- this is a dead agent, so this is the only
+    # remaining source of truth for what it actually spent (see
+    # _read_runner_cost_usd docstring / D2 openrouter FAIL-NOTE 2026-07-03).
+    _orphan_cost_usd, _orphan_tokens_in, _orphan_tokens_out = _read_runner_cost_usd(orch._workdir, session, task_id)
+
+    emit_orphan_metrics(
+        orch._workdir,
+        task_id,
+        session,
+        start_ts,
+        success=success,
+        error_type=error_type,
+        cost_usd=_orphan_cost_usd,
+        tokens_prompt=_orphan_tokens_in,
+        tokens_completion=_orphan_tokens_out,
+    )
+    orch._record_provider_health(session, success=success)
+
+    # Feed orphaned task outcome to the evolution coordinator so that
+    # failed/timed-out agent runs are visible to trend analysis, and so the
+    # priced runner cost lands in .sdd/metrics/tasks.jsonl instead of being
+    # silently zeroed out (bug family: bug-13 cost metering).
+    if orch._evolution is not None:
+        _now = time.time()
+        _duration = _now - start_ts
+        try:
+            orch._evolution.record_task_completion(
+                task=task,
+                duration_seconds=round(_duration, 2),
+                cost_usd=_orphan_cost_usd,
+                janitor_passed=success,
+                model=session.model_config.model,
+                provider=session.provider,
+                tokens_prompt=_orphan_tokens_in,
+                tokens_completion=_orphan_tokens_out,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Evolution record_task_completion for orphan %s failed: %s",
+                task_id,
+                exc,
+            )
+
+    # Also reconcile the observability MetricsCollector's in-memory
+    # TaskMetrics entry (populated at spawn time by collector.start_task()
+    # in task_lifecycle.py). Without this, retrospective.py's cost
+    # aggregation fallback (source=task_metrics) finds this task_id
+    # permanently "started, never finished" with cost_usd stuck at 0.0,
+    # because collector.complete_task() was previously only reachable from
+    # the janitor-verified normal-completion path -- never from this
+    # orphan/auto-complete-after-death path.
+    try:
+        _collector = get_collector(orch._workdir / ".sdd" / "metrics")
+        if _collector.task_metrics.get(task_id) is not None:
+            _collector.complete_task(
+                task_id,
+                success=success,
+                tokens_used=_orphan_tokens_in + _orphan_tokens_out,
+                cost_usd=_orphan_cost_usd,
+                janitor_passed=success,
+            )
+            if _orphan_cost_usd > 0:
+                logger.info(
+                    "orphan_cost_folded_in: task_id=%s agent_id=%s cost_usd=%.6f "
+                    "folded into observability MetricsCollector (retrospective cost aggregation)",
+                    task_id,
+                    session.id,
+                    _orphan_cost_usd,
+                )
+    except Exception as exc:
+        logger.warning("Failed to reconcile observability collector for orphan %s: %s", task_id, exc)
+
+
+# ---------------------------------------------------------------------------
+# Metrics emission
+# ---------------------------------------------------------------------------
+
+
+def emit_orphan_metrics(
+    workdir: Path,
+    task_id: str,
+    session: AgentSession,
+    start_ts: float,
+    *,
+    success: bool,
+    error_type: str | None,
+    cost_usd: float = 0.0,
+    tokens_prompt: int = 0,
+    tokens_completion: int = 0,
+) -> None:
+    """Write a 14-field MetricsRecord to .sdd/metrics/YYYY-MM-DD.jsonl.
+
+    Args:
+        workdir: Project working directory.
+        task_id: The task ID.
+        session: The agent session that died.
+        start_ts: Approximate start timestamp of the agent run.
+        success: Whether the orphaned task was auto-completed.
+        error_type: Error category, or None on success.
+        cost_usd: Real LLM cost recovered from the runner's cost sidecar
+            (see :func:`_read_runner_cost_usd`), or ``0.0`` if none was
+            found. Previously hardcoded to ``0.0`` unconditionally, which
+            silently dropped real spend for every orphaned/auto-completed
+            task (bug family: bug-13 cost metering).
+        tokens_prompt: Prompt tokens recovered alongside ``cost_usd``.
+        tokens_completion: Completion tokens recovered alongside ``cost_usd``.
+    """
+    now = time.time()
+    record = MetricsRecord(
+        timestamp=datetime.now(UTC).isoformat(),
+        task_id=task_id,
+        agent_id=session.id,
+        role=session.role,
+        model_used=session.model_config.model,
+        duration_seconds=round(now - start_ts, 2),
+        token_count=tokens_prompt + tokens_completion,
+        cost_usd=cost_usd,
+        success=success,
+        error_type=error_type,
+        files_modified=0,
+        test_pass_rate=1.0 if success else 0.0,
+        retry_count=0,
+        step_count=0,
+    )
+    today = datetime.now(UTC).strftime("%Y-%m-%d")
+    metrics_dir = workdir / ".sdd" / "metrics"
+    metrics_dir.mkdir(parents=True, exist_ok=True)
+    metrics_path = metrics_dir / f"{today}.jsonl"
+    with metrics_path.open("a") as f:
+        f.write(json.dumps(record.to_dict()) + "\n")
+
+
+# ---------------------------------------------------------------------------
+# Loop and deadlock detection
+# ---------------------------------------------------------------------------
+
+
+def _poll_file_mtimes(orch: Any, detector: Any, lock_mgr: Any) -> None:
+    """Poll modification times of locked files and record edits."""
+    file_mtime_cache: dict[str, float] = getattr(orch, "_loop_mtime_cache", {})
+    if not hasattr(orch, "_loop_mtime_cache"):
+        orch._loop_mtime_cache = file_mtime_cache  # type: ignore[attr-defined]
+
+    for lock in lock_mgr.all_locks():
+        candidate = orch._workdir / lock.file_path
+        if not candidate.exists():
+            candidate = Path(lock.file_path)
+        try:
+            mtime = candidate.stat().st_mtime
+        except OSError:
+            continue
+        last = file_mtime_cache.get(lock.file_path, 0.0)
+        if mtime > last:
+            detector.record_edit(lock.agent_id, lock.file_path, mtime)
+            file_mtime_cache[lock.file_path] = mtime
+
+
+def _recover_loops(orch: Any, detector: Any, lock_mgr: Any) -> None:
+    """Kill agents caught in edit loops and release their locks."""
+    for loop in detector.detect_loops():
+        session = orch._agents.get(loop.agent_id)
+        if session is None or session.status == "dead":
+            continue
+        logger.warning(
+            "Loop detected: agent %s edited '%s' %d times in %.0fs - killing agent",
+            loop.agent_id,
+            loop.file_path,
+            loop.edit_count,
+            loop.window_seconds,
+        )
+        with contextlib.suppress(Exception):
+            orch._spawner.kill(session)
+        _propagate_abort_to_children(orch, loop.agent_id)
+        detector.clear_wait(loop.agent_id)
+        if lock_mgr is not None:
+            lock_mgr.release(loop.agent_id)
+
+
+def check_loops_and_deadlocks(orch: Any) -> None:
+    """Detect and recover from agent edit loops and file-lock deadlocks.
+
+    **Loop detection** - polls modification times of files currently locked by
+    active agents.  When a file's mtime advances since the last poll, the edit
+    is recorded.  If the same agent edits the same file more than
+    :data:`~bernstein.core.loop_detector.LOOP_EDIT_THRESHOLD` times within the
+    detection window, the agent is killed so the task can be retried.
+
+    **Deadlock detection** - builds a wait-for graph from the
+    :class:`~bernstein.core.file_locks.FileLockManager` and any pending
+    lock-wait entries recorded via
+    :meth:`~bernstein.core.loop_detector.LoopDetector.record_lock_wait`.
+    When a cycle is found, the lock held by the *oldest* agent in the cycle is
+    released to break the deadlock.
+
+    This function is a no-op when the orchestrator has no ``_loop_detector``
+    attribute (e.g. in tests that do not set it up).
+
+    Args:
+        orch: Orchestrator instance.
+    """
+    from bernstein.core.loop_detector import LoopDetector  # noqa: TC001
+
+    detector: LoopDetector | None = getattr(orch, "_loop_detector", None)
+    if detector is None:
+        return
+
+    lock_mgr = getattr(orch, "_lock_manager", None)
+
+    if lock_mgr is not None:
+        _poll_file_mtimes(orch, detector, lock_mgr)
+
+    _recover_loops(orch, detector, lock_mgr)
+
+    if lock_mgr is None:
+        return
+
+    for deadlock in detector.detect_deadlocks(lock_mgr):
+        logger.warning(
+            "%s - releasing locks for victim agent %s",
+            deadlock.description,
+            deadlock.victim_agent_id,
+        )
+        lock_mgr.release(deadlock.victim_agent_id)
+        detector.clear_wait(deadlock.victim_agent_id)
+
+
+# ---------------------------------------------------------------------------
+# Stale agent detection
+# ---------------------------------------------------------------------------
+
+
+def check_stale_agents(orch: Any) -> None:
+    """Delegate stale-heartbeat checks to the shared heartbeat module."""
+    heartbeat_protocol.check_stale_agents(orch)
+
+
+# ---------------------------------------------------------------------------
+# Stall detection via progress snapshots
+# ---------------------------------------------------------------------------
+
+
+def check_stalled_tasks(orch: Any) -> None:
+    """Delegate stall checks to the shared heartbeat module."""
+    heartbeat_protocol.check_stalled_tasks(orch)
+
+
+def _has_git_commits_on_branch(worktree_path: Path, since_ts: float) -> bool:
+    """Return True if the branch has commits beyond main committed after since_ts.
+
+    Scoped to the agent's own session (issue #4466): ``git log main..HEAD``
+    alone answers "does this branch have ANY commit ahead of main", which is
+    unconditionally true for a run resumed on a branch that already carried
+    work before this agent spawned - a reviewed PR checkout, a rebase-onto
+    flow. That let a dead agent on such a branch read as "made git commits"
+    and auto-complete its task on the branch's pre-existing history, even
+    when the agent itself produced zero commits. Only commits whose
+    committer timestamp is after ``since_ts`` (the agent's own start point,
+    i.e. its ``spawn_ts``) count as evidence this agent did something.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "log", "--format=%ct", "main..HEAD"],
+            cwd=str(worktree_path),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+        )
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                commit_ts = float(line)
+            except ValueError:
+                continue
+            if commit_ts > since_ts:
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def _is_process_alive(pid: int) -> bool:
+    """Check if a process with the given PID is still running."""
+    from bernstein.core.platform_compat import process_alive
+
+    return process_alive(pid)
+
+
+# ---------------------------------------------------------------------------
+# Reap dead / timed-out agents
+# ---------------------------------------------------------------------------
+
+
+_MAX_LOG_ONLY_HEARTBEAT_TICKS = 3  # bound stderr-tainted-log suppression (issue #3058)
+
+
+def _refresh_heartbeat_from_signals(orch: Any, session: AgentSession, now: float) -> None:
+    """Refresh heartbeat_ts using multiple signals (PID, heartbeat file, log, worktree).
+
+    A live PID and the heartbeat protocol JSON are real evidence of progress and
+    refresh the heartbeat unconditionally. The plain agent log is not: most
+    adapters merge stderr into it via ``stderr=subprocess.STDOUT``, so a
+    provider retry loop, a progress spinner, or a deprecation warning moves
+    its mtime with no task progress behind it. Left unbounded, that alone
+    can sustain the heartbeat indefinitely, defeating both the
+    heartbeat-timeout reap and the wall-clock timeout's own extension logic
+    in ``reap_dead_agents``. So a heartbeat refreshed from the log (or the
+    worktree ``.git`` pointer) alone is capped to a bounded number of
+    consecutive ticks before an unconfirmed session is left to age out.
+
+    ``session.pid`` is ``int | None``: a session handed to a remote runtime
+    bridge is transitioned to "working" with no local PID at all. Those
+    sessions skip the liveness probe and are judged from their file signals,
+    the same way ``_probe_liveness_signals`` guards its own probe.
+
+    The log and ``.git`` paths are resolved through the shared
+    :func:`_resolve_agent_log_path` / :func:`_resolve_agent_worktree_dir`
+    helpers, the same way the sibling probe :func:`_probe_liveness_signals`
+    does, rather than hardcoding the legacy ``.sdd/worktrees/<id>/`` layout.
+    Hardcoding it left every other layout this codebase writes agent logs
+    into with no log signal at all: the current default worktree layout
+    (``.sdd/runtime/worktrees/<id>/``), the worktrees-disabled root log, and
+    any spawn path that reports its own ``session.log_path`` - the remote
+    runtime bridge, container, and sandbox-session paths all log to
+    ``<spawn_cwd>/.sdd/logs/<id>.log``. A bridge-backed session felt that
+    worst: it also has ``pid=None`` (no local process to probe) and gets no
+    heartbeat protocol JSON, since ``bernstein.bridges`` never writes one and
+    the single pre-spawn touch in ``spawner_core`` is never refreshed. With
+    all three signals blind it aged out at ``heartbeat_timeout_s`` however
+    healthy the remote run was.
+    """
+    _hb_freshness_s = _IDLE_HEARTBEAT_THRESHOLD_S * 0.8
+
+    if session.pid and _is_process_alive(session.pid):
+        session.heartbeat_ts = now
+        session.log_only_heartbeat_ticks = 0
+        return
+
+    heartbeat_json = orch._workdir / ".sdd" / "runtime" / "heartbeats" / f"{session.id}.json"
+    with contextlib.suppress(OSError):
+        if heartbeat_json.exists() and (now - heartbeat_json.stat().st_mtime) < _hb_freshness_s:
+            session.heartbeat_ts = now
+            session.log_only_heartbeat_ticks = 0
+            return
+
+    if session.log_only_heartbeat_ticks >= _MAX_LOG_ONLY_HEARTBEAT_TICKS:
+        return
+
+    _wt_dir = _resolve_agent_worktree_dir(orch._workdir, session)
+    paths_to_check = [
+        _resolve_agent_log_path(orch._workdir, session),
+        # No per-agent worktree means deliberately NO git signal rather than a
+        # fallback to the root ``workdir/.git``: the root repo is shared
+        # mutable state touched by the orchestrator's own git operations and
+        # by sibling agents, so its freshness cannot be attributed to this
+        # session. Same rationale as ``_probe_liveness_signals``.
+        *([_wt_dir / ".git"] if _wt_dir is not None else []),
+    ]
+    for path in paths_to_check:
+        with contextlib.suppress(OSError):
+            if path.exists() and (now - path.stat().st_mtime) < _hb_freshness_s:
+                session.heartbeat_ts = now
+                session.log_only_heartbeat_ticks += 1
+                return
+
+
+def _reap_wall_clock_timeout(
+    orch: Any,
+    session: AgentSession,
+    result: Any,
+    tasks_snapshot: dict[str, list[Task]],
+    runtime: float,
+) -> None:
+    """Reap an agent that exceeded its wall-clock timeout."""
+    collector = get_collector()
+    orch._spawner.kill(session)
+    _propagate_abort_to_children(orch, session.id)
+    result.reaped.append(session.id)
+    _release_file_ownership(orch, session.id)
+    _release_task_to_session(orch, session.task_ids)
+    collector.end_agent(session.id)
+    if orch._evolution is not None:
+        try:
+            orch._evolution.record_agent_lifetime(
+                agent_id=session.id,
+                role=session.role,
+                lifetime_seconds=round(runtime, 2),
+                tasks_completed=0,
+                _model=session.model_config.model,
+            )
+        except Exception:
+            logger.exception(
+                "record_agent_lifetime failed during wall-clock reap "
+                "(session_id=%s role=%s model=%s lifetime_seconds=%s) - reap continues",
+                session.id,
+                session.role,
+                getattr(session.model_config, "model", None),
+                round(runtime, 2),
+            )
+    with contextlib.suppress(OSError):
+        orch._signal_mgr.clear_signals(session.id)
+    _preserve_runner_logs(orch, session)
+    for task_id in session.task_ids:
+        _handle_orphaned_task_guarded(orch, task_id, session, tasks_snapshot)
+    _save_partial_work(orch._spawner, session)
+    _preserved = getattr(orch, "_preserved_worktrees", {})
+    _session_preserved = any(
+        orch._spawner.get_worktree_path(session.id) == _preserved.get(tid) for tid in session.task_ids
+    )
+    if not _session_preserved:
+        orch._spawner.cleanup_worktree(session.id)
+
+
+def _reap_heartbeat_timeout(
+    orch: Any,
+    session: AgentSession,
+    result: Any,
+    tasks_snapshot: dict[str, list[Task]],
+    now: float,
+    age: float,
+) -> None:
+    """Reap an agent whose heartbeat went stale."""
+    collector = get_collector()
+    logger.warning("Reaping stale agent %s (last heartbeat %.0fs ago)", session.id, age)
+    orch._spawner.kill(session)
+    _propagate_abort_to_children(orch, session.id)
+    result.reaped.append(session.id)
+    _release_file_ownership(orch, session.id)
+    _release_task_to_session(orch, session.task_ids)
+    collector.end_agent(session.id)
+    if orch._evolution is not None:
+        try:
+            orch._evolution.record_agent_lifetime(
+                agent_id=session.id,
+                role=session.role,
+                lifetime_seconds=round(now - session.spawn_ts, 2),
+                tasks_completed=0,
+                _model=session.model_config.model,
+            )
+        except Exception:
+            logger.exception(
+                "record_agent_lifetime failed during heartbeat-timeout reap "
+                "(session_id=%s role=%s model=%s lifetime_seconds=%s age=%.0fs) - reap continues",
+                session.id,
+                session.role,
+                getattr(session.model_config, "model", None),
+                round(now - session.spawn_ts, 2),
+                age,
+            )
+    orch._record_provider_health(session, success=False)
+    with contextlib.suppress(OSError):
+        orch._signal_mgr.clear_signals(session.id)
+    for task_id in session.task_ids:
+        _wal_r = getattr(orch, "_wal_writer", None)
+        if _wal_r is not None:
+            try:
+                _wal_r.write_entry(
+                    decision_type="task_failed",
+                    inputs={"task_id": task_id, "agent_id": session.id},
+                    output={"reason": "heartbeat_timeout"},
+                    actor="agent_lifecycle",
+                )
+            except OSError:
+                logger.debug("WAL write failed for heartbeat-reaped task %s", task_id)
+        try:
+            retry_or_fail_task(
+                task_id,
+                f"Agent {session.id} reaped (heartbeat timeout)",
+                client=orch._client,
+                server_url=orch._config.server_url,
+                max_task_retries=orch._config.max_task_retries,
+                retried_task_ids=orch._retried_task_ids,
+                tasks_snapshot=tasks_snapshot,
+                workdir=getattr(orch, "_workdir", None),
+                **_retry_escalation_context(orch),
+            )
+        except httpx.HTTPError as exc:
+            logger.error("Failed to retry/fail task %s: %s", task_id, exc)
+
+
+def reap_dead_agents(
+    orch: Any,
+    result: Any,  # TickResult
+    tasks_snapshot: dict[str, list[Task]],
+) -> None:
+    """Kill agents that exceeded heartbeat or wall-clock timeout.
+
+    Also fails any tasks owned by reaped agents.
+
+    Args:
+        orch: Orchestrator instance.
+        result: TickResult to record reaped agent IDs into.
+        tasks_snapshot: Pre-fetched tasks bucketed by status from this tick.
+    """
+    now = time.time()
+    for session in list(orch._agents.values()):
+        if session.status == "dead":
+            continue
+
+        timeout_s = session.timeout_s if session.timeout_s is not None else orch._config.max_agent_runtime_s
+        runtime = now - session.spawn_ts
+        _time_since_heartbeat = now - session.heartbeat_ts if session.heartbeat_ts > 0 else runtime
+        _hard_cap_s = 5400  # 90 minutes absolute maximum
+        if runtime > timeout_s and _time_since_heartbeat < 120 and timeout_s < _hard_cap_s:
+            session.timeout_s = min(timeout_s + 600, _hard_cap_s)
+            # #4571: the extension must reach the process watchdog, which was
+            # armed once at spawn with the original scalar. Re-arm it with the
+            # REMAINING budget (timeout_s counts from spawn_ts, but the timer
+            # counts from now), so the watchdog still fires at spawn + timeout_s
+            # rather than drift past the absolute cap. A missed re-arm leaves the
+            # original timer in place, so the agent is still killed at the old
+            # deadline - never left unguarded.
+            if session.timeout_timer is not None and session.pid is not None:
+                _adapter = getattr(getattr(orch, "_spawner", None), "_adapter", None)
+                if _adapter is not None and hasattr(_adapter, "extend_timeout"):
+                    _remaining = max(60, int(session.timeout_s - runtime))
+                    session.timeout_timer = _adapter.extend_timeout(
+                        session.timeout_timer,
+                        session.pid,
+                        _remaining,
+                        session.id,
+                    )
+            logger.info(
+                "Agent %s exceeded %.0fs timeout but heartbeated %.0fs ago - extending to %.0fs",
+                session.id,
+                timeout_s,
+                _time_since_heartbeat,
+                session.timeout_s,
+            )
+            continue
+        if runtime > timeout_s:
+            logger.warning(
+                "Reaping agent %s (exceeded timeout %.0fs, runtime %.0fs, last heartbeat %.0fs ago)",
+                session.id,
+                timeout_s,
+                runtime,
+                _time_since_heartbeat,
+            )
+            _reap_wall_clock_timeout(orch, session, result, tasks_snapshot, runtime)
+            continue
+
+        _refresh_heartbeat_from_signals(orch, session, now)
+
+        age = now - session.heartbeat_ts
+        if session.heartbeat_ts > 0 and age > orch._config.heartbeat_timeout_s:
+            _reap_heartbeat_timeout(orch, session, result, tasks_snapshot, now, age)
+
+
+# ---------------------------------------------------------------------------
+# Idle agent detection and recycling
+# ---------------------------------------------------------------------------
+#
+# The canonical implementation lives in
+# :mod:`bernstein.core.agents.agent_recycling`.  Its symbols are re-exported
+# from the bottom of this module (see the ``from agent_recycling import ...``
+# block at EOF) so existing importers of ``bernstein.core.agent_lifecycle``
+# continue to work while the constants and algorithm have a single source
+# of truth. This closes - previously ``_detect_idle_reason`` and
+# its four ``_IDLE_*`` thresholds existed in parallel copies that could
+# (and did) silently diverge when one was tuned and the other was not.
+#
+# The import lives at EOF because ``agent_recycling`` pulls in
+# ``agent_reaping``, which imports several helpers defined later in *this*
+# module; deferring the import until after those definitions avoids the
+# circular-import failure.
+
+
+# ---------------------------------------------------------------------------
+# Kill signal processing
+# ---------------------------------------------------------------------------
+
+
+def check_kill_signals(orch: Any, result: Any) -> None:
+    """Process ``.kill`` signal files from the runtime directory.
+
+    For each ``<session_id>.kill`` file found, terminates the matching
+    agent (if alive) and removes the signal file.
+
+    Args:
+        orch: Orchestrator instance.
+        result: Current tick result to record reaped agents.
+    """
+    runtime_dir = orch._workdir / ".sdd" / "runtime"
+    if not runtime_dir.is_dir():
+        return
+    for kill_file in runtime_dir.glob("*.kill"):
+        session_id = kill_file.stem
+        # Remove the signal file first (idempotent)
+        with contextlib.suppress(OSError):
+            kill_file.unlink()
+        session = orch._agents.get(session_id)
+        if session is None or session.status == "dead":
+            continue
+        logger.info("Kill signal received for %s, terminating", session_id)
+        orch._spawner.kill(session)
+        _propagate_abort_to_children(orch, session_id)
+        result.reaped.append(session_id)
+
+
+def send_shutdown_signals(orch: Any, reason: str, stagger_delay_s: float = 0.0) -> None:
+    """Write SHUTDOWN signal files to all currently active agents.
+
+    Called when ``bernstein stop`` is issued or the budget is hit so
+    agents can save WIP before the orchestrator exits.
+
+    When *stagger_delay_s* > 0, signals are sent one at a time with a
+    ``time.sleep(stagger_delay_s)`` gap between each agent.  This prevents
+    a thundering-herd of simultaneous merge attempts during drain mode.
+
+    Args:
+        orch: Orchestrator instance.
+        reason: Human-readable reason for the shutdown.
+        stagger_delay_s: Seconds to wait between consecutive SHUTDOWN signals.
+            Default 0 means all signals are sent without delay (original
+            behaviour, preserving backward compatibility).
+    """
+    active = [s for s in orch._agents.values() if s.status != "dead"]
+    for idx, session in enumerate(active):
+        task_title = ", ".join(session.task_ids) if session.task_ids else "unknown task"
+        with contextlib.suppress(OSError):
+            orch._signal_mgr.write_shutdown(session.id, reason=reason, task_title=task_title)
+        if stagger_delay_s > 0 and idx < len(active) - 1:
+            time.sleep(stagger_delay_s)
+
+
+# ---------------------------------------------------------------------------
+# Private helpers
+# ---------------------------------------------------------------------------
+
+
+def _release_file_ownership(orch: Any, agent_id: str) -> None:
+    """Release all files owned by the given agent.
+
+    Uses :class:`~bernstein.core.file_locks.FileLockManager` when available,
+    falling back to the legacy ``_file_ownership`` dict for compatibility.
+
+    Args:
+        orch: Orchestrator instance.
+        agent_id: The agent whose files to release.
+    """
+    lock_manager = getattr(orch, "_lock_manager", None)
+    if lock_manager is not None:
+        lock_manager.release(agent_id)
+    # Always clean the legacy dict so tests and code that write to it directly stay consistent
+    to_remove = [fp for fp, owner in orch._file_ownership.items() if owner == agent_id]
+    for fp in to_remove:
+        del orch._file_ownership[fp]
+
+
+def _release_task_to_session(orch: Any, task_ids: list[str]) -> None:
+    """Remove reverse-index entries for the given task IDs.
+
+    Args:
+        orch: Orchestrator instance.
+        task_ids: The task IDs whose mappings to remove.
+    """
+    for tid in task_ids:
+        orch._task_to_session.pop(tid, None)
+
+
+# ---------------------------------------------------------------------------
+# Re-exports: canonical idle-detection / recycling implementation.
+#
+# Deferred to end-of-module to avoid a circular import via
+# ``agent_recycling -> agent_reaping -> agent_lifecycle``. See.
+# ---------------------------------------------------------------------------
+
+from bernstein.core.agents.agent_recycling import (  # noqa: E402, F401 - re-exported for back-compat
+    _IDLE_GRACE_S,
+    _IDLE_HEARTBEAT_THRESHOLD_EVOLVE_S,
+    _IDLE_HEARTBEAT_THRESHOLD_S,
+    _IDLE_LIVENESS_EXTENSION_S,
+    _detect_idle_reason,
+    _reap_completed_agent,
+    _recycle_or_kill,
+    recycle_idle_agents,
+)

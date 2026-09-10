@@ -1,0 +1,2227 @@
+"""Core data models for tasks, agents, and cells."""
+
+from __future__ import annotations
+
+import logging
+import time
+import uuid
+from dataclasses import asdict, dataclass, field
+from enum import Enum, StrEnum
+from typing import TYPE_CHECKING, Any, Literal
+
+from bernstein.core import defaults as _defaults
+from bernstein.core.defaults import AGENT
+from bernstein.core.tasks.artifacts import ArtifactSpec
+
+if TYPE_CHECKING:
+    from bernstein.core.persistence.cache_policy import CachePolicy
+    from bernstein.core.protocols.cluster.cluster_tls import TLSConfig
+
+logger = logging.getLogger(__name__)
+
+
+def _default_poll_interval_s() -> int:
+    """Return the current canonical tick interval (cast to int).
+
+    Reads from :mod:`bernstein.core.defaults` each call so that runtime
+    overrides and :func:`bernstein.core.defaults.reset` (which rebinds
+    ``ORCHESTRATOR`` at module scope) are honoured.
+    """
+    return int(_defaults.ORCHESTRATOR.tick_interval_s)
+
+
+def _default_stalled_manager_threshold_s() -> float:
+    """Return the current canonical stalled-manager deadline.
+
+    Reads from :mod:`bernstein.core.defaults` each call (same pattern as
+    :func:`_default_poll_interval_s`) so that ``tuning.orchestrator.
+    stalled_manager_threshold_s`` overrides from ``bernstein.yaml`` are
+    honoured. See ``core.orchestration.stalled_manager`` for the consumer.
+    """
+    return float(_defaults.ORCHESTRATOR.stalled_manager_threshold_s)
+
+
+def _default_planning_window_s() -> float:
+    """Return the current canonical planning window.
+
+    Reads from :mod:`bernstein.core.defaults` each call (same pattern as
+    :func:`_default_poll_interval_s`) so that ``tuning.orchestrator.
+    planning_window_s`` overrides from ``bernstein.yaml`` are honoured. The
+    ``BERNSTEIN_PLANNING_WINDOW_S`` env var is applied at the use site by
+    ``core.orchestration.run_stall.resolve_planning_window_s``.
+    """
+    return float(_defaults.ORCHESTRATOR.planning_window_s)
+
+
+def _default_max_agent_runtime_s() -> int:
+    """Return the current canonical agent wall-clock kill starting value.
+
+    Reads from :mod:`bernstein.core.defaults` each call (same pattern as
+    :func:`_default_poll_interval_s`) so that ``tuning.orchestrator.
+    max_agent_runtime_s`` overrides are honoured.
+    """
+    return int(_defaults.ORCHESTRATOR.max_agent_runtime_s)
+
+
+class TaskStoreUnavailable(Exception):
+    """Raised when the task store cannot operate after exhausting retries.
+
+    The orchestrator should catch this and degrade gracefully (e.g. switch
+    to read-only mode or pause task dispatch).
+    """
+
+
+class KillReason(StrEnum):
+    """Reasons for killing an agent session."""
+
+    MANUAL = "manual"
+    SCOPE_VIOLATION = "scope_violation"
+    BUDGET_EXCEEDED = "budget_exceeded"
+    GUARDRAIL_VIOLATION = "guardrail_violation"
+
+
+class TransitionReason(StrEnum):
+    """Canonical reasons for lifecycle transitions in the runtime pipeline."""
+
+    COMPLETED = "completed"
+    ABORTED = "aborted"
+    RETRY = "retry"
+    PROMPT_TOO_LONG = "prompt_too_long"
+    MAX_OUTPUT_TOKENS = "max_output_tokens"
+    MAX_TURNS = "max_turns"
+    PROVIDER_413 = "provider_413"
+    PROVIDER_529 = "provider_529"
+    COMPACTION_FAILED = "compaction_failed"
+    STOP_HOOK_BLOCKED = "stop_hook_blocked"
+    PERMISSION_DENIED = "permission_denied"
+    SIBLING_ABORTED = "sibling_aborted"
+    ORPHAN_RECOVERED = "orphan_recovered"
+
+
+class AbortReason(StrEnum):
+    """Canonical reasons for abnormal agent termination."""
+
+    USER_INTERRUPT = "user_interrupt"
+    SHUTDOWN_SIGNAL = "shutdown_signal"
+    TIMEOUT = "timeout"
+    OOM = "oom"
+    PERMISSION_DENIED = "permission_denied"
+    PROVIDER_ERROR = "provider_error"
+    BASH_ERROR = "bash_error"
+    SIBLING_ABORTED = "sibling_aborted"
+    PARENT_ABORTED = "parent_aborted"
+    COMPACT_FAILURE = "compact_failure"
+    UNKNOWN = "unknown"
+
+
+class ProviderType(Enum):
+    """Supported API provider types."""
+
+    CLAUDE = "claude"
+    CURSOR = "cursor"
+    GEMINI = "gemini"
+    CODEX = "codex"
+    QWEN = "qwen"
+    KIRO = "kiro"
+    KILO = "kilo"
+    KIMCHI = "kimchi"
+    OLLAMA = "ollama"
+    OPENCODE = "opencode"
+
+
+class ApiTier(Enum):
+    """API subscription tiers."""
+
+    FREE = "free"
+    PLUS = "plus"
+    PRO = "pro"
+    ENTERPRISE = "enterprise"
+    UNLIMITED = "unlimited"
+
+
+@dataclass(frozen=True)
+class RateLimit:
+    """Rate limit configuration for an API tier."""
+
+    requests_per_minute: int | None = None
+    requests_per_day: int | None = None
+    tokens_per_minute: int | None = None
+    tokens_per_day: int | None = None
+
+
+@dataclass(frozen=True)
+class CostStructure:
+    """Cost structure for an API tier."""
+
+    input_cost_per_1k_tokens: float = 0.0
+    output_cost_per_1k_tokens: float = 0.0
+    monthly_subscription: float = 0.0
+    overage_cost_per_1k_tokens: float = 0.0
+
+
+@dataclass(frozen=True)
+class ApiTierInfo:
+    """Information about an API tier and remaining quota."""
+
+    provider: ProviderType
+    tier: ApiTier
+    rate_limit: RateLimit | None = None
+    cost_structure: CostStructure | None = None
+    remaining_requests: int | None = None
+    remaining_tokens: int | None = None
+    reset_timestamp: int | None = None  # Unix timestamp for rate limit reset
+    is_active: bool = True
+
+
+class Scope(Enum):
+    SMALL = "small"  # <30 min, single file
+    MEDIUM = "medium"  # 30-120 min, few files
+    LARGE = "large"  # 2-8 hours, subsystem
+
+
+class Complexity(Enum):
+    LOW = "low"  # Docs, formatting, simple fixes
+    MEDIUM = "medium"  # Feature implementation, tests
+    HIGH = "high"  # Architecture, complex reasoning, security
+
+
+class TaskStatus(Enum):
+    PLANNED = "planned"  # Awaiting human approval before execution (plan mode)
+    OPEN = "open"
+    CLAIMED = "claimed"
+    IN_PROGRESS = "in_progress"
+    DONE = "done"
+    CLOSED = "closed"
+    FAILED = "failed"
+    BLOCKED = "blocked"
+    WAITING_FOR_SUBTASKS = "waiting_for_subtasks"
+    CANCELLED = "cancelled"
+    ORPHANED = "orphaned"  # Agent crashed mid-task; pending crash recovery
+    SUSPENDED = "suspended"  # Operator-parked mid-session; infra released, resumable from an attested receipt (#2552)
+    PENDING_APPROVAL = "pending_approval"  # Completed; awaiting human approval before taking effect
+    ABANDONED = "abandoned"  # Agent voluntarily abandoned with a structured reason (#1350)
+    BLOCKED_BY_ABANDON = "blocked_by_abandon"  # Downstream task waiting on an abandoned dependency (#1350)
+    BLOCKED_BY_FAILED_DEP = "blocked_by_failed_dep"  # Downstream task whose dependency ended unsuccessfully (#3452)
+    REFUSED = "refused"  # Worker reported a typed refusal via the completion contract (#2244)
+
+
+class TaskType(Enum):
+    """Type of task for categorization and prioritization."""
+
+    STANDARD = "standard"  # Regular implementation task
+    UPGRADE_PROPOSAL = "upgrade_proposal"  # Self-evolution upgrade suggestion
+    FIX = "fix"  # Bug fix or janitor-created fix
+    RESEARCH = "research"  # Research/exploration task
+
+
+@dataclass(frozen=True)
+class RiskAssessment:
+    """Risk assessment for upgrade proposals.
+
+    Attributes:
+        level: Overall risk level (low, medium, high, critical).
+        breaking_changes: Whether this introduces breaking changes.
+        affected_components: List of components that may be affected.
+        mitigation: Suggested mitigation strategies.
+    """
+
+    level: Literal["low", "medium", "high", "critical"] = "medium"
+    breaking_changes: bool = False
+    affected_components: list[str] = field(default_factory=list[str])
+    mitigation: str = ""
+
+
+@dataclass(frozen=True)
+class RollbackPlan:
+    """Rollback plan for upgrade proposals.
+
+    Attributes:
+        steps: Step-by-step rollback instructions.
+        revert_commit: Git commit hash to revert to (if applicable).
+        data_migration: Any data migration rollback steps.
+        estimated_rollback_minutes: Time estimate for rollback.
+    """
+
+    steps: list[str] = field(default_factory=list[str])
+    revert_commit: str | None = None
+    data_migration: str = ""
+    estimated_rollback_minutes: int = 30
+
+
+@dataclass(frozen=True)
+class UpgradeProposalDetails:
+    """Details specific to upgrade proposal tasks.
+
+    Attributes:
+        current_state: Description of current implementation.
+        proposed_change: Description of the proposed upgrade.
+        benefits: Expected benefits of the upgrade.
+        risk_assessment: Risk analysis of the upgrade.
+        rollback_plan: How to revert if the upgrade fails.
+        cost_estimate_usd: Estimated cost impact in USD.
+        performance_impact: Expected performance impact description.
+    """
+
+    current_state: str = ""
+    proposed_change: str = ""
+    benefits: list[str] = field(default_factory=list[str])
+    risk_assessment: RiskAssessment = field(default_factory=RiskAssessment)
+    rollback_plan: RollbackPlan = field(default_factory=RollbackPlan)
+    cost_estimate_usd: float = 0.0
+    performance_impact: str = ""
+
+
+@dataclass(frozen=True)
+class CompletionSignal:
+    """Janitor signal for automatic task verification.
+
+    The first six types verify against the filesystem or a test command (the
+    coding path). The next three (issue #2608) operate on an artifact's
+    canonical bytes instead: ``schema_valid`` validates the artifact against a
+    declared JSON Schema, ``criteria_match`` evaluates a closed predicate set,
+    and ``hash_stable`` re-derives the canonical content hash. Their closed
+    evaluators live in :mod:`bernstein.core.tasks.artifacts`; the janitor
+    dispatches them via :func:`bernstein.core.quality.janitor.evaluate_artifact_signals`
+    when the produced artifact is in scope.
+
+    ``figures_grounded`` (issue #2888) is the tenth type: on a report bundle it
+    requires every declared figure's anchor to resolve to a verifying lineage
+    record and every material number in the body to be declared in the sidecar.
+    Its ``value`` is the severity - ``""``/``"strict"`` (an unanchored figure
+    fails completion) or ``"warn"`` (downgrade for exploratory work).
+    """
+
+    type: Literal[
+        "path_exists",
+        "glob_exists",
+        "test_passes",
+        "file_contains",
+        "llm_review",
+        "llm_judge",
+        "schema_valid",
+        "criteria_match",
+        "hash_stable",
+        "figures_grounded",
+    ]
+    value: str  # path, glob pattern, test command, search string, review instruction, criterion payload, or severity
+
+
+@dataclass(frozen=True)
+class ApprovalSpec:
+    """Explicit human-in-the-loop approval gate spec attached to a task.
+
+    Models the ``loop: interactive: true`` UX pattern. When a task carries
+    an :class:`ApprovalSpec`, the orchestrator pauses *before* spawning the
+    agent body, emits an ``approval_pending`` event into the HMAC-chained
+    audit log, writes a ``.pending`` sentinel under
+    ``.sdd/runtime/approvals/`` and blocks until either an operator decision
+    file is written (``bernstein approve <task_id>`` /
+    ``bernstein reject <task_id>``) or the TTL expires.
+
+    Validation:
+        ``timeout_seconds`` MUST be strictly positive and ``prompt`` MUST be
+        non-empty after stripping whitespace; otherwise ``__post_init__``
+        raises :class:`ValueError`. The dataclass is frozen so the
+        validation runs exactly once at construction time.
+
+    Attributes:
+        prompt: Human-readable question presented to the operator. Must be
+            non-empty (whitespace-only counts as empty).
+        timeout_seconds: Maximum seconds to wait for an operator decision
+            before the gate falls back to ``default_action``. Must be > 0.
+            Default is 24 hours so background runs do not stall forever.
+        default_action: Outcome applied when the timeout fires. ``"reject"``
+            (the safe default) marks the task failed and skips the agent
+            spawn; ``"approve"`` continues with the body; ``"fail"`` is
+            equivalent to ``"reject"`` but is preserved as a distinct value
+            so future audit consumers can distinguish "human said no" from
+            "no human responded".
+    """
+
+    prompt: str
+    timeout_seconds: int = 86_400
+    default_action: Literal["reject", "approve", "fail"] = "reject"
+
+    def __post_init__(self) -> None:
+        """Enforce non-empty prompt and positive timeout at construction."""
+        if not self.prompt or not self.prompt.strip():
+            raise ValueError("ApprovalSpec.prompt must be a non-empty string")
+        if self.timeout_seconds <= 0:
+            raise ValueError(f"ApprovalSpec.timeout_seconds must be > 0, got {self.timeout_seconds!r}")
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-serialisable representation of the spec."""
+        return {
+            "prompt": self.prompt,
+            "timeout_seconds": self.timeout_seconds,
+            "default_action": self.default_action,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ApprovalSpec:
+        """Build an :class:`ApprovalSpec` from a JSON-decoded mapping.
+
+        Args:
+            data: Mapping with at least ``prompt``; ``timeout_seconds`` and
+                ``default_action`` fall back to dataclass defaults.
+
+        Returns:
+            A validated :class:`ApprovalSpec`.
+
+        Raises:
+            ValueError: When the resulting spec violates the field
+                invariants enforced by :meth:`__post_init__`.
+        """
+        action = str(data.get("default_action", "reject"))
+        if action not in ("reject", "approve", "fail"):
+            raise ValueError(f"ApprovalSpec.default_action must be reject|approve|fail, got {action!r}")
+        return cls(
+            prompt=str(data["prompt"]),
+            timeout_seconds=int(data.get("timeout_seconds", 86_400)),
+            default_action=action,  # type: ignore[arg-type]
+        )
+
+
+def _normalize_attachments(raw: object) -> list[str]:
+    """Coerce an ``attachments`` payload into a ``list[str]``.
+
+    Rejects scalar values (e.g. ``"diagram.png"``) so a malformed
+    payload does not silently turn into one-character paths via
+    iteration. Accepts ``None`` (empty list) and any list-like
+    sequence whose elements coerce to strings.
+    (bot-ack: 3284182800 -- CodeRabbit minor.)
+    """
+    if raw is None:
+        return []
+    if isinstance(raw, str | bytes):
+        raise TypeError(
+            "Task.attachments must be a list of paths, got a "
+            f"{type(raw).__name__}; pass [path] for a single attachment."
+        )
+    if not isinstance(raw, list | tuple):
+        raise TypeError(f"Task.attachments must be a list of paths, got {type(raw).__name__}")
+    return [str(a) for a in raw]
+
+
+def _parse_cache_policy(raw: object) -> CachePolicy | None:
+    """Coerce a ``cache_policy`` payload into a :class:`CachePolicy` or ``None``.
+
+    Accepts a JSON mapping (parsed via ``CachePolicy.from_dict``) or an existing
+    ``CachePolicy``. ``None`` (the default) means the task declares no policy and
+    runs byte-identically to the pre-policy spawn path. Imported lazily so the
+    task model has no runtime dependency on the cache subsystem when no policy is
+    declared. (issue #2551)
+    """
+    if raw is None:
+        return None
+    from bernstein.core.persistence.cache_policy import CachePolicy
+
+    if isinstance(raw, CachePolicy):
+        return raw
+    if isinstance(raw, dict):
+        return CachePolicy.from_dict(raw)
+    raise TypeError(f"Task.cache_policy must be a mapping or CachePolicy, got {type(raw).__name__}")
+
+
+def _normalize_evidence_producers(raw: object) -> list[dict[str, Any]]:
+    """Coerce an ``evidence_producers`` payload into a ``list[dict]``.
+
+    Each entry declares one verification-evidence producer (issue #2362):
+    ``{name, kind, command, required}``. Full field validation lives in
+    :func:`bernstein.core.evidence.bundle.parse_producers`; this normaliser only
+    guarantees the field is a list of mappings so a malformed payload fails
+    loudly at task construction rather than at gate time.
+    """
+    if raw is None:
+        return []
+    if isinstance(raw, dict):
+        raise TypeError("Task.evidence_producers must be a list of producer specs, got a single mapping")
+    if not isinstance(raw, list | tuple):
+        raise TypeError(f"Task.evidence_producers must be a list, got {type(raw).__name__}")
+    producers: list[dict[str, Any]] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            raise TypeError(f"each evidence producer must be a mapping, got {type(entry).__name__}")
+        producers.append({str(k): v for k, v in entry.items()})
+    return producers
+
+
+def _normalize_declared_outputs(raw: object) -> list[str]:
+    """Coerce a ``declared_outputs`` payload into canonical artifact keys.
+
+    Each entry is an artifact URI or a repo-relative path, optionally carrying
+    ``*`` / ``**`` / ``?`` to declare a set (``dist/*.whl``). Entries are
+    canonicalised through
+    :func:`bernstein.core.lineage.artifact_uri.canonical_artifact_pattern`, then
+    deduplicated and sorted so the field is a pure function of the *set* the
+    operator declared: two spellings of one artifact, or the same artifacts
+    listed in a different order, produce the identical stored value and
+    therefore the identical completion diff (issue #2559).
+
+    A malformed entry raises at task construction rather than silently
+    degrading into "declared nothing" at completion time -- a declaration that
+    quietly disappears is worse than no declaration, because the missing-output
+    finding it was supposed to produce also disappears.
+    """
+    if raw is None:
+        return []
+    if isinstance(raw, str | bytes):
+        raise TypeError("Task.declared_outputs must be a list of artifact keys, got a single string")
+    if not isinstance(raw, list | tuple):
+        raise TypeError(f"Task.declared_outputs must be a list, got {type(raw).__name__}")
+
+    from bernstein.core.lineage.artifact_uri import canonical_artifact_pattern
+
+    canonical: set[str] = set()
+    for entry in raw:
+        if not isinstance(entry, str):
+            raise TypeError(f"each declared output must be a string, got {type(entry).__name__}")
+        canonical.add(canonical_artifact_pattern(entry))
+    return sorted(canonical)
+
+
+@dataclass
+class Task:
+    """A unit of work for an agent."""
+
+    id: str
+    title: str
+    description: str
+    role: str  # Which specialist role
+    priority: int = 2
+    scope: Scope = Scope.MEDIUM
+    complexity: Complexity = Complexity.MEDIUM
+    estimated_minutes: int = 30
+    status: TaskStatus = TaskStatus.OPEN
+    task_type: TaskType = TaskType.STANDARD  # Type of task
+    upgrade_details: UpgradeProposalDetails | None = None  # For upgrade proposals
+    depends_on: list[str] = field(default_factory=list[str])
+    parent_task_id: str | None = None
+    completion_signals: list[CompletionSignal] = field(default_factory=list[CompletionSignal])
+    # Issue #2608: the typed artifact contract this task produces. Declares the
+    # expected ArtifactKind, its canonicalisation rule, and typed verification
+    # criteria over the artifact bytes. Defaults to ``code_diff`` so an existing
+    # coding task is unchanged (the git-diff path). Round-trips through
+    # ``Task.to_dict`` / ``Task.from_dict``.
+    artifact_spec: ArtifactSpec = field(default_factory=ArtifactSpec)
+    owned_files: list[str] = field(default_factory=list[str])
+    assigned_agent: str | None = None
+    result_summary: str | None = None
+    tenant_id: str = "default"
+    cell_id: str | None = None  # Which cell this task belongs to
+    repo: str | None = None  # Target repo in a multi-repo workspace
+    depends_on_repo: str | None = None  # Cross-repo dependency source repo, used with depends_on task IDs
+    # Manager-specified routing hints (override auto-routing when set)
+    model: str | None = None  # "opus", "sonnet", "haiku"
+    effort: str | None = None  # "max", "high", "medium", "low"
+    cli: str | None = None  # adapter override; "claude", "opencode", "codex", … (per-step)
+    mcp_servers: list[str] = field(default_factory=list[str])  # MCP server names for this task
+    slack_context: dict[str, Any] | None = None  # Slack slash command or event metadata
+    metadata: dict[str, Any] = field(default_factory=dict)  # Trigger-source metadata (e.g. issue_number)
+    batch_eligible: bool | None = None  # Non-urgent: None=auto-detect, True=explicit batch, False=explicit realtime
+    eu_ai_act_risk: Literal["minimal", "limited", "high", "unacceptable"] = "minimal"
+    approval_required: bool = False  # Pause after completion until explicitly approved
+    # Pre-spawn human-in-the-loop gate (#1110). When set, the orchestrator
+    # blocks before invoking the agent body until an operator runs
+    # ``bernstein approve <task_id>`` / ``reject``, or the TTL fires and the
+    # spec's ``default_action`` is applied. The boolean ``approval_required``
+    # above continues to govern the *post-completion* review gate so that
+    # legacy approve/reject/pending tests stay intact.
+    approval_spec: ApprovalSpec | None = None
+    # Issue #2551: opt-in cache policy declared on the task spec. When set, the
+    # cache boundary composes keys over the policy's ingredient recipe, applies
+    # the drift verdict, and routes fleet-key contention through a claim. When
+    # None (the default) the task runs byte-identically to the pre-policy spawn
+    # path. Parsed by ``bernstein.core.persistence.cache_policy.CachePolicy``.
+    cache_policy: CachePolicy | None = None
+    risk_level: Literal["low", "medium", "high", "critical"] = "low"  # Risk for approval workflow routing
+    sensitivity: Literal["public", "internal", "confidential"] = "internal"  # Data classification level
+    max_output_tokens: int | None = None  # Escalated limit for model output
+    meta_messages: list[str] = field(default_factory=list[str])  # Operational nudges/hints (T423)
+    created_at: float = field(default_factory=time.time)
+    claimed_at: float | None = None  # Epoch timestamp when task was claimed by an agent
+    completed_at: float | None = None  # Epoch timestamp when task completed/failed
+    closed_at: float | None = None  # Epoch timestamp when task was verified and closed
+    deadline: float | None = None  # Epoch timestamp when task must be complete
+    progress_log: list[dict[str, Any]] = field(default_factory=list[dict[str, Any]])  # [{timestamp, message, percent}]
+    version: int = 1  # Optimistic locking: incremented on every status change
+    claimed_by_session: str | None = None  # Parent orchestrator session that claimed this task
+    parent_session_id: str | None = None  # Coordinator session that created/owns this task (namespace scope)
+    execution_mode: str | None = None  # "batch" → delegate to Claude Code /batch skill
+    verification_count: int = 0  # Number of verification steps run at completion
+    flagged_unverified: bool = False  # True when task completed without any verification
+    retry_count: int = 0  # Current retry number (0 = first attempt)
+    max_retries: int = 3  # Maximum retries before permanent failure
+    retry_delay_s: float = 0.0  # Delay between retries (exponential backoff base)
+    terminal_reason: str | None = None  # Why the previous attempt ended (from Claude Code)
+    subtask_wait_started_at: float | None = None  # Epoch when task entered WAITING_FOR_SUBTASKS
+    parent_context: str | None = None  # Parent agent's context summary (key decisions, files explored) for subtasks
+    requires: list[str] = field(default_factory=list[str])  # Capability-based addressing: e.g. ["python", "testing"]
+    # Issue #2544: free-form admission tags. Declared tags gate the claim
+    # deterministically (AND-of-all under their pool/tag limits) and are sealed
+    # into a post-hoc tag-conformance receipt after completion. Empty = the
+    # task makes no admission-tag claim. See bernstein.core.admission.
+    tags: list[str] = field(default_factory=list[str])
+    best_of_n: int | None = (
+        None  # Opt-in best-of-N candidate fan-out (K in [2, BEST_OF_N.max_candidates]); None/<=1 = single agent
+    )
+    # Iterative self-refinement loop (issue #1403). Opt-in: N in
+    # [2, MAX_REFINEMENT_ROUNDS]; None/<=1 = single-shot path. Mutually
+    # exclusive with ``best_of_n``; the runner asserts the invariant.
+    refinement_rounds: int | None = None
+    # Issue #1109: when True, retries spawn a fresh agent with NO accumulated
+    # state (no log carryover, no failure-context replay, no warm-pool reuse).
+    # Mirrors a ``context: fresh`` per-node semantic applied to retry
+    # attempts.  Default False preserves existing retry behaviour.
+    agent_restart_between_retries: bool = False
+    # Issue #1634: Declarative parallel-safety flag set at task generation time.
+    # When True, the orchestrator may schedule this task concurrently with
+    # other parallel-safe tasks whose dependencies are also satisfied.
+    # Absence (False) means the task runs serially. Set from the ``[P]``
+    # marker in the ``[T<id>] [P] [USn] description`` markdown checkbox
+    # format or the ``parallel_safe`` YAML frontmatter key.
+    parallel_safe: bool = False
+    # Issue #1634: Optional link to the user-story slice this task belongs to.
+    # All tasks sharing a ``story_id`` form a rollback grouping ("deliver the
+    # whole MVP slice or none of it"). Parsed from the ``[USn]`` marker.
+    story_id: str | None = None
+    # Issue #1797: operator-supplied attachments (image / diagram paths)
+    # that the orchestrator encodes into a MultiModalContext at spawn time
+    # and passes to the adapter. Empty list = no attachments. Adapters
+    # that report ``is_multimodal_capable() == False`` MUST refuse spawns
+    # carrying a non-empty list before any process is launched.
+    attachments: list[str] = field(default_factory=list[str])
+    # Issue #2362: declared verification-evidence producers. Each is a mapping
+    # ``{name, kind, command, required}`` describing a proof-of-done producer
+    # (test command, coverage, lint, optional screenshot/recording) run at gate
+    # time. Required producers gate completion; advisory ones only attach. Empty
+    # list = no evidence bundle is sealed for this task. Parsed by
+    # ``bernstein.core.evidence.bundle.parse_producers``.
+    evidence_producers: list[dict[str, Any]] = field(default_factory=list[dict[str, Any]])
+    # Issue #2559: the artifacts this task intends to produce, as canonical
+    # artifact keys or patterns (``dist/*.whl``, ``pkg://pypi/bernstein/3.9.0``,
+    # ``pr://github.com/acme/widget/2559``). Where ``evidence_producers``
+    # declares how the work is *verified*, this declares what the work is
+    # supposed to *leave behind*, which is what makes "attempted and failed"
+    # distinguishable from "nothing was scheduled" at completion. Normalised by
+    # ``_normalize_declared_outputs`` into a sorted, deduplicated list. Empty
+    # list = the task declares no outputs and the completion diff is skipped.
+    declared_outputs: list[str] = field(default_factory=list[str])
+    # Explicit override for compute_max_turns()'s complexity-based auto-computation
+    # (see bernstein.core.agents.claude_max_turns.compute_max_turns). When set,
+    # this value is used verbatim for the Claude adapter's --max-turns flag,
+    # bypassing all scope/complexity-derived math. None = auto-compute as before.
+    max_turns: int | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialise a Task into a JSON-safe mapping that ``from_dict`` reads back.
+
+        The mapping mirrors every field :meth:`from_dict` consumes, so
+        ``Task.from_dict(task.to_dict())`` reconstructs the task faithfully
+        (including the :class:`ArtifactSpec`). Enums serialise to their string
+        values and nested specs to their own ``to_dict`` form.
+        """
+        return {
+            "id": self.id,
+            "title": self.title,
+            "description": self.description,
+            "role": self.role,
+            "priority": self.priority,
+            "scope": self.scope.value,
+            "complexity": self.complexity.value,
+            "estimated_minutes": self.estimated_minutes,
+            "status": self.status.value,
+            "task_type": self.task_type.value,
+            "upgrade_details": (asdict(self.upgrade_details) if self.upgrade_details is not None else None),
+            "depends_on": list(self.depends_on),
+            "parent_task_id": self.parent_task_id,
+            "completion_signals": [{"type": s.type, "value": s.value} for s in self.completion_signals],
+            "artifact_spec": self.artifact_spec.to_dict(),
+            "owned_files": list(self.owned_files),
+            "assigned_agent": self.assigned_agent,
+            "result_summary": self.result_summary,
+            "tenant_id": self.tenant_id,
+            "cell_id": self.cell_id,
+            "repo": self.repo,
+            "depends_on_repo": self.depends_on_repo,
+            "model": self.model,
+            "effort": self.effort,
+            "cli": self.cli,
+            "mcp_servers": list(self.mcp_servers),
+            "metadata": dict(self.metadata),
+            "batch_eligible": self.batch_eligible,
+            "eu_ai_act_risk": self.eu_ai_act_risk,
+            "approval_required": self.approval_required,
+            "approval_spec": (self.approval_spec.to_dict() if self.approval_spec is not None else None),
+            "cache_policy": (self.cache_policy.to_dict() if self.cache_policy is not None else None),
+            "risk_level": self.risk_level,
+            "max_output_tokens": self.max_output_tokens,
+            "meta_messages": list(self.meta_messages),
+            "created_at": self.created_at,
+            "claimed_at": self.claimed_at,
+            "completed_at": self.completed_at,
+            "closed_at": self.closed_at,
+            "deadline": self.deadline,
+            "progress_log": list(self.progress_log),
+            "version": self.version,
+            "claimed_by_session": self.claimed_by_session,
+            "parent_session_id": self.parent_session_id,
+            "execution_mode": self.execution_mode,
+            "verification_count": self.verification_count,
+            "flagged_unverified": self.flagged_unverified,
+            "retry_count": self.retry_count,
+            "max_retries": self.max_retries,
+            "retry_delay_s": self.retry_delay_s,
+            "terminal_reason": self.terminal_reason,
+            "subtask_wait_started_at": self.subtask_wait_started_at,
+            "parent_context": self.parent_context,
+            "requires": list(self.requires),
+            "tags": list(self.tags),
+            "best_of_n": self.best_of_n,
+            "refinement_rounds": self.refinement_rounds,
+            "agent_restart_between_retries": self.agent_restart_between_retries,
+            "parallel_safe": self.parallel_safe,
+            "story_id": self.story_id,
+            "attachments": list(self.attachments),
+            "evidence_producers": [dict(p) for p in self.evidence_producers],
+            "declared_outputs": list(self.declared_outputs),
+            "max_turns": self.max_turns,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> Task:
+        """Deserialise a server JSON response into a Task.
+
+        Args:
+            raw: Dict from the task server JSON response.
+
+        Returns:
+            Populated Task dataclass.
+        """
+        task_type = TaskType.STANDARD
+        if "task_type" in raw:
+            try:
+                task_type = TaskType(raw["task_type"])
+            except ValueError:
+                logger.warning("Invalid task_type %r from server", raw["task_type"])
+
+        signals: list[CompletionSignal] = []
+        for sig in raw.get("completion_signals", []):
+            try:
+                signals.append(CompletionSignal(type=sig["type"], value=sig["value"]))
+            except (KeyError, TypeError):
+                logger.warning("Invalid completion_signal entry: %r", sig)
+
+        # Rehydration boundary, deliberately lenient (#3110): every operator
+        # input surface (plan schema/loader, backlog frontmatter, CLI flags,
+        # POST /tasks) now refuses a malformed declaration at load via
+        # ``bernstein.core.tasks.artifacts.parse_artifact_spec``, so a bad
+        # block cannot *newly* enter a store. What reaches this path is a
+        # previously persisted record or a server response; raising here would
+        # brick store rehydration over one historic record, so the entry is
+        # logged as an error (loudly - this used to be the silent-downgrade
+        # hole) and the task falls back to the code_diff contract.
+        raw_spec = raw.get("artifact_spec")
+        if isinstance(raw_spec, ArtifactSpec):
+            artifact_spec = raw_spec
+        elif isinstance(raw_spec, dict):
+            try:
+                artifact_spec = ArtifactSpec.from_dict(raw_spec)
+            except (KeyError, TypeError, ValueError):
+                logger.error(
+                    "Invalid artifact_spec entry on stored task %r: %r - falling back to code_diff. "
+                    "New declarations are refused at load; this record predates that boundary or was "
+                    "hand-edited.",
+                    raw.get("id"),
+                    raw_spec,
+                )
+                artifact_spec = ArtifactSpec()
+        else:
+            artifact_spec = ArtifactSpec()
+
+        upgrade_details: UpgradeProposalDetails | None = None
+        raw_upgrade = raw.get("upgrade_details")
+        if raw_upgrade:
+            risk = RiskAssessment(**raw_upgrade.get("risk_assessment", {}))
+            rollback = RollbackPlan(**raw_upgrade.get("rollback_plan", {}))
+            upgrade_details = UpgradeProposalDetails(
+                current_state=raw_upgrade.get("current_state", ""),
+                proposed_change=raw_upgrade.get("proposed_change", ""),
+                benefits=raw_upgrade.get("benefits", []),
+                risk_assessment=risk,
+                rollback_plan=rollback,
+                cost_estimate_usd=raw_upgrade.get("cost_estimate_usd", 0.0),
+                performance_impact=raw_upgrade.get("performance_impact", ""),
+            )
+
+        return cls(
+            id=raw["id"],
+            title=raw["title"],
+            description=raw["description"],
+            role=raw["role"],
+            priority=raw.get("priority", 2),
+            scope=Scope(raw.get("scope", "medium")),
+            complexity=Complexity(raw.get("complexity", "medium")),
+            estimated_minutes=raw.get("estimated_minutes", 30),
+            status=TaskStatus(raw.get("status", "open")),
+            task_type=task_type,
+            upgrade_details=upgrade_details,
+            depends_on=raw.get("depends_on", []),
+            parent_task_id=raw.get("parent_task_id"),
+            completion_signals=signals,
+            artifact_spec=artifact_spec,
+            owned_files=raw.get("owned_files", []),
+            assigned_agent=raw.get("assigned_agent"),
+            result_summary=raw.get("result_summary"),
+            tenant_id=str(raw.get("tenant_id", "default") or "default"),
+            cell_id=raw.get("cell_id"),
+            repo=raw.get("repo"),
+            depends_on_repo=raw.get("depends_on_repo"),
+            model=raw.get("model"),
+            effort=raw.get("effort"),
+            cli=raw.get("cli"),
+            mcp_servers=list(raw.get("mcp_servers", [])),
+            metadata=dict(raw.get("metadata") or {}),
+            batch_eligible=(lambda v: None if v is None else bool(v))(raw.get("batch_eligible")),
+            eu_ai_act_risk=raw.get("eu_ai_act_risk", "minimal"),
+            approval_required=bool(raw.get("approval_required", False)),
+            approval_spec=(
+                ApprovalSpec.from_dict(raw["approval_spec"]) if isinstance(raw.get("approval_spec"), dict) else None
+            ),
+            cache_policy=_parse_cache_policy(raw.get("cache_policy")),
+            risk_level=raw.get("risk_level", "low"),
+            max_output_tokens=raw.get("max_output_tokens"),
+            meta_messages=list(raw.get("meta_messages", [])),
+            created_at=raw.get("created_at", time.time()),
+            claimed_at=raw.get("claimed_at"),
+            completed_at=raw.get("completed_at"),
+            closed_at=raw.get("closed_at"),
+            deadline=raw.get("deadline"),
+            progress_log=list(raw.get("progress_log", [])),
+            version=raw.get("version", 1),
+            claimed_by_session=raw.get("claimed_by_session"),
+            parent_session_id=raw.get("parent_session_id"),
+            execution_mode=raw.get("execution_mode"),
+            verification_count=raw.get("verification_count", 0),
+            flagged_unverified=bool(raw.get("flagged_unverified", False)),
+            retry_count=raw.get("retry_count", 0),
+            max_retries=raw.get("max_retries", 3),
+            retry_delay_s=raw.get("retry_delay_s", 0.0),
+            terminal_reason=raw.get("terminal_reason"),
+            subtask_wait_started_at=raw.get("subtask_wait_started_at"),
+            parent_context=raw.get("parent_context"),
+            requires=list(raw.get("requires", [])),
+            tags=[str(t) for t in raw.get("tags", [])],
+            best_of_n=(lambda v: None if v is None else int(v))(raw.get("best_of_n")),
+            refinement_rounds=(lambda v: None if v is None else int(v))(raw.get("refinement_rounds")),
+            agent_restart_between_retries=bool(raw.get("agent_restart_between_retries", False)),
+            parallel_safe=bool(raw.get("parallel_safe", False)),
+            story_id=(str(raw["story_id"]) if raw.get("story_id") else None),
+            attachments=_normalize_attachments(raw.get("attachments")),
+            evidence_producers=_normalize_evidence_producers(raw.get("evidence_producers")),
+            declared_outputs=_normalize_declared_outputs(raw.get("declared_outputs")),
+            max_turns=(lambda v: None if v is None else int(v))(raw.get("max_turns")),
+        )
+
+
+@dataclass(frozen=True)
+class JudgeVerdict:
+    """Result of an LLM judge evaluation of task completion."""
+
+    verdict: Literal["accept", "retry"]
+    confidence: float  # 0.0 to 1.0
+    feedback: str
+    flagged_for_review: bool = False  # True when confidence < 0.7
+
+
+@dataclass
+class GuardrailResult:
+    """Result of a single guardrail check on an agent's diff.
+
+    Attributes:
+        check: Check name (e.g. "secret_detection", "scope_enforcement").
+        passed: Whether the check passed.
+        blocked: True if this is a hard block (merge must not proceed).
+        detail: Human-readable description of findings.
+        files: Files involved in any violation.
+    """
+
+    check: str
+    passed: bool
+    blocked: bool
+    detail: str
+    files: list[str] = field(default_factory=list[str])
+
+
+@dataclass
+class JanitorResult:
+    """Result of a janitor run for a single task."""
+
+    task_id: str
+    passed: bool
+    signal_results: list[tuple[str, bool, str]]  # (signal_desc, passed, detail)
+    fix_tasks_created: list[str] = field(default_factory=list[str])  # IDs of created fix tasks
+    judge_verdict: JudgeVerdict | None = None  # Set when llm_judge signal was evaluated
+    pr_url: str | None = None  # PR URL if created after successful verification
+    guardrail_results: list[GuardrailResult] = field(
+        default_factory=list[GuardrailResult]
+    )  # Pre-merge guardrail checks
+    # Composite verifier-ladder receipt hash (#2927). Set only when the
+    # janitor ran with a VerifierLadderContext; None when the ladder is off.
+    ladder_receipt_hash: str | None = None
+
+
+@dataclass(frozen=True)
+class ModelConfig:
+    """Which model and effort to use for a task."""
+
+    model: str  # e.g. "opus", "sonnet", "gpt-5.4-mini"
+    effort: str  # e.g. "max", "high", "normal"
+    max_tokens: int = 200_000
+    is_batch: bool = False  # Use provider batch API (~50% cost reduction) for non-urgent tasks
+    aliases: list[str] = field(default_factory=list)  # Other names this model answers to
+
+
+# ---------------------------------------------------------------------------
+# Cost tracking models
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class AgentCostSummary:
+    """Per-agent cost accumulation across a run.
+
+    Attributes:
+        agent_id: The agent session identifier.
+        total_cost_usd: Sum of all costs incurred by this agent.
+        task_count: Number of tasks (invocations) recorded for this agent.
+        model_breakdown: Mapping of model name → cost in USD for that model.
+    """
+
+    agent_id: str
+    total_cost_usd: float
+    task_count: int
+    model_breakdown: dict[str, float]
+
+
+@dataclass(frozen=True)
+class ModelCostBreakdown:
+    """Per-model cost breakdown across a run.
+
+    Attributes:
+        model: Model name (e.g. ``"sonnet"``, ``"opus"``).
+        total_cost_usd: Sum of all costs incurred using this model.
+        total_tokens: Total input + output + cached tokens consumed by this model.
+        invocation_count: Number of times this model was invoked.
+        input_tokens: Total input (prompt) tokens consumed by this model.
+        output_tokens: Total output (completion) tokens consumed by this model.
+        cache_read_tokens: Total tokens served from prompt cache (read).
+        cache_write_tokens: Total tokens written to prompt cache (creation).
+    """
+
+    model: str
+    total_cost_usd: float
+    total_tokens: int
+    invocation_count: int
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialise to a JSON-safe mapping."""
+        return {
+            "model": self.model,
+            "total_cost_usd": self.total_cost_usd,
+            "total_tokens": self.total_tokens,
+            "invocation_count": self.invocation_count,
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "cache_read_tokens": self.cache_read_tokens,
+            "cache_write_tokens": self.cache_write_tokens,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> ModelCostBreakdown:
+        """Deserialise from a dictionary."""
+        return cls(
+            model=str(d["model"]),
+            total_cost_usd=float(d["total_cost_usd"]),
+            total_tokens=int(d["total_tokens"]),
+            invocation_count=int(d["invocation_count"]),
+            input_tokens=int(d.get("input_tokens", 0)),
+            output_tokens=int(d.get("output_tokens", 0)),
+            cache_read_tokens=int(d.get("cache_read_tokens", 0)),
+            cache_write_tokens=int(d.get("cache_write_tokens", 0)),
+        )
+
+
+@dataclass(frozen=True)
+class RunCostProjection:
+    """Estimated final cost for an ongoing run.
+
+    Computes a simple linear projection: ``projected_total = current +
+    avg_cost_per_task * tasks_remaining``.  Confidence grows toward 1.0 as
+    more tasks complete and the per-task average stabilises.
+
+    Attributes:
+        run_id: Orchestrator run identifier.
+        tasks_done: Tasks completed so far.
+        tasks_remaining: Tasks still in backlog / in-progress.
+        current_cost_usd: Cost incurred so far.
+        projected_total_usd: Estimated final cost if the run completes.
+        avg_cost_per_task_usd: Average cost per completed task (0 if no data).
+        budget_usd: Budget cap (0 = unlimited).
+        within_budget: True when projected total does not exceed the cap.
+        confidence: 0.0-1.0; reaches 1.0 after 5 completed tasks.
+    """
+
+    run_id: str
+    tasks_done: int
+    tasks_remaining: int
+    current_cost_usd: float
+    projected_total_usd: float
+    avg_cost_per_task_usd: float
+    budget_usd: float
+    within_budget: bool
+    confidence: float
+
+
+@dataclass
+class RunCostReport:
+    """Aggregated cost report for a run, suitable for persistence.
+
+    Attributes:
+        run_id: Orchestrator run identifier.
+        total_spent_usd: Total cost incurred in this run.
+        budget_usd: Budget cap (0 = unlimited).
+        per_agent: Per-agent cost summaries, sorted by spend descending.
+        per_model: Per-model cost breakdowns, sorted by spend descending.
+        projection: Run-end cost projection, or ``None`` if no task counts provided.
+        timestamp: Unix timestamp when this report was generated.
+        cache_savings_usd: Estimated cost savings from prompt caching.
+            Computed as the difference between what cache-read tokens would
+            have cost at full input price vs the discounted cache-read price.
+    """
+
+    run_id: str
+    total_spent_usd: float
+    budget_usd: float
+    per_agent: list[AgentCostSummary]
+    per_model: list[ModelCostBreakdown]
+    projection: RunCostProjection | None
+    timestamp: float = field(default_factory=time.time)
+    cache_savings_usd: float = 0.0
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialise to a JSON-safe dict."""
+        proj: dict[str, Any] | None = None
+        if self.projection is not None:
+            p = self.projection
+            proj = {
+                "run_id": p.run_id,
+                "tasks_done": p.tasks_done,
+                "tasks_remaining": p.tasks_remaining,
+                "current_cost_usd": p.current_cost_usd,
+                "projected_total_usd": p.projected_total_usd,
+                "avg_cost_per_task_usd": p.avg_cost_per_task_usd,
+                "budget_usd": p.budget_usd,
+                "within_budget": p.within_budget,
+                "confidence": p.confidence,
+            }
+        return {
+            "run_id": self.run_id,
+            "total_spent_usd": self.total_spent_usd,
+            "budget_usd": self.budget_usd,
+            "timestamp": self.timestamp,
+            "per_agent": [
+                {
+                    "agent_id": a.agent_id,
+                    "total_cost_usd": a.total_cost_usd,
+                    "task_count": a.task_count,
+                    "model_breakdown": a.model_breakdown,
+                }
+                for a in self.per_agent
+            ],
+            "per_model": [
+                {
+                    "model": m.model,
+                    "total_cost_usd": m.total_cost_usd,
+                    "total_tokens": m.total_tokens,
+                    "invocation_count": m.invocation_count,
+                }
+                for m in self.per_model
+            ],
+            "projection": proj,
+            "cache_savings_usd": round(self.cache_savings_usd, 6),
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> RunCostReport:
+        """Deserialise from a dict produced by :meth:`to_dict`."""
+        per_agent = [
+            AgentCostSummary(
+                agent_id=a["agent_id"],
+                total_cost_usd=float(a["total_cost_usd"]),
+                task_count=int(a["task_count"]),
+                model_breakdown={k: float(v) for k, v in a.get("model_breakdown", {}).items()},
+            )
+            for a in d.get("per_agent", [])
+        ]
+        per_model = [
+            ModelCostBreakdown(
+                model=m["model"],
+                total_cost_usd=float(m["total_cost_usd"]),
+                total_tokens=int(m["total_tokens"]),
+                invocation_count=int(m["invocation_count"]),
+            )
+            for m in d.get("per_model", [])
+        ]
+        proj: RunCostProjection | None = None
+        if d.get("projection"):
+            p = d["projection"]
+            proj = RunCostProjection(
+                run_id=str(p["run_id"]),
+                tasks_done=int(p["tasks_done"]),
+                tasks_remaining=int(p["tasks_remaining"]),
+                current_cost_usd=float(p["current_cost_usd"]),
+                projected_total_usd=float(p["projected_total_usd"]),
+                avg_cost_per_task_usd=float(p["avg_cost_per_task_usd"]),
+                budget_usd=float(p["budget_usd"]),
+                within_budget=bool(p["within_budget"]),
+                confidence=float(p["confidence"]),
+            )
+        return cls(
+            run_id=str(d["run_id"]),
+            total_spent_usd=float(d.get("total_spent_usd", 0.0)),
+            budget_usd=float(d.get("budget_usd", 0.0)),
+            per_agent=per_agent,
+            per_model=per_model,
+            projection=proj,
+            timestamp=float(d.get("timestamp", 0.0)),
+            cache_savings_usd=float(d.get("cache_savings_usd", 0.0)),
+        )
+
+
+@dataclass
+class ProgressSnapshot:
+    """A point-in-time progress snapshot reported by an agent.
+
+    Agents POST this to the task server every 60 seconds.  The orchestrator
+    compares consecutive snapshots to detect stalled agents.
+
+    Attributes:
+        timestamp: Unix timestamp when the snapshot was written.
+        files_changed: Number of files modified since the agent started.
+        tests_passing: Number of tests currently passing (-1 = unknown).
+        errors: Number of active errors / compilation failures.
+        last_file: Last file the agent was editing (empty string if unknown).
+    """
+
+    timestamp: float
+    files_changed: int = 0
+    tests_passing: int = -1
+    errors: int = 0
+    last_file: str = ""
+
+    def is_same_progress(self, other: ProgressSnapshot) -> bool:
+        """Return True if *other* shows the same progress as self.
+
+        Compares the meaningful counters; ignores timestamp and last_file
+        (a new file open without other changes does not count as progress).
+        """
+        return (
+            self.files_changed == other.files_changed
+            and self.tests_passing == other.tests_passing
+            and self.errors == other.errors
+        )
+
+
+@dataclass
+class AgentHeartbeat:
+    """Heartbeat written by an agent to signal it is still making progress.
+
+    Agents write this to `.sdd/runtime/heartbeats/{session_id}.json` every
+    30 seconds so the orchestrator can detect stuck agents.
+
+    Attributes:
+        timestamp: Unix timestamp when the heartbeat was written.
+        files_changed: Number of files modified since the agent started.
+        status: Agent self-reported status ("working", "idle", "stuck").
+        current_file: File currently being edited, or empty string.
+        phase: Optional richer phase label ("planning", "implementing", "testing").
+        progress_pct: Optional rough completion percentage (0-100).
+        message: Optional human-readable status message.
+    """
+
+    timestamp: float
+    files_changed: int = 0
+    status: str = "working"
+    current_file: str = ""
+    phase: str = ""
+    progress_pct: int = 0
+    message: str = ""
+
+
+@dataclass
+class AgentSession:
+    """A running agent instance."""
+
+    id: str
+    role: str
+    trace_id: str = ""  # Correlation ID across task -> agent -> gate -> merge
+    pid: int | None = None
+    task_ids: list[str] = field(default_factory=list[str])
+    model_config: ModelConfig = field(default_factory=lambda: ModelConfig("sonnet", "high"))
+    heartbeat_ts: float = 0.0
+    spawn_ts: float = field(default_factory=time.time)
+    status: Literal["starting", "working", "idle", "dead"] = "starting"
+    exit_code: int | None = None  # Process exit code once known; None while still running
+    cell_id: str | None = None  # Which cell this agent belongs to
+    provider: str | None = None  # Provider selected by TierAwareRouter
+    agent_source: str = "built-in"  # "catalog", "agency", or "built-in"
+    timeout_s: int | None = None  # Per-agent wall-clock timeout; None = use OrchestratorConfig default
+    timeout_timer: Any | None = None  # Armed watchdog timer, stashed at spawn for re-arm on extension (#4571)
+    log_path: str = ""  # Path to agent log file for live streaming
+    tokens_used: int = 0  # Running total of input+output tokens consumed by this agent
+    token_budget: int = 0  # Per-task token budget computed from scope (0 = unlimited)
+    context_window_tokens: int = 0  # Provider/model max context window for utilization tracking
+    context_utilization_pct: float = 0.0  # Percentage of the context window currently consumed
+    context_utilization_alert: bool = False  # True when utilization crosses the warning threshold
+    parent_id: str | None = None  # ID of the agent session that spawned this one (delegation tree)
+    isolation: str = "none"  # "none", "worktree", or "container"
+    container_id: str | None = None  # Container ID when isolation=container
+    runtime_backend: Literal["local", "openclaw"] = "local"
+    bridge_session_key: str | None = None
+    bridge_run_id: str | None = None
+    transition_reason: TransitionReason | None = None
+    abort_reason: AbortReason | None = None
+    abort_detail: str = ""
+    finish_reason: str = ""
+    meta_messages: list[str] = field(default_factory=list[str])  # Operational nudges/hints (T423)
+    # Response-style profile applied at spawn. The profile name and the
+    # SHA-256 of the rendered style addendum are stamped here so the cost
+    # ledger entry written at task completion can attribute spend per
+    # profile without re-resolving config.
+    response_profile: str = ""
+    profile_content_sha256: str = ""
+    # Consecutive reap ticks where heartbeat_ts was refreshed only from the
+    # agent log's mtime, not a live PID or the heartbeat JSON (issue #3058).
+    # Reset whenever a stronger signal confirms real activity.
+    log_only_heartbeat_ticks: int = 0
+    # Declared context files resolved at dispatch (issue #3375). Each entry
+    # is ``{"path", "order", "sha256", "reason_code"}`` in declared order -
+    # an unresolvable path keeps its position with a reason code instead of
+    # being skipped. Stamped by the spawner so the run journal can record
+    # the attachment set next to the ``agent_spawned`` event. Empty when the
+    # session's tasks declare nothing.
+    context_attachments: list[dict[str, object]] = field(default_factory=list[dict[str, object]])
+    # Skill templates injected into the worktree at spawn time (issue #3382).
+    # Each entry is ``{"template_name", "version", "pre_render_digest",
+    # "rendered_digest", "trigger_source", "status"}`` in injection order -
+    # a revoked skill keeps its position with status="refused" instead of
+    # being skipped. Stamped by the spawner so the run journal can record
+    # the injected set next to the ``agent_spawned`` event, independent of
+    # whether the human-readable activation log is enabled. Empty when
+    # nothing was injected (not absent).
+    injected_skills: list[dict[str, str]] = field(default_factory=list)
+    # Operator attachments resolved at spawn (issue #1797). Each entry is
+    # ``{"sha256", "mime", "worktree_id", "source_path", "modality"}`` in
+    # declared order. Stamped by the spawner from the same dispatch that
+    # stored the bytes in CAS and appended the ``multimodal.attach`` chain
+    # event, so the session record names exactly the digests the chain
+    # attests. Empty when the session's tasks declare no attachments.
+    multimodal_attachments: list[dict[str, str]] = field(default_factory=list)
+    # Per-section context receipt captured at spawn time (issue #4405). Each
+    # entry is ``{"label", "content_sha256", "token_estimate", "char_count"}``
+    # in prompt order - a deterministic fingerprint of the context actually
+    # sent to the model. Empty when no receipt was captured.
+    context_receipt: list[dict[str, object]] = field(default_factory=list[dict[str, object]])
+
+    # Spawn-time prompt budget measurement (#4377). Stamped before the
+    # adapter is invoked so the cost is queryable without waiting for the
+    # session to end.
+    spawn_prompt_tokens: int = 0  # estimated token count of assembled prompt at spawn
+    spawn_prompt_utilization_pct: float = 0.0  # percentage of context window consumed by prompt
+    spawn_prompt_over_budget: bool = False  # True when prompt exceeded the budget threshold
+
+
+class IsolationMode(StrEnum):
+    """Agent isolation mode."""
+
+    NONE = "none"
+    WORKTREE = "worktree"
+    CONTAINER = "container"
+
+
+@dataclass(frozen=True, slots=True)
+class IsolationDowngrade:
+    """A requested isolation boundary that could not be provided.
+
+    Issue #3014: when a spawn is routed to container isolation - via the
+    ``sandbox:`` config, ``--sandbox docker``, or ``BERNSTEIN_SANDBOX_RUNTIME``
+    - but no container runtime is available, the spawn falls back to a weaker
+    boundary (worktree, or none). Left as a bare log WARNING, that downgrade is
+    invisible to the operator who asked for the stronger boundary. Recording it
+    as a typed value lets the run summary and the HMAC-chained audit log both
+    surface requested-vs-actual isolation, so the weaker posture is an auditable
+    decision rather than a silent substitution.
+
+    Attributes:
+        session_id: Agent session whose isolation was downgraded.
+        requested: The isolation mode that was requested (an
+            :class:`IsolationMode` value, e.g. ``"container"``).
+        actual: The isolation mode actually provided (e.g. ``"worktree"``).
+        reason: Human-readable cause (typically the container-runtime error).
+    """
+
+    session_id: str
+    requested: str
+    actual: str
+    reason: str
+
+    def as_dict(self) -> dict[str, str]:
+        """Return a JSON-serialisable mapping for run-summary rendering."""
+        return {
+            "session_id": self.session_id,
+            "requested": self.requested,
+            "actual": self.actual,
+            "reason": self.reason,
+        }
+
+
+class AgentBackend(StrEnum):
+    """Agent execution backend.
+
+    SUBPROCESS (default) launches each agent as a separate OS process.
+    TMUX runs the agent in a tmux session for manual inspection.
+    IN_PROCESS runs the agent as a Python thread in the same process
+    for lightweight, fast tasks - use with caution, crashes can take
+    down the task server.
+    SSH runs the agent on a remote machine via SSH; requires a ``remote:``
+    section in bernstein.yaml.
+    """
+
+    SUBPROCESS = "subprocess"
+    TMUX = "tmux"
+    IN_PROCESS = "in_process"
+    SSH = "ssh"
+
+
+@dataclass(frozen=True)
+class ContainerIsolationConfig:
+    """Container isolation settings for the orchestrator.
+
+    Attributes:
+        enabled: Whether container isolation is active.
+        runtime: Container runtime backend ("docker", "podman", "gvisor", "firecracker").
+        image: Container image for agent execution.
+        cpu_cores: CPU core limit per container. None = unlimited.
+        memory_mb: Memory limit in MB per container. None = unlimited.
+        pids_limit: Max processes per container. None = unlimited.
+        network_mode: Network mode ("host", "bridge", "none").
+        drop_capabilities: Linux capabilities to drop.
+        read_only_rootfs: Mount root filesystem as read-only.
+        auto_build_image: Build agent image if not found.
+        two_phase_sandbox: Enable Codex-style two-phase execution.  Phase 1
+            runs with network access to install deps; Phase 2 runs the agent
+            with the network fully disabled.
+        sandbox_setup_commands: Override auto-detected Phase 1 commands.
+            Empty tuple (default) triggers auto-detection from the workspace.
+    """
+
+    enabled: bool = False
+    runtime: str = "docker"
+    image: str = "bernstein-agent:latest"
+    cpu_cores: float | None = 2.0
+    memory_mb: int | None = 4096
+    pids_limit: int | None = 256
+    network_mode: str = "host"
+    drop_capabilities: tuple[str, ...] = (
+        "NET_RAW",
+        "SYS_ADMIN",
+        "SYS_PTRACE",
+        "MKNOD",
+    )
+    read_only_rootfs: bool = False
+    auto_build_image: bool = True
+    two_phase_sandbox: bool = False
+    sandbox_setup_commands: tuple[str, ...] = ()
+
+
+@dataclass
+class Cell:
+    """A self-contained team unit: 1 manager + N workers."""
+
+    id: str
+    name: str
+    manager: AgentSession | None = None
+    workers: list[AgentSession] = field(default_factory=list[AgentSession])
+    max_workers: int = 6
+    task_queue: list[Task] = field(default_factory=list[Task])
+
+
+@dataclass(frozen=True)
+class TelemetryConfig:
+    """OpenTelemetry configuration.
+
+    Attributes:
+        otlp_endpoint: Target OTLP collector URL (e.g. http://localhost:4317).
+            If None, telemetry is disabled.
+    """
+
+    otlp_endpoint: str | None = None
+
+
+@dataclass(frozen=True)
+class RAGConfig:
+    """Smart context injection configuration.
+
+    Attributes:
+        max_files: Maximum number of relevant files to inject.
+        max_tokens: Maximum tokens to use for injected context.
+    """
+
+    max_files: int = 5
+    max_tokens: int = 50000
+
+
+@dataclass
+class CostAnomalyConfig:
+    """Configuration for cost anomaly detection.
+
+    Args:
+        enabled: Whether cost anomaly detection is active.
+        per_task_multiplier: Alert when task cost exceeds this multiple of tier median.
+        per_task_critical_multiplier: Kill agent when cost exceeds this multiple.
+        budget_warn_pct: Log warning when spend exceeds this % of budget.
+        budget_stop_pct: Stop spawning when spend exceeds this %.
+        token_ratio_max: Flag when output/input token ratio exceeds this.
+        token_ratio_min_tokens: Minimum total tokens before ratio check applies.
+        retry_cost_multiplier: Stop retrying when cumulative retry cost exceeds
+            this multiple of the original attempt.
+        baseline_window: Number of recent tasks to keep for baseline statistics.
+        baseline_min_samples: Minimum samples per tier before ceiling checks activate.
+    """
+
+    enabled: bool = True
+    per_task_multiplier: float = 3.0
+    per_task_critical_multiplier: float = 6.0
+    budget_warn_pct: float = 60.0
+    budget_stop_pct: float = 90.0
+    token_ratio_max: float = 5.0
+    token_ratio_min_tokens: int = 5000
+    retry_cost_multiplier: float = 2.0
+    baseline_window: int = 50
+    baseline_min_samples: int = 5
+
+
+@dataclass(frozen=True)
+class BatchConfig:
+    """Provider batch execution configuration."""
+
+    enabled: bool = False
+    eligible: list[str] = field(default_factory=list[str])
+
+
+@dataclass(frozen=True)
+class TestAgentConfig:
+    """Configuration for auto-spawning paired test tasks."""
+
+    always_spawn: bool = False
+    model: str = "sonnet"
+    trigger: Literal["on_task_complete"] = "on_task_complete"
+
+
+@dataclass(frozen=True)
+class OpenClawBridgeConfig:
+    """Typed OpenClaw Gateway bridge configuration.
+
+    Attributes:
+        enabled: Whether the OpenClaw bridge should be considered for spawns.
+        url: Gateway WebSocket URL.
+        api_key: Gateway bearer token.
+        agent_id: Target OpenClaw agent identifier.
+        workspace_mode: Supported deployment mode for this bridge ticket.
+        fallback_to_local: Whether Bernstein may fall back to the local CLI
+            adapter before the remote run is accepted by the gateway.
+        connect_timeout_s: WebSocket connect timeout.
+        request_timeout_s: Per-request timeout for bridge RPC calls.
+        session_prefix: Prefix used when deriving Bernstein-owned session keys.
+        max_log_bytes: Maximum bytes served by logs().
+        model_override: Optional model override passed to the remote agent.
+    """
+
+    enabled: bool = False
+    url: str = ""
+    api_key: str = field(default="", repr=False)
+    agent_id: str = ""
+    workspace_mode: Literal["shared_workspace"] = "shared_workspace"
+    fallback_to_local: bool = True
+    connect_timeout_s: float = 10.0
+    request_timeout_s: float = 30.0
+    session_prefix: str = "bernstein-"
+    max_log_bytes: int = 1_048_576
+    model_override: str | None = None
+
+
+@dataclass(frozen=True)
+class BridgeConfigSet:
+    """Optional runtime bridge configuration set."""
+
+    openclaw: OpenClawBridgeConfig | None = None
+
+
+@dataclass
+class ApprovalWorkflowConfig:
+    """Risk-based approval workflow configuration.
+
+    Attributes:
+        enabled: Whether the approval workflow is active.
+        high_risk: Gate for high-risk tasks ("auto", "pr", "review").
+        medium_risk: Gate for medium-risk tasks.
+        low_risk: Gate for low-risk tasks.
+        timeout_hours: Auto-reject tasks if approval takes longer than this.
+        notify_channels: Where to send approval notifications.
+    """
+
+    enabled: bool = True
+    high_risk: str = "review"
+    medium_risk: str = "pr"
+    low_risk: str = "auto"
+    timeout_hours: int = 24
+    notify_channels: list[str] = field(default_factory=lambda: ["slack", "email"])
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ApprovalWorkflowConfig:
+        return cls(
+            enabled=bool(data.get("enabled", True)),
+            high_risk=str(data.get("high_risk", "review")),
+            medium_risk=str(data.get("medium_risk", "pr")),
+            low_risk=str(data.get("low_risk", "auto")),
+            timeout_hours=int(data.get("timeout_hours", 24)),
+            notify_channels=list(data.get("notify_channels", ["slack", "email"])),
+        )
+
+
+@dataclass
+class SmtpConfig:
+    """SMTP configuration for email notifications (T207)."""
+
+    host: str
+    port: int
+    username: str
+    password: str
+    from_address: str
+    to_addresses: list[str]
+
+
+@dataclass(frozen=True)
+class ConvergenceGuardConfig:
+    """Thresholds for the convergence guard (T723).
+
+    Attributes:
+        max_pending_merges: Maximum merges in the queue before blocking spawns.
+        max_active_agents: Maximum concurrent alive agents before blocking spawns.
+        max_error_rate: Maximum recent failure rate (0.0-1.0) before blocking spawns.
+        max_spawn_rate: Maximum spawns per minute before blocking spawns.
+        error_rate_window_seconds: Look-back window for computing error rate.
+        spawn_rate_window_seconds: Look-back window for computing spawn rate.
+        min_error_rate_samples: Observations the error-rate window must hold
+            before that gate may block a wave.
+    """
+
+    max_pending_merges: int = 10
+    max_active_agents: int = 8
+    max_error_rate: float = 0.5
+    max_spawn_rate: float = 12.0
+    error_rate_window_seconds: int = 300  # 5 minutes
+    spawn_rate_window_seconds: int = 60  # 1 minute
+    min_error_rate_samples: int = 3
+
+
+@dataclass(frozen=True)
+class CIAutofixConfig:
+    """Configuration for orchestrator-driven CI autofix polling.
+
+    When ``enabled`` is True, the orchestrator tick periodically polls the
+    GitHub Actions API for failing workflow runs and creates Bernstein fix
+    tasks via :class:`CIAutofixPipeline`.  GitHub token plumbing is a
+    separate ticket; when ``token`` is empty the tick falls back to the
+    ``GITHUB_TOKEN`` environment variable.
+
+    Attributes:
+        enabled: Whether the CI autofix poller runs inside the tick loop.
+            Defaults to ``False`` so the behaviour is opt-in.
+        poll_interval_s: Minimum seconds between poll attempts. The first
+            poll fires on the first tick when enabled.
+        repo: Repository in ``owner/repo`` format. When empty the poller
+            is a no-op (nothing to watch).
+        token: Optional GitHub token. When empty, ``GITHUB_TOKEN`` is read
+            from the environment at poll time.
+        per_page: Number of most recent runs to request per poll.
+    """
+
+    enabled: bool = False
+    poll_interval_s: int = 60
+    repo: str = ""
+    token: str = ""
+    per_page: int = 10
+
+
+@dataclass
+class OrchestratorConfig:
+    """Configuration for the orchestrator main loop.
+
+    Args:
+        max_agents: Maximum concurrent agent processes.
+        poll_interval_s: Seconds between orchestrator ticks.
+        heartbeat_timeout_s: Seconds before an agent is considered stale. Defaults
+            to ``AGENT.heartbeat_stale_s`` from ``core.defaults`` (canonical source).
+        heartbeat_enabled: Whether the file-based heartbeat protocol is enabled.
+        max_tasks_per_agent: Maximum tasks batched into one agent spawn.
+        server_url: Base URL of the Bernstein task server.
+        evolution_enabled: Whether the self-evolution feedback loop is active.
+        evolution_tick_interval: Run evolution analysis every N ticks (~1.5 min at 3s poll).
+        max_task_retries: Max times a task is re-queued after agent crash (0 = no retry).
+        cross_model_verify: Cross-model verification config (None = disabled).
+        context_degradation: Context-degradation detector config (None = disabled).
+            When enabled, agents with consecutive cross-model rejections are
+            checkpointed and sent SHUTDOWN so a fresh replacement spawns with
+            a recovery-context preamble.
+        telemetry: OpenTelemetry configuration.
+        smtp: SMTP configuration for email notifications.
+    """
+
+    max_agents: int = 6
+    # Derived from ORCHESTRATOR.tick_interval_s (float, canonical) so overrides
+    # via ``tuning.orchestrator.tick_interval_s`` actually change the tick rate.
+    poll_interval_s: int = field(default_factory=_default_poll_interval_s)
+    smtp: SmtpConfig | None = None
+    # Unified with AGENT.heartbeat_stale_s. Previously 900s; now defaults to 120s.
+    # Deployments that explicitly relied on the 900s value must set this field explicitly.
+    heartbeat_timeout_s: int = field(default_factory=lambda: int(AGENT.heartbeat_stale_s))
+    # Time-to-first-turn cap for agents still in the `starting` phase. Kept
+    # separate from (and larger than) ``heartbeat_timeout_s`` so a slow/free
+    # model that takes >120s to its first turn is not reaped mid-work while a
+    # non-heartbeat adapter has only its spawn-time heartbeat on disk (issue
+    # #3012). Overridable via ``tuning.agent.heartbeat_starting_timeout_s``.
+    heartbeat_starting_timeout_s: int = field(default_factory=lambda: int(AGENT.heartbeat_starting_timeout_s))
+    heartbeat_enabled: bool = True
+    # Derived from ORCHESTRATOR.max_agent_runtime_s (canonical) so
+    # ``tuning.orchestrator.max_agent_runtime_s`` overrides the starting
+    # wall-clock kill deadline (agents need time for complex tasks; this
+    # self-extends up to a 5400s hard cap while heartbeating, see
+    # core/agents/agent_lifecycle.py - this is only the starting value).
+    max_agent_runtime_s: int = field(default_factory=_default_max_agent_runtime_s)
+    # Derived from ORCHESTRATOR.stalled_manager_threshold_s (canonical) so
+    # ``tuning.orchestrator.stalled_manager_threshold_s`` overrides actually
+    # change the manager-stall deadline. See core.orchestration.stalled_manager.
+    stalled_manager_threshold_s: float = field(default_factory=_default_stalled_manager_threshold_s)
+    # Derived from ORCHESTRATOR.planning_window_s (canonical). Bounds how long
+    # the run may sit on an empty ledger after planning has already produced
+    # tasks at least once; see core.orchestration.orchestrator.
+    planning_window_s: float = field(default_factory=_default_planning_window_s)
+    max_tasks_per_agent: int = 2  # batch 2 same-role tasks per agent to reduce context overhead
+    server_url: str = "http://localhost:8052"
+    evolution_enabled: bool = True
+    evolution_tick_interval: int = 30
+    auto_decompose: bool = True
+    max_task_retries: int = 2
+    kill_on_memory_leak: bool = False
+    evolve_mode: bool = False
+    budget_usd: float = 0.0  # Stop spawning when cumulative cost reaches this (0 = unlimited)
+    budget_aware_routing_enabled: bool = True  # downgrade opus→sonnet near budget cap
+    dry_run: bool = False  # Preview planned spawns without actually spawning agents
+    auth_token: str | None = None  # Bearer token for authenticated API calls
+    merge_strategy: str = "pr"  # "pr" | "direct" - how agent work reaches the main branch
+    auto_merge: bool = True  # Auto-merge PR after code review passes (requires gh CLI)
+    pr_labels: list[str] = field(default_factory=lambda: ["bernstein", "auto-generated"])
+    approval: Any = "auto"  # "auto" | "review" | "pr" or dict for workflow
+    approval_workflow: ApprovalWorkflowConfig | None = field(default=None, repr=False)
+    recovery: str = "resume"  # "resume" | "restart" | "escalate" - crash recovery strategy
+    max_crash_retries: int = 2  # Max times to resume in same worktree before escalating
+    cross_model_verify: Any | None = None  # CrossModelVerifierConfig | None
+    context_degradation: Any | None = None  # ContextDegradationConfig | None - restart agents on quality drop
+    # Proactive compaction lane: {proactive, threshold, max_per_task}.
+    # Resolved by orchestration.proactive_compaction.resolve_compaction_settings;
+    # None keeps the lane off so existing runs are unchanged.
+    compaction: Any | None = None
+    force_parallel: bool = False  # Skip complexity advisor - always decompose/parallelize
+    plan_mode: bool = False  # When True, tasks start as PLANNED and require approval before execution
+    workflow: str | None = None  # "governed" activates governed workflow mode; None = adaptive (default)
+    container_isolation: ContainerIsolationConfig = field(
+        default_factory=ContainerIsolationConfig,
+    )  # Container-based agent isolation settings
+    compliance: Any | None = None  # ComplianceConfig | None - compliance preset configuration
+    max_tokens_per_task: dict[str, int] = field(
+        default_factory=lambda: {"small": 10_000, "medium": 50_000, "large": 200_000},
+    )  # Per-task token budget by scope; agents warned at 80%, hard-killed at 2x
+    telemetry: TelemetryConfig = field(default_factory=TelemetryConfig)
+    ab_test: bool = False
+    rag: RAGConfig = field(default_factory=RAGConfig)
+    cost_anomaly: CostAnomalyConfig = field(default_factory=CostAnomalyConfig)
+    batch: BatchConfig = field(default_factory=BatchConfig)
+    max_cost_per_agent: float = 0.0  # Hard per-agent spend cap (0 = unlimited)
+    # Cost-aware scheduling policy (issue #2354): USD caps + price-table
+    # overrides consulted before each dispatch. ``None`` (the default) leaves
+    # the deterministic USD dispatch gate a no-op (fail-open). Typed ``Any`` to
+    # avoid importing the pydantic config schema into the task models module.
+    cost_policy: Any | None = None
+    test_agent: TestAgentConfig = field(default_factory=TestAgentConfig)
+    convergence: ConvergenceGuardConfig = field(default_factory=ConvergenceGuardConfig)
+    ci_autofix: CIAutofixConfig = field(default_factory=CIAutofixConfig)
+    permission_mode: str | None = None  # "bypass" | "plan" | "auto" | "default" - see permission_mode.py
+    agent_resource_limits: Any | None = None  # ResourceLimits | None - OS-level limits for non-sandboxed spawns
+    shutdown_stagger_delay_s: float = 5.0  # Seconds between SHUTDOWN signals during drain
+    # Single source of truth lives in ``defaults.ORCHESTRATOR``; using ``default_factory`` with a
+    # module-attribute lookup (not a captured reference) ensures ``override()`` and ``reset()``
+    # in ``bernstein.core.defaults`` flow through to newly-constructed ``OrchestratorConfig``
+    # instances.
+    stale_claim_timeout_s: float = field(
+        default_factory=lambda: _defaults.ORCHESTRATOR.stale_claim_timeout_s,
+    )  # Seconds before a claimed task with no live agent is released
+    drain_timeout_s: float = field(
+        default_factory=lambda: _defaults.ORCHESTRATOR.drain_timeout_s,
+    )  # Seconds to wait for agents during drain before cleanup
+    # Terminal state for a quiescent run that produced zero terminal tasks
+    # (issue #3010). See ``core.orchestration.run_stall`` for the criterion
+    # and ``defaults.OrchestratorDefaults`` for why the grace is 1800s.
+    stalled_run_grace_s: float = field(
+        default_factory=lambda: _defaults.ORCHESTRATOR.stalled_run_grace_s,
+    )  # Seconds of unchanged task state before a zero-terminal run is stopped
+    stalled_run_ticks: int = field(
+        default_factory=lambda: _defaults.ORCHESTRATOR.stalled_run_ticks,
+    )  # Consecutive no-progress quiescent ticks required alongside the grace
+    # Priority-aging janitor: boost long-waiting low-priority tasks
+    # so they do not starve behind a steady stream of P1 work.  Default off
+    # until run data confirms behaviour; interval is measured in orchestrator ticks.
+    priority_aging_enabled: bool = False
+    priority_aging_interval_ticks: int = 60
+    # Weighted fair scheduling across tenants: re-order batches by
+    # deficit round-robin so high-weight tenants get proportionally more slots
+    # while per-tenant caps prevent any tenant from monopolising the worker pool.
+    # Default off; enable once multi-tenant workloads exist.
+    fair_scheduling_enabled: bool = False
+    cost_autopilot: bool = False  # Wire CostAutopilot when True
+    # Scheduled dependency vulnerability scan. Off by default so a scoped run
+    # is never given unrequested background maintenance tasks; enable only when
+    # the target repo declares Python dependencies that should be audited.
+    dependency_scan_enabled: bool = False
+    # Whether a run whose branch diff touches src/ without tests/ gets one
+    # bounded test-authoring follow-up task at run completion (issue #4462).
+    # On by default; threaded from the seed's ``orchestration.test_followup``
+    # (bernstein.yaml). See core.orchestration.test_followup.
+    test_followup_enabled: bool = True
+    # Issue #4463: on a merge-gate (lint/tests) failure in the reap-and-merge
+    # path, seed one bounded repair task carrying the real gate output before
+    # falling through to the existing reopen/permanent-fail handling. Default
+    # on. Env override ``BERNSTEIN_GATE_REPAIR`` takes precedence when set
+    # (see ``task_lifecycle._gate_repair_enabled``).
+    gate_repair_enabled: bool = True
+    # Janitor LLM-judge model/provider override, threaded from the seed's
+    # ``judge_model``/``judge_provider`` (bernstein.yaml). None = fall back
+    # to the janitor's hardcoded JUDGE_MODEL/JUDGE_PROVIDER defaults.
+    judge_model: str | None = None
+    judge_provider: str | None = None
+
+    def __post_init__(self) -> None:
+        """Parse nested workflow config if dict provided."""
+        if isinstance(self.approval, dict):
+            self.approval_workflow = ApprovalWorkflowConfig.from_dict(self.approval)
+            self.approval = "workflow"
+
+
+# ---------------------------------------------------------------------------
+# Plan mode models
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class TaskCostEstimate:
+    """Estimated cost and risk for a single task before execution.
+
+    Attributes:
+        task_id: Server-assigned task ID.
+        title: Task title.
+        role: Agent role.
+        model: Estimated model to use.
+        estimated_tokens: Estimated total tokens (input + output).
+        estimated_cost_usd: Estimated cost in USD.
+        risk_level: Risk classification (low, medium, high, critical).
+        risk_reasons: Why this task was classified at this risk level.
+    """
+
+    task_id: str
+    title: str
+    role: str
+    model: str = "unresolved"
+    estimated_tokens: int = 0
+    estimated_cost_usd: float = 0.0
+    risk_level: Literal["low", "medium", "high", "critical"] = "low"
+    risk_reasons: list[str] = field(default_factory=list[str])
+
+
+class PlanStatus(Enum):
+    """Status of a task execution plan."""
+
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    EXPIRED = "expired"
+
+
+@dataclass
+class TaskPlan:
+    """A plan grouping tasks with cost estimates for human approval.
+
+    Created when plan_mode is enabled. Tasks start as PLANNED and are
+    promoted to OPEN only after the human approves the plan.
+
+    Attributes:
+        id: Unique plan identifier.
+        goal: The original goal that generated this plan.
+        task_estimates: Per-task cost and risk estimates.
+        total_estimated_cost_usd: Sum of all task cost estimates.
+        total_estimated_minutes: Sum of all task time estimates.
+        high_risk_tasks: IDs of tasks classified as high or critical risk.
+        status: Current plan status.
+        created_at: Unix timestamp when the plan was created.
+        decided_at: Unix timestamp when the plan was approved/rejected.
+        decision_reason: Optional reason provided by the human.
+        rendering_hash: SHA-256 digest of the canonical plan rendering, bound
+            into the approval decision so a plan modified after review is
+            detected at decision time.
+    """
+
+    id: str
+    goal: str
+    task_estimates: list[TaskCostEstimate] = field(default_factory=list[TaskCostEstimate])
+    total_estimated_cost_usd: float = 0.0
+    total_estimated_minutes: int = 0
+    high_risk_tasks: list[str] = field(default_factory=list[str])
+    status: PlanStatus = PlanStatus.PENDING
+    created_at: float = field(default_factory=time.time)
+    decided_at: float | None = None
+    decision_reason: str = ""
+    rendering_hash: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialise to a JSON-safe dict."""
+        return {
+            "id": self.id,
+            "goal": self.goal,
+            "task_estimates": [
+                {
+                    "task_id": e.task_id,
+                    "title": e.title,
+                    "role": e.role,
+                    "model": e.model,
+                    "estimated_tokens": e.estimated_tokens,
+                    "estimated_cost_usd": round(e.estimated_cost_usd, 6),
+                    "risk_level": e.risk_level,
+                    "risk_reasons": e.risk_reasons.copy(),
+                }
+                for e in self.task_estimates
+            ],
+            "total_estimated_cost_usd": round(self.total_estimated_cost_usd, 6),
+            "total_estimated_minutes": self.total_estimated_minutes,
+            "high_risk_tasks": self.high_risk_tasks,
+            "status": self.status.value,
+            "created_at": self.created_at,
+            "decided_at": self.decided_at,
+            "decision_reason": self.decision_reason,
+            "rendering_hash": self.rendering_hash,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> TaskPlan:
+        """Deserialise from a dict produced by :meth:`to_dict`."""
+        estimates = [
+            TaskCostEstimate(
+                task_id=e["task_id"],
+                title=e["title"],
+                role=e["role"],
+                model=e.get("model", "unresolved"),
+                estimated_tokens=int(e.get("estimated_tokens", 0)),
+                estimated_cost_usd=float(e.get("estimated_cost_usd", 0.0)),
+                risk_level=e.get("risk_level", "low"),
+                risk_reasons=list(e.get("risk_reasons", [])),
+            )
+            for e in d.get("task_estimates", [])
+        ]
+        return cls(
+            id=d["id"],
+            goal=d.get("goal", ""),
+            task_estimates=estimates,
+            total_estimated_cost_usd=float(d.get("total_estimated_cost_usd", 0.0)),
+            total_estimated_minutes=int(d.get("total_estimated_minutes", 0)),
+            high_risk_tasks=list(d.get("high_risk_tasks", [])),
+            status=PlanStatus(d.get("status", "pending")),
+            created_at=float(d.get("created_at", 0.0)),
+            decided_at=d.get("decided_at"),
+            decision_reason=d.get("decision_reason", ""),
+            rendering_hash=d.get("rendering_hash", ""),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Cluster / distributed coordination models
+# ---------------------------------------------------------------------------
+
+
+class NodeStatus(Enum):
+    """Status of a cluster node."""
+
+    ONLINE = "online"
+    READY = "ready"  # Registered but not yet accepting tasks
+    DEGRADED = "degraded"  # Responding but over capacity / errors
+    CORDONED = "cordoned"  # Excluded from scheduling, still accepts heartbeats
+    DRAINING = "draining"  # Cordoned + actively draining existing agents
+    OFFLINE = "offline"
+
+
+class ClusterTopology(Enum):
+    """Cluster topology mode."""
+
+    STAR = "star"  # One central server, N worker nodes (default)
+    MESH = "mesh"  # Any node can serve tasks, gossip sync
+    HIERARCHICAL = "hierarchical"  # VP -> cell-leaders -> workers
+
+
+@dataclass
+class NodeCapacity:
+    """Advertised capacity of a cluster node."""
+
+    max_agents: int = 6
+    available_slots: int = 6
+    active_agents: int = 0
+    gpu_available: bool = False
+    supported_models: list[str] = field(default_factory=lambda: ["sonnet", "opus", "haiku"])
+
+
+@dataclass
+class NodeInfo:
+    """A registered node in the Bernstein cluster."""
+
+    id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+    name: str = ""
+    url: str = ""  # Base URL of this node's orchestrator (for callbacks)
+    capacity: NodeCapacity = field(default_factory=NodeCapacity)
+    status: NodeStatus = NodeStatus.ONLINE
+    last_heartbeat: float = field(default_factory=time.time)
+    registered_at: float = field(default_factory=time.time)
+    labels: dict[str, str] = field(default_factory=dict[str, str])  # e.g. {"gpu": "true", "region": "us-east"}
+    cell_ids: list[str] = field(default_factory=list[str])  # Cells running on this node
+
+    def is_alive(self, timeout_s: float = 60.0) -> bool:
+        """Check if the node has sent a heartbeat within timeout."""
+        return time.time() - self.last_heartbeat < timeout_s
+
+
+@dataclass(frozen=True)
+class MeshPeerKey:
+    """A gossip peer's pinned identity: its ``node_id`` and its public key.
+
+    A MESH ``node_id`` is not an operator-chosen label -- it is the RFC 7638
+    thumbprint of the node's Ed25519 claim-signing key, so the identity and the
+    key are the same fact. Pinning therefore has a checkable form: the
+    thumbprint of ``public_key_x`` must reproduce ``node_id``, which is what
+    :meth:`node_id_from_key` computes and the seed loader asserts. A pin that
+    does not verify is a typo, not a policy, and is rejected before a node
+    boots with it.
+
+    Attributes:
+        node_id: The peer's install identity id, as it appears in the
+            ``node_id`` field of every receipt that peer signs.
+        public_key_x: Base64url (unpadded) encoding of the peer's raw 32-byte
+            Ed25519 public key -- the JWK ``x`` member per RFC 8037.
+    """
+
+    node_id: str
+    public_key_x: str
+
+    def to_jwk(self) -> dict[str, str]:
+        """Return this key as an RFC 8037 OKP JWK."""
+        return {"kty": "OKP", "crv": "Ed25519", "alg": "EdDSA", "x": self.public_key_x}
+
+    def node_id_from_key(self) -> str:
+        """Return the RFC 7638 thumbprint of :attr:`public_key_x`.
+
+        Equals :attr:`node_id` for a correctly pinned peer; the seed loader
+        compares the two so a pin cannot name a node whose key it does not
+        carry.
+        """
+        import base64
+        import hashlib
+        import json
+
+        canonical = json.dumps(
+            {"crv": "Ed25519", "kty": "OKP", "x": self.public_key_x},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+        digest = hashlib.sha256(canonical).digest()
+        return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+
+    @classmethod
+    def from_material(cls, node_id: str, material: object) -> MeshPeerKey:
+        """Build a pin from the key material an operator can paste into YAML.
+
+        Three forms are accepted, all normalising to the same JWK ``x``:
+
+        * The SPKI PEM a peer publishes at
+          ``.sdd/cluster/identity/claim_signing.pub``.
+        * A JWK mapping (``kty``/``crv`` must be ``OKP``/``Ed25519``).
+        * The bare base64url ``x`` member.
+
+        Args:
+            node_id: The peer's install identity id.
+            material: The key material in one of the three forms above.
+
+        Returns:
+            The normalised :class:`MeshPeerKey`.
+
+        Raises:
+            ValueError: When the material is not a usable Ed25519 public key.
+                The message names the accepted forms so a bad paste is
+                actionable at seed load.
+        """
+        import base64
+
+        if isinstance(material, dict):
+            jwk: dict[str, object] = material
+            if jwk.get("kty") != "OKP" or jwk.get("crv") != "Ed25519":
+                raise ValueError("JWK must have kty='OKP' and crv='Ed25519'")
+            x_member = jwk.get("x")
+            if not isinstance(x_member, str) or not x_member.strip():
+                raise ValueError("JWK is missing a non-empty 'x' member")
+            x = x_member.strip()
+        elif isinstance(material, str) and material.strip():
+            text = material.strip()
+            if "-----BEGIN" in text:
+                from cryptography.hazmat.primitives import serialization
+                from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+                try:
+                    loaded = serialization.load_pem_public_key(text.encode("ascii"))
+                except Exception as exc:
+                    raise ValueError(f"not a readable PEM public key: {exc}") from exc
+                if not isinstance(loaded, Ed25519PublicKey):
+                    raise ValueError("PEM public key is not Ed25519")
+                raw = loaded.public_bytes(
+                    serialization.Encoding.Raw,
+                    serialization.PublicFormat.Raw,
+                )
+                x = base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+            else:
+                x = text
+        else:
+            raise ValueError(
+                "must be an Ed25519 public key: SPKI PEM text, an OKP JWK mapping, or the base64url 'x' member",
+            )
+
+        try:
+            raw_key = base64.urlsafe_b64decode(x + "=" * (-len(x) % 4))
+        except Exception as exc:
+            raise ValueError(f"public key is not valid base64url: {exc}") from exc
+        if len(raw_key) != 32:
+            raise ValueError(f"Ed25519 public key must decode to 32 bytes, got {len(raw_key)}")
+        return cls(node_id=node_id, public_key_x=x)
+
+
+@dataclass(frozen=True)
+class ClusterConfig:
+    """Configuration for distributed cluster mode.
+
+    Attributes:
+        enabled: Whether cluster mode is active.
+        topology: Cluster topology mode.
+        auth_token: Shared bearer token for inter-node auth.
+        node_heartbeat_interval_s: Seconds between node heartbeats.
+        node_timeout_s: Seconds before a node is considered offline.
+        server_url: URL of the central task server (for worker nodes).
+        bind_host: Host to bind the server to (0.0.0.0 for remote access).
+        tls: Optional mTLS configuration for the node-to-node transport.
+            When set, the central server serves over HTTPS with the supplied
+            cert chain and worker httpx clients present a client cert.
+            See :mod:`bernstein.core.protocols.cluster.cluster_tls`.
+        gossip_peers: MESH only. Peer base URLs this node gossips claim
+            receipts to. Empty on STAR, where coordination is central.
+        claim_lease_ttl_s: MESH only. Lease duration granted to a self-claim
+            in the signed claim journal.
+        claim_journal_path: MESH only. Explicit path to the signed claim
+            journal. ``None`` uses the conventional
+            ``.sdd/cluster/claim_journal.jsonl``.
+        gossip_peer_keys: MESH only. The peers whose gossiped receipts this
+            node will fold, each pinned to the Ed25519 key that must have
+            signed them. Empty means no peer is trusted: a MESH node folds
+            only receipts signed by a pinned key, so gossip is closed until
+            the operator opens it deliberately (#2997).
+    """
+
+    enabled: bool = False
+    topology: ClusterTopology = ClusterTopology.STAR
+    auth_token: str | None = None
+    node_heartbeat_interval_s: int = 15
+    node_timeout_s: int = 60
+    server_url: str | None = None  # Central server URL (worker nodes connect here)
+    bind_host: str = "127.0.0.1"  # Default: localhost only
+    tls: TLSConfig | None = None
+    # MESH-only keys (issue #2558). Unused on STAR, whose behaviour is
+    # unchanged by their presence.
+    gossip_peers: tuple[str, ...] = ()
+    claim_lease_ttl_s: int = 300
+    claim_journal_path: str | None = None
+    gossip_peer_keys: tuple[MeshPeerKey, ...] = ()
+
+    @property
+    def is_mesh(self) -> bool:
+        """``True`` when this config selects the leaderless MESH topology."""
+        return self.topology is ClusterTopology.MESH
+
+    @property
+    def cluster_url_scheme(self) -> str:
+        """Return ``"https"`` when TLS is configured, ``"http"`` otherwise."""
+        return "https" if self.tls is not None else "http"
+
+
+# ---------------------------------------------------------------------------
+# Trigger / event-driven models
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class TriggerEvent:
+    """A normalized event from any trigger source (GitHub, Slack, cron, etc.)."""
+
+    source: str  # "github", "slack", "cron", "webhook", etc.
+    timestamp: float = field(default_factory=time.time)
+    raw_payload: dict[str, Any] = field(default_factory=dict)
+    repo: str = ""  # Repository identifier (e.g. "owner/repo")
+    branch: str = ""  # Git branch name
+    sha: str = ""  # Git commit SHA
+    sender: str = ""  # User or actor that triggered the event
+    changed_files: tuple[str, ...] = ()  # Files affected by this event
+    message: str = ""  # Human-readable event summary
+    metadata: dict[str, Any] = field(default_factory=dict)  # Source-specific extra data
+
+
+@dataclass
+class TriggerTaskTemplate:
+    """Template for the task to create when a trigger fires."""
+
+    title: str = "Triggered task"
+    role: str = "backend"
+    priority: int = 2
+    scope: str = "small"
+    task_type: str = "standard"
+    description_template: str = ""
+    model: str | None = None
+    effort: str | None = None
+    model_escalation: dict[int, dict[str, str]] = field(default_factory=dict)
+
+
+@dataclass
+class TriggerConfig:
+    """A single trigger rule loaded from triggers.yaml."""
+
+    name: str
+    source: str  # "github", "slack", "cron", "webhook"
+    enabled: bool = True
+    filters: dict[str, Any] = field(default_factory=dict)
+    conditions: dict[str, Any] = field(default_factory=dict)
+    task: TriggerTaskTemplate = field(default_factory=TriggerTaskTemplate)
+    schedule: str | None = None  # Cron expression (source=cron only)
+
+
+@dataclass
+class TriggerFireRecord:
+    """Audit record written when a trigger fires and creates a task."""
+
+    trigger_name: str
+    source: str
+    fired_at: float
+    task_id: str
+    dedup_key: str
+    event_summary: str = ""
+
+
+@dataclass(frozen=True)
+class LifecycleEvent:
+    """Typed event emitted on every task or agent status transition.
+
+    This is the single source of truth for replay, audit, and metrics.
+    Every status change - task or agent - produces exactly one event.
+
+    Attributes:
+        timestamp: Unix epoch when the transition occurred.
+        entity_type: "task" or "agent".
+        entity_id: ID of the task or agent session.
+        from_status: Status before the transition.
+        to_status: Status after the transition.
+        actor: Who/what triggered the transition (e.g. "task_store", "spawner").
+        reason: Human-readable explanation of why the transition happened.
+    """
+
+    timestamp: float
+    entity_type: Literal["task", "agent"]
+    entity_id: str
+    from_status: str
+    to_status: str
+    actor: str = ""
+    reason: str = ""
+    transition_reason: TransitionReason | None = None
+    abort_reason: AbortReason | None = None
+
+
+@dataclass(frozen=True)
+class WorkflowPhaseEvent:
+    """Event emitted on workflow phase transitions in governed mode.
+
+    Extends the lifecycle event concept for workflow-level state changes.
+    The full sequence of LifecycleEvent + WorkflowPhaseEvent records is
+    sufficient to replay any governed run.
+
+    Attributes:
+        timestamp: Unix epoch when the phase transition occurred.
+        workflow_hash: SHA-256 hash of the workflow definition.
+        run_id: Orchestration run identifier.
+        from_phase: Phase before the transition (empty string for initial phase).
+        to_phase: Phase after the transition.
+        reason: Human-readable explanation (e.g. "all phase tasks completed").
+        tasks_completed: Task IDs that completed to trigger this transition.
+    """
+
+    timestamp: float
+    workflow_hash: str
+    run_id: str
+    from_phase: str
+    to_phase: str
+    reason: str = ""
+    tasks_completed: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class VoteEvent:
+    """Event emitted for each vote cast and for the final voting result.
+
+    Attributes:
+        timestamp: Unix epoch when this event was created.
+        task_id: ID of the task being reviewed.
+        voter_model: Model that cast this vote (empty string for final-result events).
+        verdict: Individual vote verdict or final consensus verdict.
+        confidence: Confidence score 0.0-1.0.
+        reasoning: One-sentence rationale.
+        is_final: True when this event records the aggregated voting result.
+        strategy: VotingStrategy value used (e.g. "quorum").
+    """
+
+    timestamp: float
+    task_id: str
+    voter_model: str
+    verdict: Literal["approve", "request_changes", "abstain"]
+    confidence: float
+    reasoning: str
+    is_final: bool = False
+    strategy: str = ""

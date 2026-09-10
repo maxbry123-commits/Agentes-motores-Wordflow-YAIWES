@@ -1,0 +1,222 @@
+---
+type: reference
+topic: runtime
+audience: [human, agent]
+search_hints: [present op, present reference, presentation, data_ref, data_inline, blueprint, view, catalog component, table, keyvalue, list, code, diff, markdown, image, $bind, JSON pointer, presentations.yaml, presentations.entries, present ack, bindings_dropped, presented event, replay, recovery gate, expiry placeholder]
+---
+
+# present op & サーフェス リファレンス
+
+**present レイヤ**のオペレータ/エージェント向けリファレンス——`present` op の引数、v1
+コンポーネントカタログ、パスバインディング、名前付きビュー登録、op ack、`presented`
+監査イベント、replay/rewind 挙動。*なぜ*（軸 B/C の課題、LLM は形・ユーザは中身の非対称性、
+guard/renderer の分割）については [コンセプト: Present レイヤ](../../concepts/runtime/present.ja.md)
+を参照。op は [Control IR](control-ir.ja.md) の op カタログにも現れる。
+
+## `present` op
+
+```json
+{
+  "kind": "present",
+  "data_ref": ".reyn/cache/tool-results/2026-.../structured.json",
+  "blueprint": {
+    "component": "table",
+    "rows": {"$bind": "/results"},
+    "columns": [
+      {"header": "Title",  "path": "/title"},
+      {"header": "Author", "path": "/author"}
+    ]
+  }
+}
+```
+
+**データソース**を厳密に1つ、`view` / `blueprint` は**最大1つ**（両方省略も有効——後述の
+[任意の view/blueprint](#任意の-viewblueprint-既定レンダリング) を参照）:
+
+| 引数 | 型 | 備考 |
+|---|---|---|
+| `data_ref` | string | `data_inline` と **XOR**。任意の zone-readable パス。offload された `structured_ref` は `file.read` セマンティクスで**全値に再ハイドレート**される（LLM 可視プレビューからではない）。 |
+| `data_inline` | any | `data_ref` と **XOR**。既に LLM コンテキストにある小さなデータ（便宜用）。 |
+| `view` | string | `view` / `blueprint` の最大1つ。登録済み提示名（後述の登録を参照）。未知名はエラーでなくフォールバックチェーンへ落ちる。 |
+| `blueprint` | object \| array | `view` / `blueprint` の最大1つ。インライン宣言的コンポーネントツリー（単一ノードまたは上から下への並び）。 |
+
+`view` は FP-0055 PR-1 で元の `template` 引数から改名されたもの——クリーンブレイクで
+エイリアスなし。「template」は今後、将来の `render_template` op の Jinja2 テキスト
+テンプレートのみを指す。present が使う宣言的な（登録済みまたはインラインの）提示記述は
+**view** である。
+
+- **Tier 0**（`ask_user` の兄弟）、**fire-and-continue** — ユーザ（信頼の根）への提示に出力
+  権限ゲートはなく、`ask_user` と違って run を**停止しない**。唯一のゲート: `data_ref` の
+  読み取り権限は **`file.read` と同一**に解決される——`present` はエージェントの file op 以上を
+  読めない（`present` 拒否 ⇔ `file.read` 拒否）。
+
+## v1 カタログ（表示専用・非実行）
+
+全コンポーネントは読み取り専用。blueprint ノードは `{"component": <name>, ...slots}`。
+
+| コンポーネント | スロット |
+|---|---|
+| `text` | `text`（bind またはリテラル） |
+| `markdown` | `text` — CommonMark として描画 |
+| `code` | `text`, `language?` |
+| `diff` | `text` — 統合 diff |
+| `keyvalue` | `rows: [{label, value}]` |
+| `table` | `rows`（bind → 配列）, `columns: [{header, path}]` |
+| `list` | `items`（bind → 配列）, `item_path?`（項目単位パス） |
+| `image` | `src`, `alt?` — TUI（`textual_chat`）は `src` を取得し（owner 裁定 C — client 自身が URL を取得、#3846）半ブロック Unicode セルとして描画する（`HalfBlockImage`、#4474 — 固定行高 `image.row_height_cells`、既定 20、幅はアスペクト比を保つよう derive）。本doc の以前の版は実ピクセル（Kitty/Sixel）経路＋半ブロック fallback を記述していたが、#4474 でその経路は `textual-image` 依存ごと完全に廃止された — Sixel はカーソル相対に描画するため virtualized なセル再描画行モデルでは位置決め/クリップができず、Kitty のプレースホルダー protocol も reyn が対象とする端末上では検出不能な形で壊れていることが判明し、実ピクセルは実運用上一度も届いていなかった。resolution stage の無いサーフェス（`reyn chat --cui`、`reyn pipe`）は `[image: <alt>]` という dim テキストのプレースホルダーを表示する。取得/デコード失敗時は区別可能な `[image failed: ...]` 状態を表示し、プレースホルダーと同じテキストにはならない |
+| `artifact` | LLM の成果物を**参照（またはinline text）で運ぶ、renderingでは運ばない** node（#4482 PR-2b、architect 批准の命名）。node は*何であるか*（`media_type`）と*どこに在るか*（`source`/`content`）を宣言し、**どう見せるかはclientの裁量**——terminalは開く選択肢を出すかもしれず、web clientは埋め込むかもしれない。（本docの以前の版は`artifact`を否定形「端末が描画できないもの」と定義していたが、architectの訂正により#4482の設計議論で明示的に却下された形だと判明——今日の描画上の制約をcomponentの同一性に焼き込むと、将来renderer が能力を得た瞬間に意味が偽になり過去のblueprintが誤りになる上、否定形はnode単体では検査不能（renderer全体の能力集合に依存）。さらに`content` slotのtextは端末で描画できるため自己矛盾もしていた。）`source`（実file — リテラルpath または `$bind` pointer）と `content`（agentが直接渡すtext、実fileは無い）は**どちらか一方のみ**必須 — 両方も両方無しも不可。`media_type` は `content` と組み合わせた時のみ許可され、その場合は必須（`source` の場合はOSが実fileから derive するため、agent宣言値との不一致を避けて拒否；`content` の場合に省略しても拒否 — deriveする実fileが無いため）。`description?` は常に任意。`name` は意図的にslotに含まれない — `source` はOSがfileの basename を埋め、`content` には実fileとしての identity が無い。7通りの構造妥当性ケース全てが op 検証時に enforced（render時の推測に頼らない）。
+
+**client側の挙動（`textual_chat`、#4482 PR-3）**——`present`自身の契約ではなく1つのclientの選択: **Artifactsタブ**（`Art`、下部chrome drawer）はrefを新しい順に一覧表示し、conversation paneが実際にrenderしているのと同じlive message entriesから毎回導出される（`Session.history`の常駐bufferからは決して導出しない——独自のevictionを持ち、まだ画面に見えているartifactを一覧から黙って落としかねない。今夜3度目の「資源軸が意味論的な質問を決める」形の実例）。新規永続stateは無し——別途のdisk indexも、呼び出しをまたいでwarmに保つcacheも無い。行の選択、または`/open <ref>`の実行は、fileの拡張子に対するOS既定アプリを起動する（`open`/`xdg-open`/`os.startfile`——file managerのダブルクリックと同じ affordance、reynが選んだviewerではない；拡張子を実質的な権限surfaceとして扱うため、OSが解決した内容に一切口を出さない）。**行に表示されたpathとまったく同じpathが開かれる**（architectの裁定）——`resolved_path`フィールドが、basenameだけでは区別できない別ディレクトリの同名artifactと区別する。`/open`はlocal sessionのみ対応（ローカルアプリの起動はユーザーが座っているmachine上でのみ意味を持つため）。 |
+
+v1 に**対話コンポーネント**（ボタン / フォーム）は存在しない。
+
+### バインディング — `$bind` / JSON Pointer
+
+データは **JSON Pointer (RFC 6901)** パスで構造的に結合される。
+
+- `{"$bind": "/results/0/title"}` — ポインタ文字列。`""` は**文書全体**をバインド。
+- `$bind` オブジェクトでないものは**リテラル**（例: `header` 文字列）。
+- `table` の `columns[].path` と `list` の `item_path` は**行相対**（各反復行に対する相対）。
+
+バインディング結果（§4）: パスヒット → バインド; パスミス → **ソフトスキップ** +
+`bindings_dropped` へ `path_not_found` 記録; 型不一致 → 強制変換（スカラ →
+`table` `rows` スロットは1行テーブル; コンテナ → `text` スロットはその JSON 形式）+
+**`coerced`** へ `{path, rendered_as}` 記録——型変換は drop の*逆*の結果であり、
+値は形を変えてユーザーに届いた（届かなかったのではない）ので drop としては数えない
+（#3664）; guard による無害化/サイズ上限 → `bindings_dropped` へ `guard_stripped` 記録。
+**全**バインディングがミスすると op は `all_bindings_missed` を報告しフォールバック
+チェーンへルーティングする——決してハード失敗しない。
+
+op 検証の構造ゲートは、インライン blueprint の**非カタログコンポーネント**や**非パス
+バインディング**をハードエラー（`status="error"`）として拒否する——これは blueprint のバグで
+あり、ソフトなバインディングドロップとは区別される。
+
+## 名前付きビュー登録（オペレータ専用）
+
+名前付きビューは **`presentations.yaml`**（`presentations.entries`）で登録される——
+**オペレータ/設定アクション**である。install op はなく、LLM が書くのはインライン blueprint のみ。
+
+```yaml
+presentations:
+  entries:
+    search_results:
+      blueprint:                              # 必須; インラインコンポーネントツリー
+        - component: table
+          rows: {"$bind": "/results"}
+          columns:
+            - {header: Author, path: /author}
+            - {header: Title,  path: /title}
+      description: "Search results table"      # 任意
+      enabled: true                            # 任意, 既定 true
+```
+
+blueprint はロード時に検証され、`<project>/.reyn/config/presentations.yaml` レイヤはターン
+境界でホットリロードする。全フィールド表 + マージ順:
+[reyn.yaml § presentations](../config/reyn-yaml.md#presentations-block)。
+
+## ビューフォールバック — 4段
+
+何かが描画されるまで劣化する（決してハードエラーにならない）:
+
+1. **登録 `view`** → 2. **インライン `blueprint`** → 3. **デフォルトビューア**（データ形から
+合成: `list[dict]` → `table`、`dict` → `keyvalue`、スカラ → `text`、diff-sniff → `diff`）→
+4. **ジェネリック**（構造化 → YAML を `text` へ、プレーンテキストはそのまま——常に描画）。
+
+オブジェクトのデフォルト表示は、**スカラ**のキーをまとめた `keyvalue` カードと、
+**入れ子**の値ごとの `text` ラベル＋その値自身のビューになる。オブジェクトの list は
+トップレベルと同じく `table` になる。降下は4段で止まり、その先の値は `keyvalue` の行
+（＝ JSON 表示）になる（`table` のセルと同じ底）。以前はオブジェクト全体が1枚の
+`keyvalue` カードだったため、入れ子の値は即座にこの底に落ち、同じ行データでも
+オブジェクトで包んだかどうかだけで table か JSON かが変わっていた。
+
+フォールバックは全ミスの view または未知の view 名で発火する。ack は**要求された**
+view の統計に加え、実際に描画した段を示す `note` を報告する。
+
+### 任意の view/blueprint — 既定レンダリング
+
+`view` と `blueprint` は**両方とも省略可能**（FP-0055 PR-1）——`present(data_ref=...)`
+単独も有効で、「明示的な view なし・そのまま見せる」を意味する。この場合、解決は
+**直接 stage 3**（content-type デフォルトビューア）から始まり、stage 1-2 は完全にスキップ
+される——ルックアップも、そこからのフォールバックも発生しない。ack は `mode: "default"` と
+デフォルトビューア自身の統計を運び、**`note` は付かない**——これは意図された挙動であり、
+フォールバックではない。stage 3 自身がさらに stage 4 へ劣化した場合（デフォルトビューアの
+バインディングも全ミス）のみ `note` が付き、そのさらなる劣化を説明する——要求された view が
+そもそも存在しないため、下記の「view 未登録」/「全ミス」の note とは異なる文言になる。
+
+## Ack（op 結果）
+
+LLM の唯一のフィードバック——コンパクトかつ高シグナル:
+
+```yaml
+ok: true
+mode: view        # view | blueprint | default — 呼び出し側がどの入力を与えたか
+bindings_resolved: 3
+bindings_dropped:
+  - {path: "/results/0/author", reason: path_not_found}
+  # reason ∈ {path_not_found, guard_stripped} — 型変換の coercion は drop ではない（#3664）;
+  # 下記の `coerced` を参照
+coerced:
+  - {path: "/big", rendered_as: json_text}
+  # rendered_as ∈ {json_text, single_row} — 値はユーザーに届いた（形を変えて）
+rows: 500          # #3664: すべての行状スロット（table/list と keyvalue カード両方）を
+                    # 横断した、実際に描画された行数（キャップ後）——present はゼロトークン
+                    # オフロードでデータ自体は LLM のコンテキストに入らないため、
+                    # LLM がどれだけ届いたかを知る唯一の指標
+all_bindings_missed: false
+note: "…"        # フォールバック段が描画した場合、または(#3664 (c))デフォルト
+                  # ビューアがコンテナを JSON テキストへ変換した場合のみ存在
+```
+
+多数行での `path_not_found` → 「view がデータ形に合わない」; `guard_stripped` →
+「view のバグでなく guard による無害化」; `coerced` エントリ → 「パスは正しいが
+コンポーネントが違う——JSON テキストや1行テーブルとしてユーザーに届いた、drop ではない」。
+エージェントはデータを取り込まずに自己修正する。
+
+## `presented` イベント（P6 監査）
+
+すべての提示は `presented` イベントを1つ発行し、**ref + 統計のみを運び、内容バイトは決して
+運ばない**:
+
+| フィールド | 意味 |
+|---|---|
+| `data_ref` | ref パス、または `data_inline` 提示では `<inline-data>` |
+| `view` | 登録名、インライン blueprint では `blueprint:<hash>`（blueprint バイトなし）、または両方省略時（`mode: "default"`）は `null` |
+| `mode` | `view` \| `blueprint` \| `default` — 呼び出し側が与えた3つの排他的入力のどれか |
+| `surface` | リスト、例 `["inline-cui"]`（レンダラ未接続時は `["null"]`） |
+| `ingested` | `none` \| `partial` \| `full` — **OS 計算**（データはインラインか、ref の事前 `read_file` がセッション前方に現れるか）、LLM 自己申告ではない |
+| `bindings_resolved` | 解決されたバインディング数 |
+| `bindings_dropped` | `[{path, reason}]`、`reason ∈ {path_not_found, guard_stripped}` — 決してユーザーに届かなかった値 |
+| `coerced` | `[{path, rendered_as}]`、`rendered_as ∈ {json_text, single_row}` — 型変換された値; ユーザーには届いた（#3664、`bindings_dropped` とは別に保持） |
+| `rows` | すべての行状スロット（table/list と keyvalue）を横断した、実際に描画された行数（キャップ後、#3664） |
+| `fallback_stage` | `null` \| `content_type_default` \| `generic` — 実際にユーザーへ届いたビューア。`null` = 要求された描画（または `mode: "default"` の stage-3 ビューア）が直接描画された。非 null = 要求ビューが未知 / 全ミスで合成ビューアが引き継いだ。これにより、要求どおり描画されたリテラルのみビュー（`null`）を、未知 / 全ミスのフォールバックと区別できる — 両者とも `bindings_resolved=0, bindings_dropped=[]` を運ぶため。 |
+
+## Replay / rewind — キャッシュとしての提示
+
+提示は**キャッシュ**であり、`presented` イベントが**真実**である。replay
+(`reyn events <log>`) または rewind 時、`presented` イベントは**ベストエフォート**で再描画される:
+
+- **ref がまだ読める** → 内容がデータの形から再合成され（イベントはバイトを保存していないため、
+  呼び出し側の元インライン blueprint ではなくデフォルト/ジェネリックビューアを使う）サーフェスへ届く。
+- **ref が消えた**（GC 済み・利用不可）、またはデータが**インライン**で永続化されていない →
+  耐久的な `presented` 監査イベントを指す**期限切れプレースホルダ**。クラッシュにも古い描画にも
+  ならない。
+
+`present` は保持ウィンドウに何もピン留めしない; ref は既存のライフサイクルを保ち、会話履歴に
+提示バイトは含まれない（圧縮すべき新しいものはない）。
+
+### recovery-feature ゲート — 非該当
+
+CLAUDE.md の **recovery-feature truncate-falsify ゲート**（WAL イベント由来の再構築 / PITR /
+rewind-restore 状態を追加する PR は、再構築ソースが WAL 切り詰めを生き延びることを証明せよ）は
+present レイヤには**該当しない**。ここでの replay は**権威的状態を再構築しない**: 既に耐久的な
+ref のベストエフォート再描画、またはプレースホルダという**表示専用の射影**を生成し、`present` は
+**recovery-core 状態を書かない**。`presented` イベントから回復可能な状態を導くものは何もない。
+将来の改訂が `presented` イベントから権威的状態を再構築するようになれば、その PR は
+truncate-falsify テストを arc 内で持たねばならない。
+
+## 関連
+
+- [コンセプト: Present レイヤ](../../concepts/runtime/present.ja.md)
+- [Control IR](control-ir.ja.md) — カタログ内の op
+- [reyn.yaml § presentations](../config/reyn-yaml.md#presentations-block) — 登録
+- [Events](../../concepts/runtime/events.ja.md) — replay と監査ログ

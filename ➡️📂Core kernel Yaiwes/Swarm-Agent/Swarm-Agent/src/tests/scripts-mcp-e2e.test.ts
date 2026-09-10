@@ -1,0 +1,659 @@
+import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import { unlink } from "node:fs/promises";
+import type { IncomingMessage, ServerResponse } from "node:http";
+import { join } from "node:path";
+import { Readable } from "node:stream";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { closeDb, createAgent, getDbClient, getKv, initDb } from "../be/db";
+import { setScriptEmbeddingProviderForTests } from "../be/scripts/embeddings";
+import { handleCore } from "../http/core";
+import { handleScriptRuns } from "../http/script-runs";
+import { handleScripts } from "../http/scripts";
+import { getPathSegments, parseQueryParams } from "../http/utils";
+import { registerScriptDeleteTool } from "../tools/script-delete";
+import { registerScriptRunTool } from "../tools/script-run";
+import { registerScriptRunsTools } from "../tools/script-runs";
+import { registerScriptSearchTool } from "../tools/script-search";
+import { registerScriptUpsertTool } from "../tools/script-upsert";
+import { mcpOverflowNamespace } from "../tools/utils";
+import { refreshSecretScrubberCache } from "../utils/secret-scrubber";
+
+import "../prompts/session-templates";
+
+const TEST_DB_PATH = "./test-scripts-mcp-e2e.sqlite";
+const API_KEY = "test-scripts-mcp-key-1234567890";
+
+function fakeEmbedding(text: string): Float32Array {
+  const lower = text.toLowerCase();
+  return new Float32Array([
+    lower.includes("multiply") ? 1 : 0,
+    lower.includes("seven") ? 1 : 0,
+    lower.includes("memory") ? 1 : 0,
+    lower.includes("typed") ? 1 : 0,
+  ]);
+}
+
+const fakeEmbeddingProvider = {
+  name: "test/fake-script-embedding",
+  dimensions: 4,
+  async embed(text: string) {
+    return fakeEmbedding(text);
+  },
+  async embedBatch(texts: string[]) {
+    return Promise.all(texts.map(fakeEmbedding));
+  },
+};
+
+type RegisteredTool = {
+  handler: (args: unknown, extra: unknown) => Promise<unknown>;
+};
+
+// New SwarmToolResult wire contract (src/tools/utils.ts finalizeSwarmToolResult):
+// content[0].text = message [+ details] [+ nudge]; structuredContent = the
+// script-tool `data` (here always `{ status, data }` per scriptToolOutputSchema)
+// spread with the envelope keys `success`/`message`/`details?`/`nudge?`;
+// isError = !ok. There is no top-level `error` field anymore — the honest
+// error text lives in `message` (and often `details`).
+type StructuredResult<T> = {
+  content: Array<{ type: string; text: string }>;
+  isError?: boolean;
+  structuredContent: {
+    success: boolean;
+    message: string;
+    details?: string;
+    nudge?: string;
+    truncation?: {
+      truncated: true;
+      fullValueAt: string;
+      originalBytes: number;
+      limitBytes: number;
+      retrieval: string;
+    };
+    status?: number;
+    data?: T;
+  };
+};
+
+async function removeDbFiles(path: string): Promise<void> {
+  for (const suffix of ["", "-wal", "-shm"]) {
+    try {
+      await unlink(path + suffix);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
+}
+
+function buildToolServer() {
+  const server = new McpServer({ name: "scripts-mcp-e2e", version: "1.0.0" });
+  registerScriptSearchTool(server);
+  registerScriptRunTool(server);
+  registerScriptRunsTools(server);
+  registerScriptUpsertTool(server);
+  registerScriptDeleteTool(server);
+  const registered = (server as unknown as { _registeredTools: Record<string, RegisteredTool> })
+    ._registeredTools;
+  return {
+    search: registered["script-search"]!,
+    run: registered["script-run"]!,
+    upsert: registered["script-upsert"]!,
+    del: registered["script-delete"]!,
+    launchScriptRun: registered["launch-script-run"]!,
+    getScriptRun: registered["get-script-run"]!,
+    listScriptRuns: registered["list-script-runs"]!,
+  };
+}
+
+function meta(agentId?: string) {
+  const headers: Record<string, string> = {};
+  if (agentId) headers["x-agent-id"] = agentId;
+  return { sessionId: "scripts-mcp-e2e", requestInfo: { headers } };
+}
+
+function headersRecord(headers: HeadersInit | undefined): Record<string, string> {
+  if (!headers) return {};
+  if (headers instanceof Headers) return Object.fromEntries(headers.entries());
+  if (Array.isArray(headers)) return Object.fromEntries(headers);
+  return headers as Record<string, string>;
+}
+
+async function dispatchScriptsApi(url: string, init: RequestInit = {}): Promise<Response> {
+  const parsedUrl = new URL(url);
+  const headers = Object.fromEntries(
+    Object.entries(headersRecord(init.headers)).map(([key, value]) => [
+      key.toLowerCase(),
+      String(value),
+    ]),
+  );
+  const body = init.body === undefined ? undefined : String(init.body);
+  const req = Readable.from(body ? [Buffer.from(body)] : []) as IncomingMessage;
+  req.method = init.method ?? "GET";
+  req.url = `${parsedUrl.pathname}${parsedUrl.search}`;
+  req.headers = headers;
+
+  let status = 200;
+  let text = "";
+  const res = {
+    headersSent: false,
+    writableEnded: false,
+    setHeader() {},
+    writeHead(code: number) {
+      status = code;
+      this.headersSent = true;
+      return this;
+    },
+    end(chunk?: unknown) {
+      if (chunk !== undefined) text += String(chunk);
+      this.writableEnded = true;
+      return this;
+    },
+  } as unknown as ServerResponse;
+
+  const agentId = headers["x-agent-id"];
+  if (!(await handleCore(req, res, agentId, API_KEY))) {
+    const pathSegments = getPathSegments(req.url || "");
+    const queryParams = parseQueryParams(req.url || "");
+    if (
+      !(await handleScripts(req, res, pathSegments, queryParams, agentId)) &&
+      !(await handleScriptRuns(req, res, pathSegments, queryParams, agentId))
+    ) {
+      res.writeHead(404);
+      res.end("Not Found");
+    }
+  }
+
+  return new Response(text, {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+let workerId: string;
+let savedEnv: NodeJS.ProcessEnv;
+let savedFetch: typeof globalThis.fetch;
+
+beforeAll(async () => {
+  savedEnv = { ...process.env };
+  savedFetch = globalThis.fetch;
+  await removeDbFiles(TEST_DB_PATH);
+  initDb(TEST_DB_PATH);
+  process.env.AGENT_SWARM_API_KEY = API_KEY;
+  process.env.SCRIPT_RUN_SUPERVISOR_DISABLE = "true";
+  delete process.env.API_KEY;
+  refreshSecretScrubberCache();
+  setScriptEmbeddingProviderForTests(fakeEmbeddingProvider);
+  workerId = (await createAgent({ name: "scripts-mcp-worker", isLead: false, status: "idle" })).id;
+  process.env.MCP_BASE_URL = "http://scripts-mcp-e2e.test";
+  globalThis.fetch = (async (input, init) => {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    if (
+      url.startsWith("http://scripts-mcp-e2e.test/api/scripts/") ||
+      url.startsWith("http://scripts-mcp-e2e.test/api/script-runs")
+    ) {
+      return dispatchScriptsApi(url, init);
+    }
+    return savedFetch(input, init);
+  }) as typeof globalThis.fetch;
+});
+
+afterAll(async () => {
+  globalThis.fetch = savedFetch;
+  setScriptEmbeddingProviderForTests(null);
+  closeDb();
+  await removeDbFiles(TEST_DB_PATH);
+  for (const key of Object.keys(process.env)) {
+    if (!(key in savedEnv)) delete process.env[key];
+  }
+  for (const [key, value] of Object.entries(savedEnv)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+  refreshSecretScrubberCache();
+});
+
+beforeEach(async () => {
+  const client = getDbClient();
+  await client.run("DELETE FROM scripts");
+  await client.run("DELETE FROM script_run_journal");
+  await client.run("DELETE FROM script_runs");
+});
+
+describe("script_ MCP HTTP proxy tools", () => {
+  test("upserts the canonical script authoring contract example verbatim", async () => {
+    const tools = buildToolServer();
+    // The authoring contract lives in the seeded `swarm-scripts` skill since
+    // prompt v2; its first ```ts fence is the canonical example.
+    const skillBody = await Bun.file(
+      join(import.meta.dir, "../../templates/skills/swarm-scripts/content.md"),
+    ).text();
+    const source = skillBody.match(/```ts\n([\s\S]*?)\n```/)?.[1];
+    expect(source).toBeTruthy();
+
+    const upsert = (await tools.upsert.handler(
+      {
+        name: "canonical-authoring-contract",
+        source,
+        description: "Canonical authoring contract fixture",
+        intent: "verify documented source typechecks",
+      },
+      meta(workerId),
+    )) as StructuredResult<{ name: string }>;
+
+    expect(upsert.isError).toBeFalsy();
+    expect(upsert.structuredContent.success).toBe(true);
+    expect(upsert.structuredContent.data?.name).toBe("canonical-authoring-contract");
+  });
+
+  test("exercise script-upsert -> script-search -> script-run -> script-delete", async () => {
+    const tools = buildToolServer();
+    const source = `export default async (args: { value: number }) => ({ result: args.value * 7 });`;
+
+    const upsert = (await tools.upsert.handler(
+      { name: "times-seven", source, description: "Multiply", intent: "MCP E2E" },
+      meta(workerId),
+    )) as StructuredResult<{ name: string; version: number }>;
+    expect(upsert.isError).toBeFalsy();
+    expect(upsert.structuredContent.success).toBe(true);
+    expect(upsert.structuredContent.data?.name).toBe("times-seven");
+    expect(upsert.structuredContent.message).toContain("saved");
+    expect(upsert.content[0]?.text).toContain("saved");
+
+    const search = (await tools.search.handler(
+      { query: "seven", limit: 5 },
+      meta(workerId),
+    )) as StructuredResult<{ results: Array<{ name: string }> }>;
+    expect(search.isError).toBeFalsy();
+    expect(search.structuredContent.success).toBe(true);
+    expect(search.structuredContent.data?.results.map((item) => item.name)).toContain(
+      "times-seven",
+    );
+
+    const run = (await tools.run.handler(
+      { name: "times-seven", args: { value: 6 }, intent: "MCP run" },
+      meta(workerId),
+    )) as StructuredResult<{ result: { result: number } }>;
+    expect(run.isError).toBeFalsy();
+    expect(run.structuredContent.success).toBe(true);
+    expect(run.structuredContent.data?.result).toEqual({ result: 42 });
+    // truncated is `{ stdout, stderr }` — both false here, so the text must not
+    // claim truncation (a bare truthy check on the object did exactly that).
+    expect(run.content[0]?.text).not.toContain("output truncated");
+
+    const del = (await tools.del.handler(
+      { name: "times-seven", scope: "agent" },
+      meta(workerId),
+    )) as StructuredResult<{ deleted: boolean }>;
+    expect(del.isError).toBeFalsy();
+    expect(del.structuredContent.success).toBe(true);
+    expect(del.structuredContent.data?.deleted).toBe(true);
+  });
+
+  test("oversized script result spills byte-completely and stays below the wire ceiling", async () => {
+    const tools = buildToolServer();
+    const blob = "x".repeat(11_800);
+    const source = `export default async () => ({ blob: "${blob}" });`;
+
+    const run = (await tools.run.handler(
+      { source, intent: "oversized payload regression" },
+      meta(workerId),
+    )) as StructuredResult<{ result: { blob: string } }>;
+
+    const text = run.content[0]?.text ?? "";
+    expect(run.isError).toBeFalsy();
+    expect(run.structuredContent.success).toBe(true);
+    expect(run.structuredContent.data).toBeUndefined();
+    const fullValueAt = run.structuredContent.truncation?.fullValueAt ?? "";
+    const overflowNamespace = mcpOverflowNamespace(workerId);
+    expect(fullValueAt.startsWith(`kv://${overflowNamespace}/v1/script-run/`)).toBe(true);
+    expect(run.structuredContent.truncation).toMatchObject({
+      truncated: true,
+      limitBytes: 10_000,
+      retrieval: expect.stringContaining("ctx.swarm.kv_get"),
+    });
+    expect(run.structuredContent.truncation?.originalBytes).toBeGreaterThan(blob.length);
+    const afterBytes = Buffer.byteLength(JSON.stringify(run), "utf8");
+    expect(afterBytes).toBeLessThanOrEqual(10_000);
+    expect(text).toContain('result:\n{\n  "blob": "');
+    expect(text).toContain("[truncated");
+    expect(text).toContain(`kv://${overflowNamespace}/`);
+
+    const key = fullValueAt.replace(`kv://${overflowNamespace}/`, "");
+    const stored = await getKv(overflowNamespace, key);
+    const canonical = JSON.parse(String(stored?.value)) as {
+      outcome: {
+        ok: boolean;
+        message: string;
+        details?: string;
+        data: { status: number; data: { result: { blob: string } } };
+      };
+    };
+    expect(canonical.outcome.data.data.result.blob).toBe(blob);
+
+    const fallback = JSON.stringify(canonical.outcome.data, null, 2);
+    const rendered = canonical.outcome.details ?? fallback;
+    const beforeWire = {
+      content: [{ type: "text", text: `${canonical.outcome.message}\n\n${rendered}` }],
+      structuredContent: {
+        ...canonical.outcome.data,
+        success: canonical.outcome.ok,
+        message: canonical.outcome.message,
+        ...(canonical.outcome.details ? { details: canonical.outcome.details } : {}),
+      },
+      isError: !canonical.outcome.ok,
+    };
+    const beforeBytes = Buffer.byteLength(JSON.stringify(beforeWire), "utf8");
+    expect(beforeBytes).toBeGreaterThan(10_000);
+  });
+
+  test("oversized script-return arrays keep a shortened non-empty prefix", async () => {
+    const tools = buildToolServer();
+    const source = `
+      export default async () =>
+        Array.from({ length: 20 }, (_, index) => ({
+          index,
+          text: "x".repeat(900),
+        }));
+    `;
+
+    const run = (await tools.run.handler(
+      { source, intent: "oversized array boundary-three regression" },
+      meta(workerId),
+    )) as StructuredResult<{ result: Array<{ index: number; text: string }> }>;
+
+    const kept = run.structuredContent.data?.result ?? [];
+    expect(run.isError).toBeFalsy();
+    expect(kept.length).toBeGreaterThan(0);
+    expect(kept.length).toBeLessThan(20);
+    expect(kept.map((item) => item.index)).toEqual(
+      Array.from({ length: kept.length }, (_, index) => index),
+    );
+    expect(run.structuredContent.message).toContain(`Script run completed`);
+    expect(run.structuredContent.message).toContain(`${kept.length} of 20`);
+    expect(run.structuredContent.truncation).toBeDefined();
+    expect(Buffer.byteLength(JSON.stringify(run), "utf8")).toBeLessThanOrEqual(10_000);
+
+    const overflowNamespace = mcpOverflowNamespace(workerId);
+    const fullValueAt = run.structuredContent.truncation?.fullValueAt ?? "";
+    const key = fullValueAt.replace(`kv://${overflowNamespace}/`, "");
+    const stored = await getKv(overflowNamespace, key);
+    const canonical = JSON.parse(String(stored?.value)) as {
+      outcome: {
+        data: { data: { result: Array<{ index: number; text: string }> } };
+      };
+    };
+    expect(canonical.outcome.data.data.result).toHaveLength(20);
+  });
+
+  test("persists a successful inline run with kind 'inline' and no journal", async () => {
+    const tools = buildToolServer();
+    const source = `export default async (args: { value: number }) => ({ doubled: args.value * 2 });`;
+
+    const run = (await tools.run.handler(
+      { source, args: { value: 21 }, intent: "inline persist e2e" },
+      meta(workerId),
+    )) as StructuredResult<{ result: { doubled: number } }>;
+    expect(run.isError).toBeFalsy();
+    expect(run.structuredContent.success).toBe(true);
+    expect(run.structuredContent.data?.result).toEqual({ doubled: 42 });
+
+    const listed = (await tools.listScriptRuns.handler(
+      { limit: 10, offset: 0 },
+      meta(workerId),
+    )) as StructuredResult<{
+      runs: Array<{ id: string; kind: string; status: string }>;
+      total: number;
+    }>;
+    expect(listed.structuredContent.data?.total).toBe(1);
+    const inlineRun = listed.structuredContent.data?.runs[0];
+    expect(inlineRun?.kind).toBe("inline");
+    expect(inlineRun?.status).toBe("completed");
+
+    const detail = (await tools.getScriptRun.handler(
+      { id: inlineRun?.id },
+      meta(workerId),
+    )) as StructuredResult<{ run: { kind: string }; journal: unknown[] }>;
+    expect(detail.structuredContent.data?.run.kind).toBe("inline");
+    expect(detail.structuredContent.data?.journal).toEqual([]);
+  });
+
+  test("persists a failed inline run with kind 'inline' and an error", async () => {
+    const tools = buildToolServer();
+    const source = `export default async () => { throw new Error("boom"); };`;
+
+    const run = (await tools.run.handler(
+      { source, intent: "inline failure e2e" },
+      meta(workerId),
+    )) as StructuredResult<unknown>;
+    // INVERTED: the old test asserted structuredContent.success === true for a
+    // script that threw at runtime — that was the dishonest-ok bug the
+    // describeScriptFailure() honest-failure-detection in script-common.ts
+    // exists to kill (runbooks/mcp-tool-results.md §1). A run whose body
+    // carries a runtimeError/exitCode!=0 is now reported as a real tool
+    // failure: isError:true, "Script run failed: ..." message, success:false.
+    expect(run.isError).toBe(true);
+    expect(run.structuredContent.success).toBe(false);
+    expect(run.structuredContent.message).toContain("Script run failed:");
+    expect(run.content[0]?.text).toContain("Script run failed:");
+
+    const listed = (await tools.listScriptRuns.handler(
+      { limit: 10, offset: 0 },
+      meta(workerId),
+    )) as StructuredResult<{
+      runs: Array<{ kind: string; status: string; error?: string }>;
+    }>;
+    const failed = listed.structuredContent.data?.runs[0];
+    expect(failed?.kind).toBe("inline");
+    expect(failed?.status).toBe("failed");
+    expect(failed?.error).toBeTruthy();
+  });
+
+  test("persists an actionable import violation under the inline discriminator", async () => {
+    const tools = buildToolServer();
+    const source = `import { randomUUID } from "node:crypto";
+      export default async () => randomUUID();`;
+
+    const run = (await tools.run.handler(
+      { source, intent: "import violation persistence e2e" },
+      meta(workerId),
+    )) as StructuredResult<unknown>;
+
+    expect(run.isError).toBe(true);
+    expect(run.structuredContent.details).toContain(
+      "The global crypto object already provides randomUUID, getRandomValues, and subtle.digest; delete the import and use crypto directly.",
+    );
+
+    const listed = (await tools.listScriptRuns.handler(
+      { limit: 10, offset: 0 },
+      meta(workerId),
+    )) as StructuredResult<{
+      runs: Array<{ kind: string; status: string; scriptName?: string; error?: string }>;
+    }>;
+    const failed = listed.structuredContent.data?.runs[0];
+    expect(failed?.kind).toBe("inline");
+    expect(failed?.status).toBe("failed");
+    expect(failed?.scriptName).toBe("(inline source)");
+    expect(failed?.error).toBe(
+      "import_violation — Import 'node:crypto' is not allowed in swarm scripts. " +
+        "The global crypto object already provides randomUUID, getRandomValues, and subtle.digest; " +
+        "delete the import and use crypto directly.",
+    );
+  });
+
+  test("stdio-style missing agent identity short-circuits clearly", async () => {
+    const tools = buildToolServer();
+    const result = (await tools.search.handler(
+      { query: "anything" },
+      meta(),
+    )) as StructuredResult<unknown>;
+    // SCRIPT_TRANSPORT_ERROR is still the message on missing identity, but it
+    // now flows through the SwarmToolResult envelope: isError:true,
+    // structuredContent.success:false, and the real text on BOTH channels
+    // (content[0].text and structuredContent.message) instead of a bespoke
+    // top-level `error` field.
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent.success).toBe(false);
+    expect(result.structuredContent.message).toContain("HTTP MCP transport");
+    expect(result.content[0]?.text).toContain("HTTP MCP transport");
+  });
+
+  test("launches, lists, and inspects durable script workflow runs", async () => {
+    const tools = buildToolServer();
+    const source = `export default async function main() { return { ok: true }; }`;
+
+    const launched = (await tools.launchScriptRun.handler(
+      { source, args: { input: true }, scriptName: "mcp-script-workflow" },
+      meta(workerId),
+    )) as StructuredResult<{ id: string; status: string; url: string }>;
+    expect(launched.isError).toBeFalsy();
+    expect(launched.structuredContent.success).toBe(true);
+    expect(launched.structuredContent.status).toBe(201);
+    expect(launched.structuredContent.data?.status).toBe("running");
+    const runId = launched.structuredContent.data?.id;
+    expect(runId).toBeTruthy();
+
+    const listed = (await tools.listScriptRuns.handler(
+      { status: "running", limit: 10, offset: 0 },
+      meta(workerId),
+    )) as StructuredResult<{ runs: Array<{ id: string }>; total: number }>;
+    expect(listed.structuredContent.success).toBe(true);
+    expect(listed.structuredContent.data?.total).toBe(1);
+    expect(listed.structuredContent.data?.runs[0]?.id).toBe(runId);
+
+    const detail = (await tools.getScriptRun.handler(
+      { id: runId },
+      meta(workerId),
+    )) as StructuredResult<{ run: { id: string; status: string }; journal: unknown[] }>;
+    expect(detail.structuredContent.success).toBe(true);
+    expect(detail.structuredContent.data?.run.id).toBe(runId);
+    expect(detail.structuredContent.data?.run.status).toBe("running");
+    expect(detail.structuredContent.data?.journal).toEqual([]);
+  });
+
+  test("failed durable run renders journal entries in the error text", async () => {
+    const tools = buildToolServer();
+    const source = `export default async function main() { return { ok: true }; }`;
+
+    const launched = (await tools.launchScriptRun.handler(
+      { source, scriptName: "mcp-failed-workflow" },
+      meta(workerId),
+    )) as StructuredResult<{ id: string }>;
+    const runId = launched.structuredContent.data?.id;
+    expect(runId).toBeTruthy();
+
+    const internalHeaders = {
+      authorization: `Bearer ${API_KEY}`,
+      "x-agent-id": workerId,
+      "content-type": "application/json",
+    };
+    const step = await dispatchScriptsApi(
+      `http://scripts-mcp-e2e.test/api/internal/script-runs/${runId}/steps`,
+      {
+        method: "POST",
+        headers: internalHeaders,
+        body: JSON.stringify({
+          stepKey: "flaky-step",
+          stepType: "swarm-script",
+          status: "failed",
+          error: "step exploded",
+        }),
+      },
+    );
+    expect(step.status).toBe(201);
+    const failed = await dispatchScriptsApi(
+      `http://scripts-mcp-e2e.test/api/internal/script-runs/${runId}/status`,
+      {
+        method: "POST",
+        headers: internalHeaders,
+        body: JSON.stringify({ status: "failed", error: "workflow failed at flaky-step" }),
+      },
+    );
+    expect(failed.status).toBe(204);
+
+    const detail = (await tools.getScriptRun.handler(
+      { id: runId },
+      meta(workerId),
+    )) as StructuredResult<unknown>;
+    expect(detail.isError).toBe(true);
+    expect(detail.structuredContent.success).toBe(false);
+    expect(detail.structuredContent.message).toContain("workflow failed at flaky-step");
+    // Step errors live in the journal — it must reach the text channel on
+    // failure too, not only via successDetails on the happy path.
+    expect(detail.content[0]?.text).toContain("journal (1 entry)");
+    expect(detail.content[0]?.text).toContain("flaky-step");
+    expect(detail.content[0]?.text).toContain("step exploded");
+  });
+
+  test("typed SDK fixture passes upsert typecheck and wrong arg type fails", async () => {
+    const tools = buildToolServer();
+    const source = `
+      import type { ScriptContext, SwarmSdk } from "swarm-sdk";
+      const compileOnly = (swarm: SwarmSdk) => swarm.memory_search({ query: "foo", intent: "test" });
+      export default async (_args: unknown, ctx: ScriptContext) => {
+        void compileOnly;
+        return { hasMemorySearch: typeof ctx.swarm.memory_search === "function" };
+      };
+    `;
+
+    const upsert = (await tools.upsert.handler(
+      { name: "typed-sdk", source, description: "Typed SDK fixture", intent: "typecheck" },
+      meta(workerId),
+    )) as StructuredResult<{ name: string }>;
+    expect(upsert.structuredContent.success).toBe(true);
+
+    const run = (await tools.run.handler(
+      { name: "typed-sdk", args: {}, intent: "typed SDK run" },
+      meta(workerId),
+    )) as StructuredResult<{ result: { hasMemorySearch: boolean } }>;
+    expect(run.structuredContent.success).toBe(true);
+    expect(run.structuredContent.data?.result).toEqual({ hasMemorySearch: true });
+
+    const bad = (await tools.upsert.handler(
+      {
+        name: "typed-sdk-bad",
+        source: `
+          import type { ScriptContext } from "swarm-sdk";
+          export default async (_args: unknown, ctx: ScriptContext) =>
+            ctx.swarm.memory_search({ query: 123 });
+        `,
+        description: "Bad SDK fixture",
+        intent: "typecheck",
+      },
+      meta(workerId),
+    )) as StructuredResult<{ diagnostics: string[] }>;
+    // INVERTED: the old test asserted the bare `typecheck_failed` literal on a
+    // top-level `error` field. describeScriptFailure() (src/tools/script-common.ts)
+    // now folds the real diagnostic into the message instead of the opaque
+    // code, per runbooks/mcp-tool-results.md's conversion rule ("message
+    // summarizes ... details carries the payload the model actually needs").
+    expect(bad.isError).toBe(true);
+    expect(bad.structuredContent.success).toBe(false);
+    expect(bad.structuredContent.message).toMatch(/^Typecheck failed:/);
+    expect(bad.structuredContent.message).not.toContain("(+1 more)");
+    expect(bad.structuredContent.details).toBeTruthy();
+    expect(bad.content[0]?.text).toContain(bad.structuredContent.message);
+  });
+
+  test("reports only remaining typecheck diagnostics in the summary", async () => {
+    const tools = buildToolServer();
+    const bad = (await tools.upsert.handler(
+      {
+        name: "two-type-errors",
+        source: `
+          export default async () => {
+            const count: number = "one";
+            const enabled: boolean = 1;
+            return { count, enabled };
+          };
+        `,
+        description: "Two diagnostic fixture",
+        intent: "verify diagnostic summary cardinality",
+      },
+      meta(workerId),
+    )) as StructuredResult<{ diagnostics: string[] }>;
+
+    expect(bad.isError).toBe(true);
+    expect(bad.structuredContent.success).toBe(false);
+    expect(bad.structuredContent.message).toMatch(/\(\+1 more\)$/);
+    expect(bad.structuredContent.message).not.toContain("(+2 more)");
+  });
+});

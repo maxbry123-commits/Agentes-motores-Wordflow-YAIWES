@@ -1,0 +1,14 @@
+[package]
+workspace = "../../../../../toolchain"
+name = "cmd-nice"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "nice standalone binary for agentos VM"
+
+[[bin]]
+name = "nice"
+path = "src/main.rs"
+
+[dependencies]
+shims = { package = "agentos-shims", path = "../../../../../toolchain/crates/libs/shims" }

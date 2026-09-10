@@ -1,0 +1,417 @@
+"""ContextBudgetAdvisor — per-turn token budget computation for Session.
+
+Owns the five budget-arithmetic methods:
+
+  - cap_tool_result        — truncate oversized tool-result text (#1128 size axis)
+  - per_turn_cap_tokens    — derive B_M-relative per-turn token ceiling
+  - media_followup_budget  — tokens left for media after capped text (#272)
+  - context_window_status  — {free_window, effective_trigger} for SP header
+  - enforce_new_msg_budget — reject an oversized new message before the turn starts (Axis 11)
+
+#5528 (owner ruling): the pre-frame, ESTIMATE-based proactive history
+compaction this method used to also run (a second, bundled behavior —
+"if the current history estimate exceeds effective_trigger, force-compact
+now, before ever sending") is REMOVED — same family as #5367's elide
+removal: a local token estimate cannot know what the actual provider
+payload will look like (system prompt, tool schemas, transport wrapping,
+inline media), so acting on it risked compacting a conversation that
+would have fit fine, and #5296 already decided this — that decision was
+never carried out. The genuinely distinct OTHER behavior this method
+always had — rejecting a single oversized new message outright, which
+drops nothing (the message is refused, never accepted then summarized
+away) — is owner's own "force close" (#4381 PR-4: "予算のための force
+close は残すで良い"), kept and renamed to say what it does. Recovery
+from an actual overflow (never predicted, only ever measured) is now
+entirely the reactive ladder's job — see #5531's `retry_loop`
+(``reyn.services.compaction.engine``) and `router_loop_driver.py`'s own
+byte-limit reactive `force_compact_now()` call.
+
+Plus the shared helper:
+
+  - _free_window_now      — (effective_trigger, estimated_history_tokens)
+
+All public methods are pure or only cause contained async side effects on
+the compaction controller.  Session holds an instance and forwards each
+method as a callback to RouterHostAdapter.
+
+history_fn dependency: a zero-arg callable that returns the current
+router-view history (list of dicts).
+"""
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any, Callable
+
+if TYPE_CHECKING:
+    pass
+
+
+class ContextBudgetAdvisor:
+    """Per-turn token budget advisor for the chat router loop.
+
+    Constructed once per Session; passed as callbacks to RouterHostAdapter.
+    """
+
+    def __init__(
+        self,
+        *,
+        compaction: Any,             # CompactionConfig — use_chars4_estimate
+        compaction_controller: Any,  # for engine.budgets + force_compact_now
+        media_store: Any,            # MediaStore | None — for cap_tool_result
+        model_fn: Callable[[], str],  # zero-arg → CURRENT resolved model (#1752)
+        events: Any,                 # EventLog — for fallback budget + emit
+        history_fn: Callable[[], list],  # zero-arg → current router-view history
+        offload_config: Any = None,  # OffloadConfig — tool-result-schema-redesign §5
+    ) -> None:
+        self._compaction = compaction
+        self._compaction_controller = compaction_controller
+        self._media_store = media_store
+        self._model_fn = model_fn
+        self._events = events
+        self._history_fn = history_fn
+        from reyn.config.chat import OffloadConfig
+        self._offload_config = offload_config if offload_config is not None else OffloadConfig()
+        # #2940: incremental token-estimate cache. Re-dumping the full router-view
+        # history on every call (dropdown open, pre-frame overflow check) is
+        # O(history size) each time and grows unbounded over a long session.
+        # Cache is (history length, cumulative estimated tokens) keyed by
+        # (model, use_chars4); a length decrease (compaction/rewind truncated
+        # history) or a model/config change invalidates it (full recompute),
+        # a length increase only dumps+estimates the NEW tail slice.
+        # "boundary" is the json dump of the last cached message (not a hash
+        # of it — one message's dump is cheap enough to hold verbatim) — the
+        # cache is an append-only-PREFIX assumption, but history_fn is
+        # typically a derived, recomputed view (e.g. Session._active_branch_
+        # history — the same function #2938 hoisted), not a real array: a
+        # rewind can change WHICH messages are active such that len returns
+        # to a previously-cached value while the actual content at that
+        # boundary differs. Checking length alone would then silently return
+        # a stale cached total (never re-synced until a later length
+        # decrease). The boundary hash makes this checked, not assumed.
+        self._history_token_cache: dict[str, Any] = {
+            "len": 0, "tokens": 0, "model": None, "use_chars4": None, "boundary": None,
+        }
+
+    @property
+    def _model(self) -> str:
+        # #1752: resolve the model live each call so a /model override (which can
+        # change the context window) is reflected in budgeting. The session-side
+        # fn resolves the class → litellm string; without this the advisor would
+        # budget against the construction-time model after a /model switch.
+        return self._model_fn()
+
+    # ── Internal helpers ─────────────────────────────────────────────────────
+
+    def _get_effective_trigger(self) -> int:
+        """Derive effective_trigger from engine budgets or fallback.
+
+        #2957 PR-B: delegates to
+        ``reyn.runtime.services.router_history_buffer.resolve_effective_trigger_and_budgets``
+        — single SSoT shared with ``RouterHistoryBuffer._resolve_budgets``
+        (previously each reimplemented this lookup independently).
+        """
+        from reyn.runtime.services.router_history_buffer import (
+            resolve_effective_trigger_and_budgets,
+        )
+        return resolve_effective_trigger_and_budgets(
+            self._compaction_controller, self._model, self._events,
+        )[0]
+
+    def _incremental_history_tokens(self) -> int:
+        """Estimated token count of the full router-view history (#2940).
+
+        #2957 PR-B: sums ``estimate_tokens_for_any_turn`` PER TURN (dict-aware:
+        fixed cost per image part, top-level ``tool_calls`` folded in) rather
+        than ``estimate_tokens(json.dumps(whole_or_delta_slice))`` (pre-PR-B).
+        The history this reads is ``build_history``'s own returned wire
+        dicts (see this class's docstring) — the canonical, serialised
+        quantity (see ``RouterHistoryBuffer._serialise_turn``'s docstring;
+        #5367 retired the elide-threshold check that USED to measure this
+        same quantity for a different purpose — this method's own concern
+        is independent of that removal). Before PR-B,
+        json.dumps-ing a wire dict counted an inlined image's FULL base64
+        payload as text (huge, proportional token count) while the elide
+        side (post PR-A) counted a fixed ``_IMAGE_FIXED_TOKEN_COST`` per
+        image part — the two sides disagreed by orders of magnitude on any
+        image-bearing conversation even when measuring the identical wire
+        dicts. ``estimate_tokens_for_any_turn`` (not the dict-only
+        ``estimate_tokens_for_turn`` directly) is required here because a
+        wire dict's ``tool_calls`` lives in a SEPARATE top-level key
+        (``_serialise_turn``'s real litellm wire shape), not inside
+        ``"content"`` — ``estimate_tokens_for_turn`` only reads
+        ``"content"``, so calling it directly would silently re-drop
+        ``tool_calls`` (the same class of gap PR-A fixed for ChatMessage
+        input, reappearing one call shape later).
+
+        Incremental: only the slice of history NEWER than the last call is
+        estimated; on a cache hit (no new messages since the last call)
+        THIS function's own estimate work is O(1).
+
+        That O(1) is scoped to the dump+estimate ONLY — it is NOT the cost of
+        calling this. ``self._history_fn()`` is invoked before the cache is
+        consulted (the cache is keyed on the history it returns, so it cannot
+        be), and in production that fn is
+        ``RouterHistoryBuffer.build_history`` → ``Session._active_branch_history``
+        — a whole-conversation derivation that runs on every call regardless of
+        this cache. So a "cache hit" here is not a cheap call: it still costs
+        O(history), and this cache's share of the total is small (#2940
+        measured it at ~2% when the producer was also re-scanning the WAL).
+        #2939 removed that WAL scan from the producer, so the caller-facing
+        cost now scales with the conversation rather than with WAL size — but
+        it is still the producer, not this, that dominates.
+
+        A shrink, a model/use_chars4 change, OR the cached
+        PREFIX's content actually differing (checked via a boundary — the
+        json dump of the last cached message, not assumed from length alone
+        — history_fn is often a recomputed derived view, e.g. a rewind-aware
+        active-branch filter, where the same length can recur with
+        different content) invalidates the cache for one full recompute.
+        """
+        import json as _json
+
+        from reyn.services.compaction.engine import estimate_tokens_for_any_turn
+
+        use_chars4 = getattr(self._compaction, "use_chars4_estimate", False)
+        cache = self._history_token_cache
+        try:
+            history = self._history_fn()
+            n = len(history)
+            cached_len = cache["len"]
+            # The boundary is the json dump of the LAST message that was in
+            # the cached prefix (index cached_len - 1). If it no longer
+            # matches the message currently at that index, the prefix isn't
+            # append-only-stable and the cache cannot be trusted, even at an
+            # unchanged or grown length. (json.dumps here is purely an
+            # identity fingerprint for the boundary check — NOT the token
+            # measure itself, which is estimate_tokens_for_turn below.)
+            boundary = (
+                _json.dumps(history[cached_len - 1], ensure_ascii=False)
+                if 0 < cached_len <= n
+                else None
+            )
+            prefix_unchanged = cached_len == 0 or (cached_len <= n and boundary == cache["boundary"])
+            if (
+                cached_len > n
+                or cache["model"] != self._model
+                or cache["use_chars4"] != use_chars4
+                or not prefix_unchanged
+            ):
+                tokens = sum(
+                    estimate_tokens_for_any_turn(m, self._model, use_chars4=use_chars4)
+                    for m in history
+                )
+            elif cached_len == n:
+                return int(cache["tokens"])
+            else:
+                # Only the NEW tail slice needs estimating — the cached total
+                # for the unchanged prefix carries forward unchanged.
+                delta = history[cached_len:]
+                tokens = int(cache["tokens"]) + sum(
+                    estimate_tokens_for_any_turn(m, self._model, use_chars4=use_chars4)
+                    for m in delta
+                )
+            new_boundary = _json.dumps(history[-1], ensure_ascii=False) if n > 0 else None
+            cache.update(
+                len=n, tokens=tokens, model=self._model, use_chars4=use_chars4, boundary=new_boundary,
+            )
+            return tokens
+        except Exception:  # noqa: BLE001 — estimation best-effort
+            return 0
+
+    def _free_window_now(self) -> tuple[int, int]:
+        """Return (effective_trigger, estimated_history_tokens).
+
+        Used by context_window_status — a display-only estimate. #5528:
+        no longer used by any proactive compaction decision (that call
+        site is removed; enforce_new_msg_budget checks only the new
+        message's own size, never the history estimate).
+        """
+        effective_trigger = self._get_effective_trigger()
+        estimated = self._incremental_history_tokens()
+        return effective_trigger, estimated
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    def per_turn_cap_tokens(self) -> int:
+        """B_M-relative per-turn cap (#1128/#272).
+
+        Derived from engine budgets; falls back to max_input_tokens.
+        """
+        from reyn.runtime.services.tool_result_cap import compute_cap_tokens
+        cfg = self._offload_config
+        return compute_cap_tokens(
+            self._get_effective_trigger(),
+            ceil_tokens=cfg.cap_ceil_tokens,
+            alpha=cfg.cap_alpha,
+        )
+
+    def cap_tool_result(
+        self,
+        content_str: str,
+        *,
+        content_type: "str | None" = None,
+        on_offload: "Callable[[str], None] | None" = None,
+        on_write_unavailable: "Callable[[], None] | None" = None,
+        chain_id: str = "",
+    ) -> str:
+        """Cap an oversized chat tool result (#1128 size axis).
+
+        No-op when no media_store is configured, or when ``offload.enabled: false``
+        (tool-result-schema-redesign §5 debug lever — never truncate). ``content_str``
+        is the canonical ``text`` body (#2425 案B) — already the clean payload, so the
+        stored body is it as-is and the inline is a bounded plain-text preview.
+
+        ``content_type`` (#2663) — the canonical's renderer-only sidecar (a mapper's declared MIME
+        type, e.g. ``"text/html"``); forwarded to the store's ``mime_type`` so the offloaded ref's
+        on-disk extension carries it (never into any LLM-visible field — this only ever reaches the
+        store, never the frontmatter this method's caller builds separately).
+
+        ``on_offload`` (#5364 §1.2) — forwarded to
+        ``tool_result_cap.cap_tool_result_content``'s own param of the same
+        name; optional and additive, every existing caller unaffected.
+
+        ``on_write_unavailable`` (#5364 §1.5) — forwarded to
+        ``tool_result_cap.cap_tool_result_content``'s own param of the same
+        name; optional and additive, every existing caller unaffected.
+
+        ``chain_id`` (#5387) — forwarded unchanged to
+        ``tool_result_cap.cap_tool_result_content``'s own param of the same
+        name (which forwards it to ``store.save_tool_result``, the ONE
+        thing GC needs to tell a still-open turn's content apart from an
+        evictable one — see that store's own docstring). Default ``""``:
+        byte-identical to every caller from before this parameter
+        existed.
+        """
+        if not self._offload_config.enabled:
+            return content_str
+        store = self._media_store
+        if store is None:
+            return content_str
+        from reyn.runtime.services.tool_result_cap import TRIGGER_CAP, cap_tool_result_content
+
+        use_chars4 = getattr(self._compaction, "use_chars4_estimate", False)
+        cfg = self._offload_config
+        return cap_tool_result_content(
+            content_str,
+            cap_tokens=self.per_turn_cap_tokens(),
+            model=self._model,
+            trigger=TRIGGER_CAP,
+            save_fn=store.save_tool_result,
+            use_chars4=use_chars4,
+            events=self._events,
+            content_type=content_type,
+            on_offload=on_offload,
+            on_write_unavailable=on_write_unavailable,
+            max_inline_bytes=cfg.max_inline_bytes,
+            preview_head_chars=cfg.preview_head_chars,
+            preview_tail_chars=cfg.preview_tail_chars,
+            chain_id=chain_id,
+        )
+
+    def media_followup_budget(self, tool_content: str) -> "int | None":
+        """Tokens left for media after capped tool text (#272 media axis).
+
+        ``None`` (unbounded) when ``offload.enabled: false`` (tool-result-schema-
+        redesign §5) — the media gate is one of the three size gates the debug
+        lever disables, so the opt-out isn't confounded by media starvation.
+        """
+        if not self._offload_config.enabled:
+            return None
+        from reyn.services.compaction.engine import estimate_tokens
+
+        use_chars4 = getattr(self._compaction, "use_chars4_estimate", False)
+        text_tokens = estimate_tokens(tool_content, self._model, use_chars4=use_chars4)
+        return max(0, self.per_turn_cap_tokens() - text_tokens)
+
+    def _effective_trigger_source(self) -> str:
+        """Where effective_trigger's underlying window size came from (status-bar
+        ctx chip detail). The engine-budget path subdivides T_max by configured
+        component weights, but T_max itself is always resolved via
+        get_max_input_tokens — so the root source is the same two-way split
+        either way (litellm catalog vs reyn's fallback default)."""
+        from reyn.llm.model_budget import get_max_input_tokens_source
+        return get_max_input_tokens_source(self._model)
+
+    def context_window_status(self) -> dict:
+        """Live exact-token context budget for the SP context-size signal.
+
+        Returns {free_window, effective_trigger, source}.
+        """
+        effective_trigger, used = self._free_window_now()
+        return {
+            "free_window": max(0, effective_trigger - used),
+            "effective_trigger": effective_trigger,
+            "source": self._effective_trigger_source(),
+        }
+
+    def raw_context_window(self) -> dict:
+        """The model's ACTUAL context window (get_max_input_tokens), distinct
+        from ``context_window_status``'s ``effective_trigger`` — that value is
+        already reduced by SP/head/tail/component-weight budgeting (an
+        internal compaction-trigger threshold, not the model's real limit).
+        For a user-facing "how close to the model's hard limit" display
+        (status-bar ctx chip), the denominator should be this raw figure.
+
+        Returns {window, source}.
+        """
+        from reyn.llm.model_budget import get_max_input_tokens, get_max_input_tokens_source
+        model = self._model
+        return {
+            "window": get_max_input_tokens(model, events=self._events),
+            "source": get_max_input_tokens_source(model),
+        }
+
+    async def enforce_new_msg_budget(
+        self,
+        *,
+        new_msg_text: str | None = None,
+    ) -> None:
+        """Force-close an oversized new message before the turn starts
+        (Axis 11 / #4381 PR-4 "force close" — owner: "予算のための force
+        close は残すで良い"). Drops nothing: the message is refused
+        outright, never accepted into history then summarized away — the
+        distinction #5528 draws against the REMOVED proactive-compact
+        behavior this method used to also run (see this module's own
+        docstring).
+
+        ``new_msg_text=None`` (the caller has no new message to check yet,
+        or chooses not to) is a pure no-op — this method no longer touches
+        history or the compaction controller at all.
+        """
+        from reyn.services.compaction.engine import (
+            NewMsgExceedsBudgetError,
+            estimate_tokens_for_turn,
+        )
+
+        if new_msg_text is None:
+            return
+
+        # ISSUE #4: re-measure T_SP dynamically.
+        engine = self._compaction_controller._engine
+        try:
+            engine.recompute_budgets()
+        except Exception:
+            pass
+
+        engine = self._compaction_controller._engine
+        budgets = getattr(engine, "budgets", None)
+        if budgets is not None:
+            new_msg_budget = budgets.new_msg_budget
+        else:
+            from reyn.llm.model_budget import get_max_input_tokens
+            new_msg_budget = get_max_input_tokens(self._model, events=self._events)
+
+        new_msg_turn = {"role": "user", "content": new_msg_text}
+        use_chars4 = getattr(self._compaction, "use_chars4_estimate", False)
+        new_msg_tokens = estimate_tokens_for_turn(
+            new_msg_turn, self._model, use_chars4=use_chars4
+        )
+        if new_msg_tokens > new_msg_budget:
+            self._events.emit(
+                "new_msg_exceeds_budget",
+                new_msg_tokens=new_msg_tokens,
+                new_msg_budget=new_msg_budget,
+            )
+            raise NewMsgExceedsBudgetError(
+                new_msg_tokens=new_msg_tokens,
+                new_msg_budget=new_msg_budget,
+            )

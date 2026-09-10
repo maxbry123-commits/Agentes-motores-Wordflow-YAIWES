@@ -1,0 +1,12 @@
+# Raw academic corpora you download locally (see README) — not redistributed here.
+/raw/
+*.tsv
+*.csv
+
+# Generated golden sets — regenerate with convert.mjs; don't commit large/NC-licensed dumps.
+*.jsonl
+# ...but DO keep the tiny hand-checked smoke set under version control.
+!smoke.jsonl
+
+# Per-run eval results (verdicts + rationale + evidence) — regenerate with `npm run eval:smoke`.
+*.results.json

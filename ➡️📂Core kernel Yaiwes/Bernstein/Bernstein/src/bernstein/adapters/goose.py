@@ -1,0 +1,214 @@
+"""Goose CLI adapter for Bernstein.
+
+Adapter for Goose (https://github.com/aaif-goose/goose), now stewarded by the
+Agentic AI Foundation (Linux Foundation) - the GitHub org has moved from
+``block/goose`` to ``aaif-goose/goose``, and the old paths still resolve
+through GitHub's rename redirect.  Goose is an AI agent that can execute
+tasks autonomously; this adapter allows Bernstein to orchestrate Goose as a
+worker agent.
+
+``goose run`` takes the prompt either as ``-i/--instructions <FILE>`` or as
+``-t/--text <TEXT>``; there is no singular ``--instruction`` that carries
+prompt text.  Passing one makes the argument parser abort with exit code 2
+before the agent starts, so the worker dies having done no work.
+
+Last verified against upstream Goose 1.45.0 on 2026-08-10.
+Install: ``brew install --cask block-goose`` (macOS), or
+``curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh | bash``.
+"""
+
+from __future__ import annotations
+
+import logging
+import subprocess
+from contextlib import suppress
+from typing import TYPE_CHECKING, Any
+
+from bernstein.adapters._contract import DangerousModeStrategy
+from bernstein.adapters.base import (
+    DEFAULT_TIMEOUT_SECONDS,
+    CLIAdapter,
+    SpawnResult,
+    build_worker_cmd,
+)
+from bernstein.adapters.env_isolation import build_filtered_env
+from bernstein.core.defaults import COST
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    from bernstein.core.models import ModelConfig
+
+logger = logging.getLogger(__name__)
+
+# Model mapping: Bernstein logical names → Goose model IDs
+# Updated 2026-04-17 - keep Opus alias in sync with claude.py canonical ID.
+_MODEL_MAP: dict[str, str] = {
+    "opus": "claude-opus-4-7",
+    "opus-4-6": "claude-opus-4-6",  # pinned fallback
+    "sonnet": "claude-sonnet-4-6",
+    "haiku": "claude-haiku-4-5-20251001",
+}
+
+
+class GooseAdapter(CLIAdapter):
+    """Goose CLI adapter for Bernstein.
+
+    Integrates with the Goose CLI agent.
+    GitHub: https://github.com/aaif-goose/goose
+    """
+
+    def _goose_mode(self) -> str:
+        """Return the GOOSE_MODE autonomy policy for this spawn.
+
+        Goose controls autonomy via the ``GOOSE_MODE`` env var (``auto``,
+        ``approve``, ``smart_approve``, ``chat``); there is no CLI flag. The
+        policy is pinned on every spawn from the adapter's declared
+        dangerous-mode strategy so an un-pinned spawn never inherits the
+        operator's own ``GOOSE_MODE``. A permissive strategy (``auto``) lets
+        the agent act unattended; anything else is restricted (``approve``)
+        so a headless run fails fast instead of blocking on a prompt nobody
+        answers.
+        """
+        declared = getattr(self.strategy(), "dangerous_mode", DangerousModeStrategy.UNSUPPORTED)
+        if not isinstance(declared, DangerousModeStrategy):
+            declared = DangerousModeStrategy.UNSUPPORTED
+        if declared in (
+            DangerousModeStrategy.ENV_VAR,
+            DangerousModeStrategy.CLI_FLAG,
+            DangerousModeStrategy.ALWAYS_ON,
+        ):
+            return "auto"
+        return "approve"
+
+    def spawn(
+        self,
+        *,
+        prompt: str,
+        workdir: Path,
+        model_config: ModelConfig,
+        session_id: str,
+        mcp_config: dict[str, Any] | None = None,
+        timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+        task_scope: str = "medium",
+        budget_multiplier: float = 1.0,
+        system_addendum: str = "",
+        multimodal_context: Any | None = None,
+    ) -> SpawnResult:
+        """Launch a Goose agent process.
+
+        Args:
+            prompt: Task description passed to the agent.
+            workdir: Working directory (project root).
+            model_config: Model and effort settings chosen by the orchestrator.
+            session_id: Unique identifier for this agent session.
+            mcp_config: Optional MCP server configuration (ignored by Goose).
+            timeout_seconds: Hard kill timeout in seconds.
+
+        Returns:
+            SpawnResult with the process PID and log file path.
+
+        Raises:
+            RuntimeError: If the Goose binary is not found.
+        """
+        self.refuse_multimodal_if_needed(multimodal_context)
+        self.enforce_network_policy()
+        log_path = workdir / ".sdd" / "runtime" / f"{session_id}.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+
+        model_id = _MODEL_MAP.get(model_config.model, model_config.model)
+
+        # Max turns derived from effort and task scope, mirroring the claude
+        # adapter's computation so large tasks get proportionally more turns.
+        effort = getattr(model_config, "effort", "normal")
+        base_turns = COST.effort_base_turns.get(effort, 50)
+        scope_multiplier = COST.scope_multipliers.get(task_scope, 1.5)
+        max_turns = int(base_turns * scope_multiplier)
+
+        cmd = [
+            "goose",
+            "run",
+            "--text",
+            prompt,
+            "--output-format",
+            "stream-json",
+            "--no-session",
+            "--max-turns",
+            str(max_turns),
+        ]
+        if model_id:
+            cmd += ["--model", model_id]
+
+        pid_dir = workdir / ".sdd" / "runtime" / "pids"
+        wrapped_cmd = build_worker_cmd(
+            cmd,
+            role=session_id.rsplit("-", 1)[0],
+            session_id=session_id,
+            pid_dir=pid_dir,
+            workdir=workdir,
+            log_path=log_path,
+            model=model_id,
+        )
+
+        # Always pass an explicit ``env=`` - Popen with env=None inherits
+        # the orchestrator's full environment, which is a credential-leak
+        # vector (DB URLs, internal tokens, unrelated provider keys).
+        # Goose accepts model creds via Anthropic/OpenAI/OpenRouter envs.
+        env = build_filtered_env(
+            ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY", "GOOGLE_API_KEY"],
+        )
+        # Pin the autonomy policy AFTER the allow-list so the worker sees the
+        # adapter's value whatever the operator's own environment holds.
+        # ``GOOSE_MODE`` is deliberately not in ``build_filtered_env``'s
+        # extra_keys - it is set explicitly here, never inherited.
+        env["GOOSE_MODE"] = self._goose_mode()
+        with log_path.open("w") as log_file:
+            try:
+                proc = subprocess.Popen(
+                    wrapped_cmd,
+                    cwd=workdir,
+                    env=env,
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
+            except FileNotFoundError as exc:
+                raise RuntimeError("goose not found in PATH. Install: https://github.com/aaif-goose/goose") from exc
+            except PermissionError as exc:
+                raise RuntimeError(f"Permission denied executing goose: {exc}") from exc
+
+        timer = self._start_timeout_watchdog(proc.pid, timeout_seconds, session_id)
+        return SpawnResult(pid=proc.pid, log_path=log_path, proc=proc, timeout_timer=timer)
+
+    def name(self) -> str:
+        """Human-readable adapter name shown in bernstein ps and logs."""
+        return "goose"
+
+    def get_version(self) -> str | None:
+        """Return the Goose CLI version string, or None if unavailable."""
+        with suppress(Exception):
+            result = subprocess.run(
+                ["goose", "--version"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=10,
+                check=False,
+            )
+            if result.returncode == 0:
+                return result.stdout.strip()
+        return None
+
+    def is_available(self) -> bool:
+        """Return True if the Goose CLI is installed and accessible."""
+        try:
+            result = subprocess.run(
+                ["goose", "--help"],
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+            return result.returncode == 0
+        except Exception:
+            return False

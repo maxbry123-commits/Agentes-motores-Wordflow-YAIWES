@@ -1,0 +1,104 @@
+defmodule Jidoka.Workflow.Ref do
+  @moduledoc """
+  Reference helpers for declarative `Jidoka.Workflow` data wiring.
+
+  Refs keep workflow steps data-driven. A step describes the data it needs;
+  the workflow runtime resolves that data from workflow input, runtime context,
+  prior step output, or explicit static values.
+  """
+
+  @type path :: atom() | String.t() | [atom() | String.t()]
+
+  @type t ::
+          {:jidoka_workflow_ref, :input, atom() | String.t()}
+          | {:jidoka_workflow_ref, :from, atom(), nil | [atom() | String.t()]}
+          | {:jidoka_workflow_ref, :maybe_from, atom(), nil | [atom() | String.t()]}
+          | {:jidoka_workflow_ref, :context, atom() | String.t()}
+          | {:jidoka_workflow_ref, :value, term()}
+          | {:jidoka_workflow_ref, :coalesce, [term()]}
+          | {:jidoka_workflow_ref, :item}
+          | {:jidoka_workflow_ref, :index}
+          | {:jidoka_workflow_ref, :items}
+          | {:jidoka_workflow_ref, :loop_state}
+          | {:jidoka_workflow_ref, :iteration}
+
+  @doc "References a top-level workflow input field."
+  @spec input(atom() | String.t()) :: t()
+  def input(key) when is_atom(key) or is_binary(key), do: {:jidoka_workflow_ref, :input, key}
+
+  @doc "References a prior step output."
+  @spec from(atom()) :: t()
+  def from(step) when is_atom(step), do: {:jidoka_workflow_ref, :from, step, nil}
+
+  @doc "References a field or path inside a prior step output."
+  @spec from(atom(), path()) :: t()
+  def from(step, field) when is_atom(step) and (is_atom(field) or is_binary(field)),
+    do: {:jidoka_workflow_ref, :from, step, [field]}
+
+  def from(step, path) when is_atom(step) and is_list(path),
+    do: {:jidoka_workflow_ref, :from, step, path}
+
+  @doc "References a prior step output, returning nil when the step output is missing or skipped."
+  @spec maybe_from(atom()) :: t()
+  def maybe_from(step) when is_atom(step), do: {:jidoka_workflow_ref, :maybe_from, step, nil}
+
+  @doc "References a field or path inside a prior step output, returning nil when missing or skipped."
+  @spec maybe_from(atom(), path()) :: t()
+  def maybe_from(step, field) when is_atom(step) and (is_atom(field) or is_binary(field)),
+    do: {:jidoka_workflow_ref, :maybe_from, step, [field]}
+
+  def maybe_from(step, path) when is_atom(step) and is_list(path),
+    do: {:jidoka_workflow_ref, :maybe_from, step, path}
+
+  @doc "Returns the first resolved value that is not nil."
+  @spec coalesce([term()]) :: t()
+  def coalesce(values) when is_list(values), do: {:jidoka_workflow_ref, :coalesce, values}
+
+  @doc "References the current map item. Only valid inside a map step input."
+  @spec item() :: t()
+  def item, do: {:jidoka_workflow_ref, :item}
+
+  @doc "References the current map item index. Only valid inside a map step input."
+  @spec index() :: t()
+  def index, do: {:jidoka_workflow_ref, :index}
+
+  @doc "References the current reduce item list. Only valid inside a reduce step input."
+  @spec items() :: t()
+  def items, do: {:jidoka_workflow_ref, :items}
+
+  @doc "References the current loop state. Only valid inside a loop input."
+  @spec loop_state() :: t()
+  def loop_state, do: {:jidoka_workflow_ref, :loop_state}
+
+  @doc "References the zero-based loop iteration. Only valid inside a loop input."
+  @spec iteration() :: t()
+  def iteration, do: {:jidoka_workflow_ref, :iteration}
+
+  @doc "References runtime side-band workflow context."
+  @spec context(atom() | String.t()) :: t()
+  def context(key) when is_atom(key) or is_binary(key), do: {:jidoka_workflow_ref, :context, key}
+
+  @doc "Marks a static value explicitly."
+  @spec value(term()) :: t()
+  def value(term), do: {:jidoka_workflow_ref, :value, term}
+
+  @doc false
+  @spec ref?(term()) :: boolean()
+  def ref?({:jidoka_workflow_ref, kind, _key}) when kind in [:input, :context, :value], do: true
+
+  def ref?({:jidoka_workflow_ref, :from, step, path})
+      when is_atom(step) and (is_nil(path) or is_list(path)),
+      do: true
+
+  def ref?({:jidoka_workflow_ref, :maybe_from, step, path})
+      when is_atom(step) and (is_nil(path) or is_list(path)),
+      do: true
+
+  def ref?({:jidoka_workflow_ref, :coalesce, values}) when is_list(values), do: true
+
+  def ref?({:jidoka_workflow_ref, kind})
+      when kind in [:item, :index, :items, :loop_state, :iteration],
+      do: true
+
+  def ref?(_other), do: false
+end

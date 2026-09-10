@@ -1,0 +1,179 @@
+schema_version: "0.1"
+generated_at: "2026-07-28"
+inventory_format: "[mode, blob_sha, relative_path]"
+samples:
+  ASL-C001:
+    repository_commit: b29e7cf65e5cb78a5ac33d582270551bc74a14eb
+    skill_root: skills/skill-creator
+    git_tree_sha: 3cf9a8db32597ba3e24b584a3d696f4e11c7d7b6
+    inventory_sha256: c1b64b0225f61e0cd175176b28a08c9e7f4340c88b57e9782a0d533a1a5dbbdc
+    files:
+      - [100644, 4f881c52d1f72f4cfb720e339e2d35c3058d01a9, LICENSE.txt]
+      - [100644, 65b3a402dbd09b8e83f9d637c6b553875189085c, SKILL.md]
+      - [100644, 14e41d6068635f4dd3fb878fd1626312395dda63, agents/analyzer.md]
+      - [100644, 80e00eb45db3ee53a132fc2ba97fd59a7339e563, agents/comparator.md]
+      - [100644, 558ab05c0a9a8bb062ef4c51823d4d76c3acf7c4, agents/grader.md]
+      - [100644, 938ff32aed9bffabf723bd5492d720f4736c8e4d, assets/eval_review.html]
+      - [100644, 7fa5978631fed1ed545591dbb2b0eb21ce3f3d08, eval-viewer/generate_review.py]
+      - [100644, 6d8e96348a02e66c3363d2ff3b3ae58ac11e6382, eval-viewer/viewer.html]
+      - [100644, b6eeaa2d4a34c1653069585c6c5603da39a5bdbe, references/schemas.md]
+      - [100644, e69de29bb2d1d6434b8b29ae775ad8c2e48c5391, scripts/__init__.py]
+      - [100755, 3e66e8c105be9bab9f0e9c61f0d1482619401580, scripts/aggregate_benchmark.py]
+      - [100755, 959e30a0014ec165c41a2bb7420b7dfe1416bbac, scripts/generate_report.py]
+      - [100755, 06bcec76122446986e3610c20a39c466de36f495, scripts/improve_description.py]
+      - [100755, f48eac444656ddc41204aac1760a217951ce609e, scripts/package_skill.py]
+      - [100755, ed8e1dddce77b16af13c6f36b3fe86c4ac7c590c, scripts/quick_validate.py]
+      - [100755, e58c70bea39d5b252a1e819f242bbdcdf20e8b87, scripts/run_eval.py]
+      - [100755, 30a263d674ef19de11d756d6f7537f91a421909e, scripts/run_loop.py]
+      - [100644, 51b6a07dd57174197a937034b7eecebd5768ff8a, scripts/utils.py]
+  ASL-C002:
+    repository_commit: b29e7cf65e5cb78a5ac33d582270551bc74a14eb
+    skill_root: skills/mcp-builder
+    git_tree_sha: b866bcfb57b780c10b587c7b543e871a91661ce0
+    inventory_sha256: 7f7b98e2c7298c5a4c1f1d03e41c3dd6378047a8142949017d47171d6937cb6b
+    files:
+      - [100644, 4f881c52d1f72f4cfb720e339e2d35c3058d01a9, LICENSE.txt]
+      - [100644, 8a1a77a47d141967b246adb4da4f91037578ff7d, SKILL.md]
+      - [100644, 87e9bb78840fac113d93b4a27ab5b229a18cf226, reference/evaluation.md]
+      - [100644, b9d343cc3ae89b1fc139dae96bdb2b7e29ba3648, reference/mcp_best_practices.md]
+      - [100644, f6e5df982adc0848bf261c47ab8d65a1e0469391, reference/node_mcp_server.md]
+      - [100644, cf7ec996d2e6e3655bc75ff6902738d03a37334e, reference/python_mcp_server.md]
+      - [100644, ffcd0da3fbe1539320d022017ae83b61a9587a5c, scripts/connections.py]
+      - [100644, 41778569c45a458e0eea839b8917692ad65be2d5, scripts/evaluation.py]
+      - [100644, 41e4459b5af861e61f1ca87d2f8f5ab5543dc054, scripts/example_evaluation.xml]
+      - [100644, e73e5d1e356edafadb9dc9243e6f300f2c5529b3, scripts/requirements.txt]
+  ASL-C003:
+    repository_commit: b29e7cf65e5cb78a5ac33d582270551bc74a14eb
+    skill_root: skills/webapp-testing
+    git_tree_sha: 5ffb7dc66b9fd4c25c3e400a4c00da99a349b714
+    inventory_sha256: 9766c3f7cb1949e98b08f293334a0549c5e9648e93d41551ce7559ec06d61b58
+    files:
+      - [100644, 4f881c52d1f72f4cfb720e339e2d35c3058d01a9, LICENSE.txt]
+      - [100644, 4726215301db64a0cc4d41fc3219c61f37a30f4a, SKILL.md]
+      - [100644, 9329b5e232ed53d944bfe95e750070117d31b9ab, examples/console_logging.py]
+      - [100644, 917ba72f52421a1b324f93ae8e38af72010a87b9, examples/element_discovery.py]
+      - [100644, 90bbedcc08cdb345c74fb938ebad02c0baf56603, examples/static_html_automation.py]
+      - [100755, 431f2eba16b268b7f3e2ae4daae9db41c0289b6d, scripts/with_server.py]
+  ASL-C004:
+    repository_commit: fe588b1a6267eb47f785d0c748db9f6f3e9a3b4f
+    skill_root: skills/handoff
+    git_tree_sha: 1c8427f164487c197b37a87dc76a0b5be63c3735
+    inventory_sha256: b443e7666aa7bb89936545fedd290ba560c0b173c9b50ac9d998a8a2839acf5b
+    files:
+      - [100644, 50054b4079bcc25492e27cae7b72ea748a853cc9, SKILL.md]
+  ASL-C005:
+    repository_commit: fe588b1a6267eb47f785d0c748db9f6f3e9a3b4f
+    skill_root: skills/autoreview
+    git_tree_sha: be0750c0949d270193ffe3048d8ee4465f9886c9
+    inventory_sha256: e70a7b22d01fcd21ede8488161970f8e18b8775fac93614363bf5ba2d53d2830
+    files:
+      - [100644, 5a0173d73d39a8b1e2e66ae1d54b47f960b25e43, AGENTS.md]
+      - [120000, 47dc3e3d863cfb5727b87d785d09abf9743c0a72, CLAUDE.md]
+      - [100644, a59642db760c10dac574c3d73885d7bf4aa90004, SKILL.md]
+      - [100755, e31936e8a76154fa9e70fe165012aac164b1d6d6, scripts/autoreview]
+      - [100644, ebf4cba7d3afcdbb95a2cf9259cc96fbfa23cdaa, scripts/autoreview_test.py]
+      - [100755, ab98338a891a69423beee3f21247dc215066f392, scripts/test-review-harness]
+      - [100644, 4b859ca2dc83326e3e0c983ed8d03b007deca639, scripts/test-review-harness.ps1]
+      - [100644, 5077d40f731dfff23932edb81d560d6c4a39753b, scripts/test-review-harness.py]
+      - [100644, 1b45f94e09b7c3c031b4158c8fb4dbffb33d1630, tests/fixtures/typescript-benign-config-path-references.ts]
+      - [100644, 924bdd7ab5fb5bd92ee8fcdca298770585ca625a, tests/fixtures/typescript-benign-references.ts]
+      - [100644, 1fb677b7114452fdbf00c027e822bd2dfaed84b6, tests/fixtures/typescript-sensitive-literals.ts]
+      - [100644, c6be9bc83881e89dc8cc929681d1c3d755cfffab, tests/test_autoreview_hardening.py]
+  ASL-C006:
+    repository_commit: fe588b1a6267eb47f785d0c748db9f6f3e9a3b4f
+    skill_root: skills/beam
+    git_tree_sha: 609812a01fbf69a2892ccbc06ca1c2e86d32b8db
+    inventory_sha256: 978420c45ebb2d5d5da6540eda019081653ca2f58ee3e6f4185aa441d1184e9a
+    files:
+      - [100644, adb3d98bc5f1d64cb25c5bc7f129bed8f09e480d, README.md]
+      - [100644, 7636fcc6ad3e0a61fb9019b2ef6f4f290608a945, SKILL.md]
+      - [100644, ba4e64202948c343ab5e8767d88bebab9eac11ef, references/claude-code-hooks.json]
+      - [100644, 849a71a556dce8e1a851132b6ba91ff1cd4c301c, references/codex-hooks.toml]
+      - [100755, bbbc44d063fed216a7a6a92a6dd334e9913c09cb, scripts/beam]
+      - [100644, f1f8686f514cedc5e0c5c9aefe447791487a59a6, scripts/beam-session.js]
+      - [100644, 3fe6cfcc0e71f1203351e3e8b92056524328640c, scripts/beam.test.mjs]
+  ASL-C007:
+    repository_commit: 202140db53536083b85aba7511c555d07f5ada67
+    skill_root: skills/research/llm-wiki
+    git_tree_sha: 491a4ba88477dd870379b0c10fe1751153b56d7c
+    inventory_sha256: a2531054303b4d733329dccb05e15b52ca70c31c0f5a73a90d30f296a8e91b7e
+    files:
+      - [100644, 7dc708c9a5fce649b853f87e75ae4bbf853aa2ce, SKILL.md]
+  ASL-C008:
+    repository_commit: 202140db53536083b85aba7511c555d07f5ada67
+    skill_root: skills/productivity/ocr-and-documents
+    git_tree_sha: 8b0ea191c1fb3013a607ab209e044b5aee51a751
+    inventory_sha256: 9a35a64f6d778e96aed52d77bc24ba69092cde8beaf835f9098683a78e037759
+    files:
+      - [100644, b74c8a0c6836e903121683047250e4d2ab6ad9f2, DESCRIPTION.md]
+      - [100644, 7f6e7bf2c54e3b2fd23cb698e075fb6fefd80fac, SKILL.md]
+      - [100644, d48fd10bb02cd6abe55bd29a239a2606ce382e76, scripts/extract_marker.py]
+      - [100644, 50cb8ee86c40587ce22835bbf167c64fe3800935, scripts/extract_pymupdf.py]
+  ASL-C009:
+    repository_commit: 879835bf8bb882672742f0765747312c4948420f
+    skill_root: .claude/skills/init-onecli
+    git_tree_sha: b7847fb089887618a33536151cf4a4a856f96687
+    inventory_sha256: 7890c70221d4cf684c4a68d52616537fc4f95d9746f97c2e60c8cc4d5ec6c4da
+    files:
+      - [100644, 5972a95890e72be03a8cd849433a361d4d7cdf16, SKILL.md]
+  ASL-C010:
+    repository_commit: 879835bf8bb882672742f0765747312c4948420f
+    skill_root: .claude/skills/setup
+    git_tree_sha: 7b934fcbf5f668ee524e31fcc54d915df8b34a5e
+    inventory_sha256: 70a1e3a4120cf780d3e560c6d878080fe6d243c251b9d12a3efb6b56c139dda3
+    files:
+      - [100644, 54e2458738ac4eba268d12db9ce3b523123c923c, SKILL.md]
+  ASL-C011:
+    repository_commit: de4e4498c91a600d12d9155e016012fc7ea80d74
+    skill_root: skills/jetson-init-source
+    git_tree_sha: bebb545561b94f5a8886c28772eb20a38bd1a237
+    inventory_sha256: c3fd9f510b27027f573541ce3c2b320266e315c9b181e0bfbcc6215a8e281932
+    files:
+      - [100644, 7251f67f14c83b1b658b4da9399dd70e60a2c0b8, BENCHMARK.md]
+      - [100644, 4dec5c75d14eb81e41354df5fe412fdfd7f908a6, SKILL.md]
+      - [100644, 03414ca851277abd38ba84ef93b5588fe9ac47c9, evals/evals.json]
+      - [100644, 4c5537954993c8f45119b6ac13df062a076ea9e4, references/branch-a-extraction.md]
+      - [100644, 5a49141383816aaed6b93f3256fe343e3fac2c12, skill-card.md]
+      - [100644, d9e8f9d460bceff6937405d903c8c29f05cdf915, skill.oms.sig]
+  ASL-C012:
+    repository_commit: 1ad9aaeb49caafd9e95c0a91116f71890eebbc53
+    skill_root: skills/supabase-postgres-best-practices
+    git_tree_sha: d11b54a2ab36d33940504ca9ec3a57bfd6126f26
+    inventory_sha256: 8fd0207e1406594bc4045501d7739edc46aed4c1c45664a9ac96f4263e9549b2
+    files:
+      - [100644, aea32004b1bdfb2ccf0b04c09efde63532cf62f7, CHANGELOG.md]
+      - [100644, d9ef1949f807d0b41ca85d9a0837ad78bf1c58de, SKILL.md]
+      - [100644, 1c055aff9ad2bf12cfe7edc0002f2f77fe6980d2, references/_contributing.md]
+      - [100644, 8ba57c23e8119e411fcc8a230cda08e695792cac, references/_sections.md]
+      - [100644, 91ace90e10a4d8ef354a82bb1994842e6979ebed, references/_template.md]
+      - [100644, 582cbeaada9378a280ad61f57e06c10d258e3c43, references/advanced-full-text-search.md]
+      - [100644, e3d261ea117fd7b1ad9c4f0d45308407b898ed5a, references/advanced-jsonb-indexing.md]
+      - [100644, 40b9cc50dd12cf347ed189fac965673b533f3f99, references/conn-idle-timeout.md]
+      - [100644, cb3e400c0234e7e9196c1650423faad66375b70b, references/conn-limits.md]
+      - [100644, e2ebd581d3c85bff0a077e8d9a2cb562d2513d03, references/conn-pooling.md]
+      - [100644, 555547d834e35b5059152dfb2288eca5e9838ea0, references/conn-prepared-statements.md]
+      - [100644, 997947cb17bfed67f29eaa8da2a58de2306cc2c1, references/data-batch-inserts.md]
+      - [100644, 2109186ff88b3ba1cc32789f81e2a00d345c6e3f, references/data-n-plus-one.md]
+      - [100644, 633d839323612e212a833dd96828cb31fdfb39f8, references/data-pagination.md]
+      - [100644, bc95e2305d955679446c70854cb2b56b183aa56d, references/data-upsert.md]
+      - [100644, 572eaf0dcf518ac925c4cde41beb60b62852b79c, references/lock-advisory.md]
+      - [100644, 974da5edec32f79de0fcdc771d4ef759dc3e049d, references/lock-deadlock-prevention.md]
+      - [100644, e6b8ef2633248a4aa4394628e48d8cb693e7e6ab, references/lock-short-transactions.md]
+      - [100644, 77bdbb97045010ce2fdbd90733e8f764be82881a, references/lock-skip-locked.md]
+      - [100644, 542978c3bafc510fa8d7a8864cff994ad40be4d7, references/monitor-explain-analyze.md]
+      - [100644, d7e82f1aacd105d53789eb6188d11e8ea39e7310, references/monitor-pg-stat-statements.md]
+      - [100644, e0e8ea0b7db8c1513a0d1605be477192bc21d91d, references/monitor-vacuum-analyze.md]
+      - [100644, fea64523fd5bb3696f943d486ccaf2aea75d27b8, references/query-composite-indexes.md]
+      - [100644, 9d2a4947b94516dd975e1044d132bb007280f478, references/query-covering-indexes.md]
+      - [100644, 93b32590f4bfe377869274f45414ae6e43d168fa, references/query-index-types.md]
+      - [100644, e6daace7dd368c75cdf87dc61be4afd6ff66cbbe, references/query-missing-indexes.md]
+      - [100644, 3e61a3417b9cce3c8cee99b39b78b7ebf495dd1f, references/query-partial-indexes.md]
+      - [100644, 1d2ef8f9a968cd6fa882c7299134c30ace06373c, references/schema-constraints.md]
+      - [100644, f253a5819d05531371e04485ab84f552fbb32fbe, references/schema-data-types.md]
+      - [100644, 6c3d6ff622b8a9df358f6673f323292e682ce87c, references/schema-foreign-key-indexes.md]
+      - [100644, f0072940b159ff64e0c2d4fbb499133cb8f49a66, references/schema-lowercase-identifiers.md]
+      - [100644, 13137a03275fa45001c870a40b0069204d44e005, references/schema-partitioning.md]
+      - [100644, fb0fbb166fac9ea38c127d807a263282acc2dc93, references/schema-primary-keys.md]
+      - [100644, 448ec345fab6c5a0116c584d65638b86d758c558, references/security-privileges.md]
+      - [100644, c61e1a8503de113be0981759b82f5e37090f344c, references/security-rls-basics.md]
+      - [100644, c3c7c416d57d9a46a9993f4e0c20f772fb64483d, references/security-rls-performance.md]

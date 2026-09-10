@@ -1,0 +1,1860 @@
+# Repo-OS Contract
+
+The **repo-OS contract** is the set of on-disk artifacts a loop-engineer scaffolds into a
+workspace so that an agent loop can be designed, launched, verified, repaired, resumed across
+sessions, and improved — *without* the loop's state living only in a chat context that
+compaction or a crashed session can lose. State is **externalized to files**; the loop reads
+its truth from disk on every turn.
+
+This file is the canonical schema. It is scaffolded by `[[loop-contract]]`, consumed by
+`[[loop-run]]` (which transitions `state.json`), repaired by `[[loop-repair]]`, measured by
+`[[loop-evals]]`, and mined by `[[loop-flywheel]]`. The patterns that drive each artifact live
+in `loop-patterns.md`; the safety/terminal semantics live in `safety-and-approvals.md`.
+
+---
+
+## 0. The contract is a versioned, tool-agnostic standard
+
+This document is the **normative standard** for the repo-OS contract. It is not a
+description of one tool's private file format: it is a **portable, tool-agnostic on-disk
+standard**. Any surface that can read a repo, run a shell command, and write files can emit or
+consume it — Loop Engineer is the *reference implementation*, not the only permitted producer.
+
+- **Conformance is defined by the published JSON Schemas** in `schemas/*.schema.json`, not by
+  any one validator's source code. Every schema-bearing artifact carries a `schema` key, and
+  every schema an `$id`, of the form **`loop-engineer/<artifact>@<major>`**
+  (e.g. `loop-engineer/state@1`). The major integer in that identifier is the version an
+  external emitter targets.
+- **Within a major, changes are strictly additive and optional.** Every artifact schema sets
+  `"additionalProperties": true`, so a validator for major *N* accepts any artifact whose
+  required keys and types match major *N* and **ignores unknown keys** — a newer emitter's
+  extra fields never reject a valid v1 artifact. Adding an optional key, or a new optional
+  file, does not bump the major.
+- **Breaking changes get a new major and a new `$id`.** Removing or renaming a required key,
+  changing a type, or tightening an enum ships as `loop-engineer/<artifact>@2` with a new
+  `$id`. Both majors may be published and validated **side by side**.
+- **Stability tiers.** The artifact table (§11) records each artifact's tier. For v1:
+  **manifest / state / tasks / terminal are `stable`**; **receipt / repair-record /
+  rollout-record are `provisional`** (the newest surfaces, whose additive shape may still be
+  refined within `@1`).
+
+A third-party harness whose output satisfies the §14 conformance checklist may claim it
+**"emits a Loop-Engineer-conformant contract v1."**
+
+---
+
+## 1. The full repo-OS tree
+
+```
+<workspace>/
+  AGENTS.md           # short table-of-contents of stable rules (points to the rest)
+  SPEC.md             # success criteria, constraints, non-goals, evidence rules — the INTENT
+  WORKFLOW.md         # loop policy, approval gates, budgets, terminal states — the STABLE RULES
+  TASKS.json          # machine-readable task ledger — the QUEUE
+  RUNLOG.md           # human-readable iteration history (one entry per loop) — the HISTORY
+  EVALS/
+    dataset/          # fixed eval inputs (golden cases, hidden canaries)
+    rubrics/          # model-judge rubrics (fixed schema per artifact type)
+    regressions/      # trace-derived regression cases harvested from failures
+    traces/           # captured run traces (for loop-behavior analysis)
+  scripts/
+    verify-fast       # deterministic, cheap gate (tests/lint/typecheck subset) — blocking
+    verify-full       # full deterministic gate — blocking
+    verify-safety     # red-team / approval / injection checks — blocking
+    judge-rubric      # rubric model-judge harness — advisory
+    extract-trace-metrics  # turns traces into the loop-behavior + cost metrics
+  .loop/
+    state.json        # machine status: the live FSM cursor — the SOURCE OF MACHINE TRUTH
+    terminal_state.json    # written exactly once, at loop end
+    checkpoints/      # point-in-time snapshots of best-known-good state
+    artifacts/        # intermediate work products (drafts, generated files)
+    approvals/        # one file per approval request + its resolution
+    repair/           # repair@1 records — scanned by doctor when present
+    receipts/         # receipt@1 ledgers (*.jsonl) — scanned by doctor when present
+    evidence/         # evidence@1 records — the declared location doctor scans (§17)
+    memory/
+      session-summary.md   # short-term: continue-this-run compaction summary (disposable at terminal)
+      lessons.md           # long-term: durable lessons that improve future runs
+```
+
+Every artifact has exactly one owner concern (see §9). The split is deliberate: a turn that
+needs "what does done mean" reads `SPEC.md`; a turn that needs "where am I" reads
+`.loop/state.json`; neither file is overloaded with the other's job.
+
+---
+
+## 2. `AGENTS.md` — stable rules table-of-contents
+
+**Purpose.** A *short* index the agent reads first every session. It does not contain the rules
+themselves beyond a one-line each; it points at `SPEC.md`, `WORKFLOW.md`, and `scripts/`. This is
+the engine-neutral entry point — the same file Codex Goal mode and Google Conductor read (see
+`platform-map.md`), which is why the contract names it `AGENTS.md` rather than a Claude-specific
+name.
+
+**Minimal schema (Markdown, fixed section order):**
+
+```markdown
+# AGENTS — <project>
+- **Intent:** see SPEC.md (success criteria + non-goals)
+- **Loop policy:** see WORKFLOW.md (gates, budgets, terminal states, repair cap)
+- **Verify:** scripts/verify-fast (cheap), scripts/verify-full, scripts/verify-safety
+- **Task queue:** TASKS.json   **History:** RUNLOG.md   **Live state:** .loop/state.json
+- **Resume rule:** if .loop/state.json exists, skip intake; continue from first incomplete state.
+```
+
+Keep it under ~20 lines. If it grows, the depth belongs in the file it points to.
+
+---
+
+## 3. `SPEC.md` — intent
+
+**Purpose.** The single source of *what done means*. It is the contract against which every
+verification and the prime directive are judged: if `SPEC.md` cannot state success, verification,
+or a terminal condition, the loop is **underspecified** and terminates `FailedSpecGap` rather than
+declaring the next completion "done." This is the primary defense against the documented #1
+long-horizon failure mode — false completion / weak self-verification.
+
+**Minimal schema (Markdown, fixed sections):**
+
+| Section | Content |
+|---|---|
+| `## Goal` | One paragraph: the objective in outcome terms. |
+| `## Success Criteria` | Numbered, each *independently checkable* (maps to a `verify-*` check or eval case). |
+| `## Constraints` | Hard limits (perf, deps, files-not-to-touch, style). |
+| `## Non-Goals` | Explicit out-of-scope (YAGNI fence). |
+| `## Evidence Rules` | What counts as proof a criterion is met (which `scripts/verify-*` / which `EVALS/` case). No criterion without a stated evidence source. |
+
+A `## Success Criteria` line with no corresponding evidence rule is itself a spec gap.
+
+---
+
+## 4. `WORKFLOW.md` — stable loop rules
+
+**Purpose.** The loop's operating policy — separate from intent because it changes on a different
+cadence (you tune gates and budgets far more often than you redefine success). Read by
+`[[loop-run]]` to know how to behave and by `[[loop-repair]]` to read the repair cap.
+
+**Minimal schema (Markdown, fixed sections):**
+
+| Section | Content |
+|---|---|
+| `## Loop` | The state sequence: `intake → plan → critique-plan → queue-tasks → execute-task → verify → (repair | replan | approval-wait) → terminal`. |
+| `## Approval Gates` | The side-effect boundaries that pause for approval (destructive commands, secret access, production changes, money movement, policy-sensitive output) and the `approval_policy` in force (`never` / `on_side_effects` / `strict`). |
+| `## Budgets` | `time_budget`, `cost_budget` and the rule: exhausted budget → `FailedBudget`. |
+| `## Repair Cap` | `max_repair_attempts` (default **2**), and what happens at the cap: replan / revert / approve / terminate. |
+| `## Terminal States` | All **7**, verbatim, each with its trigger (see §8). |
+| `## Dispatch` | Routing rule: every dispatched agent / Workflow `agent()` names an explicit `model:` (read→haiku, reason→sonnet, write→opus); the receipts each dispatch appends land in `.loop/receipts/*.jsonl` (schema: `schemas/receipt.schema.json`). |
+
+`WORKFLOW.md` states policy; it never records run status — that is `.loop/state.json`'s job.
+
+---
+
+## 5. `TASKS.json` — the machine-readable task ledger
+
+**Purpose.** The queue the loop executes against, machine-readable so `[[loop-run]]` can pick the
+next task deterministically and `extract-trace-metrics` can count progress. Distinct from
+`SPEC.md` (intent) and `RUNLOG.md` (narrative history): this is current queue *status*.
+
+**Minimal schema (JSON — `tasks` is an ordered array; each task object):**
+
+| Field | Type | Meaning |
+|---|---|---|
+| `id` | string | Stable task id (e.g. `T1`). |
+| `title` | string | One-line description. |
+| `status` | enum | `pending` \| `active` \| `blocked` \| `done` \| `abandoned`. |
+| `criterion_ref` | string | The `SPEC.md` success-criterion number this task advances. |
+| `verify` | string | The exact command/check that proves this task done (a `scripts/verify-*` invocation or eval case). |
+| `depends_on` | string[] | Task ids that must be `done` first. |
+| `attempts` | int | Times executed (drives repair-cap accounting). |
+| `evidence` | string\|null | Path/ref to the verification bundle proving `done`; null until proven. |
+
+```json
+{
+  "schema": "loop-engineer/tasks@1",
+  "tasks": [
+    {
+      "id": "T1",
+      "title": "Add input validation to pricing.parse_request",
+      "status": "done",
+      "criterion_ref": "2",
+      "verify": "scripts/verify-fast",
+      "depends_on": [],
+      "attempts": 1,
+      "evidence": ".loop/artifacts/verify-T1.json"
+    },
+    {
+      "id": "T2",
+      "title": "Raise pricing.py coverage to >=80%",
+      "status": "active",
+      "criterion_ref": "1",
+      "verify": "scripts/verify-full",
+      "depends_on": ["T1"],
+      "attempts": 2,
+      "evidence": null
+    }
+  ]
+}
+```
+
+A task is only `done` when `evidence` is non-null *and* its `verify` passed — never on the
+agent's assertion alone.
+
+---
+
+## 6. `RUNLOG.md` — human-readable iteration history
+
+**Purpose.** The append-only narrative of what each loop iteration did — for a human reviewer and
+for `[[loop-flywheel]]` to mine into regression cases. One entry per loop iteration; entries are
+never edited, only appended (immutable history).
+
+**Minimal schema (Markdown — one block per iteration, fixed fields):**
+
+```markdown
+## Iteration <n> — <ISO-8601 timestamp>
+- **state:** <FSM state this iteration ran>
+- **active_task:** <TASKS.json id>
+- **action:** <what was attempted, 1–2 lines>
+- **dispatch:** <agent/model used, e.g. engineer @ opus> | none
+- **verify:** <command> → PASS | FAIL (<which criteria>)
+- **score:** <best_score before → after> (deterministic and/or rubric)
+- **outcome:** advanced | repaired | replanned | approval-wait | terminal:<state>
+- **evidence:** <path to verification bundle>
+```
+
+Per-iteration fields (`state`, `active_task`, `action`, `dispatch`, `verify`, `score`,
+`outcome`, `evidence`) are required so a trace transform can parse the log mechanically.
+
+---
+
+## 7. `.loop/state.json` — the live FSM cursor
+
+**Purpose.** The **source of machine truth** for resume. Serialized after *every* state
+transition so a fresh session reconstitutes the loop exactly: the resume rule is — if
+`state.json` exists, skip intake and continue from the first incomplete state. This is the
+file-backed realization of a portable Python FSM spine pattern (init / next / complete +
+serialize-after-transition; ~100 lines); the loop-engineer does **not** ship a new spine — when the
+Python-FSM realization is chosen, implement the ~100-line pattern or reuse the author's
+`harmony-agent` `engine/cli.py` reference impl.
+
+**Minimal schema (JSON — fields are the spec's State row):**
+
+| Field | Type | Meaning |
+|---|---|---|
+| `iteration_id` | int | Monotonic loop counter (matches latest `RUNLOG` entry). |
+| `state` | enum | Current FSM state: `intake`, `plan`, `critique-plan`, `queue-tasks`, `execute-task`, `verify`, `repair`, `replan`, `approval-wait`, or `terminal`. `loop/fsm.py` is normative for the transition table. |
+| `updated_at` | string\|null | ISO-8601 UTC timestamp of the last write by a `loop.emit` writer; additive/optional and absent on legacy artifacts. |
+| `plan_version` | int | Bumped on every replan (lets traces detect churn). |
+| `active_task` | string\|null | `TASKS.json` id currently in flight. |
+| `best_score` | number\|null | Best verification score so far (repair productivity is measured against this). |
+| `failure_mode` | string\|null | Classified failure of the last failed verify (drives `[[loop-repair]]`). |
+| `pending_approval` | string\|null | `.loop/approvals/` filename if paused at a gate, else null. |
+| `budget_remaining` | object | `{ "time": <unit>, "cost": <unit> }`; hitting zero → `FailedBudget`. |
+| `checkpoint_path` | string\|null | Latest `.loop/checkpoints/` snapshot (best-known-good to revert to). |
+| `terminal_state` | string\|null | Null while running; set to one of the 7 at end. |
+
+```json
+{
+  "schema": "loop-engineer/state@1",
+  "iteration_id": 2,
+  "state": "repair",
+  "plan_version": 1,
+  "active_task": "T2",
+  "best_score": 0.74,
+  "failure_mode": "deterministic-fail",
+  "pending_approval": null,
+  "budget_remaining": { "time": "18m", "cost": "0.62usd" },
+  "checkpoint_path": ".loop/checkpoints/iter1-good.json",
+  "terminal_state": null
+}
+```
+
+`pending_approval` is how an approval gate pauses *and resumes from the same run state* — the gate
+sets it; resolution clears it; the loop never spawns a fresh untracked attempt (see
+`safety-and-approvals.md`).
+
+---
+
+## 8. `terminal_state.json` — the single end record
+
+**Purpose.** Written exactly once, when the loop reaches a terminal state. It is the definitive
+"how did this loop end" record — no silent "completed." Its `state` MUST be one of the canonical
+**7 terminal states (verbatim):**
+
+`Succeeded`, `FailedUnverifiable`, `FailedBlocked`, `FailedBudget`, `FailedSafety`,
+`FailedSpecGap`, `AbortedByHuman`.
+
+| Terminal state | Fires when |
+|---|---|
+| `Succeeded` | All `SPEC.md` success criteria verified with evidence. |
+| `FailedUnverifiable` | Work seems done but no `verify-*`/eval can prove it (cannot confirm success). |
+| `FailedBlocked` | A hard external blocker (missing dep, unavailable system) the loop cannot clear. |
+| `FailedBudget` | `time_budget` or `cost_budget` exhausted before success. |
+| `FailedSafety` | Policy/safety risk, or detected verifier-gaming → hard-terminate + logged as a security failure. |
+| `FailedSpecGap` | Success / verification / terminal condition could not be defined (underspecified — the prime directive). |
+| `AbortedByHuman` | A human stopped the run (e.g. declined an approval and chose to abort). |
+
+**Minimal schema (JSON):**
+
+| Field | Type | Meaning |
+|---|---|---|
+| `state` | enum | One of the 7 above. |
+| `iteration_id` | int | Final iteration count. |
+| `terminated_at` | string | ISO-8601 UTC timestamp stamped by `loop.emit.terminate()`; additive/optional, so legacy records without it remain valid. |
+| `criteria_met` | object | `{ "<criterion#>": true\|false }` for every `SPEC.md` criterion. |
+| `completion_policy` | object | Completion rule for the criteria map. v1 supports `{ "mode": "all_required" }`; legacy records without the field are interpreted the same way. Optional (additive). Note: a pre-migration `Succeeded` record whose criteria map contains any `false` value fails this rule and needs re-verification. |
+| `evidence` | string[] | Paths to the verification bundles backing the verdict. |
+| `false_completion` | bool | True if the loop had earlier *claimed* success that verification later refuted (feeds the false-completion-rate metric). |
+| `reason` | string | One line: why this terminal state, especially for any `Failed*`/`Aborted*`. |
+| `lessons_ref` | string\|null | Path into `.loop/memory/` long-term lessons for `[[loop-flywheel]]`. |
+
+```json
+{
+  "schema": "loop-engineer/terminal@1",
+  "state": "Succeeded",
+  "iteration_id": 2,
+  "criteria_met": { "1": true, "2": true },
+  "completion_policy": { "mode": "all_required" },
+  "evidence": [".loop/artifacts/verify-T2.json", ".loop/artifacts/verify-T1.json"],
+  "false_completion": false,
+  "reason": "All SPEC criteria verified: coverage 0.83 >= 0.80; validation tests pass.",
+  "lessons_ref": ".loop/memory/lessons.md"
+}
+```
+
+---
+
+## 9. Separation-of-concerns rationale
+
+The artifacts are deliberately partitioned so that **no file carries two jobs** and each can
+evolve on its own cadence:
+
+| Concern | Owner | Why isolated |
+|---|---|---|
+| **Stable rules** | `AGENTS.md`, `WORKFLOW.md` | Policy changes (gates/budgets) churn far more than intent; keep them out of `SPEC.md`. |
+| **Intent** | `SPEC.md` | The success contract is the one thing every verification judges against — it must be unambiguous and not buried under loop mechanics. |
+| **Machine status** | `TASKS.json`, `.loop/state.json` | Read/written every turn by code; machine-readable and small so resume is deterministic and cheap. |
+| **History** | `RUNLOG.md` | Append-only narrative — separating it from live state keeps `state.json` tiny and lets the flywheel mine a clean log. |
+| **Proof** | `scripts/verify-*`, `EVALS/`, `terminal_state.json` | Verification must be *independent* of the agent's self-report; the proof surface is its own files so success is established by evidence, not assertion. |
+
+Three properties fall out of this split:
+
+1. **Resumability.** Because machine truth lives in `.loop/state.json` (not chat context), any
+   session — even a different engine — reconstitutes the loop from disk. Compaction or a crash
+   loses no loop state.
+2. **Verifiability over assertion.** Intent (`SPEC.md`) and proof (`scripts/verify-*`,
+   `terminal_state.json`) are separate files owned by separate spokes (`loop-contract` writes
+   intent; `loop-evals` writes proof), so "done" is always evidence-backed — the structural guard
+   against false completion.
+3. **Portability.** The contract is plain Markdown + JSON + shell, engine-neutral by
+   construction. `AGENTS.md` is the shared entry point and the same artifacts map onto Codex,
+   Hermes, and Google surfaces (see `platform-map.md`); v1 specifies the contract, not a live
+   cross-engine runner.
+
+---
+
+## 10. YAML skill-manifest example
+
+A loop *declares* its operating contract explicitly (never in prose). This manifest is the
+machine-readable face of the inputs/outputs/policies/terminal-states the contract enforces; a
+loop-engineer emits it alongside the scaffold so the interface contract is checkable, not implied.
+
+```yaml
+# .loop/manifest.yaml — the explicit operating contract for one loop
+loop: pricing-coverage-and-validation
+schema: loop-engineer/manifest@1
+
+inputs:
+  goal: "Bring pricing.py to >=80% coverage and add input validation."
+  success_criteria:
+    - "1: pricing.py line coverage >= 80% (scripts/verify-full)"
+    - "2: parse_request rejects malformed input with a typed error (scripts/verify-fast)"
+  constraints:
+    - "Do not modify existing public function signatures."
+    - "No new third-party dependencies."
+  workspace_path: "./"
+  allowed_tools: [read, workspace-write]      # NOT network, NOT external-side-effects
+  risk_profile: low                           # low | med | high
+  time_budget: "30m"
+  cost_budget: "1.00usd"
+  approval_policy: on_side_effects            # never | on_side_effects | strict
+
+outputs:
+  plan: SPEC.md
+  task_queue: TASKS.json
+  current_state: .loop/state.json
+  verification_bundle: .loop/artifacts/
+  repair_actions: .loop/repair/<iteration_id>.json
+  terminal_state: .loop/terminal_state.json
+  lessons_learned: .loop/memory/lessons.md
+
+permissions:                                  # least-privilege tiers
+  - read-only
+  - workspace-write
+  # network / external-side-effects / production-mutation are OFF for this loop
+
+approval_gates:                               # each pauses-and-resumes from run state
+  - destructive_commands
+  - secret_access
+  - production_changes
+
+policies:
+  repair_cap: 2                               # then replan | revert | approve | terminate
+  plan_then_execute: false                    # set true for untrusted/web environments
+  verifier_gaming: hard_terminate_as_security_failure
+
+terminal_states:                              # the canonical 7, verbatim
+  - Succeeded
+  - FailedUnverifiable
+  - FailedBlocked
+  - FailedBudget
+  - FailedSafety
+  - FailedSpecGap
+  - AbortedByHuman
+```
+
+The `inputs`/`outputs`/`permissions`/`approval_gates`/`terminal_states` keys mirror the spec's
+interface-contract table directly; `[[loop-contract]]` scaffolds this manifest from the
+architecture decision record that `[[loop-architect]]` emits.
+
+---
+
+## 11. Artifact & schema reference
+
+Every schema-bearing artifact in the contract, its on-disk location, the schema that defines it,
+its embedded `$id`, its **required keys** (read verbatim from `schemas/*.schema.json` — an
+emitter MUST supply all of them), its lifecycle role, and its stability tier (§0). Required keys
+are the floor; `additionalProperties: true` means an artifact may carry more.
+
+| Artifact | Contract path | Schema file | `$id` | Required keys | Lifecycle role | Tier |
+|---|---|---|---|---|---|---|
+| manifest | `.loop/manifest.yaml` | `schemas/manifest.schema.json` | `loop-engineer/manifest@1` | `schema`, `loop`, `policies`, `terminal_states` | The explicit, machine-readable operating contract for one loop (§10). | **stable** |
+| state | `.loop/state.json` | `schemas/state.schema.json` | `loop-engineer/state@1` | `schema`, `iteration_id`, `state`, `plan_version`, `budget_remaining` | The live FSM cursor — the source of machine truth for resume (§7). | **stable** |
+| tasks | `TASKS.json` *(workspace root)* | `schemas/tasks.schema.json` | `loop-engineer/tasks@1` | `schema`, `tasks`; each task: `id`, `title`, `status`, `criterion_ref`, `verify`, `depends_on`, `attempts`, `evidence` | The machine-readable task queue (§5). | **stable** |
+| terminal | `.loop/terminal_state.json` | `schemas/terminal.schema.json` | `loop-engineer/terminal@1` | `schema`, `state`, `criteria_met`, `evidence`, `false_completion` | The single end record, written once at loop end (§8). | **stable** |
+| receipt | `.loop/receipts/*.jsonl` | `schemas/receipt.schema.json` | `loop-engineer/receipt@1` | `schema`, `iteration_id`, `role`, `model`, `outcome` | Append-one-per-line dispatch/cost trail (role vs model, cost-per-success). | *provisional* |
+| repair-record | `.loop/repair/<iteration_id>.json` | `schemas/repair-record.schema.json` | `loop-engineer/repair@1` | `schema`, `iteration_id`, `attempt`, `failure_mode`, `hypothesis`, `repair_action`, `verification_before`, `verification_after`, `remaining_delta`, `productive` | One bounded repair pass (diagnosis shape); the canonical repair-productivity input (§13). | *provisional* |
+| rollout-record | `.loop/rollout.jsonl` | `schemas/rollout-record.schema.json` | `loop-engineer/rollout@1` | `id`, `parent`, `verdict`, `score`, `score_delta`, `coherent_with_prior_winner`, `productive` | One candidate adjudication in a rollout / genetic-hardening ledger (§13). | *provisional* |
+
+The rollout-record's required set is the only one that does **not** require a `schema` envelope
+key (the ledger writer today emits bare records); the schema permits one via
+`additionalProperties`, but does not demand it. `doctor` validates receipts and repair/rollout
+records **only when the files are present** (§14 C1–C3): an in-flight loop that has not yet
+produced a trail still conforms.
+
+---
+
+## 12. Lifecycle vocabulary
+
+The 7 terminal states (§8) are the **frozen** set of ways a loop *ends*. Before it ends, a loop
+also holds non-terminal lifecycle values while it is *scaffolded but not started* or *running*.
+These non-terminal values are **not** terminal states and never appear in the 7-member
+`terminal_state` enum. Two rules make an in-flight loop a first-class, conformant state.
+
+### 12.1 The terminal-file-iff rule
+
+`terminal_state.json` is required **iff** `state.json`'s `terminal_state` is non-null.
+
+- While `state.json` reports `terminal_state: null`, the **absence** of `.loop/terminal_state.json`
+  is **conformant** — the loop is in-flight, not failing validation. (`validate_contract` gates
+  the terminal-file read on `state.terminal_state`; a null with no file is treated as an
+  in-flight loop, not a `missing_file` issue.)
+- A non-null `terminal_state` **without** the terminal file is a `missing_file` failure.
+
+**Why the iff, not "always require a terminal file":** a gate that demands a terminal record from
+a live loop pushes an operator to *write a terminal state onto a loop that has not terminated* —
+a fabricated end record. That is exactly the false completion this contract exists to prevent.
+The iff rule removes the incentive: an honest in-flight loop is green without inventing an ending.
+
+### 12.2 The `doctor` lifecycle line
+
+`doctor` (`validate_contract`) adds a `lifecycle` field to its report so an operator sees *why*
+no terminal file is expected. It is derived (total and pure — never an issue source) as:
+
+1. **`terminated:<X>`** — if `state.json` parsed with a non-null `terminal_state`, **or**
+   `.loop/terminal_state.json` exists. `<X>` is the terminal file's `state` value when the file
+   parses to a dict with a string `state`; else `state.json`'s `terminal_state` when that is a
+   string; else `unknown`.
+2. **`planned`** — else, if `state.json` parsed and its `iteration_id` is `0` (or `"0"`):
+   scaffolded, not yet run.
+3. **`running`** — else, if `state.json` parsed: executing.
+4. **`unknown`** — else (no parseable `state.json`).
+
+`planned`, `running`, and `unknown` are lifecycle-report values only; none is a terminal state,
+and no terminal state ever surfaces as one of them. The `terminated:<X>` form is the only overlap
+point, and there `<X>` is always drawn from the frozen 7 (or `unknown`).
+
+---
+
+## 13. Two distinct record shapes — repair-record vs rollout-record
+
+The repair-record and the rollout-record are **different artifacts** that share only a
+`productive` boolean; they must not be conflated (this section exists so no one conflates them
+again). They differ in shape, location, and what `productive` measures:
+
+| | repair-record (`loop-engineer/repair@1`) | rollout-record (`loop-engineer/rollout@1`) |
+|---|---|---|
+| **Shape** | **Diagnosis** of one bounded repair pass | **Ledger** entry adjudicating one rollout candidate |
+| **Location** | `.loop/repair/<iteration_id>.json` (one JSON object per file) | `.loop/rollout.jsonl` (append one JSON object per line) |
+| **Key fields** | `failure_mode`, `hypothesis`, `repair_action`, `verification_before`, `verification_after`, `remaining_delta`, `productive` | `id`, `parent`, `verdict`, `score`, `score_delta`, `coherent_with_prior_winner`, `productive` |
+| **`productive` means** | repair-productivity: `verification_after.score > verification_before.score` | rollout-productivity: `score_delta` is not null and `> 0` |
+| **Feeds** | the repair-productivity metric / baseline (`loop-repair`) | the flywheel's candidate-hardening view (`loop-flywheel`) |
+
+The repair-record is the diagnosis shape the repair skill prescribes and the eval structural
+invariant pins; the rollout-record is genome/candidate bookkeeping. Publishing them as two `$id`s
+resolves the historic "two 7-field shapes both called *the* repair record" ambiguity.
+
+---
+
+## 14. Conformance checklist
+
+A harness that satisfies **every** item below may claim it **"emits a Loop-Engineer-conformant
+contract v1."** Each item is a third-party-checkable statement against the published schemas.
+Items **C1–C3 are checked-when-present** — an in-flight loop that has not yet emitted a receipt,
+repair, or rollout trail still conforms. `scripts/test_conformance.py` executes this checklist in
+CI against the flagship example ([`examples/coverage-repair`](../examples/coverage-repair)) and a
+fresh template scaffold, so a drift between this doc, the schemas, and the shipped scaffold cannot
+land silently.
+
+**A. Artifacts present & well-formed**
+- **A1** — `.loop/manifest.yaml` validates against `loop-engineer/manifest@1` (including the
+  canonical 7 `terminal_states`, verbatim and in order).
+- **A2** — `.loop/state.json` validates against `loop-engineer/state@1`.
+- **A3** — `TASKS.json` validates against `loop-engineer/tasks@1`; no duplicate task ids; no task
+  marked `done` without `evidence`.
+- **A4** — `RUNLOG.md` is present.
+
+**B. Lifecycle honesty**
+- **B1** — Exactly one of: (`state.terminal_state` is null **and** no `terminal_state.json`) **or**
+  (`terminal_state` is one of the canonical 7 **and** `terminal_state.json` is present and valid).
+- **B2** — `terminal_state.json`, when present, validates against `loop-engineer/terminal@1` with a
+  `criteria_met` object, an `evidence` list, and an explicit `false_completion` boolean; a
+  `Succeeded` terminal additionally has `false_completion=false`, every declared criterion true
+  under `completion_policy.mode=all_required` (legacy records without the field are interpreted
+  the same way), and non-empty `evidence`.
+
+**C. Evidentiary trail (checked when present)**
+- **C1** — every `.loop/receipts/*.jsonl` line validates against `loop-engineer/receipt@1`.
+- **C2** — every `.loop/repair/*.json` validates against `loop-engineer/repair@1`.
+- **C3** — `.loop/rollout.jsonl`, when present, validates against `loop-engineer/rollout@1`.
+
+**D. Versioning**
+- **D1** — every artifact's `schema` key names a published, current-major schema `$id`.
+- **D2** — unknown keys are tolerated (additive fields never reject a v1 artifact).
+
+**E. Lifecycle report**
+- **E1** — `doctor` reports a `lifecycle` value consistent with B1: `terminated:<state>` iff the
+  terminal pair is present and valid; `planned` / `running` otherwise (§12.2).
+
+---
+
+## 15. `loop-engineer/plan@1` — the Loop Plan IR
+
+`schemas/plan.schema.json` defines a canonical, validated description of a
+goal, its tasks, and its policies — the document a future execution runtime
+interprets (ADR 0001). It is authored and linted as a **standalone JSON
+file**, validated by `loop plan-lint <file>` / `loop.plan.validate_plan()`.
+
+**Scope boundary:** unlike manifest/state/tasks/terminal (§11), plan@1 is
+**not yet** an artifact `loop doctor` reads from a scaffolded workspace —
+it has no `.loop/`-relative home today. The execution-runtime milestone
+that materializes a plan into a live `TASKS.json` will make that call.
+
+**Task kinds:** `agent | tool | gate | approval | join | subloop | human |
+terminal` — each carries a common `id`/`kind`/`title`/`depends_on` base
+plus kind-specific required fields (`loop/plan.py::_KIND_REQUIRED_FIELDS`).
+
+**Capability-based model policy** (issue #56, ADR 0001 consequence 5): an
+optional top-level `model_policy` maps roles (`read`/`reason`/`write`/
+`verify`) to capabilities (`fast_low_cost`/`deep_reasoning`/
+`code_generation`/`independent_review`) — never a vendor model name. An
+`agent`-kind task declares a `role`; a provider profile resolves the
+capability to an actual model **outside** the portable contract, recorded
+to a receipt for reproducibility, not to the plan.
+
+**Cross-field rules JSON Schema cannot express** (enforced by
+`loop/plan.py`, in both validation modes): task-id and
+acceptance-criteria-id uniqueness, dangling `depends_on`/`join_on`
+references, dependency-graph acyclicity, per-kind required fields, and
+`approval_gates` referential integrity.
+
+Golden examples: `examples/plans/coverage-repair.plan.json` (valid, all 8
+kinds); `examples/plans/invalid/` (deliberately broken fixtures used by
+the negative tests).
+
+---
+
+## 16. `loop-engineer/event@1` — EventStore + deterministic reducer
+
+`schemas/event.schema.json` defines one immutable, append-only fact in a run's
+event log (ADR 0001). `loop.events.SQLiteEventStore` persists events in a
+SQLite database in WAL mode with `synchronous=FULL` (every committed `append()`
+survives a crash) and DB-level `BEFORE UPDATE`/`BEFORE DELETE` triggers that
+refuse mutation or removal of a committed row **through the store API**,
+regardless of caller; a process with direct write access to the database file
+can `DROP TRIGGER` — the triggers are an anti-footgun, not a security control
+(see Integrity boundary).
+`loop.reducer.reduce_events()` is a pure, resumable left-fold that projects an
+ordered event stream into a deterministic state/runlog/receipts view — the
+same input sequence always produces a byte-identical result.
+
+**Scope boundary:** `loop doctor` reads `event@1` when `.loop/events.db`
+exists (§22) by composing the exact `status`/`replay` read-only verbs, not by
+duplicating their logic; an absent store is conformant and adds no issues
+(§12.1's terminal-file-iff rule has an analogous "absent is fine" shape). One
+run is discovered per store; multi-run support remains deferred.
+
+**Dispatch crash boundary:** `loop run` verifies first, then commits its
+`iteration_appended` (or `terminal_written`) event with a compare-and-swap
+sequence. That committed event is the source of truth; only afterwards are
+`RUNLOG.md` and `.loop/state.json` materialized from the exact recorded
+payload. A later `loop run` replays missing legacy materialization before
+selecting work, so a crash after the event commit never duplicates a dispatch.
+TASKS.json is read-only declarative input for dispatch: event-log
+`task_passed` facts supply dynamic completion and dispatch does not rewrite
+task status or evidence.
+
+**Verifier isolation:** A declared task verifier runs through
+`subprocess.run(shell=False, cwd=workspace, timeout=...)`, so it receives an
+argv rather than shell-interpreted input and cannot share the runner process.
+A timeout or nonzero exit becomes `VerifyOutcome(False, ...)`, never an
+exception. `VerifierExecutionError`, `VerifierNotImplementedError`, and
+`RunModeNotImplementedError` are the typed cases where dispatch could not be
+attempted.
+
+**Event types:** `contract_opened | iteration_appended | receipt_appended |
+terminal_written | terminal_superseded | approval_requested |
+approval_resolved | run_paused | run_resumed` — nine members, matching
+`loop.events.EVENT_TYPES` and the `type` enum of `schemas/event.schema.json`.
+The **first four** correspond to `loop.emit`'s writer operations
+(`open_contract`/`append_iteration`/`append_receipt`/`terminate`), so a
+future write-through migration targets an already-matching payload shape. The
+remaining five have no `emit` writer by design: `terminal_superseded` is the
+administrative correction of §18, and the four run-control types are §19's
+projection primitives.
+
+**Two-layer enforcement, deliberately split:** the store validates event@1
+envelope/payload *shape* only (`loop/events.py::validate_event`, both
+validation modes, both type-checked in structural fallback); the reducer
+enforces *domain* semantics at replay time — FSM transition legality
+(`loop.fsm.is_legal_transition`), G1 completion
+(`loop.completion.criteria_satisfy_completion`), and terminal immutability
+(no event may follow a `terminal_written`) — reusing the exact functions
+`loop.contract`/`loop.emit` already enforce at file-write time, never
+re-implemented. A store back-end therefore never needs domain awareness to be
+conformant; the reducer is a second, independent enforcement point that a
+tampered or foreign-sourced event stream still cannot talk past **without
+constructing a stream that is itself FSM-legal, G1-satisfying and
+hash-chain-consistent; a determined in-workspace rewriter can construct one —
+see Integrity boundary.**
+
+### Hash chain (v0.10.0+)
+
+`event@1` carries two **additive, optional** fields: `prev_event_hash` — the
+immediately preceding event's `event_hash` within the same run, `null` at
+genesis — and `event_hash`, this event's own digest. Both are
+`["string", "null"]` constrained to `^[0-9a-f]{64}$`. A fresh v0.10.0 store
+declares `PRAGMA user_version = 2`, chains every append, and holds
+`event_hash NOT NULL` at the database layer; a pre-existing unchained store is
+widened by the explicit `loop migrate` verb (§22), which never rewrites rows.
+
+**Canonical form (normative).** `event_hash` is the lowercase-hex SHA-256 of
+the UTF-8 encoding of
+
+```python
+json.dumps(preimage, sort_keys=True, separators=(",", ":"),
+           ensure_ascii=False, allow_nan=False)
+```
+
+where `preimage` is exactly these **twelve** fields:
+
+`schema`, `run_id`, `sequence`, `event_id`, `type`, `actor`, `ts`,
+`causation_id`, `correlation_id`, `payload`, `artifact_hashes`,
+`prev_event_hash`.
+
+Insertion order is irrelevant (`sort_keys=True` fixes the serialized order).
+`event_hash` is never part of its own preimage. An **absent optional field is
+hashed as `null`, never omitted** — the preimage object always carries all
+twelve keys. A genesis event (the run's `sequence` 0) hashes
+`prev_event_hash: null`.
+
+Two caveats for non-Python re-implementations. (1) Floats serialize through
+Python's shortest-round-trip `repr`, which other languages' default float
+formatting does not necessarily reproduce; keep payload numbers integral or
+string-encoded if you need cross-language digests. `allow_nan=False` means
+`NaN`/`Infinity` are a hard error, not a serialized token. (2)
+`ensure_ascii=False` emits non-ASCII characters literally in UTF-8 and
+`sort_keys` orders keys by code point, so **ASCII-only object keys are
+recommended** for interop.
+
+**Conformance vectors.** Three records and their digests, generated by
+`loop/chain.py` and pinned against it by
+`scripts/test_event_chain.py::test_documented_conformance_vectors` — docs and
+code cannot drift. Each `Preimage` line is the exact canonical string that is
+UTF-8 encoded and SHA-256'd.
+
+*Vector 1 — genesis (`prev_event_hash: null`):*
+
+```json
+{"schema":"loop-engineer/event@1","run_id":"run-1","sequence":0,"event_id":"e0","type":"contract_opened","actor":"operator","ts":"2026-07-24T00:00:00+00:00","causation_id":null,"correlation_id":null,"payload":{"workspace":"ws"},"artifact_hashes":[],"prev_event_hash":null}
+```
+
+Preimage: `{"actor":"operator","artifact_hashes":[],"causation_id":null,"correlation_id":null,"event_id":"e0","payload":{"workspace":"ws"},"prev_event_hash":null,"run_id":"run-1","schema":"loop-engineer/event@1","sequence":0,"ts":"2026-07-24T00:00:00+00:00","type":"contract_opened"}`
+
+`event_hash` = `3ca65d4da7d87a98616441a86c6866ff39b5513ccd156d8526abfd6df7ec88a7`
+
+*Vector 2 — second event, linked to vector 1:*
+
+```json
+{"schema":"loop-engineer/event@1","run_id":"run-1","sequence":1,"event_id":"e1","type":"iteration_appended","actor":"operator","ts":"2026-07-24T00:00:01+00:00","causation_id":null,"correlation_id":null,"payload":{"iteration_id":1,"outcome":"task_passed","state":"execute-task"},"artifact_hashes":[],"prev_event_hash":"3ca65d4da7d87a98616441a86c6866ff39b5513ccd156d8526abfd6df7ec88a7"}
+```
+
+Preimage: `{"actor":"operator","artifact_hashes":[],"causation_id":null,"correlation_id":null,"event_id":"e1","payload":{"iteration_id":1,"outcome":"task_passed","state":"execute-task"},"prev_event_hash":"3ca65d4da7d87a98616441a86c6866ff39b5513ccd156d8526abfd6df7ec88a7","run_id":"run-1","schema":"loop-engineer/event@1","sequence":1,"ts":"2026-07-24T00:00:01+00:00","type":"iteration_appended"}`
+
+`event_hash` = `bb40984d1b98bda565d93dd90a39ea212be999078a66cf013f37cbed650c155d`
+
+*Vector 3 — non-ASCII payload (pins `ensure_ascii=False`):*
+
+```json
+{"schema":"loop-engineer/event@1","run_id":"run-1","sequence":2,"event_id":"e2","type":"receipt_appended","actor":"operator","ts":"2026-07-24T00:00:02+00:00","causation_id":null,"correlation_id":null,"payload":{"iteration_id":1,"note":"café — naïve ✅","summary":"日本語"},"artifact_hashes":[],"prev_event_hash":"bb40984d1b98bda565d93dd90a39ea212be999078a66cf013f37cbed650c155d"}
+```
+
+Preimage: `{"actor":"operator","artifact_hashes":[],"causation_id":null,"correlation_id":null,"event_id":"e2","payload":{"iteration_id":1,"note":"café — naïve ✅","summary":"日本語"},"prev_event_hash":"bb40984d1b98bda565d93dd90a39ea212be999078a66cf013f37cbed650c155d","run_id":"run-1","schema":"loop-engineer/event@1","sequence":2,"ts":"2026-07-24T00:00:02+00:00","type":"receipt_appended"}`
+
+`event_hash` = `0d0413aa0a1903a46a802f98f0a28abafd10ca09d5e312622f729482cfc40a19`
+
+**Third-party re-verification.**
+`loop.chain.verify_chain(events, expected_head=...)` is the normative entry
+point for re-verifying a chain outside this package's store code: it is pure,
+I/O-free, imports no other `loop` module, and accepts any ordered sequence of
+event mappings (a SQLite read, a JSONL export, a JSON API response). It
+returns `{ok, issues, chained_events, unchained_prefix, head}`, and with
+`expected_head` set it additionally fails when the stream's final chained head
+is absent or differs. **Scope:** `verify_chain` verifies a *complete run
+stream beginning at sequence 0*. It cannot validate a suffix or a slice — a
+window that starts mid-run has no genesis to anchor `prev_event_hash: null`
+against, and its first record's link is unverifiable by construction.
+
+**Interop rule (normative).** Populating the chain fields is optional per run
+but all-or-nothing after the first chained event: once an event carries
+`event_hash`, every later event in that run must too and must match the
+canonical preimage exactly, or the reference implementation hard-fails the
+store.
+
+**Resume rule (normative).** `reduce_events(events, initial=snapshot)` folds a
+suffix onto a caller-supplied projection, and the chain is anchored by that
+snapshot's `chain_head`. A snapshot that predates v0.10.0 has no `chain_head`
+key at all, so a suffix whose first event is chained with a non-null
+`prev_event_hash` has nothing to link against: that is refused as an
+`EventReplayError` naming the stale snapshot, never as a `ChainBreakError` —
+an honest resume is not a tamper report. Re-fold from sequence 0, or carry
+`chain_head` in the snapshot. A suffix that begins at a chain genesis
+(`prev_event_hash: null`), and a fully unchained suffix, resume unchanged.
+
+**Compatibility rule.** A pre-0.10.0 writer must not append to a chained
+store. A fresh v0.10.0 store refuses such an append at the database
+(`event_hash NOT NULL`); a migrated store cannot, and an unchained row
+appended after a chained prefix is reported as `event_chain_broken` and is
+unrepairable, because UPDATE is trigger-blocked. Pin your loop-engineer (and
+action) version per store.
+
+**Bound artifacts (v0.11.0+).** `artifact_hashes` is field eleven of the
+twelve-field preimage, so any `{path, sha256}` an appender places there is
+already covered by `event_hash` and therefore by `--expect-chain-head`. Binding
+evidence needs **no new event type and no second append**: since the
+evidence-wiring release a verified dispatch binds three entries on the one
+`iteration_appended` event it already writes — the verify bundle, its evidence@1
+record, and the bundle's content-addressed object (§17). The digests are
+computed **before** the append and the files are written **after** it. An event
+that binds nothing — every event written before that release, and every append
+by a foreign writer — is silent by construction, and stays silent: the
+append-only triggers forbid the UPDATE a retroactive binding would need, exactly
+as `loop migrate` refuses to backfill chain hashes (§22).
+
+### Integrity boundary
+
+The chain is **tamper-evident relative to an anchored head**. That is a
+detection property, not a prevention one, and it is scoped to the anchor:
+nothing here stops a writer from changing the log. Stating the boundary in
+both directions is part of the contract — a reader must know exactly which
+claims a clean chain supports.
+
+**It detects:** splicing an event into the middle of a log; reordering events;
+editing a committed row without recomputing every downstream digest; byte
+corruption of any hashed field; and — given an externally remembered anchor —
+*any* divergence of the log from the head that anchor names, including
+truncation of the tail and wholesale replacement of the history. Note the
+asymmetry: truncation is detected **only** with an anchor, because deleting
+trailing events leaves a shorter but internally valid chain.
+
+**It does not detect:**
+
+- **A full in-workspace recompute.** A process with write access to the
+  workspace can rewrite history, re-chain from genesis, and forge
+  `.loop/state.json` and `terminal_state.json` to agree. With no anchor
+  supplied, the event-store block of such a report is wholly clean —
+  `state_json_agrees`, `deterministic`, and `legal_sequence` all `true`, a
+  `FailedBlocked` run laundered into `Succeeded` — as pinned by
+  `scripts/test_adversarial_chain.py::test_full_rewrite_with_recompute_passes_without_anchor_pinned`.
+  (In the probe that produced that fixture the report was also globally `ok`
+  with zero issues. What the committed pin actually asserts is narrower and
+  event-store-scoped: that `event_chain_broken` is absent, that the three
+  projection-disagreement codes `state_field_mismatch`,
+  `desynced_terminal_window` and `terminal_state_mismatch` stay absent, and
+  that the three event-store cleanliness flags `state_json_agrees`,
+  `deterministic` and `legal_sequence` stay `true`. A future standalone
+  event-store cross-check — a new issue code appended directly to `issues`, as
+  `chain_columns_missing` is — would not move any of those, so it must be added
+  to this pin's assertions when it is introduced. The evidence-wiring release
+  introduced exactly two such codes, `evidence_chain_mismatch` and
+  `missing_bound_evidence`; this pin's assertions were **not** widened to name
+  them. The stronger statement lives in the binding suite instead:
+  `scripts/test_adversarial_evidence_binding.py::test_a_full_rewrite_of_artifacts_and_store_is_not_caught_without_an_anchor_pinned`
+  rewrites the artifacts, the object, the bound digests and the chain, and
+  asserts the whole report is `ok` with **zero** issues.)
+- **A chain-column downgrade.** Dropping `event_hash`/`prev_event_hash`, or
+  rebuilding the store without them, silently downgrades a chained history to
+  an unchained one. An unchained or legacy doctor report is *not* proof of
+  provenance. The `chain_columns_missing` check catches only the lazy variant
+  — columns dropped while `user_version` still declares generation 2; a
+  downgrade that also resets `user_version` leaves nothing but the anchor.
+- **Deleting the store outright**, when no SQLite sidecars remain and no
+  `--expect-chain-head` is supplied: a bare `loop doctor` reads that as a
+  valid never-ran contract (§22).
+- **Well-formed lies.** Nothing in the chain judges whether a payload is
+  *true*. A truthfully-recorded, correctly-hashed event asserting a test
+  passed when it did not is chain-clean by construction; that is the job of
+  evidence@1, the held-out gate, and the verifier — not of the digest.
+- **Anything in a never-migrated prefix.** Rows written before migration have
+  no hashes to break, so there is no retroactive coverage: doctor reports them
+  as `unchained_prefix` and never elides them.
+
+**The mid-run window.** An anchor certifies the log only up to the anchored
+head. Everything appended after the last externally-read anchor — including a
+rewrite of the suffix — is unverified until the next anchor is read and
+remembered outside the workspace. The chain narrows the tampering window; it
+does not close it.
+
+Three closing notes. The append-only `BEFORE UPDATE`/`BEFORE DELETE` triggers
+are an anti-footgun, not a security control: any writer holding the database
+file can `DROP TRIGGER` first. The chain is one of several cross-checks a full
+rewrite must satisfy *simultaneously* — `_state_divergence` (state.json
+agreement), `_terminal_desync` (terminal-file agreement), and G1 completion
+all still apply, which raises the cost of a convincing forgery without
+bounding it. And `scripts/test_adversarial_chain.py` pins **both** sides of
+this boundary: the attacks that are caught, and four `PINNED LIMITATION`
+cases that are not — the full in-workspace rewrite, tail truncation without an
+anchor, tampering inside a never-migrated prefix, and the chain-column
+downgrade.
+
+---
+
+## 17. `loop-engineer/evidence@1` — hashed evidence + artifact provenance
+
+`schemas/evidence.schema.json` defines a standalone, hashed record that names
+an evidence artifact by workspace-relative URI, SHA-256 digest, media type,
+producer, optional verifier, and optional policy result. `loop.evidence`
+validates that portable record in either JSON Schema or complete structural
+fallback mode; `verify_evidence()` additionally resolves the URI beneath a
+workspace, rejects traversal and symlink escapes, and verifies the file hash.
+`artifact_object_path()` supplies the v1 content-addressed object layout under
+`.loop/artifacts/objects/` without writing it.
+
+**Scope boundary:** `loop doctor` reads evidence@1 records from the declared
+location `.loop/evidence/*.json`, validates them, **hash-verifies the artifact
+each one references**, and compares the `policy_digest` of the **latest record
+per task** against the live `TASKS.json` entry. Under the default
+`all_required` completion policy `Succeeded` still requires non-empty evidence
+*paths*; under the opt-in `all_required_verified_evidence` policy it requires
+every entry to be a hash-verified evidence@1 record that — wherever an event
+store exists to bind against — some event bound into the hash chain, and whose
+recorded goalpost is the live one. `code_digest` is still never re-hashed
+against the verifier file, and no check here proves who produced a record.
+
+**Artifact provenance:** `kind` remains an open vocabulary (for example,
+`verify-bundle`, `log`, `diff`, `screenshot`, or `report`), while `produced_by`
+identifies the run, task, attempt, and executor that produced it. Verification
+does not trust a path string: resolution and containment provide one mechanism
+for rejecting both `..` traversal and symlink escapes before a 64 KiB-chunked
+SHA-256 comparison is attempted.
+
+### Verifier identity (v0.11.0+)
+
+**The four fields.** `verified_by` gains four additive, nullable fields —
+`command`, `code_digest`, `code_digest_basis`, and `policy_digest` — recording
+what verified a task and how. `required` on `verified_by` stays `["by",
+"at"]`; all four fields are optional and nullable, and both the JSON Schema
+mode and the structural-fallback mode type-check them identically.
+
+**The code-digest honesty rule.** `code_digest` hashes argv[0] of the declared
+`verify` command only when it resolves to a readable regular file inside the
+workspace; every other case is `null`, and `code_digest_basis` names exactly
+why. The nine bases are the complete enumeration:
+
+| basis | when | digest |
+|---|---|---|
+| `workspace_file` | argv[0] is a regular file under the workspace and was readable | hex sha256 |
+| `path_lookup` | argv[0] has no path separator (`pytest`, `python3`, `true`) — the OS resolved it through `PATH`, so a same-named workspace file is *not* what ran | `null` |
+| `outside_workspace` | argv[0] resolved to a real file outside the workspace (`/usr/bin/python3`, a symlink escaping the tree) | `null` |
+| `not_a_file` | argv[0] does not resolve to an existing regular file (missing path, directory, dangling symlink) | `null` |
+| `unresolvable` | resolving argv[0] raised `OSError` (or pathlib's `RuntimeError` on Python ≤3.12 for a symlink loop), permission-denied parent, or name too long — the honest "could not determine" | `null` |
+| `unreadable` | the file exists inside the workspace but could not be read | `null` |
+| `unparseable_command` | `shlex.split` raised | `null` |
+| `empty_command` | `verify` is absent, blank, or splits to zero words | `null` |
+| `injected_verifier` | the caller injected a verifier callable, so **no declared command ran** — recording one would be a fabrication | `null` |
+
+`python3 -m pytest -q` has no hashable workspace script; `null` with basis
+`path_lookup` is the truthful record, and a fabricated digest would be worse
+than none. When a caller injects a verifier callable the declared command does
+not run at all: `command` and `code_digest` are `null` with basis
+`injected_verifier`. These nine values co-move across four surfaces:
+`CODE_DIGEST_BASES` (`loop/verifier.py`), the `enum` in
+`schemas/evidence.schema.json`, the structural-fallback check in
+`loop/evidence.py`, and this table.
+
+**The policy digest.** `policy_digest` is sha256 over
+`loop.chain.canonical_json` of `{criterion_ref, depends_on, id, verify}` — the
+TASKS.json entry's declared goalpost. Run state (`status`, `attempts`,
+`evidence`) is excluded because it changes for non-policy reasons and would
+make the digest noise; `id` binds *which* goalpost the digest names, and
+`depends_on` binds its declared ordering, so both are included.
+
+The digest binds the criterion **reference**, not the criterion **text** —
+editing `SPEC.md`'s acceptance wording leaves it unchanged. The evidence-wiring
+release did **not** change that: criterion text remains bound by nothing, pinned
+by `test_criterion_text_is_still_unbound_pinned`. Binding evidence bytes does
+not bind intent.
+
+**Conformance vector.** Over the task entry
+
+```python
+{"id": "T-1", "title": "ignored", "status": "pending", "criterion_ref": "C-1",
+ "verify": "./scripts/verify-fast.sh", "depends_on": [], "attempts": 0, "evidence": None}
+```
+
+`verification_policy` produces the canonical JSON
+
+```
+{"criterion_ref":"C-1","depends_on":[],"id":"T-1","verify":"./scripts/verify-fast.sh"}
+```
+
+and `verification_policy_digest` produces
+
+```
+cb28ced25ec75a20a153f821e7335464a1734eb781146a9d36a598e713caa9fe
+```
+
+`scripts/test_conformance.py` pins both literals against the live
+implementation.
+
+**The bundle/record pair.** A verified dispatch writes two files:
+`.loop/artifacts/verify-iter<N>.json` (the bundle — carries `outcome`/`passed`
+per the metrics green-marker convention, `verifier` including `source`, and
+`partition`) and `.loop/evidence/evidence-iter<N>.json` (evidence@1 — commits
+to the bundle bytes via `sha256`). An evidence record MUST NOT be named
+`verify-*.json` — a record in the bundle namespace is read by metrics as a
+bundle with no green marker, i.e. a phantom failing gate. `verifier.source` is
+`declared_command` only when the task's declared `verify` command was
+executed. A bundle whose source is `injected_callable` carries a
+caller-supplied verdict and is not gate evidence. `scripts/metrics.py` enforces
+that distinction: a bundle whose `verifier.source` is **explicitly**
+`injected_callable` is excluded from the FCR input set before any metric is
+derived, and the excluded filenames are listed under
+`provenance.injected_verifier_bundles` so the exclusion is visible rather than a
+silent FCR shift. A bundle carrying no `verifier` block at all has an *unknown*
+source and still counts — grandfathering by absence, not by guess. `source` is a
+string the writer declares, not a fact metrics can check, so hand-writing
+`declared_command` restores gate-evidence status; that limitation is pinned by
+`test_metrics_still_counts_a_hand_written_declared_command_bundle_pinned`.
+Two input-set changes land together in this release and are stated rather than
+absorbed: before it the runner wrote no bundles at all, and injected-callable
+bundles counted — so a runner-driven contract's FCR input set moves on upgrade.
+`loop simulate` predicts decisions, not writes: it reports
+`legacy_sync_would_write` because that write is conditional, but it does not
+enumerate the bundle, record and content-addressed object a dispatch always
+writes, and it does not enumerate the object store. A boolean that is `True` on
+every dispatch carries no information, so `_empty_prediction` gains no field
+here (§20).
+
+**The partition.** `visible` defaults to the task's `criterion_ref`;
+`holdout` is empty unless the task declares `holdout_criteria`; both fields
+are optional `array of string` on tasks@1; `holdout_executed` is always
+`false` because the runner executes exactly the declared `verify` command.
+Running a holdout set remains `scripts/holdout_gate.py`'s job and its verdict
+keeps its own canonical shape. A misspelled field name validates (tasks@1 is
+`additionalProperties: true`) and yields `declared: false` — an undeclared
+partition and a mistyped one are indistinguishable.
+
+**The independence rule.** A record whose `produced_by.executor` equals its
+`verified_by.by` (compared strip+casefold) declares that the producer
+verified its own work. `loop doctor` reports `self_verified_evidence` and
+fails. On the `loop run` path both identities are operator-supplied
+(`--executor`, `--verifier-identity`); their defaults (`unattributed`,
+`loop.run`) never collide, so a default run cannot manufacture the finding.
+
+### Bound evidence (v0.11.0+)
+
+**The bound set, in the order the writer emits it.** A verified dispatch binds
+exactly three `{path, sha256}` entries into the `artifact_hashes` of the one
+`iteration_appended` event it already writes (§16), in this order:
+
+1. `.loop/artifacts/verify-iter<N>.json` — the verify bundle, at the bundle's
+   own sha256;
+2. `.loop/evidence/evidence-iter<N>.json` — the evidence@1 record, at the
+   record file's sha256;
+3. `.loop/artifacts/objects/<aa>/<sha256>` — the content-addressed **object**, a
+   byte-identical copy of the bundle, at the bundle's sha256 again.
+
+**The object's location is derived, never declared.** It is
+`artifact_object_path(workspace, record["sha256"])` —
+`.loop/artifacts/objects/<first two hex chars>/<sha256>` — a pure function of a
+digest evidence@1 already carries, so **evidence@1 gains no field** and a
+third-party reader locates the object from `record["sha256"]` alone. The object
+is the recovery source when the friendly-named bundle is swapped: the swap fails
+doctor as `evidence_chain_mismatch` *and* the original bytes are still on disk.
+Deleting the object first does not clear the path — the object is itself a bound
+artifact, so its removal is reported as `missing_bound_evidence`.
+
+**Objects are created once and never overwritten.** The write uses the same
+hard-link create-once primitive as the immutable terminal record. An existing
+object with identical bytes is idempotent success (a re-run of the same
+dispatch); an existing object with **different** bytes for the same digest is a
+typed `EmitError` naming the digest, because a corrupted or colliding object
+store must never be silently accepted.
+
+**Ordering: build (no I/O) → append (binds) → write (object, staged bundle,
+record, replace).** The builder is pure — it renders the exact bytes and their
+digests and touches nothing — so the event commits to digests that describe what
+is about to land. Two consequences, both deliberate: a **build failure commits
+nothing** (a non-canonicalizable task or an invalid record is refused before any
+file exists), and a **crash after the durable append** leaves an event naming
+artifacts that are absent — reported as `missing_bound_evidence` rather than
+passing as a silent gap. The crash window still exists; what changed is that it
+is no longer invisible.
+
+### The verified-evidence completion mode (v0.11.0+)
+
+`completion_policy.mode` accepts a second value,
+`all_required_verified_evidence`, alongside the default `all_required`. The
+criteria half is unchanged — every declared criterion must still be `True`; the
+mode raises the **evidence** bar only. It is **opt-in and never retroactive**:
+`normalize_completion_policy(None)` still returns `{"mode": "all_required"}`, so
+every record written before this release — including both shipped examples,
+which declare no policy at all — keeps the old bar forever
+(`test_the_verified_evidence_mode_is_opt_in_and_not_retroactive_pinned`).
+
+**Four enforcement layers, each as strong as it can honestly be.**
+
+| Layer | Reaches | Enforces |
+|---|---|---|
+| `emit.terminate` (write time) | workspace + event store | the full bar; failure is a typed `EmitError` |
+| `loop doctor` / `loop.contract` (read time) | workspace + event store | the same bar, reported as `unverified_evidence_terminal` |
+| `loop.reducer` (pure fold) | nothing — no I/O | shape only: every entry is a workspace-relative `.loop/evidence/*.json` path |
+| `loop.integrations.to_terminal_state` (pure projection) | nothing — no workspace | the same shape half, returning `FailedUnverifiable` rather than raising |
+
+The two workspace-bearing layers share **one predicate**
+(`loop.contract._strict_evidence_failure`); `emit.terminate` imports it rather
+than restating it, because two hand-written copies of a four-part check drift
+and a drift here is a silent false completion. That predicate is a strict
+**superset** of the pure half: it applies the reducer's own
+`evidence_entry_is_record_shaped` to the cited entry first, so the writer can
+never accept a terminal that its own replay would refuse. The two pure layers
+check shape and nothing else because they hold no filesystem — making them
+*appear* to enforce binding would be the pretending this contract refuses.
+
+**What the mode proves, exactly.** For every cited entry: (1) the entry resolves
+to a readable evidence@1 record that validates, and the artifact its `uri` names
+resolves inside the workspace and hashes to the digest the record declares;
+(2) that artifact is a **verify bundle whose verdict is a pass**; (3) **when an
+event store exists**, those record bytes are the bytes some event bound into the
+chain, at that digest, and at exactly **one** digest; and (4) when the record
+names a task still in `TASKS.json`, its recorded `policy_digest` equals the live
+goalpost. A goalpost that cannot even be **computed** is a failure, not a skip —
+unestablished is not agreement. An event store that cannot be **read** is likewise
+a refusal, never a pass. The message names which of the four sub-checks failed.
+
+**Check (2), the verdict, in full.** Authenticity is not success. A dispatch whose
+verifier FAILS still writes and binds a perfectly genuine record — of a failure —
+so the bar asks what the artifact SAYS as well as whether it is real. Green is the
+repo's one green-marker rule, `loop.evidence.verify_bundle_is_green`: `outcome ==
+"PASS"` **or** `passed is true`. A bundle carrying only a numeric `score` reads
+**red**, here and in `scripts/metrics.py`, which imports the same predicate — a
+bundle that reads red to the FCR gate can never read green to the completion gate.
+`kind` is an open vocabulary, and a record that is **not** a `verify-bundle` (a
+log, a diff, a screenshot) carries no verdict this layer can read: it is refused,
+because an artifact with no verdict cannot show that anything passed. An
+unreadable or unparseable verdict is a refusal, never a skip.
+
+**Check (3), and why ambiguity is refused.** The write-time view
+(`loop.runtime.bound_artifact_digests`) reports every **distinct** digest a path
+was bound at, not the last one. Collapsing repeat bindings would be a laundering
+channel rather than a summary: an append-only forge that re-binds a tampered path
+at its new digest would look bound to the writer while the per-event walk still
+reported `evidence_chain_mismatch` on the same tree. A path bound at two or more
+different digests is therefore refused outright.
+
+The scope of that refusal is the **cited** evidence, and no wider. The write-time
+bar examines each entry a `Succeeded` terminal cites and the artifact that entry's
+`uri` names; it does not walk the other paths those events happened to bind. So a
+tree can carry an ambiguously-bound artifact that no terminal cites, and the
+writer will not see it while `loop doctor`'s per-event walk still reports
+`evidence_chain_mismatch`. The two layers agree about every path a terminal
+rests on, which is the claim; they are not two spellings of the same sweep.
+
+**What it does not prove, stated without hedging.** It does not prove that a
+human, a runner, or anything at all *produced* the record: a hand-written record
+whose pointer resolves and whose digests are self-consistent satisfies the mode
+in a **store-less** contract, because there is nothing there to bind against
+(`test_the_strict_mode_accepts_a_hand_written_record_in_a_store_less_contract_pinned`).
+It does not prove the chain itself was not rewritten: a worker who can rewrite
+`.loop/` can rewrite the store, so **without `--expect-chain-head` a full rewrite
+of artifacts *and* chain satisfies the strict mode**
+(`test_a_full_rewrite_satisfies_the_strict_mode_without_an_anchor_pinned`). The
+mode's strength is therefore **store-dependent and anchor-dependent**.
+
+**Deleting the store is not louder — it is quieter.** Measured, not assumed: a
+sidecar-free read (v0.10.0) leaves no `-wal`/`-shm` behind, and doctor's
+`missing_event_store` tripwire is gated on exactly that residue, so removing
+`.loop/events.db` after an ordinary run leaves plain `loop doctor` at `ok: true`
+with **zero issues**, and `emit.terminate` then accepts a hand-written record
+under the strict mode. `missing_event_store` catches only the sloppier deletion
+that leaves a sidecar. The control that does hold is the external anchor:
+`loop doctor --expect-chain-head <head>` reports `chain_anchor_mismatch` against
+the deleted store and stays quiet against an intact one. Without an external
+anchor, deleting the store silently disables this mode's chain-boundness check.
+
+**A deliberate asymmetry with doctor's general goalpost check.** Doctor compares
+the **latest record per task** (see the tier list below); the terminal check
+compares **every cited record**. "Latest" orders numbered
+`evidence-iter<N>.json` records by iteration and ranks every **unnumbered** record
+below all of them, ties broken by filename — unnumbered records are ranked in, not
+dropped, so a task whose only record carries no iteration id is still compared. Citing a record in a `Succeeded` terminal is a
+present-tense claim that *this* record backs completion now, so a stale goalpost
+in a cited record is a false completion, not an artifact of history.
+
+**`loop run`'s auto-terminal adopts the mode only when it can satisfy it**, and
+never on file existence: it evaluates the same shared predicate against the very
+records it would cite, **before** appending the terminal event. When it cannot,
+it writes `{"mode": "all_required"}` with `evidence: ["RUNLOG.md"]` and says why
+in `reason` — either `tasks with no evidence record: …` or `evidence records do
+not meet the verified-evidence bar: <record> <sub-check>`. Downgrading silently
+would be a self-serving choice; both branches are pinned.
+
+### Upgrade notes — four behavioural changes, stated without hedging
+
+These are not opt-in, and two of them can turn a contract that was clean on the
+previous release red on this one. They are recorded here rather than left to be
+discovered.
+
+**1. `policy_digest_mismatch` is NOT opt-in, and its remedy is currently
+unsatisfying.** The verified-evidence *completion mode* is opt-in; this doctor
+check is not. A contract that was doctor-clean at v0.10.0 goes **red** on upgrade
+as soon as anyone makes an ordinary goalpost edit — changing a task's `verify`,
+`criterion_ref`, `depends_on` or `id` after a verification was recorded. The
+documented remedy is "re-verify to record the current goalpost", and in a
+loop whose done-ness comes from the event log the runner will not re-verify a task
+it already considers done, so re-verification does not generally help. Measured,
+the reliable route back to green is to **rename the task** — which is precisely the
+evasion the tier list below admits this check cannot catch (a record naming a task
+absent from `TASKS.json` is never compared). So the check is honest about a moved
+goalpost and weak against a determined one, and the operator's real options today
+are: edit goalposts *before* the verification that records them, re-run the
+dispatch so a fresh record is written, or accept the finding as the true statement
+that the declared goalpost moved after the work was verified. A first-class
+"re-baseline this task's goalpost" affordance does not exist yet.
+
+**2. The `completion_policy` enum widening is forward-INCOMPATIBLE as a hard
+error.** `all_required_verified_evidence` is a new enum member, so an **older**
+kernel reading a terminal that declares it reports `invalid_completion_policy`
+and `schema_violation` — it does not degrade to the old bar, it fails. This
+matters concretely for a README-pinned action and for `uvx loop-engineer@0.10.0`:
+a gate pinned to a release older than 0.11.0 will reject a contract written by a
+newer one. Pin the gate and the writer to the same
+release, or keep writing `all_required` until the gate is upgraded.
+
+**3. `os.link` now runs once PER DISPATCH, not once per run.** The
+content-addressed object is placed with the same create-once hard link as the
+immutable terminal record, and every dispatch places one. On a filesystem without
+hard-link support (some network and container-overlay mounts, and any FAT-family
+volume) the link fails, so **every dispatch becomes a committed-then-failed
+iteration**: the durable event is already appended when the object write raises.
+Previously the same limitation existed but was hit once, at terminal write. There
+is no fallback copy path by design — a non-atomic create would reopen the
+overwrite race the hard link closes — so this is a known limitation of running a
+loop on such a filesystem, not a configuration option.
+
+**4. A bound artifact above the read cap fails doctor, and there is no knob.** The
+binding walk refuses to hash a bound path larger than `MAX_BOUND_ARTIFACT_BYTES`
+(64 MiB) and reports `missing_bound_evidence`, because a gate must not perform an
+unbounded read on a path an event names. A loop that legitimately binds an
+artifact above that size — a large log, a coverage dump — therefore goes red with
+no in-product remedy and no configuration option, the same un-satisfiable shape as
+note 1. Bind a digest of the large artifact rather than the artifact itself, or
+keep it out of `artifact_hashes`.
+
+### The integrity boundary, in four honest tiers
+
+Not a single "surfaces / does not surface" pair:
+
+- **Fails `loop doctor`:** a record declaring self-verification
+  (`self_verified_evidence`); a runner-written bundle whose record is absent
+  (`missing_evidence_record`); a malformed or unparseable record
+  (`invalid_evidence` — an errored check fails, it never skips). Added by the
+  evidence-wiring release: a discovered record whose referenced artifact does
+  not match its `sha256` (`hash_mismatch`) or does not resolve at all
+  (`missing_evidence_path`, surfaced verbatim out of `verify_evidence`); the
+  **latest** record for a task whose recorded goalpost disagrees with — or
+  cannot be compared against — the live `TASKS.json` entry
+  (`policy_digest_mismatch`); a chain-bound artifact whose bytes changed
+  (`evidence_chain_mismatch`) or vanished (`missing_bound_evidence`); and a
+  `Succeeded` terminal under `all_required_verified_evidence` whose cited
+  evidence fails the bar (`unverified_evidence_terminal`).
+- **Recorded for later comparison, not checked by any shipped surface:**
+  `code_digest`, and now only `code_digest`. Nothing re-hashes the verifier
+  file, and nothing will without a declared baseline: a verify script
+  legitimately changes between runs, so an unbaselined comparison would fire on
+  every honest edit. A swapped verify script therefore remains *legible in a
+  diff of two records* and nothing more
+  (`test_doctor_does_not_re_hash_the_verifier_file_pinned`). **`policy_digest`
+  has left this tier** — the evidence-wiring release compares it against the
+  live goalpost.
+- **Detectable only by explicitly calling `verify_evidence()`:** **this tier is
+  now empty.** The evidence-wiring release composes that call inside
+  `loop doctor` for every discovered record, so a swapped bundle — the one
+  member this tier ever had — now fails doctor as `hash_mismatch` in the first
+  tier above.
+- **Not surfaced at all:** a worker that writes a false `verified_by.by`; a
+  worker that omits its executor identity; a hand-written record whose pointer
+  resolves and whose digests are self-consistent (verification proves the
+  *pointer*, never the *provenance* —
+  `test_a_hand_written_record_pointing_at_a_real_file_still_passes_pinned`); the
+  *text* of a criterion, which `policy_digest` never covered and still does not.
+  Plus the residuals this release's own binding leaves, each pinned by name:
+  - a record written through the **writer API** (`emit.write_verify_evidence`)
+    appends no event, so nothing binds it and a later rewrite is invisible
+    (`test_a_record_written_outside_a_dispatch_is_never_chain_bound_pinned`);
+  - a **legacy** event carries `artifact_hashes: []` and can never be bound
+    retroactively — the append-only triggers forbid the UPDATE a backfill would
+    need — so a pre-release iteration whose evidence was deleted stays
+    undetectable at this layer forever
+    (`test_a_legacy_iteration_event_can_never_be_bound_retroactively_pinned`);
+  - an **older** record for a task whose goalpost has since moved is not
+    compared, because comparing every record would make each honest
+    re-verification a permanent failure
+    (`test_an_older_record_for_a_moved_goalpost_is_not_compared_pinned`);
+  - a hand-written record **satisfies `all_required_verified_evidence` in a
+    contract that has no event store**, because there is nothing to bind
+    against — and deleting a store from a run that had one is *quieter*, not
+    louder: sidecar-free reads leave no residue for the `missing_event_store`
+    tripwire, so plain doctor reports `ok` with zero issues. The external
+    anchor is the compensating control
+    (`test_the_strict_mode_accepts_a_hand_written_record_in_a_store_less_contract_pinned`);
+  - deleting the artifacts, the records, the store **and** its sidecars leaves a
+    contract that never ran, and doctor is clean and correct to be — detection
+    needs something outside the tree
+    (`test_deleting_every_artifact_and_the_store_leaves_a_clean_doctor_pinned`,
+    whose own positive control is the anchor);
+  - and — the headline — **a worker who can rewrite `.loop/` can rewrite the
+    store, so without `--expect-chain-head` a full rewrite of artifacts *and*
+    chain verifies clean, including under the strict completion mode**
+    (`test_a_full_rewrite_of_artifacts_and_store_is_not_caught_without_an_anchor_pinned`,
+    `test_a_full_rewrite_satisfies_the_strict_mode_without_an_anchor_pinned`).
+
+This does not prove independence. It surfaces **declared** self-verification,
+and it records — honestly, with nulls where the process could not know — what
+verified the work. This does not make evidence tamper-proof. It binds evidence
+bytes into a chain someone outside the worker's trust domain can anchor, and it
+fails closed when what is on disk is not what was verified.
+
+---
+
+## 18. `terminal_superseded` — administrative terminal corrections
+
+`terminal_superseded` is an append-only administrative event that corrects the
+currently effective terminal record while preserving the original decision and
+every later correction in the reducer projection's oldest-first
+`superseded_history`. Each correction carries the corrected terminal fields,
+non-empty `justification`, and `{by, at}` `authority`, and its `causation_id`
+must identify the terminal event it corrects; chained corrections therefore
+remain auditable without replacing any record.
+
+**Scope boundary:** this event type has no corresponding `loop.emit` writer
+operation — deliberately: unlike the first four types, `terminal_superseded` is
+administrative and event-log-only (§16's type list records which four types map
+to writer operations and which five do not). It is not file-based `terminal@1`
+replacement or an `emit`/`doctor` workflow.
+
+**Domain enforcement:** the EventStore validates envelope and payload shape
+only; the reducer alone admits this type after a terminal, verifies its
+causation anchor, and reuses G1 completion checks when a correction sets
+`state` to `Succeeded`. All other event types remain forbidden after a terminal.
+
+---
+
+## 19. Run-control events
+
+`approval_requested`, `approval_resolved`, `run_paused`, and `run_resumed` are
+event@1 run-control primitives. `approval_requested` records a non-empty
+request, moves the reducer projection to `approval-wait`, and records a pending
+approval anchor. `approval_resolved` cites that anchor through `causation_id`;
+an approved resolution supplies a legal non-terminal FSM resume target, while a
+denied resolution leaves the projected state at `approval-wait` and clears the
+pending request.
+
+`run_paused` and `run_resumed` are projection overlays: they set and clear the
+projection's `paused` flag and pause reason without changing the FSM state, so
+resume preserves the exact prior state. These types, like every non-
+`terminal_superseded` event, are forbidden after a terminal record.
+
+**Interop note:** the pre-existing lightweight
+`iteration_appended(outcome="approval_requested", state="approval-wait")`
+path remains valid. It has no structured request or pending-approval anchor,
+so it cannot be consumed by `approval_resolved`; CLI emission policy remains
+out of scope for event@1.
+
+---
+
+## 20. `loop simulate` — read-only dispatch prediction
+
+`loop simulate [--mode basic|strict|release] <workspace>` projects the event
+store and reports what one `loop run` step would do, without dispatching a
+task, invoking its verifier, repairing legacy files, or writing any workspace
+artifact. It uses the event store's immutable-first read path; when a crash
+left a WAL sidecar, `events.db-shm` is the sole permitted coordination-file
+difference and durable event content remains unchanged.
+
+The report includes normal projection health (`divergence`, `terminal_desync`,
+and `ok`), plus a `would` object. Its action vocabulary is deliberately
+predictive: `would_dispatch`, `would_write_terminal`, `would_block`,
+`would_refuse`, or `already_terminal`. `would_dispatch` exposes the declared
+verify command and parsed argv, but never executes it. `would_refuse` carries
+the matching runner refusal text; `would_block` has no invented refusal text.
+For terminal completion prediction, `predicted_terminal` is the payload a real
+dispatch would append.
+
+`would.legacy_sync_would_write` identifies whether a real dispatch would enter
+one of its legacy reconciliation writes. Its calculation follows the runner's
+terminal-first branch structure: terminal reconciliation is assessed only for
+terminal projections, iteration lag only for `execute-task`, and all other
+non-terminal states report false. A missing or unreadable required state file
+is reported as null rather than repaired.
+
+---
+
+## 21. `loop architect` — typed fail-loud deferral
+
+`loop architect` is a permanent typed refusal, not a scaffold. Architecture
+classification and ADR authorship — choosing the loop's shape, its
+Claude-Code realization, its loop patterns, its risk profile, its
+terminal-state plan — is agentic judgment the loop-architect skill performs,
+and this deterministic CLI does not call an LLM to reproduce it. A
+placeholder ADR file with `REPLACE` fields for the decision itself
+(architecture, realization, risk profile) would carry no real information
+while looking like a completed judgment artifact to whatever consumes it
+next — that is a silent stub in disguise, not a scaffold, so this verb does
+not write one.
+
+Every invocation of `loop architect`, with any argv shape (a target, no
+target, a nonexistent target, any `--mode` value, any other flag), exits `2`
+before parsing a target or a validation mode and prints a single typed message
+to stderr pointing at the loop-architect skill and at `loop scaffold` as the
+deterministic next step once a real architecture decision record exists. It
+performs zero filesystem or event-store I/O: no `sqlite3.connect`, no
+`subprocess.run`, no read of `.loop/state.json` or `TASKS.json`. There is no
+`0` or `1` exit path — every path is the same typed `2` refusal.
+
+Sources: "Designing a Loop Engineer Skill for Frontier Agent Workflows" (2026), synthesizing
+Anthropic guidance on long-running agent harnesses (anthropic.com, 2025), OpenAI Agents/Codex guidance, Google
+Conductor, and arXiv PreFlect (2602.07187), SWE-Marathon (2606.07682), Web Agents
+Plan-Then-Execute (2605.14290), Plan Compliance (2604.12147), and Code as Agent Harness
+(2605.18747).
+
+---
+
+## 22. `loop doctor` — event-store consistency gate
+
+When `.loop/events.db` exists, `loop doctor` composes the exact read-only
+`status`/`replay` verbs (§16, §20) — never duplicating their fold/divergence
+logic — and folds their findings into its own `issues`/`ok`. An absent store
+**with no SQLite sidecar residue and no `--expect-chain-head`** is conformant:
+doctor reports `"event_store": {"present": false}` and every other key is
+byte-identical to a store-less report; sidecar residue
+(`missing_event_store`) or a supplied anchor (`chain_anchor_mismatch`) fails
+doctor. When an absent store *does* raise one of those, the block gains the
+residue flag — `{"present": false, "sidecar_residue": true}` for a deleted
+store whose `-wal`/`-shm` files remain, and `sidecar_residue: false` when the
+only finding is the anchor. A present, readable store adds
+`"event_store": {"present": true, "readable": true, "run_id", "event_count",
+"state_json_agrees", "deterministic", "legal_sequence", "chain"}`; any of
+`state_field_mismatch`, `desynced_terminal_window`, `terminal_state_mismatch`,
+`illegal_event_sequence`, `event_chain_broken`, `chain_columns_missing`,
+`evidence_chain_mismatch`, `missing_bound_evidence`, `bound_evidence_escape`, or
+`chain_anchor_mismatch` fails doctor (`ok: false`). The findings that come from
+the composed verbs keep the identical issue code those verbs already use;
+`chain_columns_missing`, `evidence_chain_mismatch`, `missing_bound_evidence` and
+`bound_evidence_escape` are doctor's own store-gated checks, appended to the same list. A store that cannot be read at
+all — `corrupt_store`, `empty_store`, `invalid_event`, or `ambiguous_run_id` —
+also fails doctor rather than being silently skipped; `"event_store"` reports
+`{"present": true, "readable": false, "error_code": <code>}` in that case.
+Note the ordering consequence: event@1 validation runs before the fold, so a
+tamper that *also* breaks the envelope or payload shape (a payload edit that
+drops a required field, say) surfaces as `invalid_event` on an unreadable
+store, never as `event_chain_broken`.
+
+**The `chain` block.** A present, readable store nests
+`"chain": {"head": {"sequence", "event_hash"} | null, "unchained_prefix": <int>}`
+under `event_store`. `head` is `null` for a store with no chained events at
+all (a legacy or fully downgraded store) **and also for a store whose chain is
+broken**, because the fold stops at the break and never establishes a head. The
+block alone therefore does not distinguish "never chained" from "chain broken";
+the `event_chain_broken` issue is what separates them, and a `null` head with
+no such issue is the honest never-chained case. `unchained_prefix` counts the
+leading events that carry no `event_hash`; it is **never elided** — a migrated
+store legitimately reports a non-zero prefix, and silently hiding it would let
+a legacy tail read as chained provenance. A prefix is not an issue by itself;
+it is the honest statement of how much of the log the chain does not cover.
+
+**New issue codes.**
+
+| Code | Meaning |
+|---|---|
+| `event_chain_broken` | A link check failed: `prev_event_hash` mismatch, recomputed `event_hash` mismatch, an unhashable record, or an unchained row appended after a chained prefix. Unrepairable — UPDATE is trigger-blocked. |
+| `chain_anchor_mismatch` | `--expect-chain-head` was supplied and the store's actual head is absent, unreadable, unchained, or a different digest. |
+| `chain_columns_missing` | The store declares `user_version >= 2` but the chain columns are gone — the lazy downgrade. A downgrade that also resets `user_version` is invisible here; the anchor is the real control. |
+| `missing_event_store` | `events.db` is absent but `-wal`/`-shm` sidecars remain — the store was deleted. Distinct from the pre-existing `missing_store`, which `status`/`replay`/`run`/`migrate` raise when a verb that *requires* a store is pointed at a workspace that has none; `missing_event_store` is a doctor finding about a store that evidently once existed. |
+| `self_verified_evidence` | A discovered evidence@1 record declares `produced_by.executor == verified_by.by` (strip+casefold) — the producer verified its own work. Enforces the independence rule of `reference/safety-and-approvals.md` §5, which was prose-only before v0.11.0. |
+| `missing_evidence_record` | A runner-written verify bundle `.loop/artifacts/verify-iter<N>.json` exists with no matching `.loop/evidence/evidence-iter<N>.json`. Residue of a removed provenance record, in the same family as `missing_event_store`. Fires only when a bundle is present, so an absent-everything contract stays byte-identical. |
+| `evidence_chain_mismatch` | An artifact whose digest an event bound into the hash chain no longer matches its bytes on disk. The message names the digest the chain committed and the digest found; the original bytes may still remain in the content-addressed object store at `.loop/artifacts/objects/<aa>/<sha256>`. |
+| `missing_bound_evidence` | An event bound an artifact path into the chain and that path is now absent or unreadable — a deleted bundle/record pair, a deleted object, the sanctioned crash window between the durable append and the evidence write, or a path that resolves to something the gate refuses to read (a non-regular file such as a device or FIFO, or a file above the 64 MiB bound-artifact read cap). Fires only for events that bound something: a legacy event binds nothing and is silent by construction. |
+| `bound_evidence_escape` | An event bound a path that is not inside the workspace — absolute, drive-lettered, backslashed, `..`-traversing, or resolving outside through a symlinked component. `event@1` constrains `path` only to a non-empty string and the chain covers a binding rather than vouching for it, so the binding walk containment-checks every declared path **before** opening anything: an escaping path is reported, never read. |
+| `policy_digest_mismatch` | The **latest** evidence record for a task records a `policy_digest` that is not the live `TASKS.json` goalpost — the declared `verify`/`criterion_ref`/`depends_on`/`id` changed after the verification. Also fires when the live entry cannot be canonicalized at all, because a comparison that cannot run has not passed. Re-verify to record the current goalpost. |
+| `unverified_evidence_terminal` | A `Succeeded` terminal declaring `completion_policy.mode: all_required_verified_evidence` has an evidence entry that fails one of the mode's four checks: it is not a hash-verified evidence@1 record; or it does not point at a `verify-bundle` whose verdict is a pass; or (when an event store exists) no event bound those bytes into the chain, or events bound that path at two or more different digests; or the record's `policy_digest` is not the live `TASKS.json` goalpost for the task it names. The message names which. An unreadable store is also a failure. In a contract with **no** event store the chain check is skipped — the mode's strength is store-dependent by construction (§17). |
+
+**Do not confuse `missing_evidence_record` with `missing_evidence_path`.** They
+are opposite directions of the same pair. `missing_evidence_record` walks
+*bundles* looking for the record that should describe them.
+`missing_evidence_path` comes straight out of `verify_evidence()` and means a
+*record's* `uri` does not resolve. Both can be true at once and neither implies
+the other.
+
+**Evidence discovery (v0.11.0+).** `loop doctor` scans `.loop/evidence/*.json`
+when the directory exists; an absent directory with no runner bundle is a
+no-op that leaves every doctor key byte-identical (no new top-level key was
+added). A malformed or unparseable record **fails** doctor rather than being
+skipped, and `loop-engineer/evidence@1` joins `schemas_checked` when at least
+one record was read. Since the evidence-wiring release each structurally-valid
+record is additionally passed to `verify_evidence()` — surfacing
+`hash_mismatch`, `missing_evidence_path`, `workspace_escape`, `not_a_file` and
+`invalid_uri` **verbatim**, per the rule that doctor composes a verb and reuses
+its issue codes rather than inventing parallel ones — and the latest record per
+task is compared against the live goalpost (`policy_digest_mismatch`). The
+`verify_evidence()` call is guarded on the record having no structural issues,
+so a malformed record is reported once, not twice. The chain-binding walk is a
+separate, store-gated check that lives beside `chain_columns_missing` in the
+event-store block above; it costs one extra read-only fold of the store, because
+it needs envelope-level `artifact_hashes` that no report returns and widening a
+report's dict would leak into the `loop status` / `loop replay` CLI JSON.
+
+**`loop migrate`.** `loop migrate <workspace>` is the only store-upgrade path:
+explicit, idempotent, and non-rewriting. It widens `events` with the two
+nullable chain columns and stamps `user_version = 2`; it never backfills
+hashes onto existing rows, because the append-only triggers forbid UPDATE and
+a backfilled digest would be an assertion about history the store cannot
+support. Pre-migration rows therefore remain an unchained prefix forever, and
+the first post-migration append is a chain genesis
+(`chained_from_sequence` in the migrate report names it). Because migrated
+columns stay nullable, a migrated store — unlike a fresh one — cannot refuse a
+pre-0.10.0 writer at the database layer (see §16's compatibility rule).
+
+**Concurrency assumption.** The read verbs assume no concurrent writer — the
+sidecar-free guarantee holds only for a store whose last writer closed
+cleanly. `loop doctor`/`status`/`replay`/`simulate` open the store read-only
+and immutable when no WAL sidecar exists, so a clean store is read without
+leaving a byte behind; against a store with a live or crashed writer, a
+`-wal`/`-shm` sidecar is the sole permitted coordination-file difference (§20)
+and durable event content still never changes.
+
+### Anchor trust assumptions
+
+`--expect-chain-head` (valid on `doctor`, and identically on its `validate`
+and `verify` aliases) fails hard when the store is missing, unreadable, has no
+chained head, or has a head that differs from the supplied digest. It is the
+only cross-run tamper control in the toolchain — and it is only as trustworthy
+as the place the anchor is read from. The anchor is outside the worker's trust
+domain when **all three** hold:
+
+1. **The gate is not installed from the worker's own checkout.** The
+   `loop-engineer` GitHub Action is pinned to a released tag or SHA of a repo
+   the worker cannot write, **and** its `version` input is non-empty — with an
+   empty `version` the `Install loop-engineer` step takes its fallback branch
+   and installs the kernel from `github.action_path`, i.e. the checkout under
+   test, so the code doing the verifying is code the worker may have edited.
+2. **The invoking workflow is protected from worker edits** — a required
+   workflow, CODEOWNERS on `.github/`, or a branch ruleset. For a same-repo
+   pull request the workflow that runs is *the PR head's*, so an unprotected
+   workflow file is an unprotected anchor.
+3. **The expected head is remembered outside the workspace** — a repository
+   variable, a protected environment, or an operator's own record. A digest
+   read out of the tree it is meant to certify certifies nothing.
+
+State it plainly: **with the default empty `expect-chain-head`, this action
+performs no cross-run tamper detection; it records the head for a comparison
+someone else must make.** That recording is the action's `chain-head` output
+and a line in its step summary — the place an operator reads the observed head
+in order to re-anchor the next run. When an anchor *is* supplied and does not
+match, the mismatch itself surfaces in doctor's issue list as
+`chain_anchor_mismatch`.
+
+Always pass an anchor in CI. A bare `loop doctor` treats a fully deleted
+store — no database, no sidecars — as a valid never-ran contract, so
+"delete the evidence" is a passing run without one.
+
+
+## 23. `loop-engineer/verdict@1` — the CI-attested verdict predicate
+
+`loop verdict <workspace>` projects a **finished** run into one canonical JSON
+document: the doctor verdict, the chain head, the terminal outcome, and the
+chain-bound evidence digests that pass §17's strict verified-evidence bar. The
+kernel emits the **predicate body only**. It never signs, never verifies a
+signature, never constructs an in-toto Statement (`_type`, `subject`,
+`predicateType`, and `predicate` keys are forbidden in its output), and never
+reads an environment variable — every one of those boundaries is a mechanical
+test, not an intention. The signer lane (`action.yml`'s opt-in `attest` input
+→ `actions/attest`) owns the envelope, the subject, and all cryptography:
+**the kernel disposes on contents; the CI lane notarizes context; neither is
+the other.**
+
+Serialization is §16's canonical JSON — sorted keys, compact separators,
+`ensure_ascii: false`, `allow_nan: false` — so the same run always projects
+the same bytes, and a value canonical JSON cannot carry (a NaN smuggled into a
+terminal record) is a typed refusal at the CLI, never a crash.
+
+**Conformance vector (machine-pinned).** `null` is legal for `chain.head`,
+`chain.sequence`, `tool.version`, and `terminal.completion_policy`; every
+other key is always present. The field set is an allowlist enforced by test —
+everything in this document is public, append-only, and permanent, so adding a
+field is a one-way door.
+
+```json
+{
+  "schema": "loop-engineer/verdict@1",
+  "run_id": "coverage-repair",
+  "tool": { "name": "loop-engineer", "version": "0.11.0" },
+  "doctor": {
+    "ok": true,
+    "validation_mode": "jsonschema",
+    "issue_codes": [],
+    "schemas_checked": ["loop-engineer/manifest@1", "loop-engineer/state@1"]
+  },
+  "chain": {
+    "head": "9f2c…64hex",
+    "sequence": 41,
+    "unchained_prefix": 0
+  },
+  "terminal": {
+    "state": "Succeeded",
+    "completion_policy": "all_required_verified_evidence",
+    "false_completion": false
+  },
+  "evidence": [
+    {
+      "digest": "a1b2…64hex",
+      "code_digest": "c3d4…64hex",
+      "policy_digest": "e5f6…64hex"
+    }
+  ]
+}
+```
+
+Field semantics:
+
+- `run_id` — the **one operator-controlled string** in the document,
+  allowlisted deliberately so a verdict can be correlated to a run. It lands
+  in a permanent public log: run ids must not embed sensitive text. Every
+  other string is a digest, an enum, a snake_case issue code, or a schema id —
+  a whitespace-bearing value anywhere else is a conformance failure.
+- `doctor.issue_codes` — **codes only, sorted, de-duplicated.** Never
+  `message`, never `path`. Free-text detail strings and workspace paths do
+  not leave the machine.
+- `doctor.validation_mode` — which strength the contract was validated at
+  (`jsonschema` or `structural-fallback`); without it, `ok: true` from a
+  fallback environment would read as the stronger claim.
+- `chain.head` / `chain.sequence` — the store's chained head (§22's `chain`
+  block). `null` for a store-less workspace **and** for a store whose chain
+  never established a head; `unchained_prefix` carries §16's honest count of
+  events the chain does not cover.
+- `terminal.completion_policy` — the policy `mode` string, or `null` for a
+  legacy record that never declared one. Without it a reader cannot tell what
+  `Succeeded` meant (`all_required` vs `all_required_verified_evidence`).
+- `evidence[]` — one entry per **chain-bound** terminal-evidence record that
+  passes §17's strict bar, digests only. `digest` is the SHA-256 of the
+  evidence@1 **record file bytes** — the exact digest the event chain
+  committed — never the record's own `sha256` field, which hashes the cited
+  artifact instead. `code_digest`/`policy_digest` lift from the record's
+  `verified_by`. Entries are de-duplicated and sorted by
+  `(digest, code_digest, policy_digest)` with `null` ordered as the empty
+  string. No URIs: a URI is a workspace path, and this document is public.
+
+**Refusals and degradations.** A workspace with no terminal record refuses,
+typed — a verdict projects a finished run. A terminal record whose
+`false_completion` is absent or non-boolean refuses: projecting `false` for an
+unknown safety flag would trade an alarming truth for a reassuring lie. A
+store-less workspace **projects** (`chain.head: null`, evidence under §17's
+documented store-dependent degradation) — the projection is honest about what
+it cannot prove rather than refusing to say anything. An **unreadable** store
+is not that degradation: chain-boundness is then unestablished, so `evidence`
+projects empty — an errored check fails, it never skips — while the store
+failure itself surfaces in `doctor.issue_codes`.
+
+**Predicate identity.** `predicateType` is
+`urn:loop-engineer:verdict:1` — the schema `$id` transliterated
+(`/` and `@` → `:`), an equality asserted by test so the two names cannot
+drift. It names no vendor host, no organization, and no repository: a
+predicateType is written immutably into a public log, and a rename must not be
+able to orphan it.
+
+**The subject seam — read this before verifying anything.** The signer binds
+`subject-path`: a file whose **entire content is the chain head**, exactly 64
+lowercase hex bytes with no trailing newline, written by the single definition
+`loop.verdict.subject_bytes` and reachable as `loop verdict --emit-subject`. A
+consumer therefore **can** regenerate the subject's bytes from the head alone,
+and `gh attestation verify` **does** succeed against them. That is the whole
+point of the byte form: `gh attestation verify` accepts only a file path (or an
+OCI URI) and hashes that file's **content**, so a subject identified by a bare
+digest can never be presented an artifact at all.
+
+Two things a reader must not confuse with that. First, the chain head *itself*
+is still a SHA-256 over a **synthesized event preimage** (§16): no retrievable
+artifact's bytes hash **to** the head, and a consumer must not go looking for
+one. The subject file *carries* the head; it is not a preimage of it, and its
+own digest is `sha256(<the 64 head bytes>)`, which is necessarily **not** the
+head. Second, the predicate bytes are **not** the subject, deliberately:
+`doctor.validation_mode` and `tool.version` live inside the predicate, so the
+same run projects different bytes in different environments (measured:
+`873dfc87…` with jsonschema, `8de3d88c…` in structural-fallback), and a
+consumer on another tool version could never reproduce them. The head is
+version-independent; the predicate bytes are not.
+
+Authenticity (`gh attestation verify`) and agreement (`loop verdict --compare`)
+are separate checks, in that order, and **neither implies the other**. §24
+specifies both, together with the anchor carry-channel and the signer-trust
+policy.
+
+**What an attestation buys — and does not.** The signature attests *context*:
+which repository, which workflow, which trigger, at what time. It never
+attests correctness — a signed verdict over a weak gate is a signed weak
+gate. A worker with ordinary merge rights can loosen the gate
+(`loop/**`, `schemas/**` — the contract schemas define what doctor accepts —
+`action.yml`, or the workflow) and then mint a perfectly genuine attestation
+for the loosened gate, and signing does not address it. ADR 0002 decision 6 named
+human review on those paths as the control; it is **withdrawn** (ADR 0002,
+amendment 2026-07-30) because a single-maintainer repository cannot supply it —
+GitHub forbids self-approval, so requiring code-owner review would leave
+maintainer-authored pull requests unmergeable while gating only bot-authored ones.
+Read a CODEOWNERS file as a record of which paths are gate-defining, never as a
+control; that is true here permanently, not until some ruleset changes. The chain proves order and non-tampering
+relative to an anchor, not that the events happened when claimed — a history
+fabricated wholesale at authoring time is byte-valid. Detection of an
+unattested rewrite is at best one run late. And an attestation nothing
+verifies is decoration: until a consumer checks it, this section describes a
+publication surface, not a gate.
+
+## 24. Consuming an attested verdict — agreement, ancestry, and signer trust
+
+§23 specifies how a verdict is *published*. This section specifies how one is
+*consumed*, and it is deliberately explicit about what consumption does **not**
+establish. A reader who assumes otherwise has a false sense of a gate.
+
+**The comparison report.** `loop verdict --compare <file|-> <workspace>` loads an
+attested `verdict@1` predicate, projects the workspace locally, and reports
+agreement over exactly **four** facets: `run_id`, `chain.head`, the whole
+`terminal` object (`state`, `completion_policy`, `false_completion`), and the
+`evidence` digest set (set equality over the `digest`/`code_digest`/`policy_digest`
+triple). Exit **0** on agreement, **1** on disagreement, **2** on refusal. The
+report's field set is `{ok, signature_checked, compared, issues}`, and the
+`compared` block carries digests, enums and `run_id` only — no free text.
+`issues[].message` is the one exempt surface: a local report may explain itself; a
+predicate may not.
+
+`doctor` and `tool` are **deliberately not compared.** Both live inside the
+predicate and are environment-coupled — the same run projects `873dfc87…` with
+jsonschema and `8de3d88c…` in structural-fallback — so comparing them would make an
+honest environment difference read as tampering. Whether an attested `doctor.ok`
+should *gate* is a policy question, not an agreement question, and it is out of
+scope here.
+
+**`signature_checked` is the literal `false` on every path, and there is no flag to
+flip it.** The kernel establishes agreement; `gh attestation verify` establishes
+authenticity; it runs first; neither implies the other. `verdict` rejects
+`--verify-signature`, `--signature`, `--signer-workflow` and `--signer-digest`
+outright, so the absence is a contract rather than an omission.
+
+**Typed refusals: a bare predicate only.** An in-toto Statement (any of `_type`,
+`subject`, `predicateType`, `predicate`) and a `gh --format json` envelope (a
+top-level array, or `verificationResult` / `attestation`) are refused by name, with
+the documented unwrapping path `.[0].verificationResult.statement.predicate` in the
+message. Best-effort parsing of a vendor envelope inside the kernel is exactly how a
+trust boundary rots.
+
+**The subject byte form (normative).** The file a consumer presents to
+`gh attestation verify` is **exactly 64 bytes**: the chain head as lowercase hex,
+with **no trailing newline** and nothing else. There is one definition —
+`loop.verdict.subject_bytes`, reached from either side as
+`loop verdict --emit-subject` — so the signer side and the consumer side cannot
+disagree about those bytes. A stray `\n` would change the subject digest, which is
+why the form is pinned by test rather than left to a shell's `echo`. The subject
+file's own digest is `sha256(<the 64 head bytes>)` and is therefore **never** equal
+to the head itself; that inequality is the crispest check that this mechanism, and
+not §23's retired digest form, is what produced an attestation.
+
+**`loop-engineer/anchor@1` — the carry channel.** A tracked JSON document
+(conventionally `loop-anchor.json` at the workspace root) whose required fields are
+`schema` and `chain_head`; `sequence`, `attestation_id`, `run_id` and `recorded_at`
+are optional provenance. It **must be tracked and must not live under `.loop/`** —
+that directory is gitignored here, so an anchor inside the tree it certifies would
+never land in a commit; `read_anchor` refuses a path with a `.loop` component
+outright. Every `pattern` in the schema carries a sibling `maxLength`, because
+jsonschema's `pattern` is `re.search` semantics and a bare anchored pattern accepts a
+trailing newline.
+
+**The inversion that makes the anchor necessary: an attestation can corroborate a
+carried head, but it can never discover one.** `GET
+/repos/{owner}/{repo}/attestations/{subject_digest}` is the only list operation; the
+no-digest route is a 404; there is no `gh attestation list`; GraphQL's `Repository`
+type exposes no attestation fields; and **no ordering guarantee is documented
+anywhere**. You must already know the digest to look anything up. So the head is
+*carried* in a tracked file and the attestation proves that carried head was
+notarized.
+
+**Anchor trust is exactly ordinary write access — no better.** An actor who can edit
+the anchor file re-points it at a head they had attested. That is the same class of
+limit as "the worker can edit the verifier" in §23. The anchor path is listed in
+this repository's CODEOWNERS, which records the gate-defining surface and enforces
+nothing: the ruleset requires no code-owner review, and a single-maintainer
+repository cannot require it (ADR 0002, amendment 2026-07-30).
+
+**Ancestry, not head equality.** `--expect-chain-head` is exact *current-head*
+equality, so it fails **by construction** on any store that legitimately grew:
+appending one event moves the head (measured: `9d388ae5…` at sequence 4 →
+`c336ecdc…` at sequence 5). Feeding run N's head to `--expect-chain-head` at run N+1
+therefore always fails. The meaningful cross-run question is *"was this digest ever
+my head?"*, and `loop doctor --expect-chain-ancestor <sha256>` (or `--anchor <path>`,
+which resolves the digest from an `anchor@1` file) asks it via
+`loop.chain.head_sequence`.
+
+Ancestry is **established by replay, recomputing every hash — never by trusting the
+stored `event_hash` column.** A tamperer who can rewrite the store can also insert a
+row bearing the anchored digest, and only recomputation refuses that row. Sequence
+`0` is a legitimate answer, so callers compare against `None`, never truthiness.
+`--expect-chain-head` and `--expect-chain-ancestor` **compose** — equality and
+ancestry are different questions and both may be asked — while `--anchor` and
+`--expect-chain-ancestor` are **mutually exclusive** at the CLI, because silent
+precedence between an explicit digest and a resolved one is how a gate becomes a
+suggestion. Precedence between the action's `expect-chain-head` and `anchor` inputs is
+resolved in `action.yml`, where the inputs are the surface, and a dropped anchor is
+announced in the step summary rather than silently ignored.
+
+**The five new codes.**
+
+| Code | Meaning |
+|---|---|
+| `chain_anchor_not_ancestor` | The supplied ancestor digest was **never** the head at any sequence of the replayed chain. Also raised — never skipped — when the store is absent, empty or unreadable. |
+| `anchor_file_unreadable` | The `--anchor` path is absent, unreadable, not UTF-8, or not JSON. |
+| `anchor_file_invalid` | It parsed, but is not a conformant `anchor@1`. |
+| `anchor_attestation_contradicted` | The index was reached, an attestation was found, and it does not corroborate the carried head. *I looked and it said no.* |
+| `anchor_attestation_unavailable` | Nothing was found (404), **or** the index could not be reached at all (5xx, timeout, auth), **or** the classifier could not confidently classify what it saw. *I could not look.* |
+
+`chain_anchor_not_ancestor` is deliberately **not** a reuse of
+`chain_anchor_mismatch`. "Your current head is not what I expected" and "the head you
+anchored is not in my history at all" are different facts, and doctor issue codes are
+the population `verdict.doctor.issue_codes` is drawn from — a permanent, public,
+append-only log. One shared code would collapse them there forever.
+
+**The sentence that keeps this a gate.** *Anything short of a verified 200 plus a
+successful `gh attestation verify` is non-promoting, and transport-class failures
+(5xx, timeout, auth) are separately reportable but exactly as non-promoting as a
+clean denial.* The two lookup codes exist for **observability**, never for
+differential trust.
+
+This matters because the anchor is a **deletable dependency**. Attestations can be
+deleted — user- and org-scoped delete, bulk-delete and delete-request endpoints all
+exist, permission-gated — and GitHub's own guidance recommends deleting attestations
+that are no longer needed. **No retention window is documented anywhere**; the
+familiar 90-day and 400-day figures are workflow *artifacts and logs*, not
+attestations, and the roadmap issue tracking expiry records none. So a missing anchor
+attestation must be a typed failure: otherwise an availability attack on the index
+becomes a gate bypass.
+
+**Do not over-read the codes.** A 404 is consistent with never-attested,
+attested-then-deleted, and a transient index fault; HTTP status alone cannot separate
+them. And do not key logic on response *body* text — the no-digest route returns a
+generic `documentation_url` while the digest-present-but-non-matching family returns
+one pointing at the list-attestations reference.
+
+**The signer-trust policy.** `loop.attestation.check_signer_trust` is a pure function
+over an **already-verified** `verificationResult`. It reads only
+`signature.certificate` and `verifiedTimestamps` — per `gh`'s own help, those are the
+only fields the originating workflow cannot manipulate — and treats everything under
+`statement.predicate` as data to compare, never to trust. It **refuses**, loudly and
+typed, when a claim it needs is absent, because a policy that treats a missing claim
+as satisfied is worse than no policy; an unwitnessed attestation (absent or empty
+`verifiedTimestamps`) is likewise refused. Denials are typed codes —
+`signer_workflow_mismatch`, `signer_repository_mismatch`, `self_hosted_runner`,
+`signer_trigger_mismatch` — never booleans, and the returned verdict carries
+`signature_checked: false` too, because it evaluates a conclusion `gh` already
+reached.
+
+**`--signer-digest` is deliberately not required.** It pins the signer-digest
+certificate extension, which is populated from the `job_workflow_sha` claim; for a
+non-reusable top-level workflow that value **equals the triggering commit SHA**. It
+therefore does not merely invalidate on a workflow edit — **it invalidates on every push**.
+That was observed across all three attestations this repository minted before this
+slice, even though none of those commits touched `attest.yml` or `action.yml`.
+`--signer-workflow` (whose value was byte-identical across all three) is the mandatory
+pin; `--signer-digest` is offered only as an optional, human-invoked one-off.
+`check_signer_trust` has no `signer_digest` parameter at all.
+
+**The REST attestations route is deprecated.** Measured on both the 200 and the 404
+route and absent from four control endpoints, so it is route-level:
+`Deprecation: Tue, 10 Mar 2026`, **`Sunset: Fri, 10 Mar 2028`**. The fetch/verify path
+therefore goes through `gh attestation verify`, a GitHub-maintained abstraction that
+will be migrated over whatever replaces the raw route, and the single `gh` call site
+lives in `scripts/action_anchor_resolve.py` so a migration is a one-line change. The
+sunset date is recorded here so a future maintainer meets it as a documented fact
+rather than as an outage.
+
+**The `[0]` selection is an assumption, and is stated as one.** No ordering guarantee
+is documented for the underlying endpoint, so `[0]` means *"some verified attestation
+for this subject"* — never *"the newest"*. It is sound only because every entry has
+already passed the same signer-trust policy over the same subject digest, so two
+entries cannot materially disagree about the head. **If the policy is ever relaxed to
+accept more than one signer, this assumption breaks** and the step must compare every
+entry rather than indexing.
+
+**Public/private asymmetry.** Public repositories sign against the Sigstore Public
+Good instance and its public transparency log. **Private repositories use GitHub's own
+signing instance, which has no transparency log** and federates only with Actions. The
+independent-audit property this design leans on exists for public repositories and does
+**not** exist for private ones. For a public repository the attestations read also
+succeeds unauthenticated, so an `attestations: read` permission is defensive
+future-proofing rather than a requirement.
+
+**Honest limits.**
+
+1. **This repository cannot dogfood cross-run ancestry.** `.github/workflows/attest.yml`
+   seeds an ephemeral `$RUNNER_TEMP` workspace on every run, so its chain head is new
+   by construction and there is no persistent store to anchor. Coverage is therefore
+   (a) synthetic, through a fake `gh` on `PATH`, and (b) a real *within-run* grown-store
+   ancestry exercise. Do not read that CI green as a cross-run proof.
+2. **Detection of an unattested rewrite is at best one run late**, unchanged from §23.
+   An actor who can land a commit lets CI run once, which mints a genuine attestation
+   over the rewritten chain. Opt-in changes operator consent; it does not change that.
+3. **Mode parity is now CI-covered, and was not before.** Every other CI job installs
+   jsonschema, so the structural hand-checks that back `anchor@1` in a jsonschema-less
+   environment ran nowhere in CI: loosening a `fullmatch` to a `match` in `loop/anchor.py`
+   kills four tests in the pyyaml-only leg but only two with jsonschema installed,
+   because the schema layer masks the rest. The `gates-fallback` job closes that class,
+   and asserts jsonschema is genuinely absent so it cannot decay into a duplicate.
+4. **`--source-ref refs/heads/main` is a repo-specific constant, not a placeholder.** An
+   adopter whose default branch differs must change it. It is deliberately **not**
+   parameterized: a `--source-ref` taken from an untrusted input would let a caller widen
+   the pin to any ref and defeat the control.

@@ -1,0 +1,104 @@
+name: SPIFFE Extra E2E
+
+# Packages the SPIFFE credential path end to end (issue #2516). The default
+# self-contained install ships the Ed25519 identity path with the ``spiffe``
+# extra absent; operators who need workload-attested credentials install
+# ``bernstein[spiffe]``. This job builds the wheel and proves both shapes:
+#
+#   * the built wheel installs with the ``spiffe`` extra and the extra-present
+#     grant / SPIFFE suite passes (injected Workload API factory; no live SPIRE
+#     agent required);
+#   * a clean install WITHOUT the extra runs the same identity suites and the
+#     default Ed25519 paths pass unchanged.
+#
+# Kept out of the main CI matrix because it builds and installs the wheel into
+# throwaway virtualenvs, which the docs+test matrix does not need.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "src/bernstein/core/identity/grants.py"
+      - "src/bernstein/core/identity/spiffe/**"
+      - "src/bernstein/core/security/secrets_broker.py"
+      - "src/bernstein/cli/commands/secrets_cmd.py"
+      - "tests/unit/identity/test_grants.py"
+      - "tests/unit/identity/spiffe/**"
+      - "tests/unit/security/test_secrets_broker_grants.py"
+      # NOTE: bare `pyproject.toml` is deliberately NOT in this list. It
+      # fired the wheel-build e2e on every dependency bump even when the
+      # spiffe extra was untouched. Changes to the extra's declaration
+      # ship together with the source paths above; push-to-main and
+      # workflow_dispatch remain available for manual verification.
+      - ".github/workflows/spiffe-extra-e2e.yml"
+  push:
+    branches: [main]
+    paths:
+      - "src/bernstein/core/identity/grants.py"
+      - "src/bernstein/core/identity/spiffe/**"
+      - "src/bernstein/core/security/secrets_broker.py"
+      - ".github/workflows/spiffe-extra-e2e.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: spiffe-extra-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  spiffe-extra-e2e:
+    name: SPIFFE extra E2E (built wheel, extra-present + no-extra suites)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Harden runner (audit mode)
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: ./.github/actions/bootstrap
+        with:
+          python-version: "3.13"
+
+      - name: Build the wheel
+        run: |
+          uv build --wheel --out-dir dist
+          ls -1 dist/*.whl
+
+      - name: No-extra regression (default Ed25519 path, extra absent)
+        # The critical guarantee: with the spiffe extra ABSENT the packaged
+        # wheel imports and the grant / broker paths work end to end. Driven as
+        # a self-contained script off the INSTALLED wheel (not the repo pytest
+        # tree) so it needs no test-only plugins. Hard-required.
+        run: |
+          python -m venv .venv-noextra
+          . .venv-noextra/bin/activate
+          pip install --upgrade pip
+          pip install dist/*.whl
+          python tests/scripts/spiffe_extra_e2e_check.py --mode no-extra
+
+      - name: Extra-present path (built wheel installed with [spiffe])
+        # Best-effort: the py-spiffe SDK is a real third-party install; when it
+        # is unavailable on the runner this step degrades to a skip rather than
+        # reddening the packaging gate. The no-extra path above is the hard
+        # guarantee; this proves the packaged extra path when installable. The
+        # Workload API fetch uses an injected factory, so no live SPIRE agent is
+        # required. Tolerance lives in the explicit exit-0 skip below, NOT in
+        # continue-on-error: a real failure of the packaged extra path must
+        # redden the job, not vanish.
+        run: |
+          WHEEL=$(ls dist/*.whl | head -1)
+          python -m venv .venv-extra
+          . .venv-extra/bin/activate
+          pip install --upgrade pip
+          if ! pip install "${WHEEL}[spiffe]"; then
+            echo "::warning::py-spiffe SDK not installable on this runner; skipping extra-present path"
+            exit 0
+          fi
+          python tests/scripts/spiffe_extra_e2e_check.py --mode extra

@@ -1,0 +1,258 @@
+"""`reyn agent {list,new,rm,show}` — manage persistent agents.
+
+PR10 introduces multi-agent: each agent is a long-lived Session with its
+own history under `.reyn/agents/<name>/`. The `default` agent is auto-created
+on first use; users can spin up additional named agents with their own role
+prompts via `reyn agent new`.
+"""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import sys
+from pathlib import Path
+
+from reyn.core.events.state_log import StateLog
+from reyn.runtime.profile import AgentProfile
+from reyn.runtime.registry import DEFAULT_AGENT_NAME, AgentRegistry
+
+
+def register(sub) -> None:
+    p = sub.add_parser(
+        "agent", help="Manage persistent agents (multi-agent: PR10)",
+    )
+    inner = p.add_subparsers(dest="agent_cmd", metavar="<agent_cmd>")
+    inner.required = True
+
+    p_list = inner.add_parser("list", help="List agents")
+    p_list.add_argument(
+        "--all", action="store_true",
+        help="Include archived agents (marked '(archived)'). Default hides them.",
+    )
+    p_list.set_defaults(func=_cmd_list)
+
+    p_new = inner.add_parser("new", help="Create a new agent")
+    p_new.add_argument("name", help="Agent name (a-z 0-9 _ - up to 32 chars)")
+    p_new.add_argument(
+        "--role", default="",
+        help="Free-form role prompt injected into the agent's system prompt",
+    )
+    p_new.add_argument(
+        "--base-dir", default=None,
+        help=(
+            "Working-directory override for this agent (#5080; restrict-only "
+            "-- must resolve inside the project workspace, rejected otherwise, "
+            "never clamped). Relative paths resolve against the project "
+            "workspace. Omitted -> inherits the project's own base_dir."
+        ),
+    )
+    p_new.add_argument(
+        "--project-context-path", default=None,
+        help=(
+            "REYN.md / AGENTS.md override for this agent (#5111/#5084 (2); "
+            "same restrict-only shape as --base-dir -- must resolve inside "
+            "the project workspace, rejected otherwise, never clamped). "
+            "Relative paths resolve against the project workspace. Omitted "
+            "-> falls through to the project-wide file."
+        ),
+    )
+    p_new.set_defaults(func=_cmd_new)
+
+    p_rm = inner.add_parser(
+        "rm", help="Archive an agent (soft-delete; --purge to hard-delete)",
+    )
+    p_rm.add_argument("name", help="Agent name to remove")
+    p_rm.add_argument(
+        "--purge", action="store_true",
+        help="Hard-delete: destroy rewind history (default archives — "
+             "recoverable via time-travel within the retention window)",
+    )
+    p_rm.add_argument(
+        "--yes", action="store_true",
+        help="Skip the confirmation prompt",
+    )
+    p_rm.set_defaults(func=_cmd_rm)
+
+    p_show = inner.add_parser("show", help="Print an agent's profile")
+    p_show.add_argument("name", help="Agent name")
+    p_show.set_defaults(func=_cmd_show)
+
+
+def _project_root() -> Path:
+    """The actual project root, walking up from cwd — the convention every
+    other CLI command module converges on (chat/config/dogfood/mcp/memory/
+    permissions/pipe/plugin: ``_find_project_root(Path.cwd()) or
+    Path.cwd()``). #4204: this module previously anchored every path
+    directly on raw ``Path.cwd()`` instead — a real defect (not just a
+    docstring claim, unlike embeddings.py's/slash/image.py's false-claim
+    siblings this issue also names) that silently resolves to the wrong
+    ``.reyn/agents/`` / ``.reyn/state/wal.jsonl`` when ``reyn agent ...``
+    is launched from a subdirectory of the project."""
+    from reyn.config import _find_project_root
+
+    return _find_project_root(Path.cwd()) or Path.cwd()
+
+
+def _agents_dir() -> Path:
+    return _project_root() / ".reyn" / "agents"
+
+
+def _cmd_list(args: argparse.Namespace) -> None:
+    base = _agents_dir()
+    if not base.is_dir():
+        print("(no agents yet — `reyn chat` will auto-create `default`)")
+        return
+    # #1954: hide archived agents by default — consistent with routing / A2A /
+    # the TUI Agents tab (all use ``list_active_names``) + the documented intent
+    # (agent.md: "Archived agents are hidden"). ``--all`` reveals them marked so
+    # an operator can still see / recover / purge them. Use the canonical
+    # registry seam rather than re-deriving the archive marker here.
+    show_all = bool(getattr(args, "all", False))
+
+    def _no_factory(profile):  # pragma: no cover — never invoked for a read-only list
+        raise RuntimeError("session factory not used in agent CLI")
+
+    reg = AgentRegistry(project_root=_project_root(), session_factory=_no_factory)
+    active = set(reg.list_active_names())
+
+    rows: list[tuple[str, str, str]] = []
+    for entry in sorted(base.iterdir()):
+        if not entry.is_dir():
+            continue
+        try:
+            profile = AgentProfile.load(entry)
+        except FileNotFoundError:
+            continue
+        archived = profile.name not in active
+        if archived and not show_all:
+            continue  # default view hides archived agents
+        role_first_line = (profile.role or "").strip().splitlines()
+        role_excerpt = role_first_line[0] if role_first_line else ""
+        # Last activity = max mtime across history.jsonl + audit events tree.
+        latest = 0.0
+        history = entry / "history.jsonl"
+        if history.is_file():
+            latest = max(latest, history.stat().st_mtime)
+        # PR20: events live under .reyn/events/agents/<name>/chat/...
+        events_root = (
+            entry.parent.parent / "events" / "agents" / profile.name / "chat"
+        )
+        if events_root.is_dir():
+            for ef in events_root.rglob("*.jsonl"):
+                try:
+                    latest = max(latest, ef.stat().st_mtime)
+                except OSError:
+                    continue
+        if latest:
+            from datetime import datetime, timezone
+            ts = datetime.fromtimestamp(latest, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+        else:
+            ts = "—"
+        name_display = f"{profile.name} (archived)" if archived else profile.name
+        rows.append((name_display, ts, role_excerpt[:60]))
+    if not rows:
+        print("(no agents yet — `reyn chat` will auto-create `default`)")
+        return
+    name_w = max(len(n) for n, _, _ in rows)
+    print(f"{'NAME':<{name_w}}  {'LAST ACTIVITY':<17}  ROLE")
+    for n, ts, role in rows:
+        print(f"{n:<{name_w}}  {ts:<17}  {role}")
+
+
+def _cmd_new(args: argparse.Namespace) -> None:
+    # #2103 S2b: route through the registry create-seam (create_agent) so a
+    # CLI-created agent emits agent_created (rewind-trackable) — and so EVERY
+    # creation surface goes through the one canonical seam (this also fixes the
+    # prior AgentProfile.save-direct bypass). reg.create() is a safe superset of
+    # the old path (validate + create + save); existence is now profile-based
+    # (reg.exists) rather than dir-based — the canonical registry check. The WAL
+    # (read-only scan → current_seq) is attached so the emit records an accurate seq.
+    def _no_factory(profile):
+        raise RuntimeError("session factory not used in agent CLI")
+    wal_path = _project_root() / ".reyn" / "state" / "wal.jsonl"
+    state_log = StateLog(wal_path) if wal_path.is_file() else None
+    reg = AgentRegistry(
+        project_root=_project_root(), session_factory=_no_factory, state_log=state_log,
+    )
+    target = _agents_dir() / args.name
+    try:
+        asyncio.run(
+            reg.create_agent(
+                args.name, role=args.role, base_dir=args.base_dir,
+                project_context_path=args.project_context_path,
+            )
+        )
+    except ValueError as e:                       # invalid name
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(2)
+    except FileExistsError:
+        print(f"Error: agent {args.name!r} already exists at {target}", file=sys.stderr)
+        sys.exit(1)
+    print(f"Created agent {args.name!r} at {target}")
+    if args.role:
+        print(f"  role: {args.role.strip().splitlines()[0]}")
+    print(f"  attach with: reyn chat {args.name}")
+
+
+def _cmd_rm(args: argparse.Namespace) -> None:
+    if args.name == DEFAULT_AGENT_NAME:
+        print("Error: cannot remove the default agent", file=sys.stderr)
+        sys.exit(1)
+    target = _agents_dir() / args.name
+    if not target.is_dir():
+        print(f"Error: agent {args.name!r} not found at {target}", file=sys.stderr)
+        sys.exit(1)
+    purge = args.purge
+    if not args.yes:
+        prompt = (
+            f"Hard-delete agent {args.name!r} and ALL its rewind history "
+            "(irreversible)? [y/N]: "
+            if purge
+            else f"Archive agent {args.name!r}? (recoverable via time-travel "
+                 "within the retention window) [y/N]: "
+        )
+        try:
+            ans = input(prompt)
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if ans.strip().lower() != "y":
+            print("aborted")
+            return
+    # Route through AgentRegistry so PR12 topology cascade fires. Attach the WAL
+    # (a read-only scan sets current_seq) so an archive records an accurate
+    # archival seq — slice-2's WAL-window GC hinge (#1954).
+    def _no_factory(profile):
+        raise RuntimeError("session factory not used in agent CLI")
+    wal_path = _project_root() / ".reyn" / "state" / "wal.jsonl"
+    state_log = StateLog(wal_path) if wal_path.is_file() else None
+    reg = AgentRegistry(
+        project_root=_project_root(), session_factory=_no_factory, state_log=state_log,
+    )
+    # #2103 S2b: route the delete through archive_agent (emit agent_archived |
+    # agent_purged) so rewind reconstructs the as-of-cut archived-state / honors the
+    # permanent purge. asyncio.run — the CLI is a sync top-level (no running loop).
+    asyncio.run(reg.archive_agent(args.name, purge=purge))
+    print(f"{'Purged' if purge else 'Archived'} agent {args.name!r}")
+
+
+def _cmd_show(args: argparse.Namespace) -> None:
+    target = _agents_dir() / args.name
+    try:
+        profile = AgentProfile.load(target)
+    except FileNotFoundError:
+        print(f"Error: agent {args.name!r} not found at {target}", file=sys.stderr)
+        sys.exit(1)
+    print(f"name:        {profile.name}")
+    print(f"created_at:  {profile.created_at}")
+    print(f"workspace:   {target}")
+    print("role:")
+    if profile.role:
+        for line in profile.role.splitlines():
+            print(f"  {line}")
+    else:
+        print("  (empty)")
+
+
+def run(args: argparse.Namespace) -> None:
+    args.func(args)

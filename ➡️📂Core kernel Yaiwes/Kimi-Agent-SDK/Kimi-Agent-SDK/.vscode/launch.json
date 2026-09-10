@@ -1,0 +1,33 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Run Extension",
+      "type": "extensionHost",
+      "request": "launch",
+      "args": [
+        "--extensionDevelopmentPath=${workspaceFolder}/node/vscode_extension"
+      ],
+      "outFiles": [
+        "${workspaceFolder}/node/vscode_extension/dist/**/*.js"
+      ],
+      "preLaunchTask": "npm: dev",
+      "sourceMaps": true,
+      "env": {
+        "DEBUG": "kimi-sdk:*"
+      }
+    },
+    {
+      "name": "Run Extension (No Build)",
+      "type": "extensionHost",
+      "request": "launch",
+      "args": [
+        "--extensionDevelopmentPath=${workspaceFolder}/node/vscode_extension"
+      ],
+      "outFiles": [
+        "${workspaceFolder}/node/vscode_extension/dist/**/*.js"
+      ],
+      "sourceMaps": true
+    }
+  ]
+}

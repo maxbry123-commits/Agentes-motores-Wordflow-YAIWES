@@ -1,0 +1,229 @@
+"""Tier 2: OS invariant — #1172 CompactionEngine is resolver-aware (by-construction).
+
+THE BUG (dead-end-critical, all 3 compaction axes): chat / planner / phase each
+constructed ``CompactionEngine(model=<class>)`` with an UNRESOLVED model class
+("standard" / "light"). The engine forwards ``model`` straight to
+``litellm.acompletion``, which rejects a class name
+(``BadRequestError model=standard``) — so compaction failed on EVERY trigger and
+the entire dead-end-prevention stack (axis-1/2, retry_loop, chat-cap,
+re-summarize) was non-functional at runtime. Fake-engine unit tests missed it
+because they never exercised the real model→litellm path.
+
+THE FIX (by-construction): ``CompactionEngine.__init__`` resolves ``model`` via a
+``ModelResolver`` at construction, so the engine NEVER hands an unresolved class
+to litellm regardless of caller. This file pins both halves with REAL
+collaborators (no Fake engine, no mock resolver):
+
+  1. Behavioral — a real ``CompactionEngine`` built from a model CLASS + a real
+     ``ModelResolver`` calls ``litellm.acompletion`` with the RESOLVED litellm
+     string, never the raw class. Covers all 3 axes (one shared engine).
+  2. Regression guard (AST) — every ``CompactionEngine(...)`` construction in
+     ``src/`` passes a ``resolver=`` kwarg, so a future 4th caller cannot
+     reintroduce the unresolved-class leak. Catches the aliased construction
+     (``_CCE(...)`` in kernel/runtime.py) too.
+"""
+from __future__ import annotations
+
+import ast
+import asyncio
+import json
+from pathlib import Path
+from types import SimpleNamespace
+
+from reyn.config import CompactionConfig
+from reyn.core.events.events import EventLog
+from reyn.llm.model_resolver import ModelResolver
+from reyn.services.compaction.engine import CompactionEngine, HistoryChunkToCompact
+
+# ── Behavioral: real engine + real resolver → litellm sees the RESOLVED string ──
+
+
+def _resp(content: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
+    )
+
+
+def _resolved_target(model_seen: str) -> str:
+    """The model litellm saw, with any provider prefix removed.
+
+    The prefix is not part of what these tests are about. ``recorded_acompletion``
+    strips it deliberately when proxy routing is configured — the proxy expects a
+    bare model name — so ``openai/resolved-standard`` and ``resolved-standard``
+    are the SAME resolution arriving over two transports (#3791).
+
+    Asserting the prefixed form pinned the transport as well as the resolution,
+    which made these tests pass on CI and fail for every developer with a
+    ``reyn.local.yaml`` that sets ``api_base``. The claim in each docstring is
+    that the CLASS was resolved; that is what is checked now, and a wrong
+    resolution still fails because the target after the prefix must still match.
+    """
+    return model_seen.rsplit("/", 1)[-1]
+
+
+def _run_capture(monkeypatch, engine: CompactionEngine) -> str:
+    """Drive one real compact(); return the ``model`` litellm.acompletion saw."""
+    seen: dict[str, str] = {}
+
+    async def _capture(**kwargs):
+        seen["model"] = kwargs["model"]
+        return _resp(json.dumps({
+            "topic_arc": "arc", "new_turn_seqs": [1],
+            "decisions": [], "pending": [],
+            "session_user_facts": [], "artifacts_referenced": [],
+        }))
+
+    monkeypatch.setattr("litellm.acompletion", _capture)
+    chunk = HistoryChunkToCompact(
+        messages=[{"role": "user", "text": "hi", "seq": 1}],
+        section_token_caps={},
+    )
+    asyncio.run(engine.compact(chunk, covers_through=1))
+    return seen["model"]
+
+
+def test_model_class_is_resolved_before_litellm(monkeypatch) -> None:
+    """Tier 2: a CompactionEngine built from the CLASS "standard" calls litellm
+    with the resolved litellm string — never the raw class (#1172 bug)."""
+    resolver = ModelResolver({"standard": "openai/resolved-standard"})
+    engine = CompactionEngine(
+        model="standard",  # the class that broke litellm pre-#1172
+        events=EventLog(),
+        cfg=CompactionConfig(use_chars4_estimate=True),
+        resolver=resolver,
+    )
+    model_seen = _run_capture(monkeypatch, engine)
+    assert _resolved_target(model_seen) == "resolved-standard", (
+        "the engine must resolve the model class before calling litellm; "
+        f"litellm saw {model_seen!r} (a raw class would be rejected)"
+    )
+    assert model_seen != "standard", "the unresolved class must never reach litellm"
+
+
+def test_planner_default_light_class_is_resolved(monkeypatch) -> None:
+    """Tier 2: the planner axis's default class "light" is resolved too."""
+    resolver = ModelResolver({"light": "openai/resolved-light"})
+    engine = CompactionEngine(
+        model="light",  # planner.py router_model default
+        events=EventLog(),
+        cfg=CompactionConfig(use_chars4_estimate=True),
+        resolver=resolver,
+    )
+    assert _resolved_target(_run_capture(monkeypatch, engine)) == "resolved-light"
+
+
+def test_static_path_budget_uses_resolved_model_window() -> None:
+    """Tier 2: #1172 completion — a STATIC-path CompactionEngine (no
+    system_prompt_provider, e.g. the phase / swe_bench engine) derives its
+    budget from the RESOLVED model's real context window, not the 128K
+    unresolved-class fallback.
+
+    Pre-fix, __init__ called compute_budgets() with the raw class string while
+    self._model was resolved only for the litellm call — so the static path
+    (which never recompute_budgets()) handicapped every phase compaction to a
+    128K offload threshold (the C7 confound). The budget must reflect the real
+    window.
+    """
+    from reyn.llm.model_budget import get_max_input_tokens
+
+    real_model = "openai/gemini-2.5-flash-lite"
+    real_window = get_max_input_tokens(real_model)
+
+    engine = CompactionEngine(
+        model="standard",  # the class — phase engines pass the raw runtime class
+        events=EventLog(),
+        cfg=CompactionConfig(use_chars4_estimate=True),
+        resolver=ModelResolver({"standard": real_model}),
+        # no system_prompt_provider → static path (the swe_bench/phase shape)
+    )
+    # main_pool = T_max - T_SP(=0 default); must be the RESOLVED model's window,
+    # not the 128K unresolved-class fallback.
+    assert engine.budgets.main_pool == real_window, (
+        "static-path budget must use the resolved model's real window; "
+        f"got {engine.budgets.main_pool} (128000 = the unresolved-class fallback)"
+    )
+
+
+def test_literal_litellm_string_passes_through() -> None:
+    """Tier 2: an unknown literal litellm string is unchanged — asserted at the
+    RESOLVER, which is the layer that decides it.
+
+    This used to drive a whole ``compact()`` through a monkeypatched
+    ``litellm.acompletion`` and assert on the model that arrived there. That put
+    the transport inside the claim: ``recorded_acompletion`` strips the provider
+    prefix when proxy routing is configured, so "unchanged" was false in a
+    supported configuration and the test failed for every developer with
+    ``LITELLM_API_BASE`` set (#3791).
+
+    Weakening it to compare only the part after the prefix — my first repair —
+    was worse than the original: a resolver that wrongly rewrote
+    ``myvendor/custom-not-a-builtin`` to ``openai/custom-not-a-builtin`` would
+    have passed, which is the exact rewrite the test exists to forbid.
+
+    Asked of ``ModelResolver`` directly, "unchanged" is exact, byte-identical,
+    and cannot be affected by how the call is later transported.
+    """
+    assert (
+        ModelResolver({}).resolve("myvendor/custom-not-a-builtin").model
+        == "myvendor/custom-not-a-builtin"
+    ), "an unknown literal must reach litellm as written, never rewritten"
+
+
+# ── Regression guard: every src CompactionEngine construction passes resolver= ──
+
+
+def _repo_root() -> Path:
+    here = Path(__file__).resolve()
+    for ancestor in here.parents:
+        if (ancestor / "pyproject.toml").is_file():
+            return ancestor
+    raise RuntimeError("repo root not found from " + str(here))
+
+
+def _compaction_engine_constructions(path: Path) -> list[ast.Call]:
+    """Every CompactionEngine(...) construction in *path*, resolving import
+    aliases (e.g. ``from ... import CompactionEngine as _CCE``) so the kernel
+    runtime's ``_CCE(...)`` call is caught alongside bare ``CompactionEngine(``.
+    """
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    aliases: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and (node.module or "").endswith(
+            "compaction.engine"
+        ):
+            for alias in node.names:
+                if alias.name == "CompactionEngine":
+                    aliases.add(alias.asname or alias.name)
+    if not aliases:
+        return []
+    calls: list[ast.Call] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and (
+            node.func.id in aliases
+        ):
+            calls.append(node)
+    return calls
+
+
+def test_every_src_construction_passes_resolver() -> None:
+    """Tier 2: every CompactionEngine(...) construction under src/ passes a
+    ``resolver=`` kwarg — the by-construction guarantee that no compaction axis
+    leaks an unresolved model class to litellm (#1172). A new construction site
+    that omits resolver= reintroduces the dead-end-critical bug and fails here.
+    """
+    src = _repo_root() / "src" / "reyn"
+    found = 0
+    for py in src.rglob("*.py"):
+        for call in _compaction_engine_constructions(py):
+            found += 1
+            kwargs = {kw.arg for kw in call.keywords if kw.arg is not None}
+            assert "resolver" in kwargs, (
+                f"{py.relative_to(_repo_root())}:{call.lineno} constructs "
+                "CompactionEngine without resolver= — an unresolved model class "
+                "would be handed to litellm (BadRequestError). Pass the caller's "
+                "ModelResolver so the engine resolves the class by construction."
+            )
+    assert found >= 1, (
+        f"expected at least 1 known compaction axis (chat), found {found}"
+        " — did a construction site move? update this guard."
+    )

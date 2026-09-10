@@ -1,0 +1,360 @@
+"""`reyn web` — Web UI ゲートウェイサーバを起動する。
+
+FastAPI + AG-UI SSE ゲートウェイ (reyn.interfaces.web.server) を uvicorn で起動します。
+フロントエンドを http://localhost:<port> から利用できます。
+
+#5051: fastapi/starlette/uvicorn/websockets はコア依存です — 別途インストール不要。
+"""
+from __future__ import annotations
+
+import argparse
+import sys
+
+from reyn.interfaces.cli.env_backend import build_environment_backend, register_env_backend_args
+
+
+def register(sub) -> None:
+    p = sub.add_parser(
+        "web",
+        help="Web UI ゲートウェイサーバを起動する",
+        description="FastAPI + AG-UI SSE ゲートウェイを uvicorn で起動します。",
+    )
+    p.add_argument(
+        "--host",
+        default="127.0.0.1",
+        metavar="HOST",
+        help="バインドするホスト (デフォルト: 127.0.0.1)",
+    )
+    p.add_argument(
+        "--port",
+        type=int,
+        default=8080,
+        metavar="PORT",
+        help="バインドするポート番号 (デフォルト: 8080)",
+    )
+    p.add_argument(
+        "--uds",
+        default=None,
+        metavar="PATH",
+        dest="uds",
+        help=(
+            "UNIX ドメインソケットにバインドする (T2 same-machine; 指定時は "
+            "--host/--port を無視)。同一マシンの thin-client 接続向け — 認証は "
+            "OS の peer-credential (SO_PEERCRED / getpeereid)。"
+        ),
+    )
+    p.add_argument(
+        "--reload",
+        action="store_true",
+        help="コード変更時に自動リロードする (開発用)",
+    )
+    p.add_argument(
+        "--log-level",
+        default="info",
+        choices=["critical", "error", "warning", "info", "debug", "trace"],
+        dest="log_level",
+        metavar="LEVEL",
+        help="uvicorn のログレベル (デフォルト: info)",
+    )
+    p.add_argument(
+        "--default-design",
+        default=None,
+        metavar="SLUG",
+        dest="default_design",
+        help="デフォルトの design slug (env REYN_WEB_DEFAULT_DESIGN に設定)",
+    )
+    # Parity with `reyn chat --eager-embedding-build` (= B25-S5-1).
+    # Builds the action-index synchronously on session start so
+    # ``search_actions`` is visible in tools[] from the first router
+    # turn, instead of becoming visible only after the background build
+    # finishes. Paid as a one-time per-session cost; ``is_ready()`` then
+    # short-circuits subsequent turns via the SQLite cache.
+    p.add_argument(
+        "--eager-embedding-build",
+        action="store_true",
+        default=False,
+        dest="eager_embedding_build",
+        help=(
+            "action_embedding_index を session 起動時 sync で build "
+            "(env REYN_WEB_EAGER_EMBEDDING_BUILD=1 と同等)。"
+            " search_actions を 1 turn 目から見せたい dogfood / web "
+            "デプロイで有効化。"
+        ),
+    )
+    # #1401: scoped capabilities for the A2A server path — symmetric with
+    # `reyn chat`. Lets a headless `reyn web` (the faithful SWE-eval A2A host)
+    # run agent file/exec ops in a per-instance container and scope out tools
+    # (e.g. web for faithful eval). Threaded as the env-backend INSTANCE (no
+    # env-var rebuild) via web/deps; see run(). #3924 removed the
+    # --grant-file-write flag this section used to also register — file
+    # access now flows from reyn.yaml's own permissions: section only.
+    register_env_backend_args(p)  # --env-backend / --container
+    p.add_argument(
+        "--exclude-tools",
+        dest="exclude_tools",
+        default=None,
+        metavar="NAMES",
+        help=(
+            "LLM の visible catalog から隠すツール名 (カンマ区切り、例 "
+            "web_search,web_fetch)。faithful eval の web-leak 抑止に "
+            "(`reyn chat --exclude-tools` と同等)。"
+        ),
+    )
+    # FP-0058 P2: per-surface opt-in/opt-out mount toggles. Repeatable
+    # per-surface flags (NOT a comma-list) — `--enable a2a --enable mcp`.
+    # Precedence: CLI > `gateway.surfaces` config > secure-default. Surface
+    # names: agui / webui / health / api / resources (secure-default ON),
+    # a2a / mcp (secure-default OFF, opt-in). See
+    # reyn.interfaces.web.surfaces.build_registry for the authoritative list.
+    p.add_argument(
+        "--enable",
+        dest="enable_surfaces",
+        action="append",
+        default=None,
+        metavar="SURFACE",
+        help=(
+            "指定した surface を opt-in で有効化する (繰り返し指定可、例 "
+            "--enable a2a --enable mcp)。CLI > config > secure-default。"
+        ),
+    )
+    p.add_argument(
+        "--disable",
+        dest="disable_surfaces",
+        action="append",
+        default=None,
+        metavar="SURFACE",
+        help=(
+            "指定した surface を無効化する (繰り返し指定可、例 --disable api)。"
+            "CLI > config > secure-default。"
+        ),
+    )
+    p.set_defaults(func=run)
+
+
+def _apply_cli_scoped_overrides(args: argparse.Namespace) -> None:
+    """#1401: build the env-backend INSTANCE (CLI process) + thread it and
+    exclude-tools to the A2A session factory via web/deps' module-global
+    holder. No-op when no scoped flag is set (a plain `reyn web` stays
+    byte-identical). #3924 removed the file-write grant this used to also
+    thread — file access flows from reyn.yaml's own permissions: section only.
+
+    Detects scoped intent from the args BEFORE ``build_environment_backend``
+    (which may LAUNCH a container) so the --reload guard fires without side
+    effects. --reload spawns a worker subprocess the parent's module-global
+    cannot reach (silent no-op) → fail loud instead.
+    """
+    exclude_raw = getattr(args, "exclude_tools", None)
+    scoped_intent = (
+        getattr(args, "env_backend", "host") != "host"
+        or bool(exclude_raw)
+    )
+    if not scoped_intent:
+        return
+    if getattr(args, "reload", False):
+        print(
+            "Error: --reload is incompatible with the scoped capability flags "
+            "(--env-backend=docker / --exclude-tools). The "
+            "uvicorn reload worker is a subprocess the CLI-set overrides cannot "
+            "reach (silent no-op). Run without --reload for a scoped server.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    from reyn.interfaces.web import deps as _web_deps
+
+    env_backend, wb, ws, env_cleanup = build_environment_backend(args)
+    if env_cleanup is not None:
+        import atexit
+        atexit.register(env_cleanup)
+    exclude_tools = frozenset(
+        t.strip() for t in (exclude_raw or "").split(",") if t.strip()
+    ) or None
+    _web_deps.set_cli_scoped_overrides(
+        _web_deps.CliScopedOverrides(
+            environment_backend=env_backend,
+            workspace_base_dir=wb,
+            workspace_state_dir=ws,
+            exclude_tools=exclude_tools,
+        )
+    )
+
+
+def run(args: argparse.Namespace) -> None:
+    # #5051: uvicorn/fastapi are now CORE dependencies (moved off the
+    # `[web]` extra) — missing_core_dep_message, not missing_dep_message,
+    # since a `-e '.[web]'` recommendation is now wrong (empty extra,
+    # installs nothing) and re-pins the editable install pointer besides.
+    from reyn.interfaces.install_guard import missing_core_dep_message
+
+    try:
+        import uvicorn
+    except ImportError as e:
+        print(missing_core_dep_message(e, "uvicorn", "[standard]>=0.27"), file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        import fastapi  # noqa: F401
+    except ImportError as e:
+        print(missing_core_dep_message(e, "fastapi", ">=0.110,<0.137"), file=sys.stderr)
+        sys.exit(1)
+
+    # --default-design flag: propagate via env so web_config router can read it.
+    import os
+    if getattr(args, "default_design", None):
+        os.environ["REYN_WEB_DEFAULT_DESIGN"] = args.default_design
+
+    # --eager-embedding-build flag: propagate via env so the web session
+    # factory (= reyn.interfaces.web.deps:_session_factory) can read it. Parity with
+    # `reyn chat --eager-embedding-build` (= B25-S5-1).
+    if getattr(args, "eager_embedding_build", False):
+        os.environ["REYN_WEB_EAGER_EMBEDDING_BUILD"] = "1"
+
+    # FP-0058 P2: --enable/--disable surface toggles — propagate via the
+    # comma-separated env vars reyn.interfaces.web.surfaces.mount_all reads at
+    # server-module-import time (mirrors the --default-design pattern above).
+    from reyn.interfaces.web.surfaces import DISABLE_SURFACES_ENV_VAR, ENABLE_SURFACES_ENV_VAR
+    enable_surfaces = getattr(args, "enable_surfaces", None) or []
+    disable_surfaces = getattr(args, "disable_surfaces", None) or []
+    if enable_surfaces:
+        os.environ[ENABLE_SURFACES_ENV_VAR] = ",".join(enable_surfaces)
+    if disable_surfaces:
+        os.environ[DISABLE_SURFACES_ENV_VAR] = ",".join(disable_surfaces)
+
+    # #1401: thread the scoped capabilities to the A2A server path (before
+    # uvicorn.run so the lazy session factory / perm resolver read them).
+    _apply_cli_scoped_overrides(args)
+
+    # Explicit WebSocket frame ceiling: previously this relied on uvicorn's
+    # implicit ~16 MiB default, which a uvicorn version bump or operator server
+    # override could silently drop. Pin it from config (operator-tunable via
+    # gateway.ws_max_size) so the inbound-frame bound is explicit + version-independent.
+    from reyn.config import load_config
+    _config = load_config()
+    _ws_max_size = _config.gateway.ws_max_size
+
+    # ── Server-side auth (ADR-0039 P0): fail-closed bind + token + TLS ─────────
+    uvicorn_kwargs = _apply_auth_startup(args, _config)
+
+    uvicorn.run(
+        "reyn.interfaces.web.server:app",
+        reload=args.reload,
+        log_level=args.log_level,
+        ws_max_size=_ws_max_size,
+        **uvicorn_kwargs,
+    )
+
+
+def _apply_auth_startup(args: argparse.Namespace, config) -> dict:
+    """Resolve the P0 auth posture and return the uvicorn bind kwargs.
+
+    Enforces the tiered, secure-by-default model (ADR-0039):
+
+      - **UDS bind** (``--uds``): same-machine T2; identity via OS peer-cred, no
+        token needed. Binds a UNIX socket in an owner-only (0700) run dir.
+      - **Loopback TCP**: browser surface; a token is generated (Jupyter-style)
+        when none is configured and embedded in the printed launch URL.
+      - **Non-loopback TCP**: T3 network. **Fail-closed** — refuses to start
+        without an explicitly configured ``gateway.auth.token``. Provisions
+        self-signed TLS (TOFU) when the operator supplies no certificate and
+        prints the fingerprint to pin.
+
+    The effective token is exported via ``REYN_WEB_AUTH_TOKEN`` so the app's
+    AuthContext (built in the server lifespan) verifies against the same secret.
+    """
+    import os
+    import sys
+    from pathlib import Path
+
+    from reyn.interfaces.web.auth import (
+        TOKEN_ENV_VAR,
+        AuthStartupError,
+        check_startup_binding,
+        generate_token,
+        is_loopback_host,
+    )
+
+    host = args.host
+    uds_path = getattr(args, "uds", None)
+    auth_cfg = config.gateway.auth
+    configured_token = auth_cfg.token
+
+    # Fail-closed guard: a non-loopback bind with no configured token refuses
+    # to start (a UDS bind and a loopback bind are both allowed here).
+    try:
+        check_startup_binding(host, token=configured_token, uds=bool(uds_path))
+    except AuthStartupError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(2)
+
+    # #4204: was bare Path.cwd() — runs unconditionally on every `reyn web`
+    # startup (the UDS socket dir + TLS cert provisioning both live under
+    # run_dir). Launched from a subdirectory of the project, the socket/
+    # cert files land under a phantom .reyn/run/ instead of the real
+    # project's — a same-machine client connecting via the documented
+    # `.reyn/run/` path would not find them.
+    from reyn.config import _find_project_root
+
+    run_dir = (_find_project_root(Path.cwd()) or Path.cwd()) / ".reyn" / "run"
+
+    # Resolve the effective token. UDS needs none; loopback generates one for
+    # the browser surface; network is guaranteed to have a configured token
+    # (the guard above already rejected the tokenless network case).
+    effective_token = configured_token
+    if effective_token is None and not uds_path and is_loopback_host(host):
+        effective_token = generate_token()
+    if effective_token:
+        os.environ[TOKEN_ENV_VAR] = effective_token
+
+    uvicorn_kwargs: dict = {}
+    if uds_path:
+        run_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            # Owner-only (0700) run dir is the enforceable access gate for the
+            # socket: macOS ignores a UNIX socket's own file-mode bits on
+            # connect, so restricting the parent directory (not the socket file)
+            # is what keeps a foreign UID from connecting.
+            run_dir.chmod(0o700)
+        except OSError:
+            pass
+        uvicorn_kwargs["uds"] = str(uds_path)
+        print(f"reyn web: bound to UNIX socket {uds_path} (T2 peer-cred auth).")
+        return uvicorn_kwargs
+
+    uvicorn_kwargs["host"] = host
+    uvicorn_kwargs["port"] = args.port
+
+    scheme = "http"
+    if not is_loopback_host(host):
+        # T3 network bind: provision TLS (self-signed TOFU or operator cert).
+        scheme = _provision_network_tls(args, auth_cfg, run_dir, uvicorn_kwargs)
+
+    if effective_token:
+        print(
+            f"reyn web: open {scheme}://{host}:{args.port}/?token={effective_token}"
+        )
+    return uvicorn_kwargs
+
+
+def _provision_network_tls(args, auth_cfg, run_dir, uvicorn_kwargs: dict) -> str:
+    """Provision TLS for a T3 bind; set uvicorn ssl kwargs; return the scheme."""
+    import sys
+
+    from reyn.interfaces.web.auth import TlsProvisioningError, provision_tls
+
+    try:
+        material = provision_tls(
+            run_dir,
+            certfile=auth_cfg.tls_certfile,
+            keyfile=auth_cfg.tls_keyfile,
+            host=args.host,
+        )
+    except TlsProvisioningError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(2)
+    uvicorn_kwargs["ssl_certfile"] = str(material.certfile)
+    uvicorn_kwargs["ssl_keyfile"] = str(material.keyfile)
+    print(
+        "reyn web: TLS enabled (self-signed TOFU). Pin this fingerprint:\n"
+        f"  SHA256 {material.fingerprint_sha256}"
+    )
+    return "https"

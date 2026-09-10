@@ -1,0 +1,164 @@
+# frozen_string_literal: true
+
+module Providers
+  class AnthropicAdapter < Base
+    SDK_PROXY_URL = ENV.fetch("SDK_PROXY_URL", "http://sdk-proxy:3003")
+
+    def chat(messages:, tools: [], options: {}, &block)
+      params = build_chat_params(messages:, tools:, options:)
+
+      # The circuit gate goes outside everything, including the memory-sync
+      # enqueue: when it is open nothing at all happens on this credential.
+      with_circuit_breaker do
+        begin
+          result = if oauth_token? && sdk_proxy_enabled?
+            sync_memories_for_oauth(messages, options)
+            proxy_client.chat(params:, options:, &block)
+          else
+            faraday_client.chat(params:, options:, &block)
+          end
+
+          inject_request_payload(result, params)
+        rescue AgentInterrupted, AgentRedirected, PromptTooLongError
+          raise
+        rescue ProviderError => e
+          # Already classified downstream — keep the verdict intact.
+          with_provider_error(ServiceResponse.failure(error: "Anthropic API error: #{e.message}"), e)
+        rescue StandardError => e
+          ServiceResponse.failure(error: "Anthropic API error: #{e.message}")
+        end
+      end
+    end
+
+    def models
+      model_list = LlmModelRegistry.supported_for_provider("anthropic").map(&:api_id)
+      ServiceResponse.success(data: { models: model_list })
+    end
+
+    def embed(text:, model: nil)
+      ServiceResponse.failure(error: "Anthropic does not support embeddings")
+    end
+
+    private
+
+    def oauth_token?
+      api_key&.start_with?("sk-ant-oat")
+    end
+
+    def sdk_proxy_enabled?
+      self.class.sdk_proxy_enabled?
+    end
+
+    # OAuth (sk-ant-oat) tokens route through the SDK proxy by DEFAULT so chats
+    # consume the Claude subscription's included usage via Claude Code, rather
+    # than the direct API path which bills against pay-as-you-go "extra usage"
+    # and fails with "You're out of extra usage" once that allowance is spent.
+    #
+    # An explicit Setting (anthropic_use_sdk_proxy, toggleable from the provider
+    # edit page) or ENV (USE_SDK_PROXY_FALLBACK) can force either path — set it
+    # to "false" to opt back into the direct API. Absent both, the proxy is on.
+    # Only consulted for OAuth tokens; API keys always go direct.
+    def self.sdk_proxy_enabled?
+      val = Setting.get("anthropic_use_sdk_proxy")
+      return val == "true" if val.present?
+      # Default ON; the ENV escape hatch only needs to force it back off.
+      ENV["USE_SDK_PROXY_FALLBACK"] != "false"
+    rescue StandardError
+      true
+    end
+
+    def sync_memories_for_oauth(messages, options)
+      return unless options[:agent_id]
+      # Run async so memory sync doesn't block the chat response
+      MemoryFileSyncJob.perform_later(options[:agent_id], query: messages.last&.dig(:content) || messages.last&.dig("content"))
+    rescue StandardError => e
+      Rails.logger.warn("[AnthropicAdapter] Memory sync enqueue failed: #{e.message}")
+    end
+
+    def faraday_client
+      @faraday_client ||= Anthropic::FaradayClient.new(api_key:)
+    end
+
+    def proxy_client
+      @proxy_client ||= Anthropic::SdkProxyClient.new(api_key:, base_url: SDK_PROXY_URL)
+    end
+
+    # ─── Shared helpers ───
+
+    def build_chat_params(messages:, tools:, options:)
+      system_msg = messages.find { |m| m[:role]&.to_s == "system" || m["role"]&.to_s == "system" }
+      chat_msgs = messages.reject { |m| (m[:role] || m["role"])&.to_s == "system" }
+
+      formatted_msgs = chat_msgs.map do |m|
+        m = m.to_h.with_indifferent_access
+        role = m[:role].to_s
+
+        if role == "tool"
+          { role: "user", content: [ { type: "tool_result", tool_use_id: m[:tool_use_id], content: m[:content].to_s } ] }
+        elsif role == "assistant" && m[:tool_calls].present?
+          content = []
+          content << { type: "text", text: m[:content] } if m[:content].present?
+          m[:tool_calls].each do |tc|
+            content << { type: "tool_use", id: tc["id"], name: tc["name"], input: tc["input"] || {} }
+          end
+          { role: "assistant", content: content }
+        elsif m[:content].is_a?(Array)
+          { role: role, content: m[:content] }
+        else
+          { role: role, content: m[:content].to_s }
+        end
+      end
+
+      params = {
+        model: options[:model] || LlmModelRegistry::Anthropic::DEFAULT_MID,
+        messages: formatted_msgs,
+        max_tokens: options[:max_tokens] || 8192
+      }
+
+      system_content = system_msg&.dig(:content) || system_msg&.dig("content")
+      if system_content.present?
+        params[:system] = build_cached_system(system_content)
+      end
+
+      if tools.any?
+        params[:tools] = tools.map do |t|
+          { name: t[:name], description: t[:description], input_schema: t[:input_schema] }
+        end
+      end
+
+      params[:temperature] = options[:temperature] if options[:temperature]
+
+      if options[:thinking_enabled]
+        budget = options[:thinking_budget_tokens] || 10_000
+        params[:thinking] = { type: "enabled", budget_tokens: budget }
+        params.delete(:temperature)
+        params[:max_tokens] = [ params[:max_tokens] || 8192, budget + 4096 ].max
+      end
+
+      # Reasoning effort (output_config.effort) — supported on Opus 4.5+, Sonnet
+      # 4.6, Sonnet 5, and Fable 5; errors on Haiku / Sonnet 4.5, so gate by model.
+      if options[:effort].present? && effort_supported?(params[:model])
+        params[:output_config] = (params[:output_config] || {}).merge(effort: options[:effort].to_s)
+      end
+
+      params
+    end
+
+    # Whether the given model accepts output_config.effort.
+    def effort_supported?(model)
+      model.to_s.match?(/claude-(?:opus-5|opus-4-[5678]|sonnet-5|sonnet-4-6|fable-5)/)
+    end
+
+    def build_cached_system(content)
+      blocks = if content.is_a?(Array)
+                 content.map do |block|
+                   b = block.to_h.with_indifferent_access
+                   { type: "text", text: b[:text].to_s, cache_control: { type: "ephemeral" } }
+                 end
+      else
+                 [ { type: "text", text: content.to_s, cache_control: { type: "ephemeral" } } ]
+      end
+      blocks.reject { |b| b[:text].blank? }
+    end
+  end
+end

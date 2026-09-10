@@ -1,0 +1,77 @@
+"""Schema validation helpers for OVK artifacts."""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from functools import lru_cache
+from pathlib import Path
+from typing import Any
+
+from jsonschema import Draft202012Validator
+from referencing import Registry, Resource
+
+from ovk.paths import ovk_data_root
+
+
+@dataclass(frozen=True)
+class ValidationIssue:
+    """One schema validation issue."""
+
+    path: list[str | int]
+    message: str
+
+
+@dataclass(frozen=True)
+class ValidationReport:
+    """Validation result for an artifact."""
+
+    valid: bool
+    issues: list[ValidationIssue]
+
+
+def load_json(path: Path) -> dict[str, Any]:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+@lru_cache(maxsize=1)
+def schema_registry() -> Registry:
+    """Build a registry of all packaged JSON schemas for cross-file $ref resolution."""
+    registry = Registry()
+    schema_root = ovk_data_root() / "schemas"
+    for path in sorted(schema_root.glob("*.schema.json")):
+        schema = load_json(path)
+        schema_id = str(schema.get("$id", path.as_uri()))
+        registry = registry.with_resource(schema_id, Resource.from_contents(schema))
+    return registry
+
+
+def validate_against_schema(instance: dict[str, Any], schema: dict[str, Any]) -> ValidationReport:
+    """Validate a JSON object against a JSON schema."""
+    validator = Draft202012Validator(schema, registry=schema_registry())
+    issues = [
+        ValidationIssue(path=list(error.path), message=error.message)
+        for error in sorted(validator.iter_errors(instance), key=lambda item: item.path)
+    ]
+    return ValidationReport(valid=not issues, issues=issues)
+
+
+def validate_file(instance_path: Path, schema_path: Path) -> ValidationReport:
+    """Validate one JSON file against one JSON schema file."""
+    return validate_against_schema(load_json(instance_path), load_json(schema_path))
+
+
+def require_schema_valid(
+    instance: dict[str, Any],
+    schema: dict[str, Any],
+    *,
+    context: str = "payload",
+) -> None:
+    """Raise ``ValueError`` when *instance* does not satisfy *schema*."""
+    report = validate_against_schema(instance, schema)
+    if report.valid:
+        return
+    issues = "; ".join(
+        f"{'/'.join(str(part) for part in issue.path) or '$'}: {issue.message}" for issue in report.issues
+    )
+    raise ValueError(f"{context} failed schema validation: {issues}")

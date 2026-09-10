@@ -1,0 +1,218 @@
+import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import { unlink } from "node:fs/promises";
+import { closeDb, getDbClient, initDb } from "../be/db";
+import { serializeEmbedding } from "../be/embedding";
+import type { EmbeddingProvider } from "../be/memory/types";
+import { runBootReembedScripts } from "../be/scripts/boot-reembed";
+import { upsertScriptByName } from "../be/scripts/db";
+import { setScriptEmbeddingProviderForTests } from "../be/scripts/embeddings";
+
+const TEST_DB_PATH = "./test-scripts-boot-reembed.sqlite";
+
+const signatureJson = JSON.stringify({
+  argsType: "{ value: string }",
+  resultType: "Promise<{ ok: boolean }>",
+  description: "",
+});
+
+async function clearDb() {
+  for (const suffix of ["", "-wal", "-shm"]) {
+    try {
+      await unlink(TEST_DB_PATH + suffix);
+    } catch {}
+  }
+}
+
+function source(label: string) {
+  return `export default async () => ({ label: ${JSON.stringify(label)} });`;
+}
+
+class FakeEmbeddingProvider implements EmbeddingProvider {
+  readonly name = "test/fake-boot-reembed";
+  readonly dimensions = 5;
+  readonly calls: string[] = [];
+
+  async embed(text: string): Promise<Float32Array | null> {
+    this.calls.push(text);
+    return new Float32Array([0.1, 0.2, 0.3, 0.4, 0.5]);
+  }
+
+  async embedBatch(texts: string[]): Promise<(Float32Array | null)[]> {
+    return Promise.all(texts.map((text) => this.embed(text)));
+  }
+
+  reset(): void {
+    this.calls.length = 0;
+  }
+}
+
+let provider: FakeEmbeddingProvider;
+
+async function embeddingCount(scriptId: string): Promise<number> {
+  const row = await getDbClient().get<{ count: number }>(
+    "SELECT COUNT(*) as count FROM script_embeddings WHERE scriptId = ?",
+    [scriptId],
+  );
+  return row?.count ?? 0;
+}
+
+async function totalEmbeddingCount(): Promise<number> {
+  const row = await getDbClient().get<{ count: number }>(
+    "SELECT COUNT(*) as count FROM script_embeddings",
+  );
+  return row?.count ?? 0;
+}
+
+beforeAll(async () => {
+  await clearDb();
+  initDb(TEST_DB_PATH);
+});
+
+afterAll(async () => {
+  setScriptEmbeddingProviderForTests(null);
+  closeDb();
+  await clearDb();
+});
+
+beforeEach(async () => {
+  await getDbClient().run("DELETE FROM scripts");
+  await getDbClient().run("DELETE FROM script_embeddings");
+  provider = new FakeEmbeddingProvider();
+  setScriptEmbeddingProviderForTests(provider);
+});
+
+describe("boot-reembed-scripts", () => {
+  test("backfills scripts that were seeded with embeddingMode: skip", async () => {
+    const result = await upsertScriptByName({
+      name: "skipped-embed",
+      scope: "global",
+      source: source("skipped"),
+      description: "A script seeded without embedding",
+      intent: "Test backfill",
+      signatureJson,
+      embeddingMode: "skip",
+    });
+    expect(await embeddingCount(result.script.id)).toBe(0);
+
+    provider.reset();
+    await runBootReembedScripts();
+    expect(await embeddingCount(result.script.id)).toBe(1);
+    // +1 for the provider probe call ("test") that verifies the provider works
+    expect(provider.calls).toHaveLength(2);
+  });
+
+  test("no-ops when all scripts already have embeddings", async () => {
+    await upsertScriptByName({
+      name: "already-embedded",
+      scope: "global",
+      source: source("embedded"),
+      description: "Already has embedding",
+      intent: "No-op test",
+      signatureJson,
+    });
+    expect(await totalEmbeddingCount()).toBe(1);
+
+    provider.reset();
+    await runBootReembedScripts();
+    expect(provider.calls).toHaveLength(0);
+  });
+
+  test("skips scratch scripts during backfill", async () => {
+    await upsertScriptByName({
+      name: "scratch-no-backfill",
+      scope: "agent",
+      scopeId: "agent-1",
+      source: source("scratch"),
+      description: "Scratch script",
+      intent: "Should not be backfilled",
+      signatureJson,
+      isScratch: true,
+    });
+
+    provider.reset();
+    await runBootReembedScripts();
+    expect(provider.calls).toHaveLength(0);
+  });
+
+  test("backfills only scripts missing embeddings, not those that already have them", async () => {
+    const withEmbed = await upsertScriptByName({
+      name: "has-embed",
+      scope: "global",
+      source: source("has"),
+      description: "Has embedding",
+      intent: "Already embedded",
+      signatureJson,
+    });
+    const withoutEmbed = await upsertScriptByName({
+      name: "missing-embed",
+      scope: "global",
+      source: source("missing"),
+      description: "Missing embedding",
+      intent: "Needs backfill",
+      signatureJson,
+      embeddingMode: "skip",
+    });
+    expect(await embeddingCount(withEmbed.script.id)).toBe(1);
+    expect(await embeddingCount(withoutEmbed.script.id)).toBe(0);
+
+    provider.reset();
+    await runBootReembedScripts();
+    // +1 for the provider probe call
+    expect(provider.calls).toHaveLength(2);
+    expect(await embeddingCount(withoutEmbed.script.id)).toBe(1);
+  });
+
+  test("re-embeds scripts with wrong-dimension embeddings", async () => {
+    const result = await upsertScriptByName({
+      name: "wrong-dim",
+      scope: "global",
+      source: source("wrong-dim"),
+      description: "Script with legacy 1536d embedding",
+      intent: "Dimension fix test",
+      signatureJson,
+    });
+    expect(await embeddingCount(result.script.id)).toBe(1);
+
+    // Overwrite with a wrong-dimension (1536d) embedding to simulate legacy data
+    const wrongDimVector = new Float32Array(1536).fill(0.1);
+    await getDbClient().run("UPDATE script_embeddings SET embedding = ? WHERE scriptId = ?", [
+      serializeEmbedding(wrongDimVector),
+      result.script.id,
+    ]);
+
+    // Verify the wrong dim is stored
+    const stored = await getDbClient().get<{ len: number }>(
+      "SELECT length(embedding) as len FROM script_embeddings WHERE scriptId = ?",
+      [result.script.id],
+    );
+    expect(stored?.len).toBe(1536 * 4);
+
+    provider.reset();
+    await runBootReembedScripts();
+    // +1 for the provider probe call
+    expect(provider.calls).toHaveLength(2);
+
+    // Should now have correct-dimension embedding
+    const fixed = await getDbClient().get<{ len: number }>(
+      "SELECT length(embedding) as len FROM script_embeddings WHERE scriptId = ?",
+      [result.script.id],
+    );
+    expect(fixed?.len).toBe(5 * 4); // provider.dimensions = 5
+  });
+
+  test("no-ops when all scripts have correct-dimension embeddings", async () => {
+    await upsertScriptByName({
+      name: "correct-dim",
+      scope: "global",
+      source: source("correct"),
+      description: "Already correct",
+      intent: "No-op test",
+      signatureJson,
+    });
+    expect(await totalEmbeddingCount()).toBe(1);
+
+    provider.reset();
+    await runBootReembedScripts();
+    expect(provider.calls).toHaveLength(0);
+  });
+});

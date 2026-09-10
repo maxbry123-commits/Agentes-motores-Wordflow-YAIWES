@@ -1,0 +1,51 @@
+[
+  {
+    "repo": "Qwen-UI-Agent",
+    "path": "Qwen-UI-Agent/Qwen-UI-Agent-Technical-Report.pdf",
+    "chunks_dir": "Qwen-UI-Agent/Qwen-UI-Agent/Qwen-UI-Agent-Technical-Report.pdf.chunks",
+    "bytes": 32710025,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "Qwen-UI-Agent",
+    "path": "MAI-UI/assets/gif/work.gif",
+    "chunks_dir": "Qwen-UI-Agent/MAI-UI/assets/gif/work.gif.chunks",
+    "bytes": 35425511,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "Qwen-UI-Agent",
+    "path": "MAI-UI/assets/gif/dcc_complex_task.gif",
+    "chunks_dir": "Qwen-UI-Agent/MAI-UI/assets/gif/dcc_complex_task.gif.chunks",
+    "bytes": 11116441,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "Qwen-UI-Agent",
+    "path": "MAI-UI/assets/gif/living.gif",
+    "chunks_dir": "Qwen-UI-Agent/MAI-UI/assets/gif/living.gif.chunks",
+    "bytes": 40459312,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "Qwen-UI-Agent",
+    "path": "MAI-UI/assets/gif/navigation.gif",
+    "chunks_dir": "Qwen-UI-Agent/MAI-UI/assets/gif/navigation.gif.chunks",
+    "bytes": 14830207,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "Qwen-UI-Agent",
+    "path": "MAI-UI/assets/gif/dcc_simple_task.gif",
+    "chunks_dir": "Qwen-UI-Agent/MAI-UI/assets/gif/dcc_simple_task.gif.chunks",
+    "bytes": 10959599,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "Qwen-UI-Agent",
+    "path": "MAI-UI/assets/gif/shopping.gif",
+    "chunks_dir": "Qwen-UI-Agent/MAI-UI/assets/gif/shopping.gif.chunks",
+    "bytes": 17066129,
+    "chunk_bytes": 8388608
+  }
+]

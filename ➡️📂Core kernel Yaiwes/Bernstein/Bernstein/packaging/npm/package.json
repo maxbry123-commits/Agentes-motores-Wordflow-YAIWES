@@ -1,0 +1,45 @@
+{
+  "//": "The version field below is stamped from the release tag at publish time (publish.yml's npm job runs `npm version $VERSION`); the committed value is not the released value.",
+  "name": "bernstein-orchestrator",
+  "version": "1.9.0",
+  "description": "Deterministic orchestrator for CLI coding agents. Spawn parallel agents in per-task git worktrees, verify with tests, commit clean code; no model in the coordination loop, so runs replay byte-identically.",
+  "keywords": [
+    "ai",
+    "agents",
+    "orchestration",
+    "multi-agent",
+    "coding",
+    "cli",
+    "claude-code",
+    "codex",
+    "gemini-cli",
+    "mcp"
+  ],
+  "license": "Apache-2.0",
+  "author": "Alex Chernysh <alex@alexchernysh.com>",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sipyourdrink-ltd/bernstein.git"
+  },
+  "homepage": "https://github.com/sipyourdrink-ltd/bernstein",
+  "bin": {
+    "bernstein": "index.js"
+  },
+  "scripts": {
+    "postinstall": "node install.js"
+  },
+  "engines": {
+    "node": ">=16"
+  },
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ],
+  "files": [
+    "index.js",
+    "install.js",
+    "README.md"
+  ],
+  "mcpName": "io.github.sipyourdrink-ltd/bernstein"
+}

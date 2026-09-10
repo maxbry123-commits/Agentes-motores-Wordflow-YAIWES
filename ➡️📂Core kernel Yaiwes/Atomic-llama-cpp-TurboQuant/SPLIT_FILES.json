@@ -1,0 +1,16 @@
+[
+  {
+    "repo": "Atomic-llama-cpp-TurboQuant",
+    "path": "models/ggml-vocab-gemma-4.gguf",
+    "chunks_dir": "Atomic-llama-cpp-TurboQuant/models/ggml-vocab-gemma-4.gguf.chunks",
+    "bytes": 15776467,
+    "chunk_bytes": 8388608
+  },
+  {
+    "repo": "Atomic-llama-cpp-TurboQuant",
+    "path": "models/ggml-vocab-command-r.gguf",
+    "chunks_dir": "Atomic-llama-cpp-TurboQuant/models/ggml-vocab-command-r.gguf.chunks",
+    "bytes": 10874545,
+    "chunk_bytes": 8388608
+  }
+]

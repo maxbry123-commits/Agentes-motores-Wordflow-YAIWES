@@ -1,0 +1,116 @@
+# Warranty Claim
+
+This Livebook runs a deterministic warranty claim review. It does not use a
+provider key or network access.
+
+```elixir
+package_root = Path.expand("../..", __DIR__)
+
+Mix.install(
+  [
+    {:kino, "~> 0.14"},
+    {:jidoka, path: package_root}
+  ],
+  consolidate_protocols: false,
+  lockfile: Path.join(package_root, "mix.lock")
+)
+
+Code.require_file(Path.expand("../loader.exs", __DIR__))
+JidokaExamples.Loader.load!(__DIR__)
+
+alias JidokaExamples.WarrantyClaim.Agent, as: WarrantyAgent
+alias JidokaExamples.WarrantyClaim.Scenario
+alias JidokaExamples.WarrantyClaim.ScriptedLLM
+
+Jidoka.Kino.setup_notebook(model: "test:warranty-static", check_provider?: false)
+```
+
+## Compare The Authoring Paths
+
+The code-first agent and the YAML document compile to the same semantic spec.
+
+```elixir
+{:ok, imported_spec} = Scenario.imported_spec()
+
+dsl_projection = Scenario.semantic_projection(WarrantyAgent.spec())
+yaml_projection = Scenario.semantic_projection(imported_spec)
+
+unless dsl_projection == yaml_projection do
+  raise "the DSL and YAML agent specs differ"
+end
+
+%{equal?: true, dsl: dsl_projection, yaml: yaml_projection}
+```
+
+## Inspect The Multimodal Claim
+
+The public projection shows the part types and safe media data. It does not show
+the photo bytes or receipt file ID.
+
+```elixir
+Scenario.claim_input()
+|> Enum.map(&Jidoka.project/1)
+```
+
+## Run Retry, Fallback, And Repair
+
+The scripted primary model times out twice. The fallback then returns one
+invalid result. Jidoka asks for one repair and validates the next result.
+
+```elixir
+observer = self()
+{:ok, result} = Scenario.execute(observer: observer)
+
+model_calls =
+  Enum.map(1..6, fn _index ->
+    receive do
+      {:warranty_model_called, model, phase} -> %{model: model, phase: phase}
+    after
+      0 -> raise "a model call was not recorded"
+    end
+  end)
+
+backoffs =
+  Enum.map(1..2, fn _index ->
+    receive do
+      {:warranty_model_backoff, delay} -> delay
+    after
+      0 -> raise "a model retry was not recorded"
+    end
+  end)
+
+unless Enum.count(result.events, &(&1.event == :result_repair_requested)) == 1 do
+  raise "the result was not repaired exactly once"
+end
+
+unless result.value.decision == :approve do
+  raise "the final claim decision was not approved"
+end
+
+%{
+  backoffs: backoffs,
+  expected_fallback: ScriptedLLM.fallback(),
+  model_calls: model_calls,
+  value: result.value
+}
+```
+
+## Inspect The Safe Result
+
+```elixir
+%{
+  answer: result.content,
+  output_parts: Jidoka.project(result.parts),
+  resolved_instructions:
+    result.metadata.debug.prompt.messages
+    |> Enum.find(&(&1.role == :system))
+    |> Map.fetch!(:content)
+}
+```
+
+## Inspect The Runtime
+
+```elixir
+{:ok, _timeline} = Jidoka.Kino.timeline(result)
+{:ok, _graph} = Jidoka.Kino.call_graph(result)
+```

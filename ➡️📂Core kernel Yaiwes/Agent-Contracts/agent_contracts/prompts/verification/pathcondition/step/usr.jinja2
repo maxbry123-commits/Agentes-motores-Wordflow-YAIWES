@@ -1,0 +1,24 @@
+# State
+
+## Current verification internal state:
+```json
+{{ schema | tojson() }}
+```
+
+## Update instructions
+{{ update_instructions }}
+
+## Early termination condition
+{{ early_termination }}
+
+{%if prev_reasoning %}Reason for previous update: {{ prev_reasoning }}{%endif%}
+
+## Action
+
+State name: **{{ state.name }}**
+State current action:
+```json
+{{ action | tojson() }}
+```
+
+Updated Schema:

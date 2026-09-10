@@ -1,0 +1,373 @@
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { unlink } from "node:fs/promises";
+import { closeDb, getDbClient, initDb } from "../be/db";
+import { loadModelsDevCache } from "../be/modelsdev-cache";
+import { seedPricingFromModelsDev } from "../be/seed-pricing";
+import { CODEX_MODEL_PRICING } from "../providers/codex-models";
+
+const TEST_DB_PATH = "./test-migration-046.sqlite";
+
+async function removeDbFiles(path: string): Promise<void> {
+  for (const suffix of ["", "-wal", "-shm"]) {
+    try {
+      await unlink(path + suffix);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        throw error;
+      }
+    }
+  }
+}
+
+beforeAll(() => {
+  initDb(TEST_DB_PATH);
+});
+
+afterAll(async () => {
+  closeDb();
+  await removeDbFiles(TEST_DB_PATH);
+});
+
+interface TableInfoRow {
+  name: string;
+  type: string;
+  notnull: number;
+  pk: number;
+}
+
+interface MasterRow {
+  sql: string;
+  name: string;
+}
+
+interface CountRow {
+  cnt: number;
+}
+
+interface PricingRow {
+  provider: string;
+  model: string;
+  token_class: string;
+  effective_from: number;
+  price_per_million_usd: number;
+  createdAt: number;
+  lastUpdatedAt: number;
+}
+
+describe("migration 046 — budgets and pricing", () => {
+  test("budgets table exists with expected columns and PK", async () => {
+    const cols = await getDbClient().query<TableInfoRow>("PRAGMA table_info(budgets)");
+    expect(cols.length).toBeGreaterThan(0);
+
+    const colMap = new Map(cols.map((c) => [c.name, c]));
+    expect(colMap.has("scope")).toBe(true);
+    expect(colMap.has("scope_id")).toBe(true);
+    expect(colMap.has("daily_budget_usd")).toBe(true);
+    expect(colMap.has("createdAt")).toBe(true);
+    expect(colMap.has("lastUpdatedAt")).toBe(true);
+
+    // Composite PK on (scope, scope_id) — both pk fields > 0.
+    expect(colMap.get("scope")!.pk).toBeGreaterThan(0);
+    expect(colMap.get("scope_id")!.pk).toBeGreaterThan(0);
+  });
+
+  test("budgets CHECK constraints reject invalid scope and negative budget", async () => {
+    const client = getDbClient();
+    // Valid global row.
+    await client.run(
+      "INSERT INTO budgets (scope, scope_id, daily_budget_usd, createdAt, lastUpdatedAt) VALUES (?, ?, ?, ?, ?)",
+      ["global", "", 10.0, 0, 0],
+    );
+
+    // Round-trip
+    const row = await client.get<{ scope: string; scope_id: string; daily_budget_usd: number }>(
+      "SELECT scope, scope_id, daily_budget_usd FROM budgets WHERE scope = 'global'",
+    );
+    expect(row?.scope).toBe("global");
+    expect(row?.scope_id).toBe("");
+    expect(row?.daily_budget_usd).toBe(10.0);
+
+    // Inserting another row with same PK fails.
+    await expect(
+      client.run(
+        "INSERT INTO budgets (scope, scope_id, daily_budget_usd, createdAt, lastUpdatedAt) VALUES (?, ?, ?, ?, ?)",
+        ["global", "", 5.0, 0, 0],
+      ),
+    ).rejects.toThrow();
+
+    // Invalid scope rejected by CHECK.
+    await expect(
+      client.run(
+        "INSERT INTO budgets (scope, scope_id, daily_budget_usd, createdAt, lastUpdatedAt) VALUES (?, ?, ?, ?, ?)",
+        ["not-a-scope", "x", 1.0, 0, 0],
+      ),
+    ).rejects.toThrow();
+
+    // Negative budget rejected by CHECK.
+    await expect(
+      client.run(
+        "INSERT INTO budgets (scope, scope_id, daily_budget_usd, createdAt, lastUpdatedAt) VALUES (?, ?, ?, ?, ?)",
+        ["agent", "agent-x", -1, 0, 0],
+      ),
+    ).rejects.toThrow();
+  });
+
+  test("pricing table exists with expected columns and composite PK", async () => {
+    const cols = await getDbClient().query<TableInfoRow>("PRAGMA table_info(pricing)");
+    expect(cols.length).toBeGreaterThan(0);
+
+    const colMap = new Map(cols.map((c) => [c.name, c]));
+    expect(colMap.has("provider")).toBe(true);
+    expect(colMap.has("model")).toBe(true);
+    expect(colMap.has("token_class")).toBe(true);
+    expect(colMap.has("effective_from")).toBe(true);
+    expect(colMap.has("price_per_million_usd")).toBe(true);
+
+    // All four PK columns participate in the composite PK.
+    expect(colMap.get("provider")!.pk).toBeGreaterThan(0);
+    expect(colMap.get("model")!.pk).toBeGreaterThan(0);
+    expect(colMap.get("token_class")!.pk).toBeGreaterThan(0);
+    expect(colMap.get("effective_from")!.pk).toBeGreaterThan(0);
+  });
+
+  test("pricing seed includes every known Codex model/token class at effective_from=0", async () => {
+    const minimumCodexRows = Object.keys(CODEX_MODEL_PRICING).length * 3;
+
+    const seedRows = await getDbClient().get<CountRow>(
+      "SELECT COUNT(*) as cnt FROM pricing WHERE provider = 'codex' AND effective_from = 0",
+    );
+    expect(seedRows?.cnt ?? 0).toBeGreaterThanOrEqual(minimumCodexRows);
+  });
+
+  test("every CODEX_MODEL_PRICING entry has priced rows for input / cached_input / output", async () => {
+    const client = getDbClient();
+
+    // No exact-rate equality here: effective_from=0 rows are frozen history
+    // (migrations 046/114 captured launch rates), while CODEX_MODEL_PRICING
+    // tracks the live models.dev snapshot and gets corrected over time —
+    // OpenAI repriced the GPT-5.6 tier after launch. Rate truth at lookup
+    // time comes from newer effective_from rows (runtime refresh); the
+    // worker-local table is advisory and agentswarm.cost.drift.usd is the
+    // watchdog. This test pins seed COVERAGE, not rate sync.
+    for (const model of Object.keys(CODEX_MODEL_PRICING)) {
+      for (const tokenClass of ["input", "cached_input", "output"] as const) {
+        const row = await client.get<PricingRow>(
+          "SELECT * FROM pricing WHERE provider = 'codex' AND model = ? AND token_class = ? AND effective_from = ?",
+          [model, tokenClass, 0],
+        );
+        expect(row).toBeDefined();
+        expect(row?.price_per_million_usd).toBeGreaterThan(0);
+      }
+    }
+  });
+
+  test("models.dev seed includes Claude Mythos 5 pricing rows", async () => {
+    const client = getDbClient();
+    const result = seedPricingFromModelsDev({ quiet: true });
+    expect(result.modelsdevFound).toBe(true);
+
+    const expectedPrices = {
+      input: 10,
+      cached_input: 1,
+      cache_write: 12.5,
+      output: 50,
+    } as const;
+    const seededKeys = [
+      ["claude", "claude-mythos-5"],
+      ["claude-managed", "claude-mythos-5"],
+      ["claude", "mythos"],
+      ["claude-managed", "mythos"],
+      ["pi", "mythos"],
+    ] as const;
+
+    for (const [provider, model] of seededKeys) {
+      for (const [tokenClass, price] of Object.entries(expectedPrices)) {
+        const row = await client.get<PricingRow>(
+          `SELECT * FROM pricing
+             WHERE provider = ? AND model = ? AND token_class = ? AND effective_from = 0`,
+          [provider, model, tokenClass],
+        );
+        expect(row?.price_per_million_usd).toBe(price);
+      }
+    }
+  });
+
+  test("models.dev seed includes Claude Sonnet 5 pricing rows", async () => {
+    const client = getDbClient();
+    const result = seedPricingFromModelsDev({ quiet: true });
+    expect(result.modelsdevFound).toBe(true);
+
+    // Derive expected rates from the vendored snapshot instead of literals —
+    // Anthropic reprices (sonnet-5 intro rate through 2026-08-31), and this
+    // test pins faithful PROJECTION of the snapshot, not a rate freeze.
+    const cost = loadModelsDevCache()?.anthropic?.models?.["claude-sonnet-5"]?.cost;
+    expect(cost?.input).toBeGreaterThan(0);
+    const expectedPrices = {
+      input: cost?.input,
+      cached_input: cost?.cache_read,
+      cache_write: cost?.cache_write,
+      // Phase 3: Anthropic-billed rows derive the 1h class at 2x base input.
+      cache_write_1h: (cost?.input ?? 0) * 2,
+      output: cost?.output,
+    } as const;
+    const seededKeys = [
+      ["claude", "claude-sonnet-5"],
+      ["claude-managed", "claude-sonnet-5"],
+      ["claude", "sonnet"],
+      ["claude-managed", "sonnet"],
+      ["pi", "sonnet"],
+    ] as const;
+
+    for (const [provider, model] of seededKeys) {
+      for (const [tokenClass, price] of Object.entries(expectedPrices)) {
+        const row = await client.get<PricingRow>(
+          `SELECT * FROM pricing
+             WHERE provider = ? AND model = ? AND token_class = ? AND effective_from = 0`,
+          [provider, model, tokenClass],
+        );
+        expect(row?.price_per_million_usd).toBe(price as number);
+      }
+    }
+  });
+
+  test("idx_pricing_lookup index exists", async () => {
+    const idx = await getDbClient().get<MasterRow>(
+      "SELECT name, sql FROM sqlite_master WHERE type='index' AND name='idx_pricing_lookup'",
+    );
+    expect(idx?.name).toBe("idx_pricing_lookup");
+    expect(idx?.sql).toContain("provider");
+    expect(idx?.sql).toContain("model");
+    expect(idx?.sql).toContain("token_class");
+    expect(idx?.sql).toContain("effective_from");
+  });
+
+  test("re-applying seed INSERT OR IGNORE does not duplicate rows", async () => {
+    const client = getDbClient();
+    const before = await client.get<CountRow>("SELECT COUNT(*) as cnt FROM pricing");
+
+    // Replay the same seed statements.
+    await client.run(
+      `INSERT OR IGNORE INTO pricing (provider, model, token_class, effective_from, price_per_million_usd, createdAt, lastUpdatedAt)
+       VALUES ('codex', 'gpt-5.4', 'input', 0, 2.5, 0, 0)`,
+    );
+    await client.run(
+      `INSERT OR IGNORE INTO pricing (provider, model, token_class, effective_from, price_per_million_usd, createdAt, lastUpdatedAt)
+       VALUES ('codex', 'gpt-5.3-codex', 'output', 0, 14.0, 0, 0)`,
+    );
+
+    const after = await client.get<CountRow>("SELECT COUNT(*) as cnt FROM pricing");
+    expect(after?.cnt).toBe(before?.cnt);
+  });
+
+  test("append-only price history: new effective_from row coexists with seed; latest-active lookup picks correct row", async () => {
+    const client = getDbClient();
+    const NOW = 1_700_000_000_000; // arbitrary epoch ms in the future relative to 0
+
+    // Add a NEW pricing row for codex/gpt-5.3-codex/input at a later effective_from with a different price.
+    await client.run(
+      `INSERT INTO pricing (provider, model, token_class, effective_from, price_per_million_usd, createdAt, lastUpdatedAt)
+       VALUES ('codex', 'gpt-5.3-codex', 'input', ?, ?, ?, ?)`,
+      [NOW, 99.99, NOW, NOW],
+    );
+
+    // Seed row should still exist at effective_from = 0.
+    const seedRow = await client.get<PricingRow>(
+      "SELECT * FROM pricing WHERE provider='codex' AND model='gpt-5.3-codex' AND token_class='input' AND effective_from=0",
+    );
+    expect(seedRow?.price_per_million_usd).toBe(1.75);
+
+    // "Largest effective_from <= now" — should return the new row.
+    const latestRow = await client.get<PricingRow>(
+      `SELECT * FROM pricing
+         WHERE provider='codex' AND model='gpt-5.3-codex' AND token_class='input'
+         AND effective_from <= ?
+         ORDER BY effective_from DESC LIMIT 1`,
+      [NOW + 1],
+    );
+    expect(latestRow?.effective_from).toBe(NOW);
+    expect(latestRow?.price_per_million_usd).toBe(99.99);
+
+    // Same query against effective_from <= 0 should return the seed row.
+    const seedLookup = await client.get<PricingRow>(
+      `SELECT * FROM pricing
+         WHERE provider='codex' AND model='gpt-5.3-codex' AND token_class='input'
+         AND effective_from <= ?
+         ORDER BY effective_from DESC LIMIT 1`,
+      [0],
+    );
+    expect(seedLookup?.effective_from).toBe(0);
+    expect(seedLookup?.price_per_million_usd).toBe(1.75);
+  });
+
+  test("budget_refusal_notifications table exists with expected columns and composite PK", async () => {
+    const cols = await getDbClient().query<TableInfoRow>(
+      "PRAGMA table_info(budget_refusal_notifications)",
+    );
+    expect(cols.length).toBeGreaterThan(0);
+
+    const colMap = new Map(cols.map((c) => [c.name, c]));
+    expect(colMap.has("task_id")).toBe(true);
+    expect(colMap.has("date")).toBe(true);
+    expect(colMap.has("agent_id")).toBe(true);
+    expect(colMap.has("cause")).toBe(true);
+    expect(colMap.has("agent_spend_usd")).toBe(true);
+    expect(colMap.has("agent_budget_usd")).toBe(true);
+    expect(colMap.has("global_spend_usd")).toBe(true);
+    expect(colMap.has("global_budget_usd")).toBe(true);
+    expect(colMap.has("follow_up_task_id")).toBe(true);
+    expect(colMap.has("createdAt")).toBe(true);
+
+    // Composite PK on (task_id, date).
+    expect(colMap.get("task_id")!.pk).toBeGreaterThan(0);
+    expect(colMap.get("date")!.pk).toBeGreaterThan(0);
+
+    // Optional spend/budget fields are NULL-able.
+    expect(colMap.get("agent_spend_usd")!.notnull).toBe(0);
+    expect(colMap.get("global_budget_usd")!.notnull).toBe(0);
+    expect(colMap.get("follow_up_task_id")!.notnull).toBe(0);
+  });
+
+  test("budget_refusal_notifications dedup via INSERT OR IGNORE on (task_id, date)", async () => {
+    const client = getDbClient();
+
+    const taskId = "task-dedup-1";
+    const date = "2026-04-28";
+
+    const first = await client.run(
+      `INSERT OR IGNORE INTO budget_refusal_notifications
+         (task_id, date, agent_id, cause, createdAt)
+         VALUES (?, ?, ?, ?, ?)`,
+      [taskId, date, "agent-1", "agent", 0],
+    );
+    expect(first.changes).toBe(1);
+
+    // Second insert with same PK is silently ignored.
+    const second = await client.run(
+      `INSERT OR IGNORE INTO budget_refusal_notifications
+         (task_id, date, agent_id, cause, createdAt)
+         VALUES (?, ?, ?, ?, ?)`,
+      [taskId, date, "agent-1", "agent", 1],
+    );
+    expect(second.changes).toBe(0);
+
+    // Different date succeeds (PK rolls over).
+    const nextDay = await client.run(
+      `INSERT OR IGNORE INTO budget_refusal_notifications
+         (task_id, date, agent_id, cause, createdAt)
+         VALUES (?, ?, ?, ?, ?)`,
+      [taskId, "2026-04-29", "agent-1", "agent", 2],
+    );
+    expect(nextDay.changes).toBe(1);
+  });
+
+  test("budget_refusal_notifications CHECK rejects unknown cause", async () => {
+    await expect(
+      getDbClient().run(
+        `INSERT INTO budget_refusal_notifications
+           (task_id, date, agent_id, cause, createdAt)
+           VALUES (?, ?, ?, ?, ?)`,
+        ["task-cause-1", "2026-04-28", "agent-1", "not-a-cause", 0],
+      ),
+    ).rejects.toThrow();
+  });
+});
