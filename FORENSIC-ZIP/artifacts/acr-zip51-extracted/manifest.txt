@@ -1,4 +1,0 @@
-archive=zip 5.1 openclaw-2026.7.1-2.zip
-archive_size_bytes=10027045
-file_count=791
-dir_count=42
