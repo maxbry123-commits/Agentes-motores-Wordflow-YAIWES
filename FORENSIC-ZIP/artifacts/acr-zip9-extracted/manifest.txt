@@ -1,4 +1,0 @@
-archive=zip 9 open claw src.zip
-archive_size_bytes=7239313
-file_count=2579
-dir_count=44
