@@ -1,6 +1,0 @@
-{
-  "type": "module",
-  "scripts": {
-    "check-types": "exit 0"
-  }
-}

@@ -1,1 +1,0 @@
-Request a pilot kit and teacher bundle

@@ -1,4 +1,0 @@
-{
-  "id": "truncate-word",
-  "why": "cuts mid-word instead of at a boundary"
-}

@@ -1,9 +1,0 @@
-{
-  "name": "rollup-native-blocked",
-  "version": "1.0.0",
-  "private": true,
-  "type": "module",
-  "dependencies": {
-    "rollup": "4.62.2"
-  }
-}

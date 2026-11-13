@@ -1,8 +1,0 @@
-{
-  "entry": "src/index.cjs",
-  "expectation": "fail",
-  "fail": {
-    "code": 1,
-    "stderrIncludes": "TURBO_NATIVE_UNSUPPORTED:"
-  }
-}

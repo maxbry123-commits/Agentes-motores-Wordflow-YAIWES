@@ -1,4 +1,0 @@
-{
-  "id": "unique-preserve-key",
-  "why": "compares whole items, not the key"
-}

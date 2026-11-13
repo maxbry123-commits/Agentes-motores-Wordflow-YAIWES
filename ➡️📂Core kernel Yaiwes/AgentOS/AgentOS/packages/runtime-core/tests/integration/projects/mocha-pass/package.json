@@ -1,8 +1,0 @@
-{
-  "name": "mocha-pass",
-  "version": "1.0.0",
-  "private": true,
-  "dependencies": {
-    "mocha": "11.7.6"
-  }
-}

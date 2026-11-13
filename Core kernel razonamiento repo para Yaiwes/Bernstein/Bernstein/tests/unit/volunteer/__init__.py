@@ -1,1 +1,0 @@
-"""Volunteer-workers unit tests."""

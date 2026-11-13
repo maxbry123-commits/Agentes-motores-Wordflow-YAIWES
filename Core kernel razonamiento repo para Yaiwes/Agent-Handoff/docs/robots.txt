@@ -1,4 +1,0 @@
-User-agent: *
-Allow: /
-
-Sitemap: https://artyomboyko.github.io/Agent_Handoff/sitemap.xml

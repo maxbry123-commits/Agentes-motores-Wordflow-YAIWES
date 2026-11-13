@@ -1,7 +1,0 @@
-flask
-flask-wtf
-requests
-anthropic
-docker
-werkzeug
-

@@ -1,5 +1,0 @@
-{
-  "entry": "node_modules/@yarnpkg/cli-dist/bin/yarn.js",
-  "args": ["--version"],
-  "expectation": "pass"
-}

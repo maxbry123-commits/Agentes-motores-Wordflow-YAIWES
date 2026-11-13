@@ -1,9 +1,0 @@
-{
-  "entry": "src/index.cjs",
-  "expectation": "fail",
-  "packageManager": "npm",
-  "fail": {
-    "code": 1,
-    "stderrIncludes": "JEST_NATIVE_RESOLVER_UNSUPPORTED:"
-  }
-}

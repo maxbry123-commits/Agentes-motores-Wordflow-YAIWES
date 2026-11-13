@@ -1,8 +1,0 @@
-{
-  "entry": "src/index.cjs",
-  "expectation": "fail",
-  "fail": {
-    "code": 1,
-    "stderrIncludes": "BIOME_NATIVE_UNSUPPORTED:"
-  }
-}

@@ -1,6 +1,0 @@
-/* UI kit – split into sub-modules */
-@import "./kit/layout.css";
-@import "./kit/forms.css";
-@import "./kit/buttons.css";
-@import "./kit/typography.css";
-@import "./kit/modals.css";

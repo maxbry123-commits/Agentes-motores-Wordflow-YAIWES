@@ -1,9 +1,0 @@
-{
-  "mcpServers": {
-    "wiki": {
-      "command": "python",
-      "args": ["examples/assets/wiki_mcp_server.py"],
-      "transport": "stdio"
-    }
-  }
-}

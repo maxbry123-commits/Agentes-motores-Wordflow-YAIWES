@@ -1,8 +1,0 @@
-{
-  "name": "rollup-wasm-cli-pass",
-  "version": "1.0.0",
-  "private": true,
-  "dependencies": {
-    "rollup": "npm:@rollup/wasm-node@4.62.2"
-  }
-}

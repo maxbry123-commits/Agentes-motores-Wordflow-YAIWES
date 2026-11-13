@@ -1,1 +1,0 @@
-"""Git hooks for CORAL."""

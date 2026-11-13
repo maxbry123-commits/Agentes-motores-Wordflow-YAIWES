@@ -1,8 +1,0 @@
-self-hosted-runner:
-  labels:
-    - 'ecs-qwen'
-    - 'ecs-win'
-    - 'ecs-update-sg'
-    - 'ecs-update-64c'
-
-config-variables: null

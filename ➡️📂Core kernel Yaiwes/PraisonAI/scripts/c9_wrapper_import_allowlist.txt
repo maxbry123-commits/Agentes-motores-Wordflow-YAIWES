@@ -1,3 +1,0 @@
-# C9: allowlisted praisonai wrapper imports inside praisonai_bot (lazy bridges only).
-# gateway/server.py scheduled executor — lazy import inside method
-gateway/server.py

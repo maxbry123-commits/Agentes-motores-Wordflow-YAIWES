@@ -1,8 +1,0 @@
-{
-  "name": "project-matrix-vercel-sdk-root-large-graph-blocked",
-  "private": true,
-  "type": "module",
-  "dependencies": {
-    "@vercel/sdk": "1.28.8"
-  }
-}

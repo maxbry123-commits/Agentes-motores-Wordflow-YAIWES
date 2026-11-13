@@ -1,1 +1,0 @@
-"""Infrastructure exposure adapter package."""

@@ -1,1 +1,0 @@
-globalThis.__agentOSPreloaded = "ready";

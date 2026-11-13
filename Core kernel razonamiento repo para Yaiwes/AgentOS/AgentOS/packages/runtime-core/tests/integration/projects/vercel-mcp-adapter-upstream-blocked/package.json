@@ -1,8 +1,0 @@
-{
-  "name": "project-matrix-vercel-mcp-adapter-upstream-blocked",
-  "private": true,
-  "type": "module",
-  "dependencies": {
-    "@vercel/mcp-adapter": "0.3.2"
-  }
-}

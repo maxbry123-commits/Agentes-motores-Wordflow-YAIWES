@@ -1,8 +1,0 @@
-# Local secrets — holds the Anthropic API key, passwords, and app secret
-.env
-
-# Authelia runtime — real domain, secrets, and live state
-authelia/configuration.yml
-authelia/users_database.yml
-authelia/db.sqlite3
-authelia/notification.txt

@@ -1,5 +1,0 @@
-{
-  "entry": "node_modules/typescript/bin/tsc",
-  "args": ["--project", "tsconfig.json"],
-  "expectation": "pass"
-}

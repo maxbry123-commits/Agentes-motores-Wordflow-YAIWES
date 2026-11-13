@@ -1,3 +1,0 @@
-house-prices-advanced-regression-techniques
-spaceship-titanic
-titanic

@@ -1,1 +1,0 @@
-export const FAILED_TASK_OUTPUT_PREFIX = "[FAILED:";

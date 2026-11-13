@@ -1,1 +1,0 @@
-"""OpenMLE Gym metadata pipeline."""

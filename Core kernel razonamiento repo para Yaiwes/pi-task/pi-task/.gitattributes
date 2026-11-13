@@ -1,2 +1,0 @@
-# LF everywhere; CRLF on Windows CI breaks fixture-driven tests.
-* text=auto eol=lf

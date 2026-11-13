@@ -1,7 +1,0 @@
-fastapi
-uvicorn
-psycopg2-binary
-redis
-pydantic
-python-multipart
-agent-sandbox

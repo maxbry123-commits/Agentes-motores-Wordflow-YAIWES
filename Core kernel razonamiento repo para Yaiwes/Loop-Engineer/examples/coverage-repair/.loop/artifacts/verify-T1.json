@@ -1,8 +1,0 @@
-{
-  "task": "T1",
-  "verify": "scripts/verify-fast",
-  "outcome": "PASS",
-  "score": 0.74,
-  "criteria": { "2": true },
-  "detail": "malformed input raises PricingError; line_coverage 0.61 -> 0.74"
-}

@@ -1,5 +1,0 @@
-{
-  "entry": "node_modules/pnpm/bin/pnpm.cjs",
-  "args": ["--version"],
-  "expectation": "pass"
-}

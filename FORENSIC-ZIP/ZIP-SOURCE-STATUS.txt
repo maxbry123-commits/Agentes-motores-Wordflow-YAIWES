@@ -1,1 +1,0 @@
-ZIP evidence remains separate from canonical root; canonical root verification PASS.

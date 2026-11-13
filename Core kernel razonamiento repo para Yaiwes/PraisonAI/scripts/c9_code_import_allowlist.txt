@@ -1,4 +1,0 @@
-# Files allowed to reference praisonai_code directly (bridges / bootstrap only).
-_code_bridge.py
-_bootstrap.py
-_registry.py

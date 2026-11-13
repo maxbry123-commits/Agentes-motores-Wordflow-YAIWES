@@ -1,4 +1,0 @@
-{
-  "intent_id": "lean-proof-check",
-  "obligations": [{"name": "data_boundary_lemma", "proved": true}]
-}

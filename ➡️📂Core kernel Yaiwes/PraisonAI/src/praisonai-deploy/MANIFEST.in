@@ -1,3 +1,0 @@
-prune infra
-prune tests
-prune examples

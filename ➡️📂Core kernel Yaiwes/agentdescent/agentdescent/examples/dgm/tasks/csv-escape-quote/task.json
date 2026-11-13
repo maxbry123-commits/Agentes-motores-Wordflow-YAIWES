@@ -1,4 +1,0 @@
-{
-  "id": "csv-escape-quote",
-  "why": "does not double an embedded quote"
-}

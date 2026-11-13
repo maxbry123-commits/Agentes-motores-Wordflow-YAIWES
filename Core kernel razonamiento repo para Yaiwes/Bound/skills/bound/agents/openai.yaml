@@ -1,4 +1,0 @@
-interface:
-  display_name: "BOUND"
-  short_description: "Deterministic control for agent workflows"
-  default_prompt: "Use $bound to integrate deterministic ACCEPT, RETRY, REPLAN, and ROLLBACK decisions into this project."

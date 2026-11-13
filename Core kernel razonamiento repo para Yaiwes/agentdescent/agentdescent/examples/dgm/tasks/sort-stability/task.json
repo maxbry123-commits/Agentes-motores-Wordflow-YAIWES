@@ -1,4 +1,0 @@
-{
-  "id": "sort-stability",
-  "why": "sorts by the whole tuple, breaking stability"
-}

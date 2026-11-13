@@ -1,3 +1,0 @@
-# Examples
-
-Agent Handoff examples.

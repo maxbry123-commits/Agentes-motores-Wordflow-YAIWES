@@ -1,1 +1,0 @@
-"""Browser Typer commands."""

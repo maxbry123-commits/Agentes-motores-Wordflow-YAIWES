@@ -1,1 +1,0 @@
-"""CORAL.md template generation."""

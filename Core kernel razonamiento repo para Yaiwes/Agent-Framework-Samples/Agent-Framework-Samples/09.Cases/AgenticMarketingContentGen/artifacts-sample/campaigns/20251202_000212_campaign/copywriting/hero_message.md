@@ -1,1 +1,0 @@
-Bring affordable, standards-aligned edge-AI to your classroom with an ESP32 TinyML kit that empowers teachers, engages students, and scales from block coding to real TinyML projects.

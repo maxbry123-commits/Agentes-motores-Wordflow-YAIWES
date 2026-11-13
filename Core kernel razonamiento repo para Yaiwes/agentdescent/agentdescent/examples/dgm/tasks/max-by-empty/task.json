@@ -1,4 +1,0 @@
-{
-  "id": "max-by-empty",
-  "why": "raises on an empty sequence"
-}

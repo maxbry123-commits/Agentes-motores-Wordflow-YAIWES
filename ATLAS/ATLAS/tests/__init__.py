@@ -1,1 +1,0 @@
-# ATLAS Infrastructure Test Suite

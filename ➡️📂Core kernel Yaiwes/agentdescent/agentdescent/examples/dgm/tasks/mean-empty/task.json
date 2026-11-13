@@ -1,4 +1,0 @@
-{
-  "id": "mean-empty",
-  "why": "divides by zero on an empty list"
-}

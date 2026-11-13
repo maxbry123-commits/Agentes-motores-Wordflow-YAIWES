@@ -1,4 +1,0 @@
-{
-  "id": "url-query",
-  "why": "keeps only the last value of a repeated key"
-}

@@ -1,1 +1,0 @@
-"""Volunteer-workers integration tests."""

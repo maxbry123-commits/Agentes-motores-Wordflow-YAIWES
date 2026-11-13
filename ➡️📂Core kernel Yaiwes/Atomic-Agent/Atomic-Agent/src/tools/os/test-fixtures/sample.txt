@@ -1,2 +1,0 @@
-Plain text fixture.
-Second line.
